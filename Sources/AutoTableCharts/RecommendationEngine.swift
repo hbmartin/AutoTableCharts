@@ -71,7 +71,8 @@ public enum AutoChartEngine {
                 && $0.distinctCount > 0
         }
         var candidates: [AutoChartRecommendation] = []
-        let warnings = snapshot.metadata.isTruncated
+        let warnings =
+            snapshot.metadata.isTruncated
             ? ["Based on the first returned rows; totals and composition are suppressed."]
             : []
 
@@ -128,14 +129,15 @@ public enum AutoChartEngine {
         }
 
         for dimension in categorical
-            where !snapshot.metadata.isTruncated
-                && dimension.distinctCount <= options.maximumCategories
+        where !snapshot.metadata.isTruncated
+            && dimension.distinctCount <= options.maximumCategories
         {
             for measure in quantitative {
                 let uniqueAtResultGrain = dimension.distinctCount == dimension.nonNullCount
-                guard let categoryAggregation = uniqueAtResultGrain
-                    ? AutoChartAggregation.none
-                    : safeRollupAggregation(measure.column.hints)
+                guard
+                    let categoryAggregation = uniqueAtResultGrain
+                        ? AutoChartAggregation.none
+                        : safeRollupAggregation(measure.column.hints)
                 else { continue }
                 let orientation: AutoChartOrientation =
                     dimension.averageTextLength > 10 || dimension.distinctCount > 8
@@ -173,22 +175,24 @@ public enum AutoChartEngine {
                             context: context,
                             aggregation: .sum,
                             score: 58 + goalBonus(.composition, context.goal),
-                            rationale: ["Few positive, additive categories form a complete whole."]))
+                            rationale: ["Few positive, additive categories form a complete whole."])
+                    )
                 }
 
                 if let series = categorical.first(where: {
                     $0.column.id != dimension.column.id
                         && $0.distinctCount >= 2
                         && $0.distinctCount <= options.maximumSeries
-                })
-                {
+                }) {
                     let uniqueAtSeriesGrain = hasUniqueCombination(
                         snapshot: snapshot,
                         fields: [dimension.column.id, series.column.id],
-                        measure: measure.column.id)
-                    guard let seriesAggregation = uniqueAtSeriesGrain
-                        ? AutoChartAggregation.none
-                        : safeRollupAggregation(measure.column.hints)
+                        measure: measure.column.id,
+                        profiles: profileIndex)
+                    guard
+                        let seriesAggregation = uniqueAtSeriesGrain
+                            ? AutoChartAggregation.none
+                            : safeRollupAggregation(measure.column.hints)
                     else { continue }
                     candidates.append(
                         candidate(
@@ -196,7 +200,8 @@ public enum AutoChartEngine {
                             series: series, context: context,
                             aggregation: seriesAggregation,
                             score: 76 + goalBonus(.comparison, context.goal),
-                            rationale: ["Grouped bars compare a small series within each category."]))
+                            rationale: ["Grouped bars compare a small series within each category."]
+                        ))
                     if !snapshot.metadata.isTruncated,
                         measure.allNumericValuesPositive,
                         compositionIsSafe(measure.column.hints)
@@ -208,7 +213,9 @@ public enum AutoChartEngine {
                                 aggregation: seriesAggregation,
                                 stacking: .standard,
                                 score: 69 + goalBonus(.composition, context.goal),
-                                rationale: ["Stacking shows additive contribution within each category."]))
+                                rationale: [
+                                    "Stacking shows additive contribution within each category."
+                                ]))
                         candidates.append(
                             candidate(
                                 family: .normalizedBar, x: dimension, y: measure,
@@ -278,11 +285,9 @@ public enum AutoChartEngine {
 
         if !snapshot.metadata.isTruncated {
             for (leftIndex, left) in categorical.enumerated()
-                where left.distinctCount <= options.maximumCategories
-            {
+            where left.distinctCount <= options.maximumCategories {
                 for right in categorical.dropFirst(leftIndex + 1)
-                    where right.distinctCount <= options.maximumCategories
-                {
+                where right.distinctCount <= options.maximumCategories {
                     candidates.append(
                         candidate(
                             family: .heatmap, x: left, y: right,
@@ -298,13 +303,15 @@ public enum AutoChartEngine {
             temporal.count >= 2,
             let label = categorical.first
         {
-            let start = temporal.first {
-                $0.column.hints.role == .intervalStart
-            } ?? temporal[0]
-            let end = temporal.first {
-                $0.column.id != start.column.id
-                    && $0.column.hints.role == .intervalEnd
-            } ?? temporal.first { $0.column.id != start.column.id }
+            let start =
+                temporal.first {
+                    $0.column.hints.role == .intervalStart
+                } ?? temporal[0]
+            let end =
+                temporal.first {
+                    $0.column.id != start.column.id
+                        && $0.column.hints.role == .intervalEnd
+                } ?? temporal.first { $0.column.id != start.column.id }
             if let end {
                 candidates.append(
                     candidate(
@@ -316,19 +323,17 @@ public enum AutoChartEngine {
                         warnings: warnings))
             }
         } else if !snapshot.metadata.isTruncated,
-            let time = temporal.first, let label = categorical.first,
-            let measure = quantitative.first
-        {
-            candidates.append(
-                candidate(
-                    family: .bubble, x: time, y: measure, series: label,
-                    context: context,
-                    score: 72 + goalBonus(.range, context.goal),
-                    rationale: ["Dated events can be inspected along a temporal axis."],
-                    warnings: warnings))
-        } else if !snapshot.metadata.isTruncated,
             let time = temporal.first, let label = categorical.first
         {
+            if let measure = quantitative.first {
+                candidates.append(
+                    candidate(
+                        family: .scatter, x: time, y: measure, series: label,
+                        context: context,
+                        score: 72 + goalBonus(.relationship, context.goal),
+                        rationale: ["Dated values can be inspected along a temporal axis."],
+                        warnings: warnings))
+            }
             candidates.append(
                 candidate(
                     family: .range, x: label, context: context,
@@ -341,15 +346,18 @@ public enum AutoChartEngine {
 
         if let facet = categorical.first(where: {
             $0.distinctCount >= 2 && $0.distinctCount <= options.maximumFacets
-        }), let base = candidates.first(where: {
-            [.line, .bar, .scatter].contains($0.specification.family)
-                && $0.specification.encoding.x != facet.column.id
-                && $0.specification.encoding.y != facet.column.id
-                && validate(
-                    specification: $0.specification,
-                    snapshot: snapshot,
-                    profiles: profileIndex).isValid
-        }) {
+        }),
+            let base = candidates.first(where: {
+                [.line, .bar, .scatter].contains($0.specification.family)
+                    && $0.specification.encoding.x != facet.column.id
+                    && $0.specification.encoding.y != facet.column.id
+                    && validate(
+                        specification: $0.specification,
+                        snapshot: snapshot,
+                        profiles: profileIndex
+                    ).isValid
+            })
+        {
             var faceted = base
             faceted.specification.family = .faceted
             faceted.specification.encoding.facet = facet.column.id
@@ -362,7 +370,8 @@ public enum AutoChartEngine {
             validate(
                 specification: $0.specification,
                 snapshot: snapshot,
-                profiles: profileIndex).isValid
+                profiles: profileIndex
+            ).isValid
         }
         let unique = Dictionary(grouping: valid, by: \.id)
             .compactMap { $0.value.max { $0.score < $1.score } }
@@ -416,21 +425,38 @@ public enum AutoChartEngine {
                 issues.append(.init(severity: .error, message: "\(label) is required."))
                 return
             }
-            let matches: Bool = switch type {
-            case .nominal: profile.isCategorical
-            default: profile.semanticType == type
-            }
+            let matches: Bool =
+                switch type {
+                case .nominal: profile.isCategorical
+                default: profile.semanticType == type
+                }
             if !matches {
-                issues.append(.init(
-                    severity: .error,
-                    message: "\(label) must be \(type.rawValue)."))
+                issues.append(
+                    .init(
+                        severity: .error,
+                        message: "\(label) must be \(type.rawValue)."))
             }
+        }
+        func rejectMissing(_ id: AutoChartColumnID?, _ label: String) {
+            guard let id, let profile = profiles[id], profile.nullFraction > 0 else {
+                return
+            }
+            issues.append(
+                .init(
+                    severity: .error,
+                    message: "\(label) must not contain missing values."))
         }
         switch specification.family {
         case .table:
             break
         case .kpi:
             require(specification.encoding.y, .quantitative, "Value")
+            if snapshot.rows.count != 1 {
+                issues.append(
+                    .init(
+                        severity: .error,
+                        message: "Key values require exactly one source row."))
+            }
         case .bar, .rankedDot, .groupedBar, .stackedBar, .normalizedBar, .donut:
             require(specification.encoding.x, .nominal, "Category")
             require(specification.encoding.y, .quantitative, "Measure")
@@ -438,29 +464,71 @@ public enum AutoChartEngine {
             guard let x = specification.encoding.x, let profile = profiles[x],
                 profile.isTemporal || profile.semanticType == .ordinal
             else {
-                issues.append(.init(
-                    severity: .error,
-                    message: "Line and area charts require an ordered or temporal x-axis."))
+                issues.append(
+                    .init(
+                        severity: .error,
+                        message: "Line and area charts require an ordered or temporal x-axis."))
                 break
             }
             require(specification.encoding.y, .quantitative, "Measure")
+            if specification.family == .area,
+                let y = specification.encoding.y,
+                let minimum = profiles[y]?.numericMinimum,
+                minimum < 0
+            {
+                issues.append(
+                    .init(
+                        severity: .error,
+                        message: "Area charts require nonnegative values."))
+            }
         case .scatter, .bubble:
             guard let x = specification.encoding.x, let profile = profiles[x],
                 profile.isQuantitative || profile.isTemporal
             else {
-                issues.append(.init(
-                    severity: .error,
-                    message: "Scatter and bubble charts require a quantitative or temporal x-axis."))
+                issues.append(
+                    .init(
+                        severity: .error,
+                        message:
+                            "Scatter and bubble charts require a quantitative or temporal x-axis."))
                 break
             }
             require(specification.encoding.y, .quantitative, "Measure")
             if specification.family == .bubble {
                 require(specification.encoding.size, .quantitative, "Size")
+                if let size = specification.encoding.size,
+                    let minimum = profiles[size]?.numericMinimum,
+                    minimum < 0
+                {
+                    issues.append(
+                        .init(
+                            severity: .error,
+                            message: "Bubble sizes must be nonnegative."))
+                }
+                if specification.encoding.size == specification.encoding.x
+                    || specification.encoding.size == specification.encoding.y
+                {
+                    issues.append(
+                        .init(
+                            severity: .error,
+                            message: "Bubble size must use a distinct field."))
+                }
             }
         case .histogram:
             require(specification.encoding.x, .quantitative, "Binned field")
+            if let binCount = specification.binCount,
+                !(1...1_000).contains(binCount)
+            {
+                issues.append(
+                    .init(
+                        severity: .error,
+                        message: "Histogram bin count must be between 1 and 1000."))
+            }
         case .boxPlot:
             require(specification.encoding.y, .quantitative, "Measure")
+            if specification.encoding.x != nil {
+                require(specification.encoding.x, .nominal, "Category")
+                rejectMissing(specification.encoding.x, "Box-plot categories")
+            }
         case .heatmap:
             require(specification.encoding.x, .nominal, "X category")
             require(specification.encoding.y, .nominal, "Y category")
@@ -470,37 +538,100 @@ public enum AutoChartEngine {
             require(specification.encoding.end, .temporal, "End")
         case .faceted:
             require(specification.encoding.facet, .nominal, "Facet")
+            rejectMissing(specification.encoding.facet, "Facet fields")
             if let x = specification.encoding.x, let profile = profiles[x] {
                 if !profile.isCategorical && !profile.isQuantitative && !profile.isTemporal
                     && profile.semanticType != .ordinal
                 {
-                    issues.append(.init(
-                        severity: .error,
-                        message: "Faceted charts require a categorical, quantitative, or temporal x-axis."))
+                    issues.append(
+                        .init(
+                            severity: .error,
+                            message:
+                                "Faceted charts require a categorical, quantitative, or temporal x-axis."
+                        ))
                 }
             } else {
-                issues.append(.init(
-                    severity: .error,
-                    message: "Faceted charts require a categorical, quantitative, or temporal x-axis."))
+                issues.append(
+                    .init(
+                        severity: .error,
+                        message:
+                            "Faceted charts require a categorical, quantitative, or temporal x-axis."
+                    ))
             }
             require(specification.encoding.y, .quantitative, "Measure")
         }
         if [.groupedBar, .stackedBar, .normalizedBar].contains(specification.family) {
             require(specification.encoding.series, .nominal, "Series")
         }
-        if snapshot.metadata.isTruncated {
-            let truncationMessage: String? = switch specification.family {
-            case .kpi:
-                "Key values require a complete result."
-            case .heatmap:
-                "Frequency heatmaps require a complete result."
-            case .donut, .stackedBar, .normalizedBar:
-                "Composition charts require a complete result."
-            case .bar, .rankedDot, .groupedBar, .range:
-                "This chart family requires a complete result."
+        if specification.encoding.series != nil,
+            ![.groupedBar, .stackedBar, .normalizedBar].contains(specification.family)
+        {
+            require(specification.encoding.series, .nominal, "Series")
+        }
+        let temporalReferences = [
+            specification.encoding.x,
+            specification.encoding.start,
+            specification.encoding.end,
+        ].compactMap { $0 }
+        for id in temporalReferences {
+            guard let profile = profiles[id], profile.isTemporal,
+                profile.temporalValues.count != profile.nonNullCount
+            else { continue }
+            issues.append(
+                .init(
+                    severity: .error,
+                    message: "Temporal field \(id.rawValue) contains unparseable values."))
+        }
+        let expectedAggregation: AutoChartAggregation? =
+            switch specification.family {
+            case .histogram, .heatmap:
+                .count
+            case .donut:
+                .sum
+            case .table, .kpi, .boxPlot, .scatter, .bubble, .range:
+                AutoChartAggregation.none
             default:
                 nil
             }
+        if let expectedAggregation, specification.aggregation != expectedAggregation {
+            issues.append(
+                .init(
+                    severity: .error,
+                    message:
+                        "\(specification.family.displayName) requires \(expectedAggregation.rawValue) aggregation."
+                ))
+        }
+        let expectedStacking: AutoChartStacking =
+            switch specification.family {
+            case .stackedBar:
+                .standard
+            case .normalizedBar:
+                .normalized
+            default:
+                .none
+            }
+        if specification.stacking != expectedStacking {
+            issues.append(
+                .init(
+                    severity: .error,
+                    message:
+                        "\(specification.family.displayName) requires \(expectedStacking.rawValue) stacking."
+                ))
+        }
+        if snapshot.metadata.isTruncated {
+            let truncationMessage: String? =
+                switch specification.family {
+                case .kpi:
+                    "Key values require a complete result."
+                case .heatmap:
+                    "Frequency heatmaps require a complete result."
+                case .donut, .stackedBar, .normalizedBar:
+                    "Composition charts require a complete result."
+                case .bar, .rankedDot, .groupedBar, .range:
+                    "This chart family requires a complete result."
+                default:
+                    nil
+                }
             if let truncationMessage {
                 issues.append(.init(severity: .error, message: truncationMessage))
             }
@@ -510,17 +641,19 @@ public enum AutoChartEngine {
                 let profile = profiles[y],
                 !compositionIsSafe(profile.column.hints)
             {
-                issues.append(.init(
-                    severity: .error,
-                    message: "Composition requires an explicitly additive measure."))
+                issues.append(
+                    .init(
+                        severity: .error,
+                        message: "Composition requires an explicitly additive measure."))
             }
             if let y = specification.encoding.y,
                 let profile = profiles[y],
                 !profile.allNumericValuesPositive
             {
-                issues.append(.init(
-                    severity: .error,
-                    message: "Composition requires positive values."))
+                issues.append(
+                    .init(
+                        severity: .error,
+                        message: "Composition requires positive values."))
             }
         }
         if specification.aggregation != .none,
@@ -529,31 +662,41 @@ public enum AutoChartEngine {
             let profile = profiles[y],
             safeRollupAggregation(profile.column.hints) == nil
         {
-            issues.append(.init(
-                severity: .error,
-                message: "Aggregation requires an explicitly additive measure."))
+            issues.append(
+                .init(
+                    severity: .error,
+                    message: "Aggregation requires an explicitly additive measure."))
         }
-        let markFields: [AutoChartColumnID?] = switch specification.family {
-        case .bar, .rankedDot, .donut:
-            [specification.encoding.x]
-        case .groupedBar, .stackedBar, .normalizedBar:
-            [specification.encoding.x, specification.encoding.series]
-        case .line, .pointLine, .area:
-            [specification.encoding.x, specification.encoding.series]
-        default:
-            []
-        }
+        let markFields: [AutoChartColumnID?] =
+            switch specification.family {
+            case .bar, .rankedDot, .donut:
+                [specification.encoding.x]
+            case .groupedBar, .stackedBar, .normalizedBar:
+                [specification.encoding.x, specification.encoding.series]
+            case .line, .pointLine, .area:
+                [specification.encoding.x, specification.encoding.series]
+            case .faceted:
+                [
+                    specification.encoding.facet,
+                    specification.encoding.x,
+                    specification.encoding.series,
+                ]
+            default:
+                []
+            }
         if specification.aggregation == .none,
             !markFields.isEmpty,
             let y = specification.encoding.y,
             !hasUniqueCombination(
                 snapshot: snapshot,
                 fields: markFields.compactMap { $0 },
-                measure: y)
+                measure: y,
+                profiles: profiles)
         {
-            issues.append(.init(
-                severity: .error,
-                message: "Duplicate marks require an explicit safe aggregation."))
+            issues.append(
+                .init(
+                    severity: .error,
+                    message: "Duplicate marks require an explicit safe aggregation."))
         }
         if specification.family == .range,
             let start = specification.encoding.start,
@@ -565,9 +708,10 @@ public enum AutoChartEngine {
                 return startDate > endDate
             })
         {
-            issues.append(.init(
-                severity: .error,
-                message: "Range starts must not occur after their ends."))
+            issues.append(
+                .init(
+                    severity: .error,
+                    message: "Range starts must not occur after their ends."))
         }
         return AutoChartValidationResult(issues: issues)
     }
@@ -592,7 +736,8 @@ public enum AutoChartEngine {
         let title = context.title?.trimmingCharacters(in: .whitespacesAndNewlines)
         let generatedTitle: String = {
             if let y, let x {
-                return "\(AutoChartProfiler.humanized(y.column.name)) by \(AutoChartProfiler.humanized(x.column.name))"
+                return
+                    "\(AutoChartProfiler.humanized(y.column.name)) by \(AutoChartProfiler.humanized(x.column.name))"
             }
             if let y { return AutoChartProfiler.humanized(y.column.name) }
             if let x { return AutoChartProfiler.humanized(x.column.name) }
@@ -627,7 +772,8 @@ public enum AutoChartEngine {
             .sum, .count, .countDistinct,
         ]
         if hints.aggregationSafety == .safe {
-            return hints.aggregation == nil || hints.aggregation.map(additiveAggregations.contains) == true
+            return hints.aggregation == nil
+                || hints.aggregation.map(additiveAggregations.contains) == true
         }
         guard hints.aggregationSafety == .alreadyAggregated else { return false }
         return hints.aggregation.map(additiveAggregations.contains) == true
@@ -645,12 +791,16 @@ public enum AutoChartEngine {
     private static func hasUniqueCombination(
         snapshot: AutoChartSnapshot,
         fields: [AutoChartColumnID],
-        measure: AutoChartColumnID
+        measure: AutoChartColumnID,
+        profiles: [AutoChartColumnID: AutoChartColumnProfile]
     ) -> Bool {
         guard !fields.isEmpty else { return false }
         let combinations = snapshot.rows.compactMap { row -> [String]? in
             guard row.values[measure]?.numericValue != nil else { return nil }
-            let values = fields.compactMap { row.values[$0]?.categoryString() }
+            let values = fields.compactMap { field in
+                AutoChartProfiler.identityString(
+                    row.values[field], semanticType: profiles[field]?.semanticType)
+            }
             return values.count == fields.count ? values : nil
         }
         return combinations.count == Set(combinations).count
@@ -673,8 +823,7 @@ public enum AutoChartEngine {
         }
         if output.count < limit {
             for recommendation in ranked
-                where output.count < limit && !output.contains(where: { $0.id == recommendation.id })
-            {
+            where output.count < limit && !output.contains(where: { $0.id == recommendation.id }) {
                 output.append(recommendation)
             }
         }

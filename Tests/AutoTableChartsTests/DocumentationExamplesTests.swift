@@ -1,6 +1,9 @@
 import AutoTableCharts
-import SwiftUI
 import Testing
+
+#if canImport(SwiftUI)
+import SwiftUI
+#endif
 
 private struct DocumentationHoldingRow: AutoChartRow {
     let id: String
@@ -50,7 +53,7 @@ private struct DocumentationHoldingsTable: AutoChartTable {
 }
 
 @Suite struct DocumentationExamplesTests {
-    @Test func gettingStartedExampleCompilesEndToEnd() throws {
+    @Test func gettingStartedExampleCompilesEndToEnd() async throws {
         let table = DocumentationHoldingsTable(chartRows: [
             DocumentationHoldingRow(id: "office", propertyType: "Office", marketValue: 20),
             DocumentationHoldingRow(id: "retail", propertyType: "Retail", marketValue: 10),
@@ -86,12 +89,16 @@ private struct DocumentationHoldingsTable: AutoChartTable {
         )
         #expect(selection.sourceRowIDs == ["office"])
 
-        let view = AutoChartView(
-            table: table,
-            recommendation: recommendation,
-            selection: Binding<AutoChartSelection?>.constant(selection),
-            interaction: .explore
-        )
-        _ = view
+        #if canImport(SwiftUI) && canImport(Charts)
+        await MainActor.run {
+            let view = AutoChartView(
+                table: table,
+                recommendation: recommendation,
+                selection: Binding<AutoChartSelection?>.constant(selection),
+                interaction: .explore
+            )
+            _ = view
+        }
+        #endif
     }
 }

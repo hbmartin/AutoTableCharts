@@ -30,11 +30,12 @@ Use the narrowest appropriate ``AutoChartValue`` case:
 | Date | ``AutoChartValue/date(_:)`` | Temporal |
 | Binary | ``AutoChartValue/binary(_:)`` | Unsupported |
 
-Text is parsed as temporal only when all values are dates, or at least two values
-and 80 percent of the non-null values parse as ISO 8601 or `YYYY-MM-DD` dates.
-Numeric columns whose name contains `year` and have at most 100 distinct values
-are inferred as ordinal. Names equal to `id`, ending in `_id`, or ending in
-` id` are inferred as identifiers.
+Text is parsed as temporal only when every non-null value parses as ISO 8601 or
+`YYYY-MM-DD`. Mixed date and non-date text remains nominal so rendering never
+silently discards the non-date rows. Numeric columns are inferred as ordinal years
+only when `year` is a complete name token, every value is an integer from 1000
+through 3000, and there are at most 100 distinct values. Identifier detection
+recognizes a final `id` token in snake case, spaced names, and camel case.
 
 ### Override inference with hints
 

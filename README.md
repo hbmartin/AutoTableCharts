@@ -19,7 +19,8 @@ or mutates consumer-owned table storage.
 
 - Swift 6.2 or later
 - Xcode 26 or later
-- iOS 17 or later, or macOS 14 or later
+- iOS 17, macOS 14, tvOS 17, or watchOS 10 or later for Swift Charts rendering
+- Linux for the Foundation-only typed models, recommendation, and validation APIs
 
 ## Installation
 
