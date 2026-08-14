@@ -31,6 +31,20 @@ struct AutoChartSnapshot: Sendable {
         guard let id else { return nil }
         return columns.first { $0.id == id }
     }
+
+    var contentFingerprint: Int {
+        var hasher = Hasher()
+        hasher.combine(columns)
+        hasher.combine(metadata)
+        hasher.combine(rows.count)
+        for row in rows {
+            hasher.combine(row.id)
+            for column in columns {
+                hasher.combine(row.values[column.id] ?? .null)
+            }
+        }
+        return hasher.finalize()
+    }
 }
 
 struct AutoChartColumnProfile: Sendable {
@@ -108,22 +122,25 @@ enum AutoChartProfiler {
         if column.hints.role == .identifier { return .identifier }
         guard !values.isEmpty else { return .unsupported }
 
-        let normalizedName = column.name.lowercased()
-        if normalizedName == "id" || normalizedName.hasSuffix("_id")
-            || normalizedName.hasSuffix(" id")
-        {
+        let nameTokens = nameTokens(column.name)
+        if nameTokens.last == "id" {
             return .identifier
         }
         if values.allSatisfy({ if case .boolean = $0 { true } else { false } }) {
             return .boolean
         }
-        if dateCount == values.count
-            || (dateCount >= 2 && Double(dateCount) / Double(values.count) >= 0.8)
-        {
+        if dateCount == values.count {
             return .temporal
         }
         if numericCount == values.count {
-            if normalizedName.contains("year") && distinctCount <= 100 {
+            if nameTokens.contains("year"), distinctCount <= 100,
+                values.allSatisfy({ value in
+                    guard let number = value.numericValue, number.rounded() == number else {
+                        return false
+                    }
+                    return number >= 1_000 && number <= 3_000
+                })
+            {
                 return .ordinal
             }
             return .quantitative
@@ -157,6 +174,66 @@ enum AutoChartProfiler {
         let components = DateComponents(year: year, month: month, day: day)
         guard components.isValidDate(in: calendar) else { return nil }
         return calendar.date(from: components)
+    }
+
+    static func identityString(
+        _ value: AutoChartValue?,
+        semanticType: AutoChartSemanticType?
+    ) -> String? {
+        guard let value else { return nil }
+        if semanticType == .temporal {
+            guard let date = dateValue(value) else { return nil }
+            return "date:\(date.timeIntervalSinceReferenceDate.bitPattern)"
+        }
+        if semanticType == .quantitative {
+            guard let number = value.numericValue else { return nil }
+            let normalized = number == 0 ? 0.0 : number
+            return "number:\(normalized.bitPattern)"
+        }
+        switch value {
+        case .null, .binary:
+            return nil
+        case .boolean(let value):
+            return value ? "boolean:1" : "boolean:0"
+        case .integer(let value):
+            return "integer:\(value)"
+        case .double(let value):
+            guard value.isFinite else { return nil }
+            return "double:\(value.bitPattern)"
+        case .decimal(let value):
+            let number = NSDecimalNumber(decimal: value)
+            guard number.doubleValue.isFinite else { return nil }
+            return "decimal:\(number.stringValue)"
+        case .text(let value):
+            return "text:\(value.utf8.count):\(value)"
+        case .date(let value):
+            return "date:\(value.timeIntervalSinceReferenceDate.bitPattern)"
+        }
+    }
+
+    private static func nameTokens(_ name: String) -> [String] {
+        var tokens: [String] = []
+        var current = ""
+        var previousWasLowercaseOrDigit = false
+        func flush() {
+            guard !current.isEmpty else { return }
+            tokens.append(current.lowercased())
+            current.removeAll(keepingCapacity: true)
+        }
+        for character in name {
+            guard character.isLetter || character.isNumber else {
+                flush()
+                previousWasLowercaseOrDigit = false
+                continue
+            }
+            if character.isUppercase && previousWasLowercaseOrDigit {
+                flush()
+            }
+            current.append(character)
+            previousWasLowercaseOrDigit = character.isLowercase || character.isNumber
+        }
+        flush()
+        return tokens
     }
 
     static func humanized(_ name: String) -> String {

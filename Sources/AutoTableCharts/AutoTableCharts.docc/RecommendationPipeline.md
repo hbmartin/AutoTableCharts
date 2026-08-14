@@ -16,15 +16,16 @@ it doesn't sample them.
 
 Each column profile records non-null and distinct counts, null fraction, numeric
 extent, positivity, average text length, and parsed dates. Explicit
-``AutoChartColumnHints/semanticType`` wins. An identifier role or conventional
-`id`, `_id`, and ` id` suffix wins next. Otherwise the profiler recognizes
+``AutoChartColumnHints/semanticType`` wins. An identifier role or final `id` name
+token—including snake case, spaced names, and camel case—wins next. Otherwise the profiler recognizes
 booleans, dates, numeric columns, year-like ordinals, binary data, and finally
 nominal text.
 
-Date inference accepts entirely date-valued columns, or mixed columns with at
-least two dates and an 80% date parse rate. Numeric year-like columns with no
-more than 100 distinct values are ordinal. These are fixed rules, not learned
-predictions.
+Date inference requires every non-null value to parse, preventing mixed text from
+being silently omitted during rendering. A numeric column is year-like only when
+`year` is a complete name token, all values are integer years from 1000 through
+3000, and it has no more than 100 distinct values. These are fixed rules, not
+learned predictions.
 
 ### 3. Enumerate candidates
 
