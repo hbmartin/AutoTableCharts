@@ -1,52 +1,74 @@
 # AutoTableCharts
 
+[![DocC](https://github.com/hbmartin/AutoTableCharts/actions/workflows/docc.yml/badge.svg)](https://github.com/hbmartin/AutoTableCharts/actions/workflows/docc.yml)
+
 AutoTableCharts turns typed tabular data into a bounded set of deterministic,
 semantically safe native Swift Charts. It runs fully offline, has no external
-dependencies, and targets iOS 17 and macOS 14.
+runtime dependencies.
+
+[Read the complete DocC documentation](https://hbmartin.github.io/AutoTableCharts/documentation/autotablecharts/),
+including modeling guidance, all 18 chart families, safety semantics, and the
+implemented research lineage.
 
 The recommendation pipeline is: typed profiling → candidate generation → hard
 safety constraints → deterministic ranking → Swift Charts rendering. It never
 parses natural-language questions, calls a model, rewrites SQL, samples rows,
 or mutates consumer-owned table storage.
 
-## Use
+## Requirements
+
+- Swift 6.2 or later
+- Xcode 26 or later
+- iOS 17 or later, or macOS 14 or later
+
+## Installation
+
+Until a versioned release exists, depend on the repository's `main` branch:
+
+```swift
+dependencies: [
+    .package(
+        url: "https://github.com/hbmartin/AutoTableCharts.git",
+        branch: "main"
+    )
+]
+```
+
+## Quickstart
 
 Conform the consumer's existing table and row types to `AutoChartTable` and
-`AutoChartRow`, then request recommendations:
+`AutoChartRow`, then request and render a recommendation:
 
 ```swift
 import AutoTableCharts
 import SwiftUI
 
-let context = AutoChartContext(
-    goal: .comparison,
-    title: "Current market value by fund")
-let result = AutoChartEngine.recommendations(
-    for: table,
-    context: context)
-let recommendation = result.chartRecommendations.first
-```
-
-Render a recommendation while preserving linked source-row selection:
-
-```swift
 struct ResultChart: View {
     let table: MyTable
-    let recommendation: AutoChartRecommendation
     @State private var selection: AutoChartSelection?
 
     var body: some View {
-        AutoChartView(
-            table: table,
-            recommendation: recommendation,
-            selection: $selection,
-            interaction: .explore)
+        let result = AutoChartEngine.recommendations(
+            for: table,
+            context: AutoChartContext(goal: .comparison)
+        )
+
+        if let recommendation = result.chartRecommendations.first {
+            AutoChartView(
+                table: table,
+                recommendation: recommendation,
+                selection: $selection,
+                interaction: .explore
+            )
+        }
     }
 }
 ```
 
 Caller-provided overrides can be checked with
 `AutoChartEngine.validate(specification:for:)` before rendering.
+The [Getting Started guide](https://hbmartin.github.io/AutoTableCharts/documentation/autotablecharts/gettingstarted)
+contains a complete table adapter.
 
 ## Safety and behavior
 
@@ -63,4 +85,35 @@ Caller-provided overrides can be checked with
   charts support dense-axis scrolling, pinch zoom, and Reset Zoom; range
   brushing is intentionally not provided.
 
-Run the package tests with `swift test`.
+## Develop and preview documentation
+
+Run the package tests:
+
+```sh
+swift test
+```
+
+Launch DocC's local preview server:
+
+```sh
+swift package --disable-sandbox preview-documentation \
+  --target AutoTableCharts
+```
+
+Build the same static-hosting archive used by GitHub Pages, with analysis,
+coverage, and warnings treated as errors:
+
+```sh
+swift package --allow-writing-to-directory .build/docc generate-documentation \
+  --target AutoTableCharts \
+  --disable-indexing \
+  --transform-for-static-hosting \
+  --hosting-base-path AutoTableCharts \
+  --output-path .build/docc \
+  --analyze \
+  --warnings-as-errors \
+  --experimental-documentation-coverage \
+  --coverage-summary-level detailed
+```
+
+The generated site stays under `.build`; it is never committed.
