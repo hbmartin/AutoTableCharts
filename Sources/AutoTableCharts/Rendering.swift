@@ -115,14 +115,18 @@ enum AutoChartDataPreparation {
         forceSum: Bool
     ) -> [AutoChartDatum] {
         let rawData = raw(snapshot: snapshot, specification: specification)
-        let groups = Dictionary(grouping: rawData) { datum in
-            GroupKey(
+        let groups = Dictionary(grouping: rawData.enumerated()) { indexedDatum in
+            let datum = indexedDatum.element
+            return GroupKey(
                 x: datum.xLabel ?? datum.xDate?.ISO8601Format()
                     ?? datum.xNumber.map { String($0) } ?? "",
                 series: datum.series ?? "",
                 facet: datum.facet ?? "")
         }
-        let aggregated = groups.map { key, group -> AutoChartDatum in
+        let aggregated = groups.sorted {
+            $0.value[0].offset < $1.value[0].offset
+        }.map { key, indexedGroup -> AutoChartDatum in
+            let group = indexedGroup.map { $0.element }
             let values = group.compactMap { $0.yNumber }
             let aggregation = forceSum ? AutoChartAggregation.sum : specification.aggregation
             let result: Double = switch aggregation {
@@ -148,7 +152,7 @@ enum AutoChartDataPreparation {
     ) -> [AutoChartDatum] {
         guard let x = specification.encoding.x else { return [] }
         let values = snapshot.rows.compactMap { row -> (Double, AutoChartRowID)? in
-            guard let value = row.values[x]?.numericValue else { return nil }
+            guard let value = row.values[x]?.numericValue, value.isFinite else { return nil }
             return (value, row.id)
         }
         guard let minimum = values.map(\.0).min(), let maximum = values.map(\.0).max() else {
@@ -249,9 +253,16 @@ enum AutoChartDataPreparation {
     }
 }
 
+/// A native Swift Charts view for an AutoTableCharts recommendation or specification.
+///
+/// The view snapshots the supplied table, prepares marks without mutating source
+/// storage, validates the specification, and preserves contributing
+/// ``AutoChartRowID`` values in bound selection state.
 public struct AutoChartView: View {
     private let snapshot: AutoChartSnapshot
     private let recommendation: AutoChartRecommendation
+    private let data: [AutoChartDatum]
+    private let sizeBounds: (minimum: Double, maximum: Double)?
     private let interaction: AutoChartInteraction
     private let chartHeight: CGFloat
     @Binding private var selection: AutoChartSelection?
@@ -263,6 +274,17 @@ public struct AutoChartView: View {
     @State private var zoomScale = 1.0
     @State private var zoomAnchor = 1.0
 
+    /// Creates a chart from an engine-generated recommendation.
+    ///
+    /// Use this initializer when you want the recommendation's explanation and
+    /// warnings to remain attached to the rendered chart.
+    ///
+    /// - Parameters:
+    ///   - table: The same typed table used to generate the recommendation.
+    ///   - recommendation: A validated engine result.
+    ///   - selection: Optional linked selection state containing source-row IDs.
+    ///   - interaction: Compact preview or exploratory interaction behavior.
+    ///   - height: The requested chart height in points.
     public init<Table: AutoChartTable>(
         table: Table,
         recommendation: AutoChartRecommendation,
@@ -270,13 +292,36 @@ public struct AutoChartView: View {
         interaction: AutoChartInteraction = .explore,
         height: CGFloat = 280
     ) {
-        snapshot = AutoChartSnapshot(table)
+        let snapshot = AutoChartSnapshot(table)
+        let data = AutoChartDataPreparation.data(
+            snapshot: snapshot,
+            specification: recommendation.specification)
+        let sizes = data.compactMap(\.size).filter(\.isFinite)
+        self.snapshot = snapshot
         self.recommendation = recommendation
+        self.data = data
+        if let minimum = sizes.min(), let maximum = sizes.max() {
+            sizeBounds = (minimum, maximum)
+        } else {
+            sizeBounds = nil
+        }
         self._selection = selection
         self.interaction = interaction
         chartHeight = height
     }
 
+    /// Creates a chart from a caller-provided specification.
+    ///
+    /// The view validates the specification and displays diagnostics instead of
+    /// an invalid chart. Call ``AutoChartEngine/validate(specification:for:)``
+    /// first when the surrounding UI needs to react to errors.
+    ///
+    /// - Parameters:
+    ///   - table: The typed table represented by the specification.
+    ///   - specification: A caller-authored chart description.
+    ///   - selection: Optional linked selection state containing source-row IDs.
+    ///   - interaction: Compact preview or exploratory interaction behavior.
+    ///   - height: The requested chart height in points.
     public init<Table: AutoChartTable>(
         table: Table,
         specification: AutoChartSpecification,
@@ -300,10 +345,8 @@ public struct AutoChartView: View {
     }
 
     private var specification: AutoChartSpecification { recommendation.specification }
-    private var data: [AutoChartDatum] {
-        AutoChartDataPreparation.data(snapshot: snapshot, specification: specification)
-    }
 
+    /// The validated chart, warnings, selection summary, and exploration controls.
     public var body: some View {
         let validation = AutoChartEngine.validate(
             specification: specification,
@@ -316,8 +359,7 @@ public struct AutoChartView: View {
             }
             if validation.isValid {
                 chartBody
-                    .frame(minHeight: interaction == .preview ? chartHeight : 180)
-                    .frame(height: chartHeight)
+                    .frame(minHeight: interaction == .explore ? chartHeight : 180)
                 if interaction == .explore, let selection {
                     HStack(alignment: .firstTextBaseline) {
                         VStack(alignment: .leading, spacing: 2) {
@@ -548,7 +590,7 @@ public struct AutoChartView: View {
                 PointMark(
                     x: .value(xTitle, datum.xDate ?? .distantPast),
                     y: .value(yTitle, datum.yNumber ?? 0))
-                .symbolSize(specification.family == .bubble ? max(24, min(240, datum.size ?? 40)) : 45)
+                .symbolSize(symbolSize(for: datum.size))
                 .foregroundStyle(by: .value(seriesTitle, datum.series ?? primarySeriesLabel))
                 .symbol(by: .value(seriesTitle, datum.series ?? primarySeriesLabel))
                 .accessibilityLabel(datum.accessibilityLabel)
@@ -561,7 +603,7 @@ public struct AutoChartView: View {
                 PointMark(
                     x: .value(xTitle, datum.xNumber ?? 0),
                     y: .value(yTitle, datum.yNumber ?? 0))
-                .symbolSize(specification.family == .bubble ? max(24, min(240, datum.size ?? 40)) : 45)
+                .symbolSize(symbolSize(for: datum.size))
                 .foregroundStyle(by: .value(seriesTitle, datum.series ?? primarySeriesLabel))
                 .symbol(by: .value(seriesTitle, datum.series ?? primarySeriesLabel))
                 .accessibilityLabel(datum.accessibilityLabel)
@@ -711,6 +753,16 @@ public struct AutoChartView: View {
 
     private var primarySeriesLabel: String { yTitle }
     private var uniqueXCount: Int { Set(data.compactMap(\.xLabel)).count }
+
+    private func symbolSize(for value: Double?) -> Double {
+        guard specification.family == .bubble else { return 45 }
+        guard let value, value.isFinite, let sizeBounds else { return 40 }
+        guard sizeBounds.maximum > sizeBounds.minimum else { return 132 }
+        let normalized = min(
+            1,
+            max(0, (value - sizeBounds.minimum) / (sizeBounds.maximum - sizeBounds.minimum)))
+        return 24 + normalized * 216
+    }
 
     private var stackingMethod: MarkStackingMethod {
         switch specification.stacking {

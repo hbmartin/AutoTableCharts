@@ -11,13 +11,17 @@ struct AutoChartSnapshot: Sendable {
     var metadata: AutoChartTableMetadata
 
     init<Table: AutoChartTable>(_ table: Table) {
-        columns = table.chartColumns
+        var seenColumnIDs: Set<AutoChartColumnID> = []
+        let columns = table.chartColumns.filter { column in
+            seenColumnIDs.insert(column.id).inserted
+        }
+        self.columns = columns
         metadata = table.chartMetadata
         rows = table.chartRows.map { row in
             Row(
                 id: row.chartRowID,
                 values: Dictionary(
-                    uniqueKeysWithValues: table.chartColumns.map { column in
+                    uniqueKeysWithValues: columns.map { column in
                         (column.id, row.chartValue(for: column.id))
                     }))
         }
@@ -149,8 +153,10 @@ enum AutoChartProfiler {
             (1...31).contains(day)
         else { return nil }
         var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
-        return calendar.date(from: DateComponents(year: year, month: month, day: day))
+        calendar.timeZone = TimeZone.gmt
+        let components = DateComponents(year: year, month: month, day: day)
+        guard components.isValidDate(in: calendar) else { return nil }
+        return calendar.date(from: components)
     }
 
     static func humanized(_ name: String) -> String {
@@ -168,15 +174,11 @@ enum AutoChartProfiler {
 }
 
 extension AutoChartValue {
-    func categoryString(semanticType: AutoChartSemanticType? = nil) -> String? {
+    func categoryString() -> String? {
         switch self {
         case .null, .binary: nil
-        case .boolean(let value): value ? "Yes" : "No"
         case .integer(let value): String(value)
-        case .double(let value): value.formatted(.number.precision(.fractionLength(0...3)))
-        case .decimal(let value): NSDecimalNumber(decimal: value).stringValue
-        case .text(let value): value
-        case .date(let value): value.formatted(date: .abbreviated, time: .omitted)
+        default: displayString
         }
     }
 }

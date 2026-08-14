@@ -1,6 +1,23 @@
 import Foundation
 
+/// Profiles typed tables and returns a deterministic, semantically safe set of charts.
+///
+/// The engine generates candidates from table structure, rejects candidates that
+/// violate hard constraints, ranks the survivors for the requested task, and
+/// returns a bounded set with diverse chart families. It runs synchronously and
+/// entirely offline.
 public enum AutoChartEngine {
+    /// Generates ranked chart recommendations for a typed table.
+    ///
+    /// Explicit column hints take precedence over inferred semantics. If no chart
+    /// can represent the supplied rows without changing their meaning, the result
+    /// contains a table fallback and a ``AutoChartRecommendationSet/fallbackReason``.
+    ///
+    /// - Parameters:
+    ///   - table: The typed rows, columns, and completeness metadata to profile.
+    ///   - context: The analytical task and optional title used during ranking.
+    ///   - options: Limits for result count and visual density.
+    /// - Returns: A deterministic, ranked set of recommendations.
     public static func recommendations<Table: AutoChartTable>(
         for table: Table,
         context: AutoChartContext = AutoChartContext(),
@@ -12,6 +29,17 @@ public enum AutoChartEngine {
             options: options)
     }
 
+    /// Checks whether a caller-provided specification safely represents a table.
+    ///
+    /// Validation covers column existence, required channel semantics, complete-
+    /// result requirements, additive aggregation, duplicate marks, and interval
+    /// ordering. Validate before using the specification initializer of
+    /// ``AutoChartView`` when invalid input should be handled outside the view.
+    ///
+    /// - Parameters:
+    ///   - specification: The proposed chart family, encodings, and transforms.
+    ///   - table: The data and metadata the specification will represent.
+    /// - Returns: All discovered validation diagnostics.
     public static func validate<Table: AutoChartTable>(
         specification: AutoChartSpecification,
         for table: Table
@@ -31,6 +59,9 @@ public enum AutoChartEngine {
         }
 
         let profiles = AutoChartProfiler.profiles(snapshot)
+        let profileIndex = Dictionary(
+            profiles.map { ($0.column.id, $0) },
+            uniquingKeysWith: { first, _ in first })
         let quantitative = profiles.filter {
             $0.isQuantitative && $0.column.hints.role != .identifier
         }
@@ -273,15 +304,17 @@ public enum AutoChartEngine {
             let end = temporal.first {
                 $0.column.id != start.column.id
                     && $0.column.hints.role == .intervalEnd
-            } ?? temporal.first { $0.column.id != start.column.id }!
-            candidates.append(
-                candidate(
-                    family: .range, x: label, context: context,
-                    start: start, end: end,
-                    orientation: .horizontal,
-                    score: 78 + goalBonus(.range, context.goal),
-                    rationale: ["Start and end dates define comparable intervals."],
-                    warnings: warnings))
+            } ?? temporal.first { $0.column.id != start.column.id }
+            if let end {
+                candidates.append(
+                    candidate(
+                        family: .range, x: label, context: context,
+                        start: start, end: end,
+                        orientation: .horizontal,
+                        score: 78 + goalBonus(.range, context.goal),
+                        rationale: ["Start and end dates define comparable intervals."],
+                        warnings: warnings))
+            }
         } else if !snapshot.metadata.isTruncated,
             let time = temporal.first, let label = categorical.first,
             let measure = quantitative.first
@@ -312,6 +345,10 @@ public enum AutoChartEngine {
             [.line, .bar, .scatter].contains($0.specification.family)
                 && $0.specification.encoding.x != facet.column.id
                 && $0.specification.encoding.y != facet.column.id
+                && validate(
+                    specification: $0.specification,
+                    snapshot: snapshot,
+                    profiles: profileIndex).isValid
         }) {
             var faceted = base
             faceted.specification.family = .faceted
@@ -322,7 +359,10 @@ public enum AutoChartEngine {
         }
 
         let valid = candidates.filter {
-            validate(specification: $0.specification, snapshot: snapshot).isValid
+            validate(
+                specification: $0.specification,
+                snapshot: snapshot,
+                profiles: profileIndex).isValid
         }
         let unique = Dictionary(grouping: valid, by: \.id)
             .compactMap { $0.value.max { $0.score < $1.score } }
@@ -348,9 +388,19 @@ public enum AutoChartEngine {
         snapshot: AutoChartSnapshot
     ) -> AutoChartValidationResult {
         let profiles = Dictionary(
-            uniqueKeysWithValues: AutoChartProfiler.profiles(snapshot).map {
-                ($0.column.id, $0)
-            })
+            AutoChartProfiler.profiles(snapshot).map { ($0.column.id, $0) },
+            uniquingKeysWith: { first, _ in first })
+        return validate(
+            specification: specification,
+            snapshot: snapshot,
+            profiles: profiles)
+    }
+
+    private static func validate(
+        specification: AutoChartSpecification,
+        snapshot: AutoChartSnapshot,
+        profiles: [AutoChartColumnID: AutoChartColumnProfile]
+    ) -> AutoChartValidationResult {
         var issues: [AutoChartValidationIssue] = []
         let referenced = [
             specification.encoding.x, specification.encoding.y,
@@ -404,6 +454,9 @@ public enum AutoChartEngine {
                 break
             }
             require(specification.encoding.y, .quantitative, "Measure")
+            if specification.family == .bubble {
+                require(specification.encoding.size, .quantitative, "Size")
+            }
         case .histogram:
             require(specification.encoding.x, .quantitative, "Binned field")
         case .boxPlot:
@@ -412,41 +465,47 @@ public enum AutoChartEngine {
             require(specification.encoding.x, .nominal, "X category")
             require(specification.encoding.y, .nominal, "Y category")
         case .range:
+            require(specification.encoding.x, .nominal, "Category")
             require(specification.encoding.start, .temporal, "Start")
             require(specification.encoding.end, .temporal, "End")
         case .faceted:
             require(specification.encoding.facet, .nominal, "Facet")
+            if let x = specification.encoding.x, let profile = profiles[x] {
+                if !profile.isCategorical && !profile.isQuantitative && !profile.isTemporal
+                    && profile.semanticType != .ordinal
+                {
+                    issues.append(.init(
+                        severity: .error,
+                        message: "Faceted charts require a categorical, quantitative, or temporal x-axis."))
+                }
+            } else {
+                issues.append(.init(
+                    severity: .error,
+                    message: "Faceted charts require a categorical, quantitative, or temporal x-axis."))
+            }
+            require(specification.encoding.y, .quantitative, "Measure")
         }
         if [.groupedBar, .stackedBar, .normalizedBar].contains(specification.family) {
             require(specification.encoding.series, .nominal, "Series")
         }
-        if specification.family == .kpi, snapshot.metadata.isTruncated {
-            issues.append(.init(
-                severity: .error,
-                message: "Key values require a complete result."))
-        }
-        if specification.family == .heatmap, snapshot.metadata.isTruncated {
-            issues.append(.init(
-                severity: .error,
-                message: "Frequency heatmaps require a complete result."))
-        }
-        let allowedWhenTruncated: Set<AutoChartFamily> = [
-            .table, .line, .pointLine, .area, .scatter, .bubble,
-            .histogram, .boxPlot, .faceted,
-        ]
-        if snapshot.metadata.isTruncated,
-            !allowedWhenTruncated.contains(specification.family)
-        {
-            issues.append(.init(
-                severity: .error,
-                message: "This chart family requires a complete result."))
+        if snapshot.metadata.isTruncated {
+            let truncationMessage: String? = switch specification.family {
+            case .kpi:
+                "Key values require a complete result."
+            case .heatmap:
+                "Frequency heatmaps require a complete result."
+            case .donut, .stackedBar, .normalizedBar:
+                "Composition charts require a complete result."
+            case .bar, .rankedDot, .groupedBar, .range:
+                "This chart family requires a complete result."
+            default:
+                nil
+            }
+            if let truncationMessage {
+                issues.append(.init(severity: .error, message: truncationMessage))
+            }
         }
         if [.donut, .stackedBar, .normalizedBar].contains(specification.family) {
-            if snapshot.metadata.isTruncated {
-                issues.append(.init(
-                    severity: .error,
-                    message: "Composition charts require a complete result."))
-            }
             if let y = specification.encoding.y,
                 let profile = profiles[y],
                 !compositionIsSafe(profile.column.hints)
@@ -478,6 +537,8 @@ public enum AutoChartEngine {
         case .bar, .rankedDot, .donut:
             [specification.encoding.x]
         case .groupedBar, .stackedBar, .normalizedBar:
+            [specification.encoding.x, specification.encoding.series]
+        case .line, .pointLine, .area:
             [specification.encoding.x, specification.encoding.series]
         default:
             []
@@ -562,16 +623,23 @@ public enum AutoChartEngine {
     }
 
     private static func compositionIsSafe(_ hints: AutoChartColumnHints) -> Bool {
-        if hints.aggregationSafety == .safe { return true }
+        let additiveAggregations: Set<AutoChartAggregation> = [
+            .sum, .count, .countDistinct,
+        ]
+        if hints.aggregationSafety == .safe {
+            return hints.aggregation == nil || hints.aggregation.map(additiveAggregations.contains) == true
+        }
         guard hints.aggregationSafety == .alreadyAggregated else { return false }
-        return [.sum, .count, .countDistinct].contains(hints.aggregation)
+        return hints.aggregation.map(additiveAggregations.contains) == true
     }
 
     private static func safeRollupAggregation(
         _ hints: AutoChartColumnHints
     ) -> AutoChartAggregation? {
-        if hints.aggregationSafety == .safe { return .sum }
-        return compositionIsSafe(hints) ? .sum : nil
+        guard hints.aggregationSafety == .safe || compositionIsSafe(hints) else {
+            return nil
+        }
+        return hints.aggregation ?? .sum
     }
 
     private static func hasUniqueCombination(
