@@ -1,0 +1,622 @@
+import Foundation
+
+public enum AutoChartEngine {
+    public static func recommendations<Table: AutoChartTable>(
+        for table: Table,
+        context: AutoChartContext = AutoChartContext(),
+        options: AutoChartOptions = AutoChartOptions()
+    ) -> AutoChartRecommendationSet {
+        recommendations(
+            snapshot: AutoChartSnapshot(table),
+            context: context,
+            options: options)
+    }
+
+    public static func validate<Table: AutoChartTable>(
+        specification: AutoChartSpecification,
+        for table: Table
+    ) -> AutoChartValidationResult {
+        validate(specification: specification, snapshot: AutoChartSnapshot(table))
+    }
+
+    static func recommendations(
+        snapshot: AutoChartSnapshot,
+        context: AutoChartContext,
+        options: AutoChartOptions
+    ) -> AutoChartRecommendationSet {
+        guard !snapshot.rows.isEmpty, !snapshot.columns.isEmpty else {
+            return AutoChartRecommendationSet(
+                recommendations: [tableFallback(reason: "The result has no chartable rows.")],
+                fallbackReason: "The result has no chartable rows.")
+        }
+
+        let profiles = AutoChartProfiler.profiles(snapshot)
+        let quantitative = profiles.filter {
+            $0.isQuantitative && $0.column.hints.role != .identifier
+        }
+        let temporal = profiles.filter(\.isTemporal)
+        let categorical = profiles.filter {
+            $0.isCategorical && $0.column.hints.role != .identifier
+                && $0.distinctCount > 0
+        }
+        var candidates: [AutoChartRecommendation] = []
+        let warnings = snapshot.metadata.isTruncated
+            ? ["Based on the first returned rows; totals and composition are suppressed."]
+            : []
+
+        if !snapshot.metadata.isTruncated,
+            snapshot.rows.count == 1,
+            let measure = quantitative.first
+        {
+            candidates.append(
+                candidate(
+                    family: .kpi,
+                    y: measure,
+                    context: context,
+                    score: 98,
+                    rationale: ["A single quantitative result is clearest as a key value."]))
+        }
+
+        for time in temporal {
+            for measure in quantitative {
+                candidates.append(
+                    candidate(
+                        family: .line, x: time, y: measure,
+                        context: context,
+                        score: 84 + goalBonus(.trend, context.goal),
+                        rationale: ["Temporal position reveals change over time."],
+                        warnings: warnings))
+                candidates.append(
+                    candidate(
+                        family: .pointLine, x: time, y: measure,
+                        context: context,
+                        score: 80 + goalBonus(.trend, context.goal),
+                        rationale: ["Points preserve exact observations along the trend."],
+                        warnings: warnings))
+                if (measure.numericMinimum ?? -1) >= 0 {
+                    candidates.append(
+                        candidate(
+                            family: .area, x: time, y: measure,
+                            context: context,
+                            score: 70 + goalBonus(.trend, context.goal),
+                            rationale: ["A nonnegative temporal measure can use an area baseline."],
+                            warnings: warnings))
+                }
+                if let series = categorical.first(where: {
+                    $0.distinctCount >= 2 && $0.distinctCount <= options.maximumSeries
+                }) {
+                    candidates.append(
+                        candidate(
+                            family: .line, x: time, y: measure, series: series,
+                            context: context,
+                            score: 87 + goalBonus(.trend, context.goal),
+                            rationale: ["A small number of series supports comparable trends."],
+                            warnings: warnings))
+                }
+            }
+        }
+
+        for dimension in categorical
+            where !snapshot.metadata.isTruncated
+                && dimension.distinctCount <= options.maximumCategories
+        {
+            for measure in quantitative {
+                let uniqueAtResultGrain = dimension.distinctCount == dimension.nonNullCount
+                guard let categoryAggregation = uniqueAtResultGrain
+                    ? AutoChartAggregation.none
+                    : safeRollupAggregation(measure.column.hints)
+                else { continue }
+                let orientation: AutoChartOrientation =
+                    dimension.averageTextLength > 10 || dimension.distinctCount > 8
+                    ? .horizontal : .vertical
+                candidates.append(
+                    candidate(
+                        family: .bar, x: dimension, y: measure,
+                        context: context,
+                        aggregation: categoryAggregation,
+                        orientation: orientation,
+                        sort: context.goal == .ranking ? .descending : .source,
+                        score: 82 + goalBonus(.comparison, context.goal)
+                            + goalBonus(.ranking, context.goal),
+                        rationale: ["Position and length compare categories accurately."],
+                        warnings: warnings))
+                candidates.append(
+                    candidate(
+                        family: .rankedDot, x: dimension, y: measure,
+                        context: context,
+                        aggregation: categoryAggregation,
+                        orientation: .horizontal,
+                        sort: .descending,
+                        score: 74 + goalBonus(.ranking, context.goal),
+                        rationale: ["A common quantitative scale supports compact ranking."],
+                        warnings: warnings))
+
+                if !snapshot.metadata.isTruncated,
+                    dimension.distinctCount <= options.maximumDonutSectors,
+                    measure.allNumericValuesPositive,
+                    compositionIsSafe(measure.column.hints)
+                {
+                    candidates.append(
+                        candidate(
+                            family: .donut, x: dimension, y: measure,
+                            context: context,
+                            aggregation: .sum,
+                            score: 58 + goalBonus(.composition, context.goal),
+                            rationale: ["Few positive, additive categories form a complete whole."]))
+                }
+
+                if let series = categorical.first(where: {
+                    $0.column.id != dimension.column.id
+                        && $0.distinctCount >= 2
+                        && $0.distinctCount <= options.maximumSeries
+                })
+                {
+                    let uniqueAtSeriesGrain = hasUniqueCombination(
+                        snapshot: snapshot,
+                        fields: [dimension.column.id, series.column.id],
+                        measure: measure.column.id)
+                    guard let seriesAggregation = uniqueAtSeriesGrain
+                        ? AutoChartAggregation.none
+                        : safeRollupAggregation(measure.column.hints)
+                    else { continue }
+                    candidates.append(
+                        candidate(
+                            family: .groupedBar, x: dimension, y: measure,
+                            series: series, context: context,
+                            aggregation: seriesAggregation,
+                            score: 76 + goalBonus(.comparison, context.goal),
+                            rationale: ["Grouped bars compare a small series within each category."]))
+                    if !snapshot.metadata.isTruncated,
+                        measure.allNumericValuesPositive,
+                        compositionIsSafe(measure.column.hints)
+                    {
+                        candidates.append(
+                            candidate(
+                                family: .stackedBar, x: dimension, y: measure,
+                                series: series, context: context,
+                                aggregation: seriesAggregation,
+                                stacking: .standard,
+                                score: 69 + goalBonus(.composition, context.goal),
+                                rationale: ["Stacking shows additive contribution within each category."]))
+                        candidates.append(
+                            candidate(
+                                family: .normalizedBar, x: dimension, y: measure,
+                                series: series, context: context,
+                                aggregation: seriesAggregation,
+                                stacking: .normalized,
+                                score: 62 + goalBonus(.composition, context.goal),
+                                rationale: ["Normalization compares proportional composition."]))
+                    }
+                }
+            }
+        }
+
+        for (leftIndex, left) in quantitative.enumerated() {
+            for right in quantitative.dropFirst(leftIndex + 1) {
+                candidates.append(
+                    candidate(
+                        family: .scatter, x: left, y: right,
+                        context: context,
+                        score: 81 + goalBonus(.relationship, context.goal),
+                        rationale: ["Two quantitative fields support relationship analysis."],
+                        warnings: warnings))
+                if let size = quantitative.first(where: {
+                    $0.column.id != left.column.id && $0.column.id != right.column.id
+                        && ($0.numericMinimum ?? -1) >= 0
+                }) {
+                    var bubble = candidate(
+                        family: .bubble, x: left, y: right,
+                        context: context,
+                        score: 68 + goalBonus(.relationship, context.goal),
+                        rationale: ["A third nonnegative measure can encode point size."],
+                        warnings: warnings)
+                    bubble.specification.encoding.size = size.column.id
+                    candidates.append(bubble)
+                }
+            }
+        }
+
+        for measure in quantitative {
+            let binCount = max(5, min(20, Int(Double(measure.nonNullCount).squareRoot().rounded())))
+            candidates.append(
+                candidate(
+                    family: .histogram, x: measure, context: context,
+                    aggregation: .count, binCount: binCount,
+                    score: 71 + goalBonus(.distribution, context.goal),
+                    rationale: ["Binning reveals the distribution of a quantitative field."],
+                    warnings: warnings))
+            candidates.append(
+                candidate(
+                    family: .boxPlot, y: measure, context: context,
+                    score: 66 + goalBonus(.distribution, context.goal)
+                        + goalBonus(.outlier, context.goal),
+                    rationale: ["Quartiles summarize spread and potential outliers."],
+                    warnings: warnings))
+            if let group = categorical.first(where: {
+                $0.distinctCount >= 2 && $0.distinctCount <= min(10, options.maximumCategories)
+            }) {
+                var groupedBox = candidate(
+                    family: .boxPlot, x: group, y: measure, context: context,
+                    score: 73 + goalBonus(.distribution, context.goal),
+                    rationale: ["Grouped quartiles compare distributions across categories."],
+                    warnings: warnings)
+                groupedBox.specification.orientation = .vertical
+                candidates.append(groupedBox)
+            }
+        }
+
+        if !snapshot.metadata.isTruncated {
+            for (leftIndex, left) in categorical.enumerated()
+                where left.distinctCount <= options.maximumCategories
+            {
+                for right in categorical.dropFirst(leftIndex + 1)
+                    where right.distinctCount <= options.maximumCategories
+                {
+                    candidates.append(
+                        candidate(
+                            family: .heatmap, x: left, y: right,
+                            context: context,
+                            aggregation: .count,
+                            score: 67 + goalBonus(.relationship, context.goal),
+                            rationale: ["Cell counts expose relationships between categories."]))
+                }
+            }
+        }
+
+        if !snapshot.metadata.isTruncated,
+            temporal.count >= 2,
+            let label = categorical.first
+        {
+            let start = temporal.first {
+                $0.column.hints.role == .intervalStart
+            } ?? temporal[0]
+            let end = temporal.first {
+                $0.column.id != start.column.id
+                    && $0.column.hints.role == .intervalEnd
+            } ?? temporal.first { $0.column.id != start.column.id }!
+            candidates.append(
+                candidate(
+                    family: .range, x: label, context: context,
+                    start: start, end: end,
+                    orientation: .horizontal,
+                    score: 78 + goalBonus(.range, context.goal),
+                    rationale: ["Start and end dates define comparable intervals."],
+                    warnings: warnings))
+        } else if !snapshot.metadata.isTruncated,
+            let time = temporal.first, let label = categorical.first,
+            let measure = quantitative.first
+        {
+            candidates.append(
+                candidate(
+                    family: .bubble, x: time, y: measure, series: label,
+                    context: context,
+                    score: 72 + goalBonus(.range, context.goal),
+                    rationale: ["Dated events can be inspected along a temporal axis."],
+                    warnings: warnings))
+        } else if !snapshot.metadata.isTruncated,
+            let time = temporal.first, let label = categorical.first
+        {
+            candidates.append(
+                candidate(
+                    family: .range, x: label, context: context,
+                    start: time, end: time,
+                    orientation: .horizontal,
+                    score: 70 + goalBonus(.range, context.goal),
+                    rationale: ["Discrete events can be inspected on a temporal axis."],
+                    warnings: warnings))
+        }
+
+        if let facet = categorical.first(where: {
+            $0.distinctCount >= 2 && $0.distinctCount <= options.maximumFacets
+        }), let base = candidates.first(where: {
+            [.line, .bar, .scatter].contains($0.specification.family)
+                && $0.specification.encoding.x != facet.column.id
+                && $0.specification.encoding.y != facet.column.id
+        }) {
+            var faceted = base
+            faceted.specification.family = .faceted
+            faceted.specification.encoding.facet = facet.column.id
+            faceted.score -= 4
+            faceted.rationale = ["Small multiples separate a low-cardinality dimension."]
+            candidates.append(faceted)
+        }
+
+        let valid = candidates.filter {
+            validate(specification: $0.specification, snapshot: snapshot).isValid
+        }
+        let unique = Dictionary(grouping: valid, by: \.id)
+            .compactMap { $0.value.max { $0.score < $1.score } }
+        let ranked = unique.sorted {
+            if $0.score != $1.score { return $0.score > $1.score }
+            let lhs = familyPriority($0.specification.family)
+            let rhs = familyPriority($1.specification.family)
+            if lhs != rhs { return lhs < rhs }
+            return $0.id < $1.id
+        }
+        let diverse = diversify(ranked, limit: options.maximumRecommendations)
+        guard !diverse.isEmpty else {
+            let reason = "No safe chart can represent this result without changing its meaning."
+            return AutoChartRecommendationSet(
+                recommendations: [tableFallback(reason: reason)],
+                fallbackReason: reason)
+        }
+        return AutoChartRecommendationSet(recommendations: diverse)
+    }
+
+    static func validate(
+        specification: AutoChartSpecification,
+        snapshot: AutoChartSnapshot
+    ) -> AutoChartValidationResult {
+        let profiles = Dictionary(
+            uniqueKeysWithValues: AutoChartProfiler.profiles(snapshot).map {
+                ($0.column.id, $0)
+            })
+        var issues: [AutoChartValidationIssue] = []
+        let referenced = [
+            specification.encoding.x, specification.encoding.y,
+            specification.encoding.series, specification.encoding.size,
+            specification.encoding.facet, specification.encoding.start,
+            specification.encoding.end,
+        ].compactMap { $0 }
+        for id in referenced where profiles[id] == nil {
+            issues.append(.init(severity: .error, message: "Unknown column \(id.rawValue)."))
+        }
+        func require(_ id: AutoChartColumnID?, _ type: AutoChartSemanticType, _ label: String) {
+            guard let id, let profile = profiles[id] else {
+                issues.append(.init(severity: .error, message: "\(label) is required."))
+                return
+            }
+            let matches: Bool = switch type {
+            case .nominal: profile.isCategorical
+            default: profile.semanticType == type
+            }
+            if !matches {
+                issues.append(.init(
+                    severity: .error,
+                    message: "\(label) must be \(type.rawValue)."))
+            }
+        }
+        switch specification.family {
+        case .table:
+            break
+        case .kpi:
+            require(specification.encoding.y, .quantitative, "Value")
+        case .bar, .rankedDot, .groupedBar, .stackedBar, .normalizedBar, .donut:
+            require(specification.encoding.x, .nominal, "Category")
+            require(specification.encoding.y, .quantitative, "Measure")
+        case .line, .pointLine, .area:
+            guard let x = specification.encoding.x, let profile = profiles[x],
+                profile.isTemporal || profile.semanticType == .ordinal
+            else {
+                issues.append(.init(
+                    severity: .error,
+                    message: "Line and area charts require an ordered or temporal x-axis."))
+                break
+            }
+            require(specification.encoding.y, .quantitative, "Measure")
+        case .scatter, .bubble:
+            guard let x = specification.encoding.x, let profile = profiles[x],
+                profile.isQuantitative || profile.isTemporal
+            else {
+                issues.append(.init(
+                    severity: .error,
+                    message: "Scatter and bubble charts require a quantitative or temporal x-axis."))
+                break
+            }
+            require(specification.encoding.y, .quantitative, "Measure")
+        case .histogram:
+            require(specification.encoding.x, .quantitative, "Binned field")
+        case .boxPlot:
+            require(specification.encoding.y, .quantitative, "Measure")
+        case .heatmap:
+            require(specification.encoding.x, .nominal, "X category")
+            require(specification.encoding.y, .nominal, "Y category")
+        case .range:
+            require(specification.encoding.start, .temporal, "Start")
+            require(specification.encoding.end, .temporal, "End")
+        case .faceted:
+            require(specification.encoding.facet, .nominal, "Facet")
+        }
+        if [.groupedBar, .stackedBar, .normalizedBar].contains(specification.family) {
+            require(specification.encoding.series, .nominal, "Series")
+        }
+        if specification.family == .kpi, snapshot.metadata.isTruncated {
+            issues.append(.init(
+                severity: .error,
+                message: "Key values require a complete result."))
+        }
+        if specification.family == .heatmap, snapshot.metadata.isTruncated {
+            issues.append(.init(
+                severity: .error,
+                message: "Frequency heatmaps require a complete result."))
+        }
+        let allowedWhenTruncated: Set<AutoChartFamily> = [
+            .table, .line, .pointLine, .area, .scatter, .bubble,
+            .histogram, .boxPlot, .faceted,
+        ]
+        if snapshot.metadata.isTruncated,
+            !allowedWhenTruncated.contains(specification.family)
+        {
+            issues.append(.init(
+                severity: .error,
+                message: "This chart family requires a complete result."))
+        }
+        if [.donut, .stackedBar, .normalizedBar].contains(specification.family) {
+            if snapshot.metadata.isTruncated {
+                issues.append(.init(
+                    severity: .error,
+                    message: "Composition charts require a complete result."))
+            }
+            if let y = specification.encoding.y,
+                let profile = profiles[y],
+                !compositionIsSafe(profile.column.hints)
+            {
+                issues.append(.init(
+                    severity: .error,
+                    message: "Composition requires an explicitly additive measure."))
+            }
+            if let y = specification.encoding.y,
+                let profile = profiles[y],
+                !profile.allNumericValuesPositive
+            {
+                issues.append(.init(
+                    severity: .error,
+                    message: "Composition requires positive values."))
+            }
+        }
+        if specification.aggregation != .none,
+            ![.histogram, .heatmap].contains(specification.family),
+            let y = specification.encoding.y,
+            let profile = profiles[y],
+            safeRollupAggregation(profile.column.hints) == nil
+        {
+            issues.append(.init(
+                severity: .error,
+                message: "Aggregation requires an explicitly additive measure."))
+        }
+        let markFields: [AutoChartColumnID?] = switch specification.family {
+        case .bar, .rankedDot, .donut:
+            [specification.encoding.x]
+        case .groupedBar, .stackedBar, .normalizedBar:
+            [specification.encoding.x, specification.encoding.series]
+        default:
+            []
+        }
+        if specification.aggregation == .none,
+            !markFields.isEmpty,
+            let y = specification.encoding.y,
+            !hasUniqueCombination(
+                snapshot: snapshot,
+                fields: markFields.compactMap { $0 },
+                measure: y)
+        {
+            issues.append(.init(
+                severity: .error,
+                message: "Duplicate marks require an explicit safe aggregation."))
+        }
+        if specification.family == .range,
+            let start = specification.encoding.start,
+            let end = specification.encoding.end,
+            snapshot.rows.contains(where: { row in
+                guard let startDate = row.values[start].flatMap(AutoChartProfiler.dateValue),
+                    let endDate = row.values[end].flatMap(AutoChartProfiler.dateValue)
+                else { return false }
+                return startDate > endDate
+            })
+        {
+            issues.append(.init(
+                severity: .error,
+                message: "Range starts must not occur after their ends."))
+        }
+        return AutoChartValidationResult(issues: issues)
+    }
+
+    private static func candidate(
+        family: AutoChartFamily,
+        x: AutoChartColumnProfile? = nil,
+        y: AutoChartColumnProfile? = nil,
+        series: AutoChartColumnProfile? = nil,
+        context: AutoChartContext,
+        start: AutoChartColumnProfile? = nil,
+        end: AutoChartColumnProfile? = nil,
+        aggregation: AutoChartAggregation = .none,
+        binCount: Int? = nil,
+        orientation: AutoChartOrientation = .vertical,
+        stacking: AutoChartStacking = .none,
+        sort: AutoChartSort = .source,
+        score: Double,
+        rationale: [String],
+        warnings: [String] = []
+    ) -> AutoChartRecommendation {
+        let title = context.title?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let generatedTitle: String = {
+            if let y, let x {
+                return "\(AutoChartProfiler.humanized(y.column.name)) by \(AutoChartProfiler.humanized(x.column.name))"
+            }
+            if let y { return AutoChartProfiler.humanized(y.column.name) }
+            if let x { return AutoChartProfiler.humanized(x.column.name) }
+            return family.displayName
+        }()
+        return AutoChartRecommendation(
+            specification: AutoChartSpecification(
+                family: family,
+                encoding: AutoChartEncoding(
+                    x: x?.column.id,
+                    y: y?.column.id,
+                    series: series?.column.id,
+                    start: start?.column.id,
+                    end: end?.column.id),
+                aggregation: aggregation,
+                binCount: binCount,
+                orientation: orientation,
+                stacking: stacking,
+                sort: sort,
+                title: title?.isEmpty == false ? title! : generatedTitle),
+            score: score,
+            rationale: rationale,
+            warnings: warnings)
+    }
+
+    private static func goalBonus(_ target: AutoChartGoal, _ actual: AutoChartGoal) -> Double {
+        target == actual ? 18 : 0
+    }
+
+    private static func compositionIsSafe(_ hints: AutoChartColumnHints) -> Bool {
+        if hints.aggregationSafety == .safe { return true }
+        guard hints.aggregationSafety == .alreadyAggregated else { return false }
+        return [.sum, .count, .countDistinct].contains(hints.aggregation)
+    }
+
+    private static func safeRollupAggregation(
+        _ hints: AutoChartColumnHints
+    ) -> AutoChartAggregation? {
+        if hints.aggregationSafety == .safe { return .sum }
+        return compositionIsSafe(hints) ? .sum : nil
+    }
+
+    private static func hasUniqueCombination(
+        snapshot: AutoChartSnapshot,
+        fields: [AutoChartColumnID],
+        measure: AutoChartColumnID
+    ) -> Bool {
+        guard !fields.isEmpty else { return false }
+        let combinations = snapshot.rows.compactMap { row -> [String]? in
+            guard row.values[measure]?.numericValue != nil else { return nil }
+            let values = fields.compactMap { row.values[$0]?.categoryString() }
+            return values.count == fields.count ? values : nil
+        }
+        return combinations.count == Set(combinations).count
+    }
+
+    private static func familyPriority(_ family: AutoChartFamily) -> Int {
+        AutoChartFamily.allCases.firstIndex(of: family) ?? Int.max
+    }
+
+    private static func diversify(
+        _ ranked: [AutoChartRecommendation],
+        limit: Int
+    ) -> [AutoChartRecommendation] {
+        var output: [AutoChartRecommendation] = []
+        var seenFamilies: Set<AutoChartFamily> = []
+        for recommendation in ranked where output.count < limit {
+            if seenFamilies.insert(recommendation.specification.family).inserted {
+                output.append(recommendation)
+            }
+        }
+        if output.count < limit {
+            for recommendation in ranked
+                where output.count < limit && !output.contains(where: { $0.id == recommendation.id })
+            {
+                output.append(recommendation)
+            }
+        }
+        return output
+    }
+
+    private static func tableFallback(reason: String) -> AutoChartRecommendation {
+        AutoChartRecommendation(
+            specification: AutoChartSpecification(family: .table, title: "Result Table"),
+            score: 0,
+            rationale: [reason])
+    }
+}
