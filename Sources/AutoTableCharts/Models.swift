@@ -85,7 +85,12 @@ public enum AutoChartValue: Hashable, Codable, Sendable {
             value.formatted(
                 .number.grouping(.automatic).precision(.fractionLength(0...3)))
         case .text(let value): value
-        case .date(let value): value.formatted(date: .abbreviated, time: .omitted)
+        case .date(let value):
+            value.formatted(
+                Date.FormatStyle(
+                    date: .abbreviated,
+                    time: .omitted,
+                    timeZone: TimeZone.gmt))
         case .binary: "<binary>"
         }
     }
@@ -171,7 +176,7 @@ public enum AutoChartAggregationSafety: String, Codable, Sendable {
     case unknown
     /// Values occur at the table's row grain but aren't explicitly declared additive.
     case rowLevel
-    /// Values may be safely summed when a chart groups multiple rows.
+    /// Values may use the declared aggregation, or sum when none is declared.
     case safe
     /// Values were aggregated upstream; their source aggregation determines rollup safety.
     case alreadyAggregated

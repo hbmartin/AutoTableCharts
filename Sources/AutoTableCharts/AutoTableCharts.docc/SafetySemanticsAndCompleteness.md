@@ -62,7 +62,8 @@ Donut, stacked-bar, and normalized-bar charts require all of the following:
 1. A complete result.
 2. Strictly positive observed values.
 3. An explicitly additive measure.
-4. A bounded number of categories or series during generation.
+4. No missing category, series, or measure values.
+5. A bounded number of categories or series during generation.
 
 These checks prevent partial wholes, negative sectors, and sums of non-additive
 metrics. They don't prove that categories are mutually exclusive or collectively
