@@ -9,13 +9,13 @@ Choose among the 18 implemented families without weakening the engine's safety c
 “Complete” means ``AutoChartTable/chartMetadata`` must report
 ``AutoChartTableMetadata/isTruncated`` as `false`. A safe rollup means the measure
 is explicitly marked ``AutoChartAggregationSafety/safe``, or is
-``AutoChartAggregationSafety/alreadyAggregated`` with a sum-like aggregation.
+``AutoChartAggregationSafety/alreadyAggregated`` with a sum or count aggregation.
 Generated recommendations also obey the limits in ``AutoChartOptions``.
 
 | Family | Required encodings | Generated when | Aggregation and completeness | Explore interaction |
 | --- | --- | --- | --- | --- |
 | ``AutoChartFamily/table`` | None | No safe visual candidate survives, or the input is empty | Never aggregates; allowed for complete and truncated results | Scrollable rows; no mark selection or zoom |
-| ``AutoChartFamily/kpi`` | Quantitative `y` | Exactly one complete row has a measure | Complete result; preserves the row's value | Read-only value |
+| ``AutoChartFamily/kpi`` | Quantitative `y` | Exactly one complete row has a nonmissing measure | Complete result; preserves the row's value | Read-only value |
 | ``AutoChartFamily/bar`` | Categorical `x`, quantitative `y` | A complete, bounded-cardinality dimension can be compared with a measure | Uses no aggregation at a unique category grain; otherwise requires a declared safe rollup | Category selection; scroll and zoom beyond 10 categories |
 | ``AutoChartFamily/rankedDot`` | Categorical `x`, quantitative `y` | The same inputs as a bar chart | Same safety as bar; generated in descending order | Category selection; scroll and zoom beyond 10 categories |
 | ``AutoChartFamily/groupedBar`` | Categorical `x` and `series`, quantitative `y` | A second dimension has 2…`maximumSeries` values | Complete result; no aggregation at a unique category/series grain, otherwise a declared safe rollup | Grouped mark selection; categorical scroll and zoom |
@@ -29,7 +29,7 @@ Generated recommendations also obey the limits in ``AutoChartOptions``.
 | ``AutoChartFamily/histogram`` | Quantitative `x` | A measure can be binned | Counts rows in 5…20 bins; truncated results are allowed but describe only returned rows | Bin selection returns all contributing row IDs; quantitative zoom beyond 30 bins/values |
 | ``AutoChartFamily/boxPlot`` | Quantitative `y`; optional categorical `x` | A measure has a distribution; grouping is limited to at most 10 categories | Computes five-number summaries over returned rows; truncated results are allowed with a warning | Group selection returns the contributing source rows |
 | ``AutoChartFamily/heatmap`` | Two categorical fields in `x` and `y` | Both dimensions fit `maximumCategories` | Complete result; counts rows per cell | Cell selection returns all contributing row IDs |
-| ``AutoChartFamily/donut`` | Categorical `x`, quantitative `y` | Few categories form a complete, positive, additive whole | Complete result; safe sum; at most `maximumDonutSectors` sectors | Angle selection resolves a sector and all contributing row IDs |
+| ``AutoChartFamily/donut`` | Categorical `x`, quantitative `y` | Few categories form a complete, positive, additive whole | Complete result; safe sum or ordinary count; at most `maximumDonutSectors` sectors | Angle selection resolves a sector and all contributing row IDs |
 | ``AutoChartFamily/range`` | Categorical label in `x`, temporal `start` and `end` | Complete interval data has two temporal fields; a single date can represent an event with equal start/end | Never aggregates; complete result; every start must be no later than its end | Category selection; categorical scroll and zoom |
 | ``AutoChartFamily/faceted`` | Categorical `facet`, quantitative `y`, and categorical, quantitative, temporal, or ordinal `x` | A line, bar, or scatter candidate can be split into 2…`maximumFacets` panels | Inherits the base candidate's preparation and completeness rules | Mark selection preserves row lineage within panels |
 

@@ -78,7 +78,7 @@ public enum AutoChartEngine {
 
         if !snapshot.metadata.isTruncated,
             snapshot.rows.count == 1,
-            let measure = quantitative.first
+            let measure = quantitative.first(where: { $0.nonNullCount > 0 })
         {
             candidates.append(
                 candidate(
@@ -167,13 +167,14 @@ public enum AutoChartEngine {
                 if !snapshot.metadata.isTruncated,
                     dimension.distinctCount <= options.maximumDonutSectors,
                     measure.allNumericValuesPositive,
-                    compositionIsSafe(measure.column.hints)
+                    compositionIsSafe(measure.column.hints),
+                    let compositionAggregation = safeRollupAggregation(measure.column.hints)
                 {
                     candidates.append(
                         candidate(
                             family: .donut, x: dimension, y: measure,
                             context: context,
-                            aggregation: .sum,
+                            aggregation: compositionAggregation,
                             score: 58 + goalBonus(.composition, context.goal),
                             rationale: ["Few positive, additive categories form a complete whole."])
                     )
@@ -304,15 +305,19 @@ public enum AutoChartEngine {
             temporal.count >= 2,
             let label = categorical.first
         {
+            let hintedStart = temporal.first {
+                $0.column.hints.role == .intervalStart
+            }
+            let hintedEnd = temporal.first {
+                $0.column.hints.role == .intervalEnd
+            }
             let start =
-                temporal.first {
-                    $0.column.hints.role == .intervalStart
-                } ?? temporal[0]
+                hintedStart
+                ?? temporal.first { $0.column.id != hintedEnd?.column.id }
+                ?? temporal[0]
             let end =
-                temporal.first {
-                    $0.column.id != start.column.id
-                        && $0.column.hints.role == .intervalEnd
-                } ?? temporal.first { $0.column.id != start.column.id }
+                hintedEnd.flatMap { $0.column.id == start.column.id ? nil : $0 }
+                ?? temporal.first { $0.column.id != start.column.id }
             if let end {
                 candidates.append(
                     candidate(
@@ -326,10 +331,14 @@ public enum AutoChartEngine {
         } else if !snapshot.metadata.isTruncated,
             let time = temporal.first, let label = categorical.first
         {
-            if let measure = quantitative.first {
+            if let measure = quantitative.first,
+                let series = categorical.first(where: {
+                    $0.distinctCount >= 2 && $0.distinctCount <= options.maximumSeries
+                })
+            {
                 candidates.append(
                     candidate(
-                        family: .scatter, x: time, y: measure, series: label,
+                        family: .scatter, x: time, y: measure, series: series,
                         context: context,
                         score: 72 + goalBonus(.relationship, context.goal),
                         rationale: ["Dated values can be inspected along a temporal axis."],
@@ -452,6 +461,7 @@ public enum AutoChartEngine {
             break
         case .kpi:
             require(specification.encoding.y, .quantitative, "Value")
+            rejectMissing(specification.encoding.y, "Value")
             if snapshot.rows.count != 1 {
                 issues.append(
                     .init(
@@ -566,16 +576,28 @@ public enum AutoChartEngine {
             }
             require(specification.encoding.y, .quantitative, "Measure")
         }
-        if [.groupedBar, .stackedBar, .normalizedBar].contains(specification.family) {
-            require(specification.encoding.series, .nominal, "Series")
-        }
-        if specification.encoding.series != nil,
-            ![.groupedBar, .stackedBar, .normalizedBar].contains(specification.family)
+        if [.groupedBar, .stackedBar, .normalizedBar].contains(specification.family),
+            specification.encoding.series == nil
         {
             require(specification.encoding.series, .nominal, "Series")
         }
         if specification.encoding.series != nil {
-            rejectMissing(specification.encoding.series, "Series fields")
+            let supportsSeries: Set<AutoChartFamily> = [
+                .groupedBar, .stackedBar, .normalizedBar,
+                .line, .pointLine, .area,
+                .scatter, .bubble, .faceted,
+            ]
+            if supportsSeries.contains(specification.family) {
+                require(specification.encoding.series, .nominal, "Series")
+                rejectMissing(specification.encoding.series, "Series fields")
+            } else {
+                issues.append(
+                    .init(
+                        severity: .error,
+                        message:
+                            "\(specification.family.displayName) does not support a series encoding."
+                    ))
+            }
         }
         let temporalReferences = [
             specification.encoding.x,
@@ -596,7 +618,9 @@ public enum AutoChartEngine {
             case .histogram, .heatmap:
                 .count
             case .donut:
-                .sum
+                specification.encoding.y.flatMap { profiles[$0] }.flatMap {
+                    safeRollupAggregation($0.column.hints)
+                }
             case .table, .kpi, .boxPlot, .scatter, .bubble, .range:
                 AutoChartAggregation.none
             default:
@@ -638,6 +662,12 @@ public enum AutoChartEngine {
                     "Composition charts require a complete result."
                 case .bar, .rankedDot, .groupedBar, .range:
                     "This chart family requires a complete result."
+                case .faceted:
+                    if let x = specification.encoding.x, profiles[x]?.isCategorical == true {
+                        "Categorical small multiples require a complete result."
+                    } else {
+                        nil
+                    }
                 default:
                     nil
                 }
@@ -668,7 +698,7 @@ public enum AutoChartEngine {
             }
         }
         if specification.aggregation != .none,
-            ![.histogram, .heatmap].contains(specification.family),
+            ![.histogram, .heatmap, .donut].contains(specification.family),
             let y = specification.encoding.y,
             let profile = profiles[y]
         {
@@ -791,7 +821,7 @@ public enum AutoChartEngine {
 
     private static func compositionIsSafe(_ hints: AutoChartColumnHints) -> Bool {
         let additiveAggregations: Set<AutoChartAggregation> = [
-            .sum, .count, .countDistinct,
+            .sum, .count,
         ]
         if hints.aggregationSafety == .safe {
             return hints.aggregation == nil
@@ -804,10 +834,17 @@ public enum AutoChartEngine {
     private static func safeRollupAggregation(
         _ hints: AutoChartColumnHints
     ) -> AutoChartAggregation? {
-        guard hints.aggregationSafety == .safe || compositionIsSafe(hints) else {
+        switch hints.aggregationSafety {
+        case .safe:
+            return hints.aggregation ?? .sum
+        case .alreadyAggregated:
+            guard hints.aggregation == .sum || hints.aggregation == .count else {
+                return nil
+            }
+            return .sum
+        case .unknown, .rowLevel, .unsafe:
             return nil
         }
-        return hints.aggregation ?? .sum
     }
 
     private static func hasUniqueCombination(

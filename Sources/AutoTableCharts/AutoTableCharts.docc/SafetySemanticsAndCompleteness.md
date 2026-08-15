@@ -28,14 +28,16 @@ For bars, grouped bars, and connected series, the renderer needs one mark per
 encoded category or x/series key. If the returned rows are already unique at that
 mark grain, ``AutoChartAggregation/none`` preserves them. Duplicate keys require
 an aggregation for categorical marks and are rejected for generated connected
-series. When rollup is explicitly safe, the engine honors a declared aggregation
-or defaults to sum.
+series. For ``AutoChartAggregationSafety/safe`` values, the engine honors a
+declared aggregation or defaults to sum.
 
 ``AutoChartAggregationSafety/rowLevel`` doesn't mean “safe to sum”; it says the
 measure is at a more detailed row grain and requires domain knowledge before a
 rollup. ``AutoChartAggregationSafety/alreadyAggregated`` permits another sum only
-when the declared existing aggregation is sum-like (`sum`, `count`, or
-`countDistinct`). ``AutoChartAggregationSafety/unsafe`` and
+when the declared existing aggregation is `sum` or `count`; the downstream
+rollup operation is `sum` in both cases. Distinct counts aren't additive without
+an explicit guarantee that their underlying populations are disjoint.
+``AutoChartAggregationSafety/unsafe`` and
 ``AutoChartAggregationSafety/unknown`` block inferred rollups.
 
 This is intentionally conservative. A price, percentage, median, inventory

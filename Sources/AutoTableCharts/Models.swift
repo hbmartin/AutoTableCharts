@@ -169,8 +169,8 @@ public enum AutoChartAggregation: String, CaseIterable, Codable, Sendable {
 /// Declares whether a measure may be aggregated without changing its meaning.
 ///
 /// Recommendation safety is conservative: unknown or unsafe aggregation blocks
-/// implicit rollups, and already-aggregated measures are additive only for sum-
-/// and count-like source aggregations.
+/// implicit rollups, and already-aggregated measures are additive only for
+/// upstream sums and ordinary counts. Both roll up by summing their values.
 public enum AutoChartAggregationSafety: String, Codable, Sendable {
     /// The caller hasn't established whether aggregation is semantically valid.
     case unknown
@@ -178,7 +178,7 @@ public enum AutoChartAggregationSafety: String, Codable, Sendable {
     case rowLevel
     /// Values may use the declared aggregation, or sum when none is declared.
     case safe
-    /// Values were aggregated upstream; their source aggregation determines rollup safety.
+    /// Values were aggregated upstream; only sums and ordinary counts may be summed again.
     case alreadyAggregated
     /// Values must never be aggregated automatically.
     case unsafe
