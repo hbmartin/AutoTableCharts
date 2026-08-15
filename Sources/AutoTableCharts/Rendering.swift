@@ -88,7 +88,9 @@ enum AutoChartSelectionPreparation {
         var cumulative = 0.0
         for datum in candidates {
             cumulative += datum.yNumber ?? 0
-            if selectedAngle <= cumulative { return datum }
+            if selectedAngle <= cumulative {
+                return datum.sourceRowIDs.isEmpty ? nil : datum
+            }
         }
         return nil
     }
@@ -539,17 +541,19 @@ enum AutoChartDataPreparation {
 func disambiguatedCategoryLabels(
     _ pairs: [(identity: String, label: String)]
 ) -> [String: String] {
-    let grouped = Dictionary(grouping: pairs, by: \.label)
+    let groups = Dictionary(grouping: pairs, by: \.label)
+        .map { label, pairs in
+            (label: label, identities: Array(Set(pairs.map(\.identity))).sorted())
+        }
+        .sorted { $0.label < $1.label }
     var labels: [String: String] = [:]
-    for label in grouped.keys.sorted() {
-        let identities = Array(Set(grouped[label, default: []].map(\.identity))).sorted()
+    for (label, identities) in groups {
         if identities.count == 1, let identity = identities.first {
             labels[identity] = label
         }
     }
     var usedLabels = Set(labels.values)
-    for label in grouped.keys.sorted() {
-        let identities = Array(Set(grouped[label, default: []].map(\.identity))).sorted()
+    for (label, identities) in groups {
         guard identities.count > 1 else { continue }
         let kinds = identities.map { identity -> String in
             switch identity.split(separator: ":", maxSplits: 1).first {
@@ -674,18 +678,15 @@ public struct AutoChartView: View {
         let xIsCategorical = specification.encoding.x.flatMap {
             profiles[$0]?.isCategorical
         } ?? false
-        let usesCategoricalXLabels = xIsCategorical
-            && [
-                .bar, .rankedDot, .groupedBar, .stackedBar, .normalizedBar,
-                .line, .pointLine, .area, .boxPlot, .heatmap, .donut, .range, .faceted,
-            ].contains(specification.family)
-        let xDisplayLabels = usesCategoricalXLabels
+        let xUsesIdentityLabels = xIsCategorical
+            || (specification.family == .boxPlot && specification.encoding.x == nil)
+        let xDisplayLabels = xUsesIdentityLabels
             ? categoryLabels(identity: \.xIdentity, label: \.xLabel) : [:]
         let yDisplayLabels = specification.family == .heatmap
             ? categoryLabels(identity: \.yIdentity, label: \.yLabel) : [:]
         let seriesDisplayLabels = specification.encoding.series != nil
             ? categoryLabels(identity: \.seriesIdentity, label: \.series) : [:]
-        let facetDisplayLabels = specification.family == .faceted
+        let facetDisplayLabels = specification.encoding.facet != nil
             ? categoryLabels(identity: \.facetIdentity, label: \.facet) : [:]
         self.snapshot = snapshot
         self.recommendation = recommendation
@@ -700,16 +701,12 @@ public struct AutoChartView: View {
             sizeBounds = nil
         }
         if let minimum = yValues.min(), let maximum = yValues.max() {
-            let includesCategoricalX =
-                specification.encoding.x.flatMap {
-                    profiles[$0]?.isCategorical
-                } ?? false
-            let lower = includesCategoricalX ? min(0, minimum) : minimum
-            let upper = includesCategoricalX ? max(0, maximum) : maximum
+            let lower = xIsCategorical ? min(0, minimum) : minimum
+            let upper = xIsCategorical ? max(0, maximum) : maximum
             if lower == upper {
                 let padding = max(1, abs(lower) * 0.05)
                 sharedYDomain = (lower - padding)...(upper + padding)
-            } else if includesCategoricalX {
+            } else if xIsCategorical {
                 sharedYDomain = lower...upper
             } else {
                 let padding = max(abs(lower), abs(upper)) * 0.05

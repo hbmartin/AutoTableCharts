@@ -588,7 +588,7 @@ private let date = AutoChartColumn(
             context: AutoChartContext(goal: .composition)
         ).chartRecommendations.first { $0.specification.family == .donut }
         #expect(donut?.specification.aggregation == .count)
-        #expect(donut?.specification.title == "Count by Property Type")
+        #expect(donut?.specification.title == "Count of Count by Property Type")
         let data = donut.map {
             AutoChartDataPreparation.data(
                 snapshot: AutoChartSnapshot(input),
@@ -649,6 +649,25 @@ private let date = AutoChartColumn(
                 $0.specification.family == .scatter
                     && $0.specification.encoding.series == highCardinality.id
             })
+    }
+
+    @Test func datedMeasuresWithoutCategoriesStillOfferScatter() {
+        let input = table(
+            columns: [date, measure],
+            rows: [
+                [.text("2026-01-01"), .double(1)],
+                [.text("2026-01-02"), .double(2)],
+                [.text("2026-01-03"), .double(3)],
+            ])
+        let scatter = AutoChartEngine.recommendations(
+            for: input,
+            context: AutoChartContext(goal: .relationship),
+            options: AutoChartOptions(maximumRecommendations: 12)
+        ).chartRecommendations.first { $0.specification.family == .scatter }
+        #expect(scatter != nil)
+        #expect(scatter?.specification.encoding.x == date.id)
+        #expect(scatter?.specification.encoding.y == measure.id)
+        #expect(scatter?.specification.encoding.series == nil)
     }
 }
 
@@ -783,9 +802,18 @@ private let date = AutoChartColumn(
         let line = AutoChartSpecification(
             family: .line,
             encoding: AutoChartEncoding(x: date.id, y: measure.id))
+        let barWithFacet = AutoChartSpecification(
+            family: .bar,
+            encoding: AutoChartEncoding(x: category.id, y: measure.id, facet: facet.id))
         #expect(!AutoChartEngine.validate(specification: bubble, for: input).isValid)
         #expect(!AutoChartEngine.validate(specification: range, for: input).isValid)
         #expect(!AutoChartEngine.validate(specification: faceted, for: input).isValid)
+        #expect(
+            AutoChartEngine.validate(
+                specification: barWithFacet, for: input
+            ).issues.contains {
+                $0.message == "Bar does not support a facet encoding."
+            })
         #expect(
             AutoChartEngine.validate(
                 specification: line, for: input
@@ -1326,6 +1354,13 @@ private let date = AutoChartColumn(
                 family: .histogram) == "0–10")
         #expect(AutoChartSelectionPreparation.angleMatch(to: 2, in: bins)?.id == "second")
         #expect(AutoChartSelectionPreparation.angleMatch(to: 4, in: bins) == nil)
+
+        let sectors = [
+            AutoChartDatum(id: "missing-lineage", sourceRowIDs: [], yNumber: 1),
+            AutoChartDatum(id: "selectable", sourceRowIDs: ["r2"], yNumber: 2),
+        ]
+        #expect(AutoChartSelectionPreparation.angleMatch(to: 0.5, in: sectors) == nil)
+        #expect(AutoChartSelectionPreparation.angleMatch(to: 2, in: sectors)?.id == "selectable")
     }
 
     @Test func selectionSummariesRespectNonadditiveAggregations() {
