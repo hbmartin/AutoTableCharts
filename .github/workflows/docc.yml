@@ -61,7 +61,10 @@ jobs:
           cp .github/pages-root-redirect.html "$DOCC_OUTPUT/index.html"
           grep -F './documentation/autotablecharts/' "$DOCC_OUTPUT/index.html" >/dev/null
           grep -F 'window.location.search + window.location.hash' "$DOCC_OUTPUT/index.html" >/dev/null
-          ! grep -F '<meta http-equiv="refresh"' "$DOCC_OUTPUT/index.html" >/dev/null
+          if grep -F '<meta http-equiv="refresh"' "$DOCC_OUTPUT/index.html" >/dev/null; then
+            echo "Unexpected meta refresh in GitHub Pages landing page" >&2
+            exit 1
+          fi
 
       - name: Upload GitHub Pages artifact
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'

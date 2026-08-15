@@ -248,12 +248,21 @@ enum AutoChartProfiler {
         nameTokens(name)
             .map { token in
                 let lower = token.lowercased()
-                if ["id", "noi", "ltv", "irr", "dscr"].contains(lower) {
+                if lower == "id" {
                     return lower.uppercased()
                 }
                 return lower.prefix(1).uppercased() + lower.dropFirst()
             }
             .joined(separator: " ")
+    }
+
+    static func displayName(_ column: AutoChartColumn) -> String {
+        if let override = column.displayName?.trimmingCharacters(in: .whitespacesAndNewlines),
+            !override.isEmpty
+        {
+            return override
+        }
+        return humanized(column.name)
     }
 }
 

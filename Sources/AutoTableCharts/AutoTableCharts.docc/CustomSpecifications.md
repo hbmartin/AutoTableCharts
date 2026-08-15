@@ -25,6 +25,19 @@ The names `x` and `y` describe semantic channels before orientation is applied.
 A horizontal bar renderer places the category labels vertically and the measure
 horizontally.
 
+For small multiples, record which base chart each panel repeats:
+
+```swift
+let facetedTrend = AutoChartSpecification(
+    family: .faceted,
+    encoding: AutoChartEncoding(x: "date", y: "value", facet: "region"),
+    facetBaseFamily: .line
+)
+```
+
+Legacy decoded faceted specifications without `facetBaseFamily` remain valid when
+a compatible base can be inferred, but validation emits a migration warning.
+
 ### Validate before rendering
 
 ```swift
@@ -44,6 +57,7 @@ Validation checks:
 - Every referenced column exists.
 - Required channels have compatible semantic types.
 - Series and facet channels are categorical where required.
+- Heatmap axes and facet/x/series channels use distinct fields where required.
 - Incomplete results use only families that remain truthful for partial rows.
 - Composition is complete, positive, and explicitly additive.
 - Composition, heatmap, range, series, and facet channels contain no missing values.
