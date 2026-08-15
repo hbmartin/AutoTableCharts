@@ -163,7 +163,10 @@ enum AutoChartProfiler {
         if let date = try? Date(text, strategy: .iso8601) { return date }
         let parts = text.split(separator: "-", omittingEmptySubsequences: false)
         guard parts.count == 3,
+            parts[0].utf8.count == 4,
+            parts[0].utf8.allSatisfy({ (48...57).contains($0) }),
             let year = Int(parts[0]),
+            (1...9_999).contains(year),
             let month = Int(parts[1]),
             let day = Int(parts[2]),
             (1...12).contains(month),

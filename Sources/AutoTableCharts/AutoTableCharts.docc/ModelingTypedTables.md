@@ -57,8 +57,9 @@ Aggregation safety is distinct from physical type:
   declare it additive.
 - ``AutoChartAggregationSafety/safe`` permits the declared aggregation, or a
   sum when no aggregation is declared.
-- ``AutoChartAggregationSafety/alreadyAggregated`` permits rollup only when the
-  source aggregation is sum, count, or distinct count.
+- ``AutoChartAggregationSafety/alreadyAggregated`` permits a sum rollup only
+  when the source aggregation is sum or ordinary count. Distinct counts remain
+  non-additive.
 - ``AutoChartAggregationSafety/unsafe`` explicitly prohibits rollup.
 
 An average, ratio, balance, or repeated value from a one-to-many join can be

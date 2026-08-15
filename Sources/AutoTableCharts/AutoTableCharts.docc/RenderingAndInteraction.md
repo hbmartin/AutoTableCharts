@@ -39,9 +39,11 @@ if let selection {
 ```
 
 Selection is exact for prepared marks; it isn't a predicate or approximate range.
-Category selection matches rendered category labels. Temporal and quantitative
-selection chooses the nearest rendered mark. Donut selection resolves cumulative
-angle to the corresponding sector.
+Category selection matches collision-safe rendered category labels. Temporal and
+quantitative selection chooses the nearest rendered x position and includes every
+series at that position. Donut selection resolves cumulative angle to the
+corresponding sector. A multi-mark selection combines values only when its
+aggregation supports a meaningful combined summary.
 
 ### Navigate dense charts
 

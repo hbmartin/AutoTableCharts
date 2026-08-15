@@ -145,6 +145,16 @@ private let date = AutoChartColumn(
         #expect(datum.accessibilityLabel == "\(expectedAccessibleDate), 2")
         #expect(!datum.accessibilityLabel.contains("T00:00:00Z"))
     }
+
+    @Test func accessibilityLabelsIncludeSeriesContext() {
+        let datum = AutoChartDatum(
+            id: "series",
+            sourceRowIDs: ["r0"],
+            xLabel: "Office",
+            yNumber: 2,
+            series: "North")
+        #expect(datum.accessibilityLabel == "Office, North, 2")
+    }
 }
 
 @Suite struct ProfilingTests {
@@ -170,6 +180,12 @@ private let date = AutoChartColumn(
     @Test func invalidCalendarDatesAreRejected() {
         #expect(AutoChartProfiler.parseISODate("2026-02-29") == nil)
         #expect(AutoChartProfiler.parseISODate("2024-02-29") != nil)
+    }
+
+    @Test func abbreviatedAndCodeLikeDatesAreRejected() {
+        #expect(AutoChartProfiler.parseISODate("1-2-3") == nil)
+        #expect(AutoChartProfiler.parseISODate("10-11-12") == nil)
+        #expect(AutoChartProfiler.parseISODate("0001-02-03") != nil)
     }
 
     @Test func duplicateColumnIDsAreDeduplicatedAtSnapshotBoundary() {
@@ -262,6 +278,26 @@ private let date = AutoChartColumn(
             for: table(
                 columns: [measure], rows: [[.double(42)]]))
         #expect(result.chartRecommendations.first?.specification.family == .kpi)
+    }
+
+    @Test func scalarKPIChoosesAPopulatedMeasure() {
+        let empty = AutoChartColumn(
+            id: "empty", name: "empty",
+            hints: AutoChartColumnHints(semanticType: .quantitative))
+        let populated = AutoChartColumn(
+            id: "populated", name: "populated",
+            hints: AutoChartColumnHints(semanticType: .quantitative))
+        let input = table(
+            columns: [empty, populated],
+            rows: [[.null, .double(42)]])
+        let result = AutoChartEngine.recommendations(for: input)
+        #expect(result.chartRecommendations.first?.specification.family == .kpi)
+        #expect(result.chartRecommendations.first?.specification.encoding.y == populated.id)
+
+        let emptyKPI = AutoChartSpecification(
+            family: .kpi,
+            encoding: .init(y: empty.id))
+        #expect(!AutoChartEngine.validate(specification: emptyKPI, for: input).isValid)
     }
 
     @Test func categoryMeasureUsesBarAndDonutAlternatives() {
@@ -441,6 +477,136 @@ private let date = AutoChartColumn(
         #expect(
             !result.chartRecommendations.contains {
                 [.donut, .stackedBar, .normalizedBar].contains($0.specification.family)
+            })
+    }
+
+    @Test func preaggregatedCountsRollUpBySummingValues() {
+        let count = AutoChartColumn(
+            id: "count", name: "count",
+            hints: AutoChartColumnHints(
+                semanticType: .quantitative,
+                aggregation: .count,
+                aggregationSafety: .alreadyAggregated))
+        let input = table(
+            columns: [category, count],
+            rows: [
+                [.text("A"), .double(2)],
+                [.text("A"), .double(3)],
+            ])
+        let recommendation = AutoChartEngine.recommendations(for: input)
+            .chartRecommendations.first { $0.specification.family == .bar }
+        #expect(recommendation?.specification.aggregation == .sum)
+        let data = recommendation.map {
+            AutoChartDataPreparation.data(
+                snapshot: AutoChartSnapshot(input),
+                specification: $0.specification)
+        }
+        #expect(data?.first?.yNumber == 5)
+
+        let wrongCount = AutoChartSpecification(
+            family: .bar,
+            encoding: .init(x: category.id, y: count.id),
+            aggregation: .count)
+        #expect(!AutoChartEngine.validate(specification: wrongCount, for: input).isValid)
+
+        let donut = AutoChartSpecification(
+            family: .donut,
+            encoding: .init(x: category.id, y: count.id),
+            aggregation: .sum)
+        #expect(AutoChartEngine.validate(specification: donut, for: input).isValid)
+    }
+
+    @Test func distinctCountsAreNotCompositionSafeOrImplicitlyRollable() {
+        let distinctCount = AutoChartColumn(
+            id: "distinct", name: "distinct",
+            hints: AutoChartColumnHints(
+                semanticType: .quantitative,
+                aggregation: .countDistinct,
+                aggregationSafety: .alreadyAggregated))
+        let input = table(
+            columns: [category, distinctCount],
+            rows: [
+                [.text("A"), .double(2)],
+                [.text("A"), .double(3)],
+                [.text("B"), .double(4)],
+            ])
+        let result = AutoChartEngine.recommendations(
+            for: input,
+            context: AutoChartContext(goal: .composition))
+        #expect(!result.chartRecommendations.contains { $0.specification.family == .donut })
+        #expect(!result.chartRecommendations.contains { $0.specification.family == .bar })
+    }
+
+    @Test func rowLevelSafeCountsProduceCountAggregatedDonuts() {
+        let count = AutoChartColumn(
+            id: "count", name: "count",
+            hints: AutoChartColumnHints(
+                semanticType: .quantitative,
+                aggregation: .count,
+                aggregationSafety: .safe))
+        let input = table(
+            columns: [category, count],
+            rows: [
+                [.text("A"), .double(10)],
+                [.text("A"), .double(20)],
+                [.text("B"), .double(30)],
+            ])
+        let donut = AutoChartEngine.recommendations(
+            for: input,
+            context: AutoChartContext(goal: .composition)
+        ).chartRecommendations.first { $0.specification.family == .donut }
+        #expect(donut?.specification.aggregation == .count)
+        let data = donut.map {
+            AutoChartDataPreparation.data(
+                snapshot: AutoChartSnapshot(input),
+                specification: $0.specification)
+        }
+        #expect(
+            Dictionary(
+                uniqueKeysWithValues: data?.compactMap { datum in
+                    guard let label = datum.xLabel, let value = datum.yNumber else { return nil }
+                    return (label, value)
+                } ?? []) == ["A": 2, "B": 1])
+    }
+
+    @Test func intervalEndHintsDoNotBecomeRangeStarts() {
+        let end = AutoChartColumn(
+            id: "end", name: "end",
+            hints: AutoChartColumnHints(
+                semanticType: .temporal,
+                role: .intervalEnd))
+        let start = AutoChartColumn(
+            id: "start", name: "start",
+            hints: AutoChartColumnHints(semanticType: .temporal))
+        let input = table(
+            columns: [end, start, category],
+            rows: [[.text("2026-12-31"), .text("2026-01-01"), .text("A")]])
+        let range = AutoChartEngine.recommendations(
+            for: input,
+            context: AutoChartContext(goal: .range)
+        ).chartRecommendations.first { $0.specification.family == .range }
+        #expect(range?.specification.encoding.start == start.id)
+        #expect(range?.specification.encoding.end == end.id)
+    }
+
+    @Test func datedEventSeriesRespectMaximumSeries() {
+        let highCardinality = AutoChartColumn(
+            id: "event", name: "event",
+            hints: AutoChartColumnHints(semanticType: .nominal))
+        let input = table(
+            columns: [date, highCardinality, measure],
+            rows: [
+                [.text("2026-01-01"), .text("A"), .double(1)],
+                [.text("2026-01-02"), .text("B"), .double(2)],
+                [.text("2026-01-03"), .text("C"), .double(3)],
+            ])
+        let result = AutoChartEngine.recommendations(
+            for: input,
+            options: AutoChartOptions(maximumSeries: 2))
+        #expect(
+            !result.chartRecommendations.contains {
+                $0.specification.family == .scatter
+                    && $0.specification.encoding.series == highCardinality.id
             })
     }
 }
@@ -650,6 +816,24 @@ private let date = AutoChartColumn(
         #expect(data[0].sourceRowIDs == ["r0", "r1"])
     }
 
+    @Test func boxPlotsExcludeNullMeasuresFromLineage() {
+        let input = table(
+            columns: [category, measure],
+            rows: [
+                [.text("A"), .double(1)],
+                [.text("A"), .null],
+                [.text("A"), .double(3)],
+            ])
+        let specification = AutoChartSpecification(
+            family: .boxPlot,
+            encoding: .init(x: category.id, y: measure.id))
+        let data = AutoChartDataPreparation.data(
+            snapshot: AutoChartSnapshot(input),
+            specification: specification)
+        #expect(data.first?.sourceRowIDs == ["r0", "r2"])
+        #expect(data.first?.median == 2)
+    }
+
     @Test func groupedMarksPreserveFirstSourceOrder() {
         let input = table(
             columns: [category, measure],
@@ -704,6 +888,27 @@ private let date = AutoChartColumn(
         #expect(data.count == 3)
         #expect(data.compactMap(\.xDate) == dates.sorted())
         #expect(data.compactMap(\.yNumber) == [1, 2, 3])
+    }
+
+    @Test func numericOrdinalsKeepCategoricalSourceOrder() {
+        let ordinal = AutoChartColumn(
+            id: "ordinal", name: "ordinal",
+            hints: AutoChartColumnHints(semanticType: .ordinal))
+        let input = table(
+            columns: [ordinal, measure],
+            rows: [
+                [.integer(2), .double(20)],
+                [.integer(1), .double(10)],
+            ])
+        let specification = AutoChartSpecification(
+            family: .line,
+            encoding: .init(x: ordinal.id, y: measure.id),
+            sort: .source)
+        #expect(AutoChartEngine.validate(specification: specification, for: input).isValid)
+        let data = AutoChartDataPreparation.data(
+            snapshot: AutoChartSnapshot(input),
+            specification: specification)
+        #expect(data.compactMap(\.xLabel) == ["2", "1"])
     }
 
     @Test func invalidTransformAndFamilyCombinationsAreRejected() {
@@ -770,6 +975,59 @@ private let date = AutoChartColumn(
             ).isValid)
     }
 
+    @Test func ordinaryBarsRejectSeriesEncodings() {
+        let series = AutoChartColumn(
+            id: "series", name: "series",
+            hints: AutoChartColumnHints(semanticType: .nominal))
+        let input = table(
+            columns: [category, series, measure],
+            rows: [
+                [.text("A"), .text("One"), .double(1)],
+                [.text("A"), .text("Two"), .double(2)],
+            ])
+        let specification = AutoChartSpecification(
+            family: .bar,
+            encoding: .init(x: category.id, y: measure.id, series: series.id),
+            aggregation: .sum)
+        #expect(
+            AutoChartEngine.validate(
+                specification: specification,
+                for: input
+            ).issues.contains {
+                $0.message == "Bar does not support a series encoding."
+            })
+    }
+
+    @Test func truncatedCategoricalFacetsInheritBarCompleteness() {
+        let facet = AutoChartColumn(
+            id: "facet", name: "facet",
+            hints: AutoChartColumnHints(semanticType: .nominal))
+        let categoricalInput = table(
+            columns: [category, facet, measure],
+            rows: [
+                [.text("A"), .text("One"), .double(1)],
+                [.text("B"), .text("Two"), .double(2)],
+            ],
+            truncated: true)
+        let categorical = AutoChartSpecification(
+            family: .faceted,
+            encoding: .init(x: category.id, y: measure.id, facet: facet.id))
+        #expect(
+            !AutoChartEngine.validate(specification: categorical, for: categoricalInput).isValid)
+
+        let temporalInput = table(
+            columns: [date, facet, measure],
+            rows: [
+                [.text("2026-01-01"), .text("One"), .double(1)],
+                [.text("2026-01-02"), .text("Two"), .double(2)],
+            ],
+            truncated: true)
+        let temporal = AutoChartSpecification(
+            family: .faceted,
+            encoding: .init(x: date.id, y: measure.id, facet: facet.id))
+        #expect(AutoChartEngine.validate(specification: temporal, for: temporalInput).isValid)
+    }
+
     @Test func nullGroupsDoNotMergeWithRealLabels() {
         let input = table(
             columns: [category, measure],
@@ -796,8 +1054,10 @@ private let date = AutoChartColumn(
             family: .faceted,
             encoding: AutoChartEncoding(
                 x: category.id, y: measure.id, facet: facet.id))
-        #expect(!AutoChartEngine.validate(
-            specification: faceted, for: facetedInput).isValid)
+        #expect(
+            !AutoChartEngine.validate(
+                specification: faceted, for: facetedInput
+            ).isValid)
         let facetData = AutoChartDataPreparation.data(
             snapshot: AutoChartSnapshot(facetedInput), specification: faceted)
         #expect(facetData[0].facetIdentity == nil)
@@ -866,7 +1126,8 @@ private let date = AutoChartColumn(
             encoding: .init(x: category.id, y: measure.id, series: series.id),
             stacking: .normalized)
         let compositionIssues = AutoChartEngine.validate(
-            specification: normalized, for: compositionInput).issues.map(\.message)
+            specification: normalized, for: compositionInput
+        ).issues.map(\.message)
         #expect(compositionIssues.contains("Series fields must not contain missing values."))
         #expect(
             compositionIssues.contains(
@@ -956,6 +1217,59 @@ private let date = AutoChartColumn(
             specification: specification)
         #expect(hyphenated.count == 2)
         #expect(Set(hyphenated.map(\.id)).count == 2)
+    }
+
+    @Test func typedIdentityDisplayLabelsRemainVisuallyDistinct() {
+        let labels = disambiguatedCategoryLabels([
+            (identity: "integer:1", label: "1"),
+            (identity: "text:1:1", label: "1"),
+        ])
+        let integer = disambiguatedCategoryValue(
+            identity: "integer:1", label: "1", labels: labels)
+        let text = disambiguatedCategoryValue(
+            identity: "text:1:1", label: "1", labels: labels)
+        #expect(integer == "1 (Integer)")
+        #expect(text == "1 (Text)")
+        #expect(integer != text)
+    }
+
+    @Test func nearestAxisSelectionIncludesEverySeriesAtTheNearestPosition() throws {
+        let selectedDate = try Date("2026-01-01T00:00:00Z", strategy: .iso8601)
+        let matches = [
+            AutoChartDatum(
+                id: "first", sourceRowIDs: ["r0"], xDate: selectedDate,
+                yNumber: 10, series: "First"),
+            AutoChartDatum(
+                id: "second", sourceRowIDs: ["r1"], xDate: selectedDate,
+                yNumber: 20, series: "Second"),
+            AutoChartDatum(
+                id: "later", sourceRowIDs: ["r2"],
+                xDate: selectedDate.addingTimeInterval(86_400),
+                yNumber: 30, series: "First"),
+        ]
+        let nearest = AutoChartSelectionPreparation.nearestDateMatches(
+            to: selectedDate.addingTimeInterval(60),
+            in: matches)
+        #expect(Set(nearest.map(\.id)) == ["first", "second"])
+        #expect(
+            AutoChartSelectionPreparation.valueDescription(
+                for: nearest,
+                aggregation: .none) == "2 marks · 2 source rows")
+    }
+
+    @Test func selectionSummariesRespectNonadditiveAggregations() {
+        let matches = [
+            AutoChartDatum(id: "first", sourceRowIDs: ["r0"], yNumber: 10),
+            AutoChartDatum(id: "second", sourceRowIDs: ["r1", "r2"], yNumber: 20),
+        ]
+        #expect(
+            AutoChartSelectionPreparation.valueDescription(
+                for: matches,
+                aggregation: .mean) == "16.667 · 3 source rows")
+        #expect(
+            AutoChartSelectionPreparation.valueDescription(
+                for: matches,
+                aggregation: .countDistinct) == "2 marks · 3 source rows")
     }
 
     @Test func boxPlotLabelTiesUseIdentityAsDeterministicTieBreaker() {

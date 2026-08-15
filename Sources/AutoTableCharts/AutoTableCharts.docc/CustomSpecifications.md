@@ -47,7 +47,8 @@ Validation checks:
 - Incomplete results use only families that remain truthful for partial rows.
 - Composition is complete, positive, and explicitly additive.
 - Composition, heatmap, range, series, and facet channels contain no missing values.
-- Non-frequency aggregation exactly matches its declared safe rollup operation.
+- Non-frequency aggregation exactly matches its safe rollup operation. Upstream
+  sums and counts marked `alreadyAggregated` both roll up with `sum`.
 - Unaggregated categorical marks have a unique result-grain value.
 - Temporal range starts don't occur after their ends.
 
