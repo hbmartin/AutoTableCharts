@@ -3,6 +3,11 @@ import Testing
 
 @testable import AutoTableCharts
 
+#if canImport(Charts) && canImport(SwiftUI)
+import Charts
+import SwiftUI
+#endif
+
 private struct TestRow: AutoChartRow {
     var chartRowID: AutoChartRowID
     var values: [AutoChartColumnID: AutoChartValue]
@@ -16,6 +21,47 @@ private struct TestTable: AutoChartTable {
     var chartColumns: [AutoChartColumn]
     var chartRows: [TestRow]
     var chartMetadata = AutoChartTableMetadata()
+}
+
+private final class ChartValueReadCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+
+    func increment() {
+        lock.lock()
+        value += 1
+        lock.unlock()
+    }
+
+    func reset() {
+        lock.lock()
+        value = 0
+        lock.unlock()
+    }
+
+    var count: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+}
+
+private struct CountingRow: AutoChartRow {
+    var chartRowID: AutoChartRowID
+    var values: [AutoChartColumnID: AutoChartValue]
+    var counter: ChartValueReadCounter
+
+    func chartValue(for columnID: AutoChartColumnID) -> AutoChartValue {
+        counter.increment()
+        return values[columnID] ?? .null
+    }
+}
+
+private struct VersionedCountingTable: AutoChartTable {
+    var chartColumns: [AutoChartColumn]
+    var chartRows: [CountingRow]
+    var chartMetadata = AutoChartTableMetadata()
+    var chartDataVersion: String?
 }
 
 private func table(
@@ -64,20 +110,23 @@ private let date = AutoChartColumn(
             maximumCategories: 0,
             maximumDonutSectors: 0,
             maximumSeries: 0,
-            maximumFacets: 0)
+            maximumFacets: 0,
+            maximumCandidateColumns: 0)
         options.maximumRecommendations = 0
         options.maximumCategories = 0
         options.maximumDonutSectors = 0
         options.maximumSeries = 0
         options.maximumFacets = 0
+        options.maximumCandidateColumns = 0
         let mutatedLimits: [Int] = [
             options.maximumRecommendations,
             options.maximumCategories,
             options.maximumDonutSectors,
             options.maximumSeries,
             options.maximumFacets,
+            options.maximumCandidateColumns,
         ]
-        #expect(mutatedLimits == [1, 2, 2, 2, 2])
+        #expect(mutatedLimits == [1, 2, 2, 2, 2, 2])
 
         let encoded = Data(
             #"{"maximumRecommendations":0,"maximumCategories":0,"maximumDonutSectors":0,"maximumSeries":0,"maximumFacets":0}"#
@@ -89,11 +138,12 @@ private let date = AutoChartColumn(
             decoded.maximumDonutSectors,
             decoded.maximumSeries,
             decoded.maximumFacets,
+            decoded.maximumCandidateColumns,
         ]
-        #expect(decodedLimits == [1, 2, 2, 2, 2])
+        #expect(decodedLimits == [1, 2, 2, 2, 2, 24])
     }
 
-    @Test func specificationIDsEncodeSeparatorsAndOptionalBinCounts() {
+    @Test func specificationIDsEncodeSeparatorsOptionalBinsAndFacetBases() throws {
         let first = AutoChartSpecification(
             family: .bar,
             encoding: AutoChartEncoding(x: "a|b", y: "c"))
@@ -102,9 +152,49 @@ private let date = AutoChartColumn(
             encoding: AutoChartEncoding(x: "a", y: "b|c"))
         let noBins = AutoChartSpecification(family: .histogram, binCount: nil)
         let zeroBins = AutoChartSpecification(family: .histogram, binCount: 0)
+        let facetedLine = AutoChartSpecification(
+            family: .faceted,
+            facetBaseFamily: .line)
+        let facetedBar = AutoChartSpecification(
+            family: .faceted,
+            facetBaseFamily: .bar)
         #expect(first.id != second.id)
         #expect(noBins.id != zeroBins.id)
+        #expect(facetedLine.id != facetedBar.id)
+
+        let encoded = try JSONEncoder().encode(facetedLine)
+        var legacyObject = try #require(
+            JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        legacyObject.removeValue(forKey: "facetBaseFamily")
+        let legacyData = try JSONSerialization.data(withJSONObject: legacyObject)
+        let legacy = try JSONDecoder().decode(AutoChartSpecification.self, from: legacyData)
+        #expect(legacy.facetBaseFamily == nil)
     }
+
+    #if canImport(Charts) && canImport(SwiftUI)
+    @Test @MainActor func versionedTablesReusePreparedRenderingData() throws {
+        let counter = ChartValueReadCounter()
+        let input = VersionedCountingTable(
+            chartColumns: [category, measure],
+            chartRows: [
+                CountingRow(
+                    chartRowID: "r0",
+                    values: [category.id: .text("A"), measure.id: .double(1)],
+                    counter: counter)
+            ],
+            chartDataVersion: UUID().uuidString)
+        let recommendation = try #require(
+            AutoChartEngine.recommendations(for: input).chartRecommendations.first)
+
+        counter.reset()
+        _ = AutoChartView(table: input, recommendation: recommendation)
+        #expect(counter.count > 0)
+
+        counter.reset()
+        _ = AutoChartView(table: input, recommendation: recommendation)
+        #expect(counter.count == 0)
+    }
+    #endif
 
     @Test func snapshotFingerprintTracksTableContent() {
         let first = AutoChartSnapshot(
@@ -301,6 +391,10 @@ private let date = AutoChartColumn(
         #expect(AutoChartProfiler.humanized("propertyType") == "Property Type")
         #expect(AutoChartProfiler.humanized("current_market_value") == "Current Market Value")
         #expect(AutoChartProfiler.humanized("propertyId") == "Property ID")
+        #expect(AutoChartProfiler.humanized("noi") == "Noi")
+        #expect(
+            AutoChartProfiler.displayName(
+                AutoChartColumn(id: "noi", name: "noi", displayName: "NOI")) == "NOI")
     }
 }
 
@@ -345,6 +439,25 @@ private let date = AutoChartColumn(
         let families = Set(result.chartRecommendations.map(\.specification.family))
         #expect(families.contains(.bar))
         #expect(families.contains(.donut))
+    }
+
+    @Test func displayNamesOverrideGeneratedChartLabels() throws {
+        let segment = AutoChartColumn(
+            id: "segment", name: "segment_code", displayName: "Segment")
+        let income = AutoChartColumn(
+            id: "income", name: "noi", displayName: "NOI",
+            hints: AutoChartColumnHints(
+                semanticType: .quantitative,
+                aggregation: .sum,
+                aggregationSafety: .alreadyAggregated))
+        let input = table(
+            columns: [segment, income],
+            rows: [[.text("A"), .double(1)], [.text("B"), .double(2)]])
+        let bar = try #require(
+            AutoChartEngine.recommendations(for: input).chartRecommendations.first {
+                $0.specification.family == .bar
+            })
+        #expect(bar.specification.title == "NOI by Segment")
     }
 
     @Test func temporalMeasureUsesLine() {
@@ -668,6 +781,57 @@ private let date = AutoChartColumn(
         #expect(scatter?.specification.encoding.x == date.id)
         #expect(scatter?.specification.encoding.y == measure.id)
         #expect(scatter?.specification.encoding.series == nil)
+    }
+
+    @Test func candidateColumnsAreBoundedPerSemanticType() {
+        let measures = (0..<3).map { index in
+            AutoChartColumn(
+                id: AutoChartColumnID(rawValue: "measure-\(index)"),
+                name: "measure_\(index)",
+                hints: AutoChartColumnHints(semanticType: .quantitative))
+        }
+        let input = table(
+            columns: measures,
+            rows: [
+                [.double(1), .double(2), .double(3)],
+                [.double(4), .double(5), .double(6)],
+            ])
+        let result = AutoChartEngine.recommendations(
+            for: input,
+            options: AutoChartOptions(
+                maximumRecommendations: 12,
+                maximumCandidateColumns: 2))
+        let referenced = result.chartRecommendations.flatMap { recommendation in
+            [recommendation.specification.encoding.x, recommendation.specification.encoding.y]
+                .compactMap { $0 }
+        }
+        #expect(!referenced.contains(measures[2].id))
+    }
+
+    @Test func facetingSkipsAColumnAlreadyUsedAsSeriesAndPreservesTheBaseFamily() throws {
+        let series = AutoChartColumn(
+            id: "series", name: "series",
+            hints: AutoChartColumnHints(semanticType: .nominal))
+        let facet = AutoChartColumn(
+            id: "facet", name: "facet",
+            hints: AutoChartColumnHints(semanticType: .nominal))
+        let input = table(
+            columns: [date, series, facet, measure],
+            rows: [
+                [.text("2026-01-01"), .text("A"), .text("East"), .double(1)],
+                [.text("2026-01-01"), .text("B"), .text("East"), .double(2)],
+                [.text("2026-01-02"), .text("A"), .text("West"), .double(3)],
+                [.text("2026-01-02"), .text("B"), .text("West"), .double(4)],
+            ],
+            truncated: true)
+        let recommendation = try #require(
+            AutoChartEngine.recommendations(
+                for: input,
+                options: AutoChartOptions(maximumRecommendations: 12)
+            ).chartRecommendations.first { $0.specification.family == .faceted })
+        #expect(recommendation.specification.encoding.series == series.id)
+        #expect(recommendation.specification.encoding.facet == facet.id)
+        #expect(recommendation.specification.facetBaseFamily == .line)
     }
 }
 
@@ -1158,6 +1322,81 @@ private let date = AutoChartColumn(
         #expect(AutoChartEngine.validate(specification: separated, for: input).isValid)
     }
 
+    @Test func redundantFamilyChannelsAreRejectedWithoutBanningDiscreteEvents() {
+        let facet = AutoChartColumn(
+            id: "facet", name: "facet",
+            hints: AutoChartColumnHints(semanticType: .nominal))
+        let input = table(
+            columns: [category, facet, measure],
+            rows: [
+                [.text("A"), .text("East"), .double(1)],
+                [.text("B"), .text("West"), .double(2)],
+            ])
+        let heatmap = AutoChartSpecification(
+            family: .heatmap,
+            encoding: .init(x: category.id, y: category.id),
+            aggregation: .count)
+        let facetEqualsX = AutoChartSpecification(
+            family: .faceted,
+            encoding: .init(x: category.id, y: measure.id, facet: category.id),
+            facetBaseFamily: .bar)
+        let facetEqualsSeries = AutoChartSpecification(
+            family: .faceted,
+            encoding: .init(
+                x: category.id, y: measure.id, series: facet.id, facet: facet.id),
+            facetBaseFamily: .bar)
+        #expect(!AutoChartEngine.validate(specification: heatmap, for: input).isValid)
+        #expect(!AutoChartEngine.validate(specification: facetEqualsX, for: input).isValid)
+        #expect(!AutoChartEngine.validate(specification: facetEqualsSeries, for: input).isValid)
+
+        let eventDate = AutoChartColumn(
+            id: "event-date", name: "event_date",
+            hints: AutoChartColumnHints(semanticType: .temporal))
+        let events = table(
+            columns: [category, eventDate],
+            rows: [[.text("A"), .text("2026-01-01")]])
+        let discreteEvent = AutoChartSpecification(
+            family: .range,
+            encoding: .init(
+                x: category.id,
+                start: eventDate.id,
+                end: eventDate.id),
+            orientation: .horizontal)
+        #expect(AutoChartEngine.validate(specification: discreteEvent, for: events).isValid)
+    }
+
+    @Test func legacyFacetsInferTheirBaseWhileExplicitBasesControlValidation() {
+        let ordinal = AutoChartColumn(
+            id: "ordinal", name: "ordinal",
+            hints: AutoChartColumnHints(semanticType: .ordinal))
+        let facet = AutoChartColumn(
+            id: "facet", name: "facet",
+            hints: AutoChartColumnHints(semanticType: .nominal))
+        let input = table(
+            columns: [ordinal, facet, measure],
+            rows: [
+                [.integer(1), .text("East"), .double(1)],
+                [.integer(2), .text("West"), .double(2)],
+            ])
+        let legacy = AutoChartSpecification(
+            family: .faceted,
+            encoding: .init(x: ordinal.id, y: measure.id, facet: facet.id))
+        let legacyValidation = AutoChartEngine.validate(specification: legacy, for: input)
+        #expect(legacyValidation.isValid)
+        #expect(legacyValidation.issues.contains { $0.severity == .warning })
+
+        let line = AutoChartSpecification(
+            family: .faceted,
+            encoding: legacy.encoding,
+            facetBaseFamily: .line)
+        let scatter = AutoChartSpecification(
+            family: .faceted,
+            encoding: legacy.encoding,
+            facetBaseFamily: .scatter)
+        #expect(AutoChartEngine.validate(specification: line, for: input).isValid)
+        #expect(!AutoChartEngine.validate(specification: scatter, for: input).isValid)
+    }
+
     @Test func explicitTemporalColumnsRejectUnparseableRows() {
         let temporal = AutoChartColumn(
             id: "temporal", name: "temporal",
@@ -1361,6 +1600,12 @@ private let date = AutoChartColumn(
         ]
         #expect(AutoChartSelectionPreparation.angleMatch(to: 0.5, in: sectors) == nil)
         #expect(AutoChartSelectionPreparation.angleMatch(to: 2, in: sectors)?.id == "selectable")
+        #expect(
+            AutoChartSelectionPreparation.selection(
+                for: [], label: "Missing", aggregation: .none) == nil)
+        #expect(
+            AutoChartSelectionPreparation.selection(
+                for: [sectors[0]], label: "Missing", aggregation: .none) == nil)
     }
 
     @Test func selectionSummariesRespectNonadditiveAggregations() {

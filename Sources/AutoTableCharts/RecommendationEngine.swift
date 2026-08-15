@@ -62,14 +62,17 @@ public enum AutoChartEngine {
         let profileIndex = Dictionary(
             profiles.map { ($0.column.id, $0) },
             uniquingKeysWith: { first, _ in first })
-        let quantitative = profiles.filter {
-            $0.isQuantitative && $0.column.hints.role != .identifier
-        }
-        let temporal = profiles.filter(\.isTemporal)
-        let categorical = profiles.filter {
-            $0.isCategorical && $0.column.hints.role != .identifier
-                && $0.distinctCount > 0
-        }
+        let quantitative = Array(
+            profiles.filter {
+                $0.isQuantitative && $0.column.hints.role != .identifier
+            }.prefix(options.maximumCandidateColumns))
+        let temporal = Array(
+            profiles.filter(\.isTemporal).prefix(options.maximumCandidateColumns))
+        let categorical = Array(
+            profiles.filter {
+                $0.isCategorical && $0.column.hints.role != .identifier
+                    && $0.distinctCount > 0
+            }.prefix(options.maximumCandidateColumns))
         var candidates: [AutoChartRecommendation] = []
         let warnings =
             snapshot.metadata.isTruncated
@@ -275,12 +278,11 @@ public enum AutoChartEngine {
             if let group = categorical.first(where: {
                 $0.distinctCount >= 2 && $0.distinctCount <= min(10, options.maximumCategories)
             }) {
-                var groupedBox = candidate(
+                let groupedBox = candidate(
                     family: .boxPlot, x: group, y: measure, context: context,
                     score: 73 + goalBonus(.distribution, context.goal),
                     rationale: ["Grouped quartiles compare distributions across categories."],
                     warnings: warnings)
-                groupedBox.specification.orientation = .vertical
                 candidates.append(groupedBox)
             }
         }
@@ -351,22 +353,31 @@ public enum AutoChartEngine {
             }
         }
 
-        if let facet = categorical.first(where: {
-            $0.distinctCount >= 2 && $0.distinctCount <= options.maximumFacets
-        }),
-            let base = candidates.first(where: {
-                [.line, .bar, .scatter].contains($0.specification.family)
-                    && $0.specification.encoding.x != facet.column.id
-                    && $0.specification.encoding.y != facet.column.id
+        var facetProfile: AutoChartColumnProfile?
+        var facetBase: AutoChartRecommendation?
+        for facet in categorical
+        where facet.distinctCount >= 2 && facet.distinctCount <= options.maximumFacets {
+            let base = candidates.first { recommendation in
+                [.line, .bar, .scatter].contains(recommendation.specification.family)
+                    && recommendation.specification.encoding.x != facet.column.id
+                    && recommendation.specification.encoding.y != facet.column.id
+                    && recommendation.specification.encoding.series != facet.column.id
                     && validate(
-                        specification: $0.specification,
+                        specification: recommendation.specification,
                         snapshot: snapshot,
                         profiles: profileIndex
                     ).isValid
-            })
-        {
+            }
+            guard let base else { continue }
+            facetProfile = facet
+            facetBase = base
+            break
+        }
+        if let facet = facetProfile, let base = facetBase {
             var faceted = base
+            let baseFamily = faceted.specification.family
             faceted.specification.family = .faceted
+            faceted.specification.facetBaseFamily = baseFamily
             faceted.specification.encoding.facet = facet.column.id
             faceted.score -= 4
             faceted.rationale = ["Small multiples separate a low-cardinality dimension."]
@@ -552,31 +563,83 @@ public enum AutoChartEngine {
         case .faceted:
             require(specification.encoding.facet, .nominal, "Facet")
             rejectMissing(specification.encoding.facet, "Facet fields")
-            if let x = specification.encoding.x, let profile = profiles[x] {
-                if !profile.isCategorical && !profile.isQuantitative && !profile.isTemporal
-                    && profile.semanticType != .ordinal
-                {
+            let baseFamily = resolvedFacetBaseFamily(
+                specification: specification,
+                profiles: profiles)
+            switch baseFamily {
+            case .bar:
+                require(specification.encoding.x, .nominal, "Category")
+            case .line:
+                guard let x = specification.encoding.x, let profile = profiles[x],
+                    profile.isTemporal || profile.semanticType == .ordinal
+                else {
                     issues.append(
                         .init(
                             severity: .error,
                             message:
-                                "Faceted charts require a categorical, quantitative, or temporal x-axis."
+                                "Faceted line charts require an ordered or temporal x-axis."
                         ))
+                    break
                 }
-            } else {
+            case .scatter:
+                guard let x = specification.encoding.x, let profile = profiles[x],
+                    profile.isQuantitative || profile.isTemporal
+                else {
+                    issues.append(
+                        .init(
+                            severity: .error,
+                            message:
+                                "Faceted scatter charts require a quantitative or temporal x-axis."
+                        ))
+                    break
+                }
+            default:
                 issues.append(
                     .init(
                         severity: .error,
                         message:
-                            "Faceted charts require a categorical, quantitative, or temporal x-axis."
+                            "Faceted charts require a bar, line, or scatter base family."
+                    ))
+            }
+            if specification.facetBaseFamily == nil, baseFamily != nil {
+                issues.append(
+                    .init(
+                        severity: .warning,
+                        message:
+                            "Facet base family was inferred for a legacy specification; encode it explicitly before persisting again."
                     ))
             }
             require(specification.encoding.y, .quantitative, "Measure")
         }
+        if specification.family == .heatmap,
+            specification.encoding.x == specification.encoding.y
+        {
+            issues.append(
+                .init(
+                    severity: .error,
+                    message: "Heatmap x and y categories must use distinct fields."))
+        }
+        if specification.encoding.series != nil,
+            specification.encoding.series == specification.encoding.x
+        {
+            issues.append(
+                .init(
+                    severity: .error,
+                    message: "Series and x-axis encodings must use distinct fields."))
+        }
+        if specification.family == .faceted,
+            let facet = specification.encoding.facet,
+            facet == specification.encoding.x || facet == specification.encoding.series
+        {
+            issues.append(
+                .init(
+                    severity: .error,
+                    message: "Facet, x-axis, and series encodings must use distinct fields."))
+        }
         if [.groupedBar, .stackedBar, .normalizedBar].contains(specification.family),
             specification.encoding.series == nil
         {
-            require(specification.encoding.series, .nominal, "Series")
+            issues.append(.init(severity: .error, message: "Series is required."))
         }
         if specification.encoding.series != nil {
             let supportsSeries: Set<AutoChartFamily> = [
@@ -602,6 +665,14 @@ public enum AutoChartEngine {
                     severity: .error,
                     message:
                         "\(specification.family.displayName) does not support a facet encoding."
+                ))
+        }
+        if specification.facetBaseFamily != nil, specification.family != .faceted {
+            issues.append(
+                .init(
+                    severity: .error,
+                    message:
+                        "\(specification.family.displayName) does not support a facet base family."
                 ))
         }
         let temporalReferences = [
@@ -668,7 +739,10 @@ public enum AutoChartEngine {
                 case .bar, .rankedDot, .groupedBar, .range:
                     "This chart family requires a complete result."
                 case .faceted:
-                    if let x = specification.encoding.x, profiles[x]?.isCategorical == true {
+                    if resolvedFacetBaseFamily(
+                        specification: specification,
+                        profiles: profiles) == .bar
+                    {
                         "Categorical small multiples require a complete result."
                     } else {
                         nil
@@ -797,18 +871,18 @@ public enum AutoChartEngine {
                 ![.histogram, .heatmap].contains(family),
                 let x
             {
-                let category = AutoChartProfiler.humanized(x.column.name)
+                let category = AutoChartProfiler.displayName(x.column)
                 if let y {
-                    return "Count of \(AutoChartProfiler.humanized(y.column.name)) by \(category)"
+                    return "Count of \(AutoChartProfiler.displayName(y.column)) by \(category)"
                 }
                 return "Count by \(category)"
             }
             if let y, let x {
                 return
-                    "\(AutoChartProfiler.humanized(y.column.name)) by \(AutoChartProfiler.humanized(x.column.name))"
+                    "\(AutoChartProfiler.displayName(y.column)) by \(AutoChartProfiler.displayName(x.column))"
             }
-            if let y { return AutoChartProfiler.humanized(y.column.name) }
-            if let x { return AutoChartProfiler.humanized(x.column.name) }
+            if let y { return AutoChartProfiler.displayName(y.column) }
+            if let x { return AutoChartProfiler.displayName(x.column) }
             return family.displayName
         }()
         return AutoChartRecommendation(
@@ -863,6 +937,50 @@ public enum AutoChartEngine {
         }
     }
 
+    static func resolvedFacetBaseFamily(
+        specification: AutoChartSpecification,
+        profiles: [AutoChartColumnID: AutoChartColumnProfile]
+    ) -> AutoChartFamily? {
+        if let baseFamily = specification.facetBaseFamily { return baseFamily }
+        guard specification.family == .faceted,
+            let x = specification.encoding.x,
+            let profile = profiles[x]
+        else { return nil }
+        if profile.semanticType == .ordinal { return .line }
+        if profile.isTemporal { return .line }
+        if profile.isQuantitative { return .scatter }
+        if profile.isCategorical { return .bar }
+        return nil
+    }
+
+    private enum CombinationValue: Hashable {
+        case missing
+        case number(UInt64)
+        case date(UInt64)
+        case value(AutoChartValue)
+    }
+
+    private static func combinationValue(
+        _ value: AutoChartValue?,
+        semanticType: AutoChartSemanticType?
+    ) -> CombinationValue {
+        guard let value else { return .missing }
+        if semanticType == .temporal {
+            guard let date = AutoChartProfiler.dateValue(value) else { return .missing }
+            return .date(date.timeIntervalSinceReferenceDate.bitPattern)
+        }
+        if semanticType == .quantitative {
+            guard let number = value.numericValue else { return .missing }
+            return .number((number == 0 ? 0.0 : number).bitPattern)
+        }
+        switch value {
+        case .null, .binary:
+            return .missing
+        default:
+            return .value(value)
+        }
+    }
+
     private static func hasUniqueCombination(
         snapshot: AutoChartSnapshot,
         fields: [AutoChartColumnID],
@@ -871,19 +989,20 @@ public enum AutoChartEngine {
         droppingRowsMissing: Set<AutoChartColumnID> = []
     ) -> Bool {
         guard !fields.isEmpty else { return false }
-        let combinations = snapshot.rows.compactMap { row -> [String]? in
-            guard row.values[measure]?.numericValue != nil else { return nil }
+        var seen: Set<[CombinationValue]> = []
+        for row in snapshot.rows {
+            guard row.values[measure]?.numericValue != nil else { continue }
             let values = fields.map { field in
-                AutoChartProfiler.identityString(
+                combinationValue(
                     row.values[field], semanticType: profiles[field]?.semanticType)
-                    ?? "missing"
             }
             let dropsRow = zip(fields, values).contains { field, value in
-                droppingRowsMissing.contains(field) && value == "missing"
+                droppingRowsMissing.contains(field) && value == .missing
             }
-            return dropsRow ? nil : values
+            if dropsRow { continue }
+            if !seen.insert(values).inserted { return false }
         }
-        return combinations.count == Set(combinations).count
+        return true
     }
 
     private static func familyPriority(_ family: AutoChartFamily) -> Int {

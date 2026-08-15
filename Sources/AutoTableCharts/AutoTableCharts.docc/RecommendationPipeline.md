@@ -36,6 +36,11 @@ facet limits; positive baselines; unique grains; interval roles; and explicit
 aggregation safety. Truncated results suppress totals, categorical rollups,
 frequency heatmaps, composition, and ranges before ranking.
 
+Profiling still covers every column, while candidate enumeration considers at
+most `maximumCandidateColumns` columns per semantic type. This makes combination
+and uniqueness work bounded for very wide tables; increase the option when a
+later source column must participate in automatic recommendations.
+
 ### 4. Apply hard validation
 
 Every generated candidate passes through the same validator exposed by
@@ -56,9 +61,9 @@ a bar chart can serve comparison and ranking—but one requested goal matches at
 most one of those terms.
 
 This base-score plus task-bonus formula is the policy-v1 scoring model. The
-package's public policy version is now 3 because later identity, missing-value,
-and aggregation-safety hardening can also change recommendation output; version
-3 retains the same transparent scoring formula.
+package's public policy version is now 5 because later identity, missing-value,
+aggregation-safety, candidate-bound, and facet-semantics hardening can also change
+recommendation output; version 5 retains the same transparent scoring formula.
 
 Scores are meaningful only within the candidate set produced for the same
 snapshot, options, context, and policy version. They aren't probabilities,

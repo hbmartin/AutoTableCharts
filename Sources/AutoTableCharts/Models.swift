@@ -236,6 +236,8 @@ public struct AutoChartColumn: Identifiable, Hashable, Codable, Sendable {
     public var id: AutoChartColumnID
     /// A human-readable source name used to generate titles and labels.
     public var name: String
+    /// An optional presentation label used verbatim in generated titles and axes.
+    public var displayName: String?
     /// Semantic metadata that overrides or supplements profiling.
     public var hints: AutoChartColumnHints
 
@@ -244,14 +246,17 @@ public struct AutoChartColumn: Identifiable, Hashable, Codable, Sendable {
     /// - Parameters:
     ///   - id: The stable column identifier.
     ///   - name: A source or display name.
+    ///   - displayName: An optional caller-authored presentation label.
     ///   - hints: Optional semantic metadata.
     public init(
         id: AutoChartColumnID,
         name: String,
+        displayName: String? = nil,
         hints: AutoChartColumnHints = AutoChartColumnHints()
     ) {
         self.id = id
         self.name = name
+        self.displayName = displayName
         self.hints = hints
     }
 }
@@ -302,7 +307,7 @@ public protocol AutoChartRow: Sendable {
 public protocol AutoChartTable: Sendable {
     /// The random-access collection that stores this table's rows.
     associatedtype ChartRows: RandomAccessCollection & Sendable
-        where ChartRows.Element: AutoChartRow
+    where ChartRows.Element: AutoChartRow
 
     /// Column descriptions in source order.
     var chartColumns: [AutoChartColumn] { get }
@@ -310,6 +315,16 @@ public protocol AutoChartTable: Sendable {
     var chartRows: ChartRows { get }
     /// Result-level completeness, grain, and provenance metadata.
     var chartMetadata: AutoChartTableMetadata { get }
+    /// A caller-managed identifier for the exact table contents, used to reuse
+    /// prepared rendering data across SwiftUI view reconstruction.
+    ///
+    /// Change this value whenever columns, rows, values, or metadata change. The
+    /// default is `nil`, which keeps content-derived invalidation behavior.
+    var chartDataVersion: String? { get }
+}
+
+extension AutoChartTable {
+    public var chartDataVersion: String? { nil }
 }
 
 /// The analytical task used to favor otherwise valid recommendations.
@@ -357,7 +372,8 @@ public struct AutoChartContext: Hashable, Codable, Sendable {
 /// Limits candidate output and visual density.
 ///
 /// Initializer inputs are clamped to safe minimums: at least one
-/// recommendation and at least two categories, sectors, series, or facets.
+/// recommendation and at least two categories, sectors, series, facets, or
+/// candidate columns per semantic type.
 public struct AutoChartOptions: Hashable, Codable, Sendable {
     /// The maximum number of diverse recommendations returned. Defaults to five.
     public var maximumRecommendations: Int {
@@ -379,6 +395,12 @@ public struct AutoChartOptions: Hashable, Codable, Sendable {
     public var maximumFacets: Int {
         didSet { maximumFacets = max(2, maximumFacets) }
     }
+    /// The maximum columns of each semantic type considered during candidate generation.
+    /// Defaults to twenty-four. Profiling and caller-specification validation still cover
+    /// every declared column.
+    public var maximumCandidateColumns: Int {
+        didSet { maximumCandidateColumns = max(2, maximumCandidateColumns) }
+    }
 
     private enum CodingKeys: String, CodingKey {
         case maximumRecommendations
@@ -386,6 +408,7 @@ public struct AutoChartOptions: Hashable, Codable, Sendable {
         case maximumDonutSectors
         case maximumSeries
         case maximumFacets
+        case maximumCandidateColumns
     }
 
     /// Creates recommendation and density limits.
@@ -396,18 +419,21 @@ public struct AutoChartOptions: Hashable, Codable, Sendable {
     ///   - maximumDonutSectors: Maximum donut cardinality.
     ///   - maximumSeries: Maximum series cardinality.
     ///   - maximumFacets: Maximum facet cardinality.
+    ///   - maximumCandidateColumns: Maximum candidate columns per semantic type.
     public init(
         maximumRecommendations: Int = 5,
         maximumCategories: Int = 20,
         maximumDonutSectors: Int = 6,
         maximumSeries: Int = 6,
-        maximumFacets: Int = 6
+        maximumFacets: Int = 6,
+        maximumCandidateColumns: Int = 24
     ) {
         self.maximumRecommendations = max(1, maximumRecommendations)
         self.maximumCategories = max(2, maximumCategories)
         self.maximumDonutSectors = max(2, maximumDonutSectors)
         self.maximumSeries = max(2, maximumSeries)
         self.maximumFacets = max(2, maximumFacets)
+        self.maximumCandidateColumns = max(2, maximumCandidateColumns)
     }
 
     /// Decodes recommendation limits and applies the same safe minimums as the initializer.
@@ -420,7 +446,9 @@ public struct AutoChartOptions: Hashable, Codable, Sendable {
             maximumDonutSectors: try container.decode(
                 Int.self, forKey: .maximumDonutSectors),
             maximumSeries: try container.decode(Int.self, forKey: .maximumSeries),
-            maximumFacets: try container.decode(Int.self, forKey: .maximumFacets))
+            maximumFacets: try container.decode(Int.self, forKey: .maximumFacets),
+            maximumCandidateColumns: try container.decodeIfPresent(
+                Int.self, forKey: .maximumCandidateColumns) ?? 24)
     }
 }
 
@@ -582,6 +610,11 @@ public struct AutoChartSpecification: Identifiable, Hashable, Codable, Sendable 
     public var orientation: AutoChartOrientation
     /// The series-stacking behavior.
     public var stacking: AutoChartStacking
+    /// The line, bar, or scatter family repeated by a faceted chart.
+    ///
+    /// Legacy decoded specifications may leave this `nil`; validation then reports
+    /// a warning and the renderer infers a compatible family from the x-axis type.
+    public var facetBaseFamily: AutoChartFamily?
     /// The order applied to prepared marks.
     public var sort: AutoChartSort
     /// The visible and accessible chart title.
@@ -596,6 +629,7 @@ public struct AutoChartSpecification: Identifiable, Hashable, Codable, Sendable 
     ///   - binCount: The number of histogram bins.
     ///   - orientation: The primary layout direction.
     ///   - stacking: The series-stacking behavior.
+    ///   - facetBaseFamily: The base family repeated by a faceted chart.
     ///   - sort: The mark order.
     ///   - title: The visible and accessible title.
     public init(
@@ -605,6 +639,7 @@ public struct AutoChartSpecification: Identifiable, Hashable, Codable, Sendable 
         binCount: Int? = nil,
         orientation: AutoChartOrientation = .vertical,
         stacking: AutoChartStacking = .none,
+        facetBaseFamily: AutoChartFamily? = nil,
         sort: AutoChartSort = .source,
         title: String = ""
     ) {
@@ -614,6 +649,7 @@ public struct AutoChartSpecification: Identifiable, Hashable, Codable, Sendable 
         self.binCount = binCount
         self.orientation = orientation
         self.stacking = stacking
+        self.facetBaseFamily = facetBaseFamily
         self.sort = sort
         self.title = title
     }
@@ -644,6 +680,7 @@ public struct AutoChartSpecification: Identifiable, Hashable, Codable, Sendable 
             binCount.map { "value:\($0)" } ?? "nil",
             orientation.rawValue,
             stacking.rawValue,
+            facetBaseFamily.map { "value:\($0.rawValue)" } ?? "nil",
             sort.rawValue,
         ]
         return components.map(encode).joined(separator: "|")

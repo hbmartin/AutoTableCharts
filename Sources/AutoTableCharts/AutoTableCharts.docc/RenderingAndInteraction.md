@@ -23,6 +23,12 @@ Use ``AutoChartInteraction/preview`` in a recommendation gallery. Preview mode
 uses compact typography and omits exploratory selection and zoom controls. Use
 ``AutoChartInteraction/explore`` for a chosen chart.
 
+`AutoChartView` caches snapshot profiling, validation, and mark preparation. By
+default it fingerprints table content before looking up the cache. Implement
+``AutoChartTable/chartDataVersion`` with a stable version, revision, or content
+identifier to skip that repeated table scan during SwiftUI view reconstruction.
+Change the version whenever columns, rows, values, or metadata change.
+
 ### Link selections to source rows
 
 Bind an optional ``AutoChartSelection`` to coordinate the chart with a table or
@@ -42,7 +48,8 @@ Selection is exact for prepared marks; it isn't a predicate or approximate range
 Category selection matches collision-safe rendered category labels. Temporal and
 quantitative selection chooses the nearest rendered x position and includes every
 series at that position. Donut selection resolves cumulative angle to the
-corresponding sector. A multi-mark selection combines values only when its
+corresponding sector. Empty or lineage-free matches clear selection rather than
+publishing an empty selection. A multi-mark selection combines values only when its
 aggregation supports a meaningful combined summary.
 
 ### Navigate dense charts

@@ -31,7 +31,7 @@ Generated recommendations also obey the limits in ``AutoChartOptions``.
 | ``AutoChartFamily/heatmap`` | Two categorical fields in `x` and `y` | Both dimensions fit `maximumCategories` | Complete result; counts rows per cell | Cell selection returns all contributing row IDs |
 | ``AutoChartFamily/donut`` | Categorical `x`, quantitative `y` | Few categories form a complete, positive, additive whole | Complete result; safe sum or ordinary count; at most `maximumDonutSectors` sectors | Angle selection resolves a sector and all contributing row IDs |
 | ``AutoChartFamily/range`` | Categorical label in `x`, temporal `start` and `end` | Complete interval data has two temporal fields; a single date can represent an event with equal start/end | Never aggregates; complete result; every start must be no later than its end | Category selection; categorical scroll and zoom |
-| ``AutoChartFamily/faceted`` | Categorical `facet`, quantitative `y`, and categorical, quantitative, temporal, or ordinal `x` | A line, bar, or scatter candidate can be split into 2…`maximumFacets` panels | Inherits the base candidate's preparation and completeness rules | Mark selection preserves row lineage within panels |
+| ``AutoChartFamily/faceted`` | Categorical `facet`, quantitative `y`, categorical, quantitative, temporal, or ordinal `x`, and a line, bar, or scatter `facetBaseFamily` | A line, bar, or scatter candidate can be split into 2…`maximumFacets` panels | Inherits the recorded base candidate's preparation and completeness rules; panels share comparable x and y domains | Mark selection preserves row lineage within panels |
 
 ### Separate generation from validation
 

@@ -11,6 +11,10 @@ meaning of your result.
 stable even if a visible name changes. ``AutoChartRowID`` connects chart marks
 back to source records and must uniquely identify each supplied row.
 
+`AutoChartColumn.name` is humanized for default labels. Set
+`AutoChartColumn.displayName` when capitalization or domain terminology must be
+preserved exactly, such as `NOI` or a localized business label.
+
 The engine snapshots `chartColumns` and `chartRows` at the start of a request.
 It reads each declared column from each row, but doesn't retain or mutate the
 consumer's collection.
