@@ -166,9 +166,9 @@ public enum AutoChartEngine {
 
                 if !snapshot.metadata.isTruncated,
                     dimension.distinctCount <= options.maximumDonutSectors,
-                    measure.allNumericValuesPositive,
                     compositionIsSafe(measure.column.hints),
-                    let compositionAggregation = safeRollupAggregation(measure.column.hints)
+                    let compositionAggregation = safeRollupAggregation(measure.column.hints),
+                    compositionAggregation == .count || measure.allNumericValuesPositive
                 {
                     candidates.append(
                         candidate(
@@ -205,7 +205,7 @@ public enum AutoChartEngine {
                             rationale: ["Grouped bars compare a small series within each category."]
                         ))
                     if !snapshot.metadata.isTruncated,
-                        measure.allNumericValuesPositive,
+                        seriesAggregation == .count || measure.allNumericValuesPositive,
                         compositionIsSafe(measure.column.hints)
                     {
                         candidates.append(
@@ -331,11 +331,10 @@ public enum AutoChartEngine {
         } else if !snapshot.metadata.isTruncated,
             let time = temporal.first, let label = categorical.first
         {
-            if let measure = quantitative.first,
+            if let measure = quantitative.first {
                 let series = categorical.first(where: {
                     $0.distinctCount >= 2 && $0.distinctCount <= options.maximumSeries
                 })
-            {
                 candidates.append(
                     candidate(
                         family: .scatter, x: time, y: measure, series: series,
@@ -687,7 +686,8 @@ public enum AutoChartEngine {
                         severity: .error,
                         message: "Composition requires an explicitly additive measure."))
             }
-            if let y = specification.encoding.y,
+            if specification.aggregation != .count,
+                let y = specification.encoding.y,
                 let profile = profiles[y],
                 !profile.allNumericValuesPositive
             {
@@ -787,6 +787,12 @@ public enum AutoChartEngine {
     ) -> AutoChartRecommendation {
         let title = context.title?.trimmingCharacters(in: .whitespacesAndNewlines)
         let generatedTitle: String = {
+            if aggregation == .count,
+                ![.histogram, .heatmap].contains(family),
+                let x
+            {
+                return "Count by \(AutoChartProfiler.humanized(x.column.name))"
+            }
             if let y, let x {
                 return
                     "\(AutoChartProfiler.humanized(y.column.name)) by \(AutoChartProfiler.humanized(x.column.name))"

@@ -154,6 +154,34 @@ private let date = AutoChartColumn(
             yNumber: 2,
             series: "North")
         #expect(datum.accessibilityLabel == "Office, North, 2")
+        #expect(
+            datum.accessibilityLabel(
+                name: "Office",
+                series: "North",
+                facet: "Region: West") == "Office, North, Region: West, 2")
+    }
+
+    @Test func rangeAccessibilityDescribesDates() throws {
+        let start = try Date("2026-01-01T00:00:00Z", strategy: .iso8601)
+        let end = try Date("2026-02-01T00:00:00Z", strategy: .iso8601)
+        let style = Date.FormatStyle(
+            date: .abbreviated,
+            time: .shortened,
+            timeZone: TimeZone.gmt)
+        let datum = AutoChartDatum(
+            id: "range",
+            sourceRowIDs: ["r0"],
+            xLabel: "Lease",
+            startDate: start,
+            endDate: end)
+        let interval = "From \(start.formatted(style)) to \(end.formatted(style))"
+        #expect(datum.intervalAccessibilityDescription == interval)
+        #expect(
+            datum.accessibilityLabel(
+                name: "Lease",
+                series: nil,
+                valueDescription: datum.intervalAccessibilityDescription)
+                == "Lease, \(interval)")
     }
 }
 
@@ -185,6 +213,10 @@ private let date = AutoChartColumn(
     @Test func abbreviatedAndCodeLikeDatesAreRejected() {
         #expect(AutoChartProfiler.parseISODate("1-2-3") == nil)
         #expect(AutoChartProfiler.parseISODate("10-11-12") == nil)
+        #expect(AutoChartProfiler.parseISODate("2026-1-05") == nil)
+        #expect(AutoChartProfiler.parseISODate("2026-05-1") == nil)
+        #expect(AutoChartProfiler.parseISODate("2026-+1-05") == nil)
+        #expect(AutoChartProfiler.parseISODate("2026-05-+1") == nil)
         #expect(AutoChartProfiler.parseISODate("0001-02-03") != nil)
     }
 
@@ -547,7 +579,7 @@ private let date = AutoChartColumn(
         let input = table(
             columns: [category, count],
             rows: [
-                [.text("A"), .double(10)],
+                [.text("A"), .double(-10)],
                 [.text("A"), .double(20)],
                 [.text("B"), .double(30)],
             ])
@@ -556,6 +588,7 @@ private let date = AutoChartColumn(
             context: AutoChartContext(goal: .composition)
         ).chartRecommendations.first { $0.specification.family == .donut }
         #expect(donut?.specification.aggregation == .count)
+        #expect(donut?.specification.title == "Count by Property Type")
         let data = donut.map {
             AutoChartDataPreparation.data(
                 snapshot: AutoChartSnapshot(input),
@@ -602,7 +635,15 @@ private let date = AutoChartColumn(
             ])
         let result = AutoChartEngine.recommendations(
             for: input,
-            options: AutoChartOptions(maximumSeries: 2))
+            context: AutoChartContext(goal: .relationship),
+            options: AutoChartOptions(
+                maximumRecommendations: 12,
+                maximumSeries: 2))
+        let scatter = result.chartRecommendations.first {
+            $0.specification.family == .scatter
+        }
+        #expect(scatter != nil)
+        #expect(scatter?.specification.encoding.series == nil)
         #expect(
             !result.chartRecommendations.contains {
                 $0.specification.family == .scatter
@@ -1233,6 +1274,18 @@ private let date = AutoChartColumn(
         #expect(integer != text)
     }
 
+    @Test func disambiguatedLabelsDoNotCollideWithExistingLabels() {
+        let labels = disambiguatedCategoryLabels([
+            (identity: "integer:1", label: "1"),
+            (identity: "text:1:1", label: "1"),
+            (identity: "text:11:qualified", label: "1 (Integer)"),
+            (identity: "text:13:qualified-2", label: "1 (Integer) 2"),
+        ])
+        #expect(labels["text:11:qualified"] == "1 (Integer)")
+        #expect(labels["text:13:qualified-2"] == "1 (Integer) 2")
+        #expect(Set(labels.values).count == labels.count)
+    }
+
     @Test func nearestAxisSelectionIncludesEverySeriesAtTheNearestPosition() throws {
         let selectedDate = try Date("2026-01-01T00:00:00Z", strategy: .iso8601)
         let matches = [
@@ -1255,6 +1308,24 @@ private let date = AutoChartColumn(
             AutoChartSelectionPreparation.valueDescription(
                 for: nearest,
                 aggregation: .none) == "2 marks · 2 source rows")
+    }
+
+    @Test func selectionHelpersPreserveBinRangesAndRejectAnglesPastTotal() {
+        let bins = [
+            AutoChartDatum(
+                id: "first", sourceRowIDs: ["r0"], xLabel: "0–10",
+                xNumber: 5, yNumber: 1),
+            AutoChartDatum(
+                id: "second", sourceRowIDs: ["r1"], xLabel: "10–20",
+                xNumber: 15, yNumber: 2),
+        ]
+        #expect(
+            AutoChartSelectionPreparation.numberSelectionLabel(
+                for: [bins[0]],
+                selectedNumber: 5,
+                family: .histogram) == "0–10")
+        #expect(AutoChartSelectionPreparation.angleMatch(to: 2, in: bins)?.id == "second")
+        #expect(AutoChartSelectionPreparation.angleMatch(to: 4, in: bins) == nil)
     }
 
     @Test func selectionSummariesRespectNonadditiveAggregations() {

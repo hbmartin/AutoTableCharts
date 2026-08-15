@@ -54,6 +54,14 @@ jobs:
           test -f "$DOCC_OUTPUT/data/documentation/autotablecharts.json"
           grep -F 'var baseUrl = "/AutoTableCharts/"' "$DOCC_OUTPUT/index.html" >/dev/null
 
+      - name: Add GitHub Pages landing redirect
+        env:
+          DOCC_OUTPUT: ${{ runner.temp }}/autotablecharts-docc
+        run: |
+          cp .github/pages-root-redirect.html "$DOCC_OUTPUT/index.html"
+          cmp .github/pages-root-redirect.html "$DOCC_OUTPUT/index.html"
+          grep -F './documentation/autotablecharts/' "$DOCC_OUTPUT/index.html" >/dev/null
+
       - name: Upload GitHub Pages artifact
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         uses: actions/upload-pages-artifact@v5
