@@ -301,37 +301,8 @@ public enum AutoChartEngine {
             }
         }
 
-        if !snapshot.metadata.isTruncated,
-            temporal.count >= 2,
-            let label = categorical.first
-        {
-            let hintedStart = temporal.first {
-                $0.column.hints.role == .intervalStart
-            }
-            let hintedEnd = temporal.first {
-                $0.column.hints.role == .intervalEnd
-            }
-            let start =
-                hintedStart
-                ?? temporal.first { $0.column.id != hintedEnd?.column.id }
-                ?? temporal[0]
-            let end =
-                hintedEnd.flatMap { $0.column.id == start.column.id ? nil : $0 }
-                ?? temporal.first { $0.column.id != start.column.id }
-            if let end {
-                candidates.append(
-                    candidate(
-                        family: .range, x: label, context: context,
-                        start: start, end: end,
-                        orientation: .horizontal,
-                        score: 78 + goalBonus(.range, context.goal),
-                        rationale: ["Start and end dates define comparable intervals."],
-                        warnings: warnings))
-            }
-        } else if !snapshot.metadata.isTruncated,
-            let time = temporal.first, let label = categorical.first
-        {
-            if let measure = quantitative.first {
+        if !snapshot.metadata.isTruncated {
+            if let time = temporal.first, let measure = quantitative.first {
                 let series = categorical.first(where: {
                     $0.distinctCount >= 2 && $0.distinctCount <= options.maximumSeries
                 })
@@ -343,14 +314,41 @@ public enum AutoChartEngine {
                         rationale: ["Dated values can be inspected along a temporal axis."],
                         warnings: warnings))
             }
-            candidates.append(
-                candidate(
-                    family: .range, x: label, context: context,
-                    start: time, end: time,
-                    orientation: .horizontal,
-                    score: 70 + goalBonus(.range, context.goal),
-                    rationale: ["Discrete events can be inspected on a temporal axis."],
-                    warnings: warnings))
+
+            if temporal.count >= 2, let label = categorical.first {
+                let hintedStart = temporal.first {
+                    $0.column.hints.role == .intervalStart
+                }
+                let hintedEnd = temporal.first {
+                    $0.column.hints.role == .intervalEnd
+                }
+                let start =
+                    hintedStart
+                    ?? temporal.first { $0.column.id != hintedEnd?.column.id }
+                    ?? temporal[0]
+                let end =
+                    hintedEnd.flatMap { $0.column.id == start.column.id ? nil : $0 }
+                    ?? temporal.first { $0.column.id != start.column.id }
+                if let end {
+                    candidates.append(
+                        candidate(
+                            family: .range, x: label, context: context,
+                            start: start, end: end,
+                            orientation: .horizontal,
+                            score: 78 + goalBonus(.range, context.goal),
+                            rationale: ["Start and end dates define comparable intervals."],
+                            warnings: warnings))
+                }
+            } else if let time = temporal.first, let label = categorical.first {
+                candidates.append(
+                    candidate(
+                        family: .range, x: label, context: context,
+                        start: time, end: time,
+                        orientation: .horizontal,
+                        score: 70 + goalBonus(.range, context.goal),
+                        rationale: ["Discrete events can be inspected on a temporal axis."],
+                        warnings: warnings))
+            }
         }
 
         if let facet = categorical.first(where: {
@@ -598,6 +596,14 @@ public enum AutoChartEngine {
                     ))
             }
         }
+        if specification.encoding.facet != nil, specification.family != .faceted {
+            issues.append(
+                .init(
+                    severity: .error,
+                    message:
+                        "\(specification.family.displayName) does not support a facet encoding."
+                ))
+        }
         let temporalReferences = [
             specification.encoding.x,
             specification.encoding.start,
@@ -791,7 +797,11 @@ public enum AutoChartEngine {
                 ![.histogram, .heatmap].contains(family),
                 let x
             {
-                return "Count by \(AutoChartProfiler.humanized(x.column.name))"
+                let category = AutoChartProfiler.humanized(x.column.name)
+                if let y {
+                    return "Count of \(AutoChartProfiler.humanized(y.column.name)) by \(category)"
+                }
+                return "Count by \(category)"
             }
             if let y, let x {
                 return

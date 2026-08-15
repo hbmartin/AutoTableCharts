@@ -59,8 +59,9 @@ jobs:
           DOCC_OUTPUT: ${{ runner.temp }}/autotablecharts-docc
         run: |
           cp .github/pages-root-redirect.html "$DOCC_OUTPUT/index.html"
-          cmp .github/pages-root-redirect.html "$DOCC_OUTPUT/index.html"
           grep -F './documentation/autotablecharts/' "$DOCC_OUTPUT/index.html" >/dev/null
+          grep -F 'window.location.search + window.location.hash' "$DOCC_OUTPUT/index.html" >/dev/null
+          ! grep -F '<meta http-equiv="refresh"' "$DOCC_OUTPUT/index.html" >/dev/null
 
       - name: Upload GitHub Pages artifact
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
