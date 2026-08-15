@@ -185,6 +185,10 @@ private let date = AutoChartColumn(
     @Test func abbreviatedAndCodeLikeDatesAreRejected() {
         #expect(AutoChartProfiler.parseISODate("1-2-3") == nil)
         #expect(AutoChartProfiler.parseISODate("10-11-12") == nil)
+        #expect(AutoChartProfiler.parseISODate("2026-1-05") == nil)
+        #expect(AutoChartProfiler.parseISODate("2026-05-1") == nil)
+        #expect(AutoChartProfiler.parseISODate("2026-+1-05") == nil)
+        #expect(AutoChartProfiler.parseISODate("2026-05-+1") == nil)
         #expect(AutoChartProfiler.parseISODate("0001-02-03") != nil)
     }
 

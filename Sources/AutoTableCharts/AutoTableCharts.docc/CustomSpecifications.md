@@ -71,8 +71,9 @@ AutoChartView(
 Set ``AutoChartAggregation/none`` when the encoded fields already identify one
 measure per mark. Use an aggregate only when the measure's hints establish that
 rollup is safe. Histogram and heatmap counts are structural frequencies and are
-validated separately; donut specifications must explicitly request `.sum` for
-their positive additive measure.
+validated separately; a donut specification's aggregation must match the positive
+additive measure's `safeRollupAggregation`-derived operation, such as `.count` for
+a safe count measure or `.sum` for an already-aggregated count.
 
 Choose ``AutoChartStacking/standard`` only for additive contributions and
 ``AutoChartStacking/normalized`` only when the intended question is proportional

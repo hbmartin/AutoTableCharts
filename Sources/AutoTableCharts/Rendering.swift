@@ -36,9 +36,13 @@ struct AutoChartDatum: Identifiable, Sendable {
                     time: .shortened,
                     timeZone: TimeZone.gmt)) ?? xLabel
             ?? xNumber?.formatted() ?? yLabel ?? "Value"
+        return accessibilityLabel(name: name, series: series)
+    }
+
+    func accessibilityLabel(name: String, series: String?) -> String {
         let value =
             yNumber?.formatted(.number.precision(.fractionLength(0...3)))
-            ?? median?.formatted(.number.precision(.fractionLength(0...3))) ?? ""
+            ?? median?.formatted(.number.precision(.fractionLength(0...3)))
         return [name, series, value]
             .compactMap { component in
                 guard let component, !component.isEmpty else { return nil }
@@ -1325,16 +1329,9 @@ public struct AutoChartView: View {
                 }
             }
         }()
-        let value =
-            datum.yNumber?.formatted(.number.precision(.fractionLength(0...3)))
-            ?? datum.median?.formatted(.number.precision(.fractionLength(0...3)))
-        let series = specification.encoding.series == nil ? nil : seriesValue(for: datum)
-        return [name, series, value]
-            .compactMap { component in
-                guard let component, !component.isEmpty else { return nil }
-                return component
-            }
-            .joined(separator: ", ")
+        return datum.accessibilityLabel(
+            name: name,
+            series: specification.encoding.series == nil ? nil : seriesValue(for: datum))
     }
 
     private func selectionLabel(

@@ -163,12 +163,10 @@ enum AutoChartProfiler {
         if let date = try? Date(text, strategy: .iso8601) { return date }
         let parts = text.split(separator: "-", omittingEmptySubsequences: false)
         guard parts.count == 3,
-            parts[0].utf8.count == 4,
-            parts[0].utf8.allSatisfy({ (48...57).contains($0) }),
-            let year = Int(parts[0]),
+            let year = decimalInteger(parts[0], digitCount: 4),
             (1...9_999).contains(year),
-            let month = Int(parts[1]),
-            let day = Int(parts[2]),
+            let month = decimalInteger(parts[1], digitCount: 2),
+            let day = decimalInteger(parts[2], digitCount: 2),
             (1...12).contains(month),
             (1...31).contains(day)
         else { return nil }
@@ -177,6 +175,13 @@ enum AutoChartProfiler {
         let components = DateComponents(year: year, month: month, day: day)
         guard components.isValidDate(in: calendar) else { return nil }
         return calendar.date(from: components)
+    }
+
+    private static func decimalInteger(_ component: Substring, digitCount: Int) -> Int? {
+        guard component.utf8.count == digitCount,
+            component.utf8.allSatisfy({ (48...57).contains($0) })
+        else { return nil }
+        return Int(component)
     }
 
     static func identityString(
