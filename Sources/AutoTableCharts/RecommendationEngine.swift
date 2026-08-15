@@ -188,7 +188,8 @@ public enum AutoChartEngine {
                         snapshot: snapshot,
                         fields: [dimension.column.id, series.column.id],
                         measure: measure.column.id,
-                        profiles: profileIndex)
+                        profiles: profileIndex,
+                        droppingRowsMissing: [dimension.column.id])
                     guard
                         let seriesAggregation = uniqueAtSeriesGrain
                             ? AutoChartAggregation.none
@@ -405,7 +406,7 @@ public enum AutoChartEngine {
             profiles: profiles)
     }
 
-    private static func validate(
+    static func validate(
         specification: AutoChartSpecification,
         snapshot: AutoChartSnapshot,
         profiles: [AutoChartColumnID: AutoChartColumnProfile]
@@ -532,10 +533,15 @@ public enum AutoChartEngine {
         case .heatmap:
             require(specification.encoding.x, .nominal, "X category")
             require(specification.encoding.y, .nominal, "Y category")
+            rejectMissing(specification.encoding.x, "Heatmap x categories")
+            rejectMissing(specification.encoding.y, "Heatmap y categories")
         case .range:
             require(specification.encoding.x, .nominal, "Category")
             require(specification.encoding.start, .temporal, "Start")
             require(specification.encoding.end, .temporal, "End")
+            rejectMissing(specification.encoding.x, "Range categories")
+            rejectMissing(specification.encoding.start, "Range starts")
+            rejectMissing(specification.encoding.end, "Range ends")
         case .faceted:
             require(specification.encoding.facet, .nominal, "Facet")
             rejectMissing(specification.encoding.facet, "Facet fields")
@@ -567,6 +573,9 @@ public enum AutoChartEngine {
             ![.groupedBar, .stackedBar, .normalizedBar].contains(specification.family)
         {
             require(specification.encoding.series, .nominal, "Series")
+        }
+        if specification.encoding.series != nil {
+            rejectMissing(specification.encoding.series, "Series fields")
         }
         let temporalReferences = [
             specification.encoding.x,
@@ -637,6 +646,8 @@ public enum AutoChartEngine {
             }
         }
         if [.donut, .stackedBar, .normalizedBar].contains(specification.family) {
+            rejectMissing(specification.encoding.x, "Composition categories")
+            rejectMissing(specification.encoding.y, "Composition measures")
             if let y = specification.encoding.y,
                 let profile = profiles[y],
                 !compositionIsSafe(profile.column.hints)
@@ -659,13 +670,23 @@ public enum AutoChartEngine {
         if specification.aggregation != .none,
             ![.histogram, .heatmap].contains(specification.family),
             let y = specification.encoding.y,
-            let profile = profiles[y],
-            safeRollupAggregation(profile.column.hints) == nil
+            let profile = profiles[y]
         {
-            issues.append(
-                .init(
-                    severity: .error,
-                    message: "Aggregation requires an explicitly additive measure."))
+            if let safeAggregation = safeRollupAggregation(profile.column.hints) {
+                if specification.aggregation != safeAggregation {
+                    issues.append(
+                        .init(
+                            severity: .error,
+                            message:
+                                "Aggregation must use the declared safe \(safeAggregation.rawValue) operation."
+                        ))
+                }
+            } else {
+                issues.append(
+                    .init(
+                        severity: .error,
+                        message: "Aggregation requires an explicitly safe measure."))
+            }
         }
         let markFields: [AutoChartColumnID?] =
             switch specification.family {
@@ -691,7 +712,8 @@ public enum AutoChartEngine {
                 snapshot: snapshot,
                 fields: markFields.compactMap { $0 },
                 measure: y,
-                profiles: profiles)
+                profiles: profiles,
+                droppingRowsMissing: Set([specification.encoding.x].compactMap { $0 }))
         {
             issues.append(
                 .init(
@@ -792,16 +814,21 @@ public enum AutoChartEngine {
         snapshot: AutoChartSnapshot,
         fields: [AutoChartColumnID],
         measure: AutoChartColumnID,
-        profiles: [AutoChartColumnID: AutoChartColumnProfile]
+        profiles: [AutoChartColumnID: AutoChartColumnProfile],
+        droppingRowsMissing: Set<AutoChartColumnID> = []
     ) -> Bool {
         guard !fields.isEmpty else { return false }
         let combinations = snapshot.rows.compactMap { row -> [String]? in
             guard row.values[measure]?.numericValue != nil else { return nil }
-            let values = fields.compactMap { field in
+            let values = fields.map { field in
                 AutoChartProfiler.identityString(
                     row.values[field], semanticType: profiles[field]?.semanticType)
+                    ?? "missing"
             }
-            return values.count == fields.count ? values : nil
+            let dropsRow = zip(fields, values).contains { field, value in
+                droppingRowsMissing.contains(field) && value == "missing"
+            }
+            return dropsRow ? nil : values
         }
         return combinations.count == Set(combinations).count
     }

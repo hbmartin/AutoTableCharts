@@ -109,6 +109,8 @@ private let date = AutoChartColumn(
     @Test func snapshotFingerprintTracksTableContent() {
         let first = AutoChartSnapshot(
             table(columns: [measure], rows: [[.double(1)]]))
+        let identical = AutoChartSnapshot(
+            table(columns: [measure], rows: [[.double(1)]]))
         let changedValue = AutoChartSnapshot(
             table(columns: [measure], rows: [[.double(2)]]))
         let changedRow = TestTable(
@@ -116,8 +118,32 @@ private let date = AutoChartColumn(
             chartRows: [
                 TestRow(chartRowID: "different", values: [measure.id: .double(1)])
             ])
+        #expect(first.contentFingerprint == identical.contentFingerprint)
         #expect(first.contentFingerprint != changedValue.contentFingerprint)
         #expect(first.contentFingerprint != AutoChartSnapshot(changedRow).contentFingerprint)
+    }
+
+    @Test func dateDisplayAndAccessibilityUseGMTLocalizedFormatting() throws {
+        let value = try Date("2026-01-01T00:00:00Z", strategy: .iso8601)
+        let expectedDate = value.formatted(
+            Date.FormatStyle(
+                date: .abbreviated,
+                time: .omitted,
+                timeZone: TimeZone.gmt))
+        #expect(AutoChartValue.date(value).displayString == expectedDate)
+
+        let expectedAccessibleDate = value.formatted(
+            Date.FormatStyle(
+                date: .abbreviated,
+                time: .shortened,
+                timeZone: TimeZone.gmt))
+        let datum = AutoChartDatum(
+            id: "date",
+            sourceRowIDs: ["r0"],
+            xDate: value,
+            yNumber: 2)
+        #expect(datum.accessibilityLabel == "\(expectedAccessibleDate), 2")
+        #expect(!datum.accessibilityLabel.contains("T00:00:00Z"))
     }
 }
 
@@ -221,6 +247,12 @@ private let date = AutoChartColumn(
         let profile = AutoChartProfiler.profiles(snapshot)[0]
         #expect(profile.nonNullCount == 1)
         #expect(profile.nullFraction == 0.5)
+    }
+
+    @Test func humanizedNamesReuseCamelCaseTokens() {
+        #expect(AutoChartProfiler.humanized("propertyType") == "Property Type")
+        #expect(AutoChartProfiler.humanized("current_market_value") == "Current Market Value")
+        #expect(AutoChartProfiler.humanized("propertyId") == "Property ID")
     }
 }
 
@@ -812,4 +844,135 @@ private let date = AutoChartColumn(
             encoding: AutoChartEncoding(x: temporal.id, y: measure.id))
         #expect(!AutoChartEngine.validate(specification: specification, for: input).isValid)
     }
+
+    @Test func completeResultFamiliesRejectMissingEncodedValues() {
+        let series = AutoChartColumn(
+            id: "series", name: "series",
+            hints: AutoChartColumnHints(semanticType: .nominal))
+        let end = AutoChartColumn(
+            id: "end", name: "end",
+            hints: AutoChartColumnHints(semanticType: .temporal))
+
+        let compositionInput = table(
+            columns: [category, series, measure],
+            rows: [
+                [.text("A"), .text("One"), .double(1)],
+                [.text("B"), .null, .double(2)],
+                [.text("C"), .text("Two"), .null],
+                [.null, .text("Three"), .double(3)],
+            ])
+        let normalized = AutoChartSpecification(
+            family: .normalizedBar,
+            encoding: .init(x: category.id, y: measure.id, series: series.id),
+            stacking: .normalized)
+        let compositionIssues = AutoChartEngine.validate(
+            specification: normalized, for: compositionInput).issues.map(\.message)
+        #expect(compositionIssues.contains("Series fields must not contain missing values."))
+        #expect(
+            compositionIssues.contains(
+                "Composition categories must not contain missing values."))
+        #expect(
+            compositionIssues.contains(
+                "Composition measures must not contain missing values."))
+
+        let heatmapInput = table(
+            columns: [category, series],
+            rows: [[.text("A"), .text("One")], [.null, .text("Two")]])
+        let heatmap = AutoChartSpecification(
+            family: .heatmap,
+            encoding: .init(x: category.id, y: series.id),
+            aggregation: .count)
+        #expect(
+            AutoChartEngine.validate(
+                specification: heatmap, for: heatmapInput
+            ).issues.contains {
+                $0.message == "Heatmap x categories must not contain missing values."
+            })
+
+        let rangeInput = table(
+            columns: [category, date, end],
+            rows: [[.text("A"), .text("2026-01-01"), .null]])
+        let range = AutoChartSpecification(
+            family: .range,
+            encoding: .init(x: category.id, start: date.id, end: end.id))
+        #expect(
+            AutoChartEngine.validate(
+                specification: range, for: rangeInput
+            ).issues.contains {
+                $0.message == "Range ends must not contain missing values."
+            })
+    }
+
+    @Test func callerAggregationMustMatchDeclaredSafeOperation() {
+        let average = AutoChartColumn(
+            id: "average", name: "average",
+            hints: AutoChartColumnHints(
+                semanticType: .quantitative,
+                aggregation: .mean,
+                aggregationSafety: .safe))
+        let input = table(
+            columns: [category, average],
+            rows: [[.text("A"), .double(1)], [.text("A"), .double(3)]])
+        let sum = AutoChartSpecification(
+            family: .bar,
+            encoding: .init(x: category.id, y: average.id),
+            aggregation: .sum)
+        let mean = AutoChartSpecification(
+            family: .bar,
+            encoding: .init(x: category.id, y: average.id),
+            aggregation: .mean)
+        #expect(!AutoChartEngine.validate(specification: sum, for: input).isValid)
+        #expect(AutoChartEngine.validate(specification: mean, for: input).isValid)
+    }
+
+    @Test func typedHeatmapIdentitiesAndIDsDoNotCollide() {
+        let x = AutoChartColumn(
+            id: "x", name: "x",
+            hints: AutoChartColumnHints(semanticType: .nominal))
+        let y = AutoChartColumn(
+            id: "y", name: "y",
+            hints: AutoChartColumnHints(semanticType: .nominal))
+        let specification = AutoChartSpecification(
+            family: .heatmap,
+            encoding: .init(x: x.id, y: y.id),
+            aggregation: .count)
+
+        let typed = AutoChartDataPreparation.data(
+            snapshot: AutoChartSnapshot(
+                table(
+                    columns: [x, y],
+                    rows: [[.integer(1), .text("A")], [.text("1"), .text("A")]])),
+            specification: specification)
+        #expect(typed.count == 2)
+        #expect(Set(typed.compactMap(\.xLabel)) == ["1"])
+        #expect(Set(typed.compactMap(\.xIdentity)).count == 2)
+        #expect(Set(typed.map(\.id)).count == 2)
+
+        let hyphenated = AutoChartDataPreparation.data(
+            snapshot: AutoChartSnapshot(
+                table(
+                    columns: [x, y],
+                    rows: [[.text("a-b"), .text("c")], [.text("a"), .text("b-c")]])),
+            specification: specification)
+        #expect(hyphenated.count == 2)
+        #expect(Set(hyphenated.map(\.id)).count == 2)
+    }
+
+    @Test func boxPlotLabelTiesUseIdentityAsDeterministicTieBreaker() {
+        let mixed = AutoChartColumn(
+            id: "mixed", name: "mixed",
+            hints: AutoChartColumnHints(semanticType: .nominal))
+        let input = table(
+            columns: [mixed, measure],
+            rows: [[.text("1"), .double(2)], [.integer(1), .double(1)]])
+        let specification = AutoChartSpecification(
+            family: .boxPlot,
+            encoding: .init(x: mixed.id, y: measure.id))
+        let data = AutoChartDataPreparation.data(
+            snapshot: AutoChartSnapshot(input),
+            specification: specification)
+        #expect(data.compactMap(\.xLabel) == ["1", "1"])
+        #expect(data.compactMap(\.xIdentity) == ["integer:1", "text:1:1"])
+    }
+
 }

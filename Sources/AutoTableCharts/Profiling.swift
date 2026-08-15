@@ -237,8 +237,7 @@ enum AutoChartProfiler {
     }
 
     static func humanized(_ name: String) -> String {
-        name.replacingOccurrences(of: "_", with: " ")
-            .split(separator: " ")
+        nameTokens(name)
             .map { token in
                 let lower = token.lowercased()
                 if ["id", "noi", "ltv", "irr", "dscr"].contains(lower) {
