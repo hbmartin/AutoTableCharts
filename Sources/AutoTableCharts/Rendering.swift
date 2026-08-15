@@ -39,20 +39,74 @@ struct AutoChartDatum: Identifiable, Sendable {
         return accessibilityLabel(name: name, series: series)
     }
 
-    func accessibilityLabel(name: String, series: String?) -> String {
-        let value =
+    var intervalAccessibilityDescription: String? {
+        guard let startDate else { return nil }
+        let style = Date.FormatStyle(
+            date: .abbreviated,
+            time: .shortened,
+            timeZone: TimeZone.gmt)
+        let start = startDate.formatted(style)
+        guard let endDate, endDate != startDate else { return "Date: \(start)" }
+        return "From \(start) to \(endDate.formatted(style))"
+    }
+
+    func accessibilityLabel(
+        name: String,
+        context: [String?],
+        valueDescription: String? = nil
+    ) -> String {
+        let valueDescription = valueDescription ??
             yNumber?.formatted(.number.precision(.fractionLength(0...3)))
             ?? median?.formatted(.number.precision(.fractionLength(0...3)))
-        return [name, series, value]
+        return ([name] + context + [valueDescription])
             .compactMap { component in
                 guard let component, !component.isEmpty else { return nil }
                 return component
             }
             .joined(separator: ", ")
     }
+
+    func accessibilityLabel(
+        name: String,
+        series: String?,
+        facet: String? = nil,
+        valueDescription: String? = nil
+    ) -> String {
+        accessibilityLabel(
+            name: name,
+            context: [series, facet],
+            valueDescription: valueDescription)
+    }
 }
 
 enum AutoChartSelectionPreparation {
+    static func angleMatch(
+        to selectedAngle: Double,
+        in candidates: [AutoChartDatum]
+    ) -> AutoChartDatum? {
+        guard selectedAngle.isFinite, selectedAngle >= 0 else { return nil }
+        var cumulative = 0.0
+        for datum in candidates {
+            cumulative += datum.yNumber ?? 0
+            if selectedAngle <= cumulative { return datum }
+        }
+        return nil
+    }
+
+    static func numberSelectionLabel(
+        for matches: [AutoChartDatum],
+        selectedNumber: Double,
+        family: AutoChartFamily
+    ) -> String {
+        if family == .histogram,
+            let range = matches.first?.xLabel,
+            !range.isEmpty
+        {
+            return range
+        }
+        return selectedNumber.formatted()
+    }
+
     static func nearestDateMatches(
         to selectedDate: Date,
         in candidates: [AutoChartDatum]
@@ -485,13 +539,18 @@ enum AutoChartDataPreparation {
 func disambiguatedCategoryLabels(
     _ pairs: [(identity: String, label: String)]
 ) -> [String: String] {
+    let grouped = Dictionary(grouping: pairs, by: \.label)
     var labels: [String: String] = [:]
-    for (label, pairs) in Dictionary(grouping: pairs, by: \.label) {
-        let identities = Array(Set(pairs.map(\.identity))).sorted()
-        guard identities.count > 1 else {
-            if let identity = identities.first { labels[identity] = label }
-            continue
+    for label in grouped.keys.sorted() {
+        let identities = Array(Set(grouped[label, default: []].map(\.identity))).sorted()
+        if identities.count == 1, let identity = identities.first {
+            labels[identity] = label
         }
+    }
+    var usedLabels = Set(labels.values)
+    for label in grouped.keys.sorted() {
+        let identities = Array(Set(grouped[label, default: []].map(\.identity))).sorted()
+        guard identities.count > 1 else { continue }
         let kinds = identities.map { identity -> String in
             switch identity.split(separator: ":", maxSplits: 1).first {
             case "boolean": "Boolean"
@@ -511,7 +570,15 @@ func disambiguatedCategoryLabels(
             let qualifier =
                 kindCounts[kind, default: 0] == 1
                 ? kind : "\(kind) \(kindIndexes[kind, default: 0])"
-            labels[identity] = "\(label) (\(qualifier))"
+            let base = "\(label) (\(qualifier))"
+            var candidate = base
+            var suffix = 2
+            while usedLabels.contains(candidate) {
+                candidate = "\(base) \(suffix)"
+                suffix += 1
+            }
+            labels[identity] = candidate
+            usedLabels.insert(candidate)
         }
     }
     return labels
@@ -547,10 +614,12 @@ public struct AutoChartView: View {
     private let xTitle: String
     private let yTitle: String
     private let seriesTitle: String
+    private let facetTitle: String
     private let xSemanticType: AutoChartSemanticType?
     private let xDisplayLabels: [String: String]
     private let yDisplayLabels: [String: String]
     private let seriesDisplayLabels: [String: String]
+    private let facetDisplayLabels: [String: String]
     private let uniqueXCount: Int
     @Binding private var selection: AutoChartSelection?
 
@@ -590,23 +659,34 @@ public struct AutoChartView: View {
             profiles: profiles)
         let sizes = data.compactMap(\.size).filter(\.isFinite)
         let yValues = data.compactMap(\.yNumber).filter(\.isFinite)
-        let xDisplayLabels = disambiguatedCategoryLabels(
-            data.compactMap { datum -> (identity: String, label: String)? in
-                guard let identity = datum.xIdentity, let label = datum.xLabel else { return nil }
-                return (identity, label)
-            })
-        let yDisplayLabels = disambiguatedCategoryLabels(
-            data.compactMap { datum -> (identity: String, label: String)? in
-                guard let identity = datum.yIdentity, let label = datum.yLabel else { return nil }
-                return (identity, label)
-            })
-        let seriesDisplayLabels = disambiguatedCategoryLabels(
-            data.compactMap { datum -> (identity: String, label: String)? in
-                guard let identity = datum.seriesIdentity, let label = datum.series else {
-                    return nil
-                }
-                return (identity, label)
-            })
+        func categoryLabels(
+            identity: KeyPath<AutoChartDatum, String?>,
+            label: KeyPath<AutoChartDatum, String?>
+        ) -> [String: String] {
+            disambiguatedCategoryLabels(
+                data.compactMap { datum -> (identity: String, label: String)? in
+                    guard let identity = datum[keyPath: identity],
+                        let label = datum[keyPath: label]
+                    else { return nil }
+                    return (identity, label)
+                })
+        }
+        let xIsCategorical = specification.encoding.x.flatMap {
+            profiles[$0]?.isCategorical
+        } ?? false
+        let usesCategoricalXLabels = xIsCategorical
+            && [
+                .bar, .rankedDot, .groupedBar, .stackedBar, .normalizedBar,
+                .line, .pointLine, .area, .boxPlot, .heatmap, .donut, .range, .faceted,
+            ].contains(specification.family)
+        let xDisplayLabels = usesCategoricalXLabels
+            ? categoryLabels(identity: \.xIdentity, label: \.xLabel) : [:]
+        let yDisplayLabels = specification.family == .heatmap
+            ? categoryLabels(identity: \.yIdentity, label: \.yLabel) : [:]
+        let seriesDisplayLabels = specification.encoding.series != nil
+            ? categoryLabels(identity: \.seriesIdentity, label: \.series) : [:]
+        let facetDisplayLabels = specification.family == .faceted
+            ? categoryLabels(identity: \.facetIdentity, label: \.facet) : [:]
         self.snapshot = snapshot
         self.recommendation = recommendation
         validation = AutoChartEngine.validate(
@@ -645,16 +725,23 @@ public struct AutoChartView: View {
         xTitle =
             specification.encoding.x.flatMap { snapshot.column($0)?.name }
             .map(AutoChartProfiler.humanized) ?? "Category"
-        yTitle =
-            specification.encoding.y.flatMap { snapshot.column($0)?.name }
-            .map(AutoChartProfiler.humanized) ?? "Value"
+        let usesStructuralCountTitle = specification.aggregation == .count
+            && ![.histogram, .heatmap].contains(specification.family)
+        yTitle = usesStructuralCountTitle
+            ? "Count"
+            : specification.encoding.y.flatMap { snapshot.column($0)?.name }
+                .map(AutoChartProfiler.humanized) ?? "Value"
         seriesTitle =
             specification.encoding.series.flatMap { snapshot.column($0)?.name }
             .map(AutoChartProfiler.humanized) ?? "Series"
+        facetTitle =
+            specification.encoding.facet.flatMap { snapshot.column($0)?.name }
+            .map(AutoChartProfiler.humanized) ?? "Facet"
         xSemanticType = specification.encoding.x.flatMap { profiles[$0]?.semanticType }
         self.xDisplayLabels = xDisplayLabels
         self.yDisplayLabels = yDisplayLabels
         self.seriesDisplayLabels = seriesDisplayLabels
+        self.facetDisplayLabels = facetDisplayLabels
         uniqueXCount = Set(data.compactMap { $0.xIdentity ?? $0.xLabel }).count
     }
 
@@ -1049,7 +1136,7 @@ public struct AutoChartView: View {
                 xEnd: .value(xTitle, datum.upper ?? 0),
                 y: .value("Count", datum.yNumber ?? 0)
             )
-            .accessibilityLabel(datum.accessibilityLabel)
+            .accessibilityLabel(markAccessibilityLabel(for: datum))
         }
         .chartXAxisLabel(xTitle)
         .chartYAxisLabel("Count")
@@ -1101,7 +1188,17 @@ public struct AutoChartView: View {
             )
             .foregroundStyle(by: .value("Count", datum.yNumber ?? 0))
             .accessibilityLabel(
-                "\(disambiguatedCategoryValue(identity: datum.xIdentity, label: datum.xLabel, labels: xLabels)), \(disambiguatedCategoryValue(identity: datum.yIdentity, label: datum.yLabel, labels: yLabels)), \((datum.yNumber ?? 0).formatted())"
+                datum.accessibilityLabel(
+                    name: disambiguatedCategoryValue(
+                        identity: datum.xIdentity,
+                        label: datum.xLabel,
+                        labels: xLabels),
+                    context: [
+                        disambiguatedCategoryValue(
+                            identity: datum.yIdentity,
+                            label: datum.yLabel,
+                            labels: yLabels)
+                    ])
             )
         }
         .chartXAxisLabel(xTitle)
@@ -1182,18 +1279,13 @@ public struct AutoChartView: View {
             if left != right { return left < right }
             return ($0 ?? "") < ($1 ?? "")
         }
-        let facetTitles = disambiguatedCategoryLabels(
-            facetKeys.compactMap { key -> (identity: String, label: String)? in
-                guard let key else { return nil }
-                return (key, facets[key]?.first?.facet ?? "Missing value")
-            })
         let yDomain = sharedYDomain ?? 0...1
         return ScrollView {
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 220), spacing: 16)], spacing: 16) {
                 ForEach(facetKeys, id: \.self) { facetKey in
                     let facetData = facets[facetKey] ?? []
                     VStack(alignment: .leading, spacing: 4) {
-                        Text(facetKey.flatMap { facetTitles[$0] } ?? "Missing value")
+                        Text(facetKey.flatMap { facetDisplayLabels[$0] } ?? "Missing value")
                             .font(.caption.weight(.semibold))
                         if xSemanticType == .temporal {
                             let chart = Chart(facetData) { datum in
@@ -1306,6 +1398,14 @@ public struct AutoChartView: View {
             fallback: "Missing series")
     }
 
+    private func facetValue(for datum: AutoChartDatum) -> String {
+        disambiguatedCategoryValue(
+            identity: datum.facetIdentity,
+            label: datum.facet,
+            labels: facetDisplayLabels,
+            fallback: "Missing facet")
+    }
+
     private func markAccessibilityLabel(for datum: AutoChartDatum) -> String {
         let name: String = {
             switch specification.family {
@@ -1331,17 +1431,30 @@ public struct AutoChartView: View {
         }()
         return datum.accessibilityLabel(
             name: name,
-            series: specification.encoding.series == nil ? nil : seriesValue(for: datum))
+            series: specification.encoding.series == nil ? nil : seriesValue(for: datum),
+            facet: specification.encoding.facet == nil
+                ? nil : "\(facetTitle): \(facetValue(for: datum))",
+            valueDescription: specification.family == .range
+                ? datum.intervalAccessibilityDescription : nil)
     }
 
     private func selectionLabel(
         base: String,
         matches: [AutoChartDatum]
     ) -> String {
-        guard specification.encoding.series != nil else { return base }
-        let series = Array(Set(matches.map { seriesValue(for: $0) })).sorted()
-        guard !series.isEmpty else { return base }
-        return "\(base) · \(series.joined(separator: ", "))"
+        var context: [String] = []
+        if specification.encoding.series != nil {
+            let series = Array(Set(matches.map { seriesValue(for: $0) })).sorted()
+            if !series.isEmpty { context.append(series.joined(separator: ", ")) }
+        }
+        if specification.encoding.facet != nil {
+            let facets = Array(Set(matches.map { facetValue(for: $0) })).sorted()
+            if !facets.isEmpty {
+                context.append("\(facetTitle): \(facets.joined(separator: ", "))")
+            }
+        }
+        guard !context.isEmpty else { return base }
+        return ([base] + context).joined(separator: " · ")
     }
 
     private func symbolSize(for value: Double?) -> Double {
@@ -1673,7 +1786,12 @@ public struct AutoChartView: View {
         guard let nearestNumber = matches.first?.xNumber else { return }
         applySelection(
             matches,
-            label: selectionLabel(base: nearestNumber.formatted(), matches: matches))
+            label: selectionLabel(
+                base: AutoChartSelectionPreparation.numberSelectionLabel(
+                    for: matches,
+                    selectedNumber: nearestNumber,
+                    family: specification.family),
+                matches: matches))
     }
 
     private func select(angle: Double?) {
@@ -1681,14 +1799,11 @@ public struct AutoChartView: View {
             selection = nil
             return
         }
-        var cumulative = 0.0
-        for datum in data {
-            cumulative += datum.yNumber ?? 0
-            if angle <= cumulative {
-                applySelection([datum], label: xCategoryValue(for: datum))
-                return
-            }
+        guard let datum = AutoChartSelectionPreparation.angleMatch(to: angle, in: data) else {
+            selection = nil
+            return
         }
+        applySelection([datum], label: xCategoryValue(for: datum))
     }
 
     private func applySelection(_ matches: [AutoChartDatum], label: String) {
