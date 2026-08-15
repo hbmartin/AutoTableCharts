@@ -61,6 +61,7 @@ private struct VersionedCountingTable: AutoChartTable {
     var chartColumns: [AutoChartColumn]
     var chartRows: [CountingRow]
     var chartMetadata = AutoChartTableMetadata()
+    var chartDataIdentity: String?
     var chartDataVersion: String?
 }
 
@@ -182,6 +183,7 @@ private let date = AutoChartColumn(
                     values: [category.id: .text("A"), measure.id: .double(1)],
                     counter: counter)
             ],
+            chartDataIdentity: UUID().uuidString,
             chartDataVersion: UUID().uuidString)
         let recommendation = try #require(
             AutoChartEngine.recommendations(for: input).chartRecommendations.first)
@@ -193,6 +195,34 @@ private let date = AutoChartColumn(
         counter.reset()
         _ = AutoChartView(table: input, recommendation: recommendation)
         #expect(counter.count == 0)
+    }
+
+    @Test @MainActor func aVersionWithoutATableIdentityCannotCrossContaminateTables() {
+        let counter = ChartValueReadCounter()
+        func input(value: Double) -> VersionedCountingTable {
+            VersionedCountingTable(
+                chartColumns: [category, measure],
+                chartRows: [
+                    CountingRow(
+                        chartRowID: "r0",
+                        values: [category.id: .text("A"), measure.id: .double(value)],
+                        counter: counter)
+                ],
+                chartDataIdentity: nil,
+                chartDataVersion: "shared-version")
+        }
+        let recommendation = AutoChartRecommendation(
+            specification: AutoChartSpecification(
+                family: .bar,
+                encoding: .init(x: category.id, y: measure.id)),
+            score: 0,
+            rationale: ["Test"])
+
+        _ = AutoChartView(table: input(value: 1), recommendation: recommendation)
+        counter.reset()
+        _ = AutoChartView(table: input(value: 2), recommendation: recommendation)
+
+        #expect(counter.count > 0)
     }
     #endif
 
@@ -232,8 +262,13 @@ private let date = AutoChartColumn(
             sourceRowIDs: ["r0"],
             xDate: value,
             yNumber: 2)
-        #expect(datum.accessibilityLabel == "\(expectedAccessibleDate), 2")
-        #expect(!datum.accessibilityLabel.contains("T00:00:00Z"))
+        let label = AutoChartAccessibility.markLabel(
+            for: datum,
+            family: .line,
+            xSemanticType: .temporal,
+            xCategoryName: "Unused")
+        #expect(label == "\(expectedAccessibleDate), 2")
+        #expect(!label.contains("T00:00:00Z"))
     }
 
     @Test func accessibilityLabelsIncludeSeriesContext() {
@@ -243,12 +278,14 @@ private let date = AutoChartColumn(
             xLabel: "Office",
             yNumber: 2,
             series: "North")
-        #expect(datum.accessibilityLabel == "Office, North, 2")
         #expect(
-            datum.accessibilityLabel(
-                name: "Office",
-                series: "North",
-                facet: "Region: West") == "Office, North, Region: West, 2")
+            AutoChartAccessibility.markLabel(
+                for: datum,
+                family: .bar,
+                xSemanticType: .nominal,
+                xCategoryName: "Office",
+                seriesName: "North",
+                facetDescription: "Region: West") == "Office, North, Region: West, 2")
     }
 
     @Test func rangeAccessibilityDescribesDates() throws {
@@ -833,6 +870,31 @@ private let date = AutoChartColumn(
         #expect(recommendation.specification.encoding.facet == facet.id)
         #expect(recommendation.specification.facetBaseFamily == .line)
     }
+
+    @Test func facetedBarsPreserveHorizontalBaseOrientation() throws {
+        let longCategory = AutoChartColumn(
+            id: "long-category", name: "long_category",
+            hints: AutoChartColumnHints(semanticType: .nominal))
+        let facet = AutoChartColumn(
+            id: "facet", name: "facet",
+            hints: AutoChartColumnHints(semanticType: .nominal))
+        let input = table(
+            columns: [longCategory, facet, measure],
+            rows: [
+                [.text("A very long category"), .text("East"), .double(1)],
+                [.text("A very long category"), .text("West"), .double(2)],
+            ])
+        let recommendation = try #require(
+            AutoChartEngine.recommendations(
+                for: input,
+                options: AutoChartOptions(maximumRecommendations: 12)
+            ).chartRecommendations.first {
+                $0.specification.family == .faceted
+                    && $0.specification.facetBaseFamily == .bar
+            })
+
+        #expect(recommendation.specification.orientation == .horizontal)
+    }
 }
 
 @Suite struct ValidationAndLineageTests {
@@ -1411,6 +1473,52 @@ private let date = AutoChartColumn(
             family: .line,
             encoding: AutoChartEncoding(x: temporal.id, y: measure.id))
         #expect(!AutoChartEngine.validate(specification: specification, for: input).isValid)
+    }
+
+    @Test func explicitQuantitativeColumnsRejectNonNumericRows() {
+        let quantitative = AutoChartColumn(
+            id: "quantitative", name: "quantitative",
+            hints: AutoChartColumnHints(semanticType: .quantitative))
+        let input = table(
+            columns: [category, quantitative],
+            rows: [
+                [.text("A"), .double(1)],
+                [.text("B"), .text("not-a-number")],
+            ])
+        let specification = AutoChartSpecification(
+            family: .bar,
+            encoding: .init(x: category.id, y: quantitative.id))
+        let validation = AutoChartEngine.validate(
+            specification: specification,
+            for: input)
+
+        #expect(!validation.isValid)
+        #expect(
+            validation.issues.contains {
+                $0.message == "Quantitative field quantitative contains non-numeric values."
+            })
+    }
+
+    @Test func duplicateValidationUsesTheSameTypedIdentityAsRendering() {
+        let mixed = AutoChartColumn(
+            id: "mixed", name: "mixed",
+            hints: AutoChartColumnHints(semanticType: .nominal))
+        let input = table(
+            columns: [mixed, measure],
+            rows: [
+                [.double(0.0), .double(1)],
+                [.double(-0.0), .double(2)],
+            ])
+        let specification = AutoChartSpecification(
+            family: .bar,
+            encoding: .init(x: mixed.id, y: measure.id))
+        let snapshot = AutoChartSnapshot(input)
+        let prepared = AutoChartDataPreparation.data(
+            snapshot: snapshot,
+            specification: specification)
+
+        #expect(Set(prepared.compactMap(\.xIdentity)).count == 2)
+        #expect(AutoChartEngine.validate(specification: specification, for: input).isValid)
     }
 
     @Test func completeResultFamiliesRejectMissingEncodedValues() {

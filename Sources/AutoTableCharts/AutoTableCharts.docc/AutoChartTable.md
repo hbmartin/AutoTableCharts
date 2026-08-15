@@ -21,6 +21,11 @@ identifier, date, year, rate, balance, or preaggregated measure.
 - ``chartMetadata``
 - ``AutoChartRow``
 
+### Rendering Cache Identity
+
+- ``chartDataIdentity``
+- ``chartDataVersion``
+
 ### Schema and Meaning
 
 - ``AutoChartColumn``
@@ -32,4 +37,3 @@ identifier, date, year, rate, balance, or preaggregated measure.
 
 - <doc:ModelingTypedTables>
 - <doc:SafetySemanticsAndCompleteness>
-
