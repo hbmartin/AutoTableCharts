@@ -1389,6 +1389,9 @@ private extension AutoChartRenderPreparationCache {
             revision: configurationRevision)
     }
 
+    /// Evicts table and render entries that exceed the active limits.
+    ///
+    /// - Precondition: The caller already holds `lock`, which is not recursive.
     func trimLocked() {
         while tableRecency.count > activeConfiguration.maximumTableEntries
             || tableTotalCost > activeConfiguration.maximumTableCost

@@ -846,11 +846,14 @@ public enum AutoChartEngine {
                         severity: .error,
                         message: "Composition requires an explicitly additive measure."))
             }
-            // Missing and non-finite measures are already reported above, so this
-            // error is reserved for a value that really is zero or negative.
+            // Missing, non-numeric, and non-finite measures all shrink the
+            // renderable count and are reported above, so this error is reserved
+            // for a complete measure that really is zero or negative — including
+            // one with no values at all to compose.
             if specification.aggregation != .count,
                 let y = specification.encoding.y,
                 let profile = profiles[y],
+                profile.renderableValueCount == snapshot.rows.count,
                 (profile.numericMinimum ?? 0) <= 0
             {
                 issues.append(

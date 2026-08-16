@@ -445,20 +445,24 @@ private let date = AutoChartColumn(
             rationale: ["Signed-zero cache test"])
 
         // The cache is process-wide and other suites render into it, so measure
-        // this test's own effect on it rather than its absolute size.
+        // growth from this test's own insertions rather than its absolute size.
         let baseline = AutoChartRenderCache.retainedTableCount
         _ = AutoChartView(table: input(value: 0.0), recommendation: recommendation)
-        #expect(AutoChartRenderCache.retainedTableCount == baseline + 1)
+        let afterPositiveZero = AutoChartRenderCache.retainedTableCount
+        #expect(afterPositiveZero >= baseline + 1)
         let negative = AutoChartView(
             table: input(value: -0.0), recommendation: recommendation)
         let negativeValue = try #require(preparedData(in: negative)?.first?.yNumber)
         #expect(negativeValue.bitPattern == (-0.0).bitPattern)
-        #expect(AutoChartRenderCache.retainedTableCount == baseline + 2)
+        let afterNegativeZero = AutoChartRenderCache.retainedTableCount
+        // Signed-zero content is distinct, so it takes an entry of its own.
+        #expect(afterNegativeZero >= afterPositiveZero + 1)
 
         counter.reset()
         _ = AutoChartView(table: input(value: -0.0), recommendation: recommendation)
         #expect(counter.count == 2)
-        #expect(AutoChartRenderCache.retainedTableCount == baseline + 2)
+        // Repeating identical content reuses the entry instead of adding one.
+        #expect(AutoChartRenderCache.retainedTableCount == afterNegativeZero)
     }
 
     @Test @MainActor func recommendationsShareOneVersionedTableSnapshot() {
@@ -511,9 +515,10 @@ private let date = AutoChartColumn(
 
     @Test @MainActor func oversizedBinaryPayloadsAreNotRetainedByTheRenderCache() {
         let counter = ChartValueReadCounter()
-        // The renderer's standard table-cache budget is 32 MiB. This payload must
-        // exceed it so the prepared table is rejected from the process-wide cache.
-        let oversizedPayloadSize = 33 * 1_024 * 1_024
+        // The payload must exceed whatever table-cache budget is active so the
+        // prepared table is rejected from the process-wide cache.
+        let oversizedPayloadSize =
+            AutoChartRenderCache.configuration.maximumTableCost + 1_024 * 1_024
         let blob = AutoChartColumn(id: "blob", name: "blob")
         let input = VersionedCountingTable(
             chartColumns: [category, measure, blob],
@@ -2037,6 +2042,32 @@ private let date = AutoChartColumn(
                         || $0.message == "Composition requires positive values."
                 })
         }
+    }
+
+    @Test func compositionPositivityIsReportedOnlyForCompleteMeasures() {
+        func donut(_ rows: [[AutoChartValue]]) -> [String] {
+            AutoChartEngine.validate(
+                specification: AutoChartSpecification(
+                    family: .donut,
+                    encoding: .init(x: category.id, y: measure.id),
+                    aggregation: .sum),
+                for: table(columns: [category, measure], rows: rows)
+            ).issues.map(\.message)
+        }
+        let positive = "Composition requires positive values."
+
+        // A complete measure that isn't positive is exactly what this error is for.
+        #expect(donut([[.text("A"), .double(1)], [.text("B"), .double(-2)]]).contains(positive))
+        #expect(donut([[.text("A"), .double(1)], [.text("B"), .double(0)]]).contains(positive))
+        #expect(donut([]).contains(positive))
+        // Non-finite and missing measures are already reported by their own,
+        // more specific errors, so they must not also be called non-positive.
+        let nonFinite = donut([[.text("A"), .double(.nan)], [.text("B"), .double(.infinity)]])
+        #expect(nonFinite.contains("Quantitative field measure contains non-finite values."))
+        #expect(!nonFinite.contains(positive))
+        let missing = donut([[.text("A"), .double(1)], [.text("B"), .null]])
+        #expect(missing.contains("Composition measures must not contain missing values."))
+        #expect(!missing.contains(positive))
     }
 
     @Test func explicitNominalBinaryValuesFailCompletenessValidation() {
