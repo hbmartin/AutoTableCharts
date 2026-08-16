@@ -1,5 +1,9 @@
 import Foundation
 
+#if canImport(UIKit) && !os(watchOS)
+import UIKit
+#endif
+
 #if canImport(Charts) && canImport(SwiftUI)
 import Charts
 import SwiftUI
@@ -812,18 +816,21 @@ private final class AutoChartPreparedTable: Sendable {
     let snapshot: AutoChartSnapshot
     let profiles: [AutoChartColumnID: AutoChartColumnProfile]
     let fingerprint: Int
-    let estimatedCost: Int
+    let estimatedCost: Int?
+    let cacheConfigurationRevision: UInt64
 
     init(
         snapshot: AutoChartSnapshot,
         profiles: [AutoChartColumnID: AutoChartColumnProfile],
         fingerprint: Int,
-        estimatedCost: Int
+        estimatedCost: Int?,
+        cacheConfigurationRevision: UInt64
     ) {
         self.snapshot = snapshot
         self.profiles = profiles
         self.fingerprint = fingerprint
         self.estimatedCost = estimatedCost
+        self.cacheConfigurationRevision = cacheConfigurationRevision
     }
 }
 
@@ -835,6 +842,68 @@ private struct AutoChartRenderCore {
 
     var snapshot: AutoChartSnapshot { table.snapshot }
     var fingerprint: Int { table.fingerprint }
+}
+
+/// Process-wide retention limits for prepared rendering data.
+///
+/// The table and render costs are approximate retained-byte budgets rather than
+/// exact allocation limits. Set either entry count or cost to zero to disable
+/// that cache layer. Initializer inputs below zero are clamped to zero.
+public struct AutoChartRenderCacheConfiguration: Equatable, Sendable {
+    /// The standard cache limits used until a host supplies another configuration.
+    public static let standard = AutoChartRenderCacheConfiguration()
+
+    /// The maximum number of snapshots and profile sets retained. Defaults to eight.
+    public let maximumTableEntries: Int
+    /// The approximate retained-byte budget for snapshots and profiles. Defaults to 32 MiB.
+    public let maximumTableCost: Int
+    /// The maximum number of prepared recommendation results retained. Defaults to sixteen.
+    public let maximumRenderEntries: Int
+    /// The approximate retained-byte budget for prepared recommendation results.
+    /// Defaults to 32 MiB and does not include their shared table snapshots.
+    public let maximumRenderCost: Int
+
+    /// Creates process-wide rendering cache limits.
+    ///
+    /// - Parameters:
+    ///   - maximumTableEntries: Maximum retained snapshots and profile sets.
+    ///   - maximumTableCost: Approximate retained-byte budget for snapshots and profiles.
+    ///   - maximumRenderEntries: Maximum retained prepared recommendation results.
+    ///   - maximumRenderCost: Approximate retained-byte budget for prepared results,
+    ///     excluding their shared table snapshots.
+    public init(
+        maximumTableEntries: Int = 8,
+        maximumTableCost: Int = 32 * 1_024 * 1_024,
+        maximumRenderEntries: Int = 16,
+        maximumRenderCost: Int = 32 * 1_024 * 1_024
+    ) {
+        self.maximumTableEntries = max(0, maximumTableEntries)
+        self.maximumTableCost = max(0, maximumTableCost)
+        self.maximumRenderEntries = max(0, maximumRenderEntries)
+        self.maximumRenderCost = max(0, maximumRenderCost)
+    }
+}
+
+/// Controls the process-wide cache used by ``AutoChartView``.
+public enum AutoChartRenderCache {
+    /// The currently active process-wide limits.
+    public static var configuration: AutoChartRenderCacheConfiguration {
+        AutoChartRenderPreparationCache.shared.configuration
+    }
+
+    /// Applies new process-wide limits and immediately evicts entries that exceed them.
+    ///
+    /// Configuration and rendering may safely occur from different threads. Configure
+    /// the cache during application or extension startup when possible so its behavior
+    /// remains predictable for every chart in the process.
+    public static func configure(_ configuration: AutoChartRenderCacheConfiguration) {
+        AutoChartRenderPreparationCache.shared.configure(configuration)
+    }
+
+    /// Releases every retained table and prepared rendering result.
+    public static func removeAll() {
+        AutoChartRenderPreparationCache.shared.removeAll()
+    }
 }
 
 private struct AutoChartRenderTableCacheKey: Hashable {
@@ -852,6 +921,8 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
     static let shared = AutoChartRenderPreparationCache()
 
     private let lock = NSLock()
+    private var activeConfiguration = AutoChartRenderCacheConfiguration.standard
+    private var configurationRevision: UInt64 = 0
     private var tableEntries: [AutoChartRenderTableCacheKey: AutoChartPreparedTable] = [:]
     private var tableRecency: [AutoChartRenderTableCacheKey] = []
     private var tableTotalCost = 0
@@ -859,12 +930,30 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
     private var costs: [AutoChartRenderCacheKey: Int] = [:]
     private var recency: [AutoChartRenderCacheKey] = []
     private var totalCost = 0
-    // Separate approximate retained-byte budgets keep shared tables and prepared
-    // recommendation data bounded without charging every chart for the same snapshot.
-    private let tableCapacity = 8
-    private let tableCostCapacity = 32 * 1_024 * 1_024
-    private let capacity = 16
-    private let costCapacity = 32 * 1_024 * 1_024
+    private var memoryWarningObserver: NSObjectProtocol?
+
+    private struct ConfigurationSnapshot {
+        let value: AutoChartRenderCacheConfiguration
+        let revision: UInt64
+    }
+
+    private init() {
+        #if canImport(UIKit) && !os(watchOS)
+        memoryWarningObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.didReceiveMemoryWarningNotification,
+            object: nil,
+            queue: nil
+        ) { [weak self] _ in
+            self?.removeAll()
+        }
+        #endif
+    }
+
+    deinit {
+        if let memoryWarningObserver {
+            NotificationCenter.default.removeObserver(memoryWarningObserver)
+        }
+    }
 
     func core<Table: AutoChartTable>(
         table: Table,
@@ -920,6 +1009,7 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
         recommendation: AutoChartRecommendation,
         fingerprint: Int
     ) -> AutoChartRenderCore {
+        let cacheConfiguration = configurationSnapshot()
         let profiles = Dictionary(
             AutoChartProfiler.profiles(snapshot).map { ($0.column.id, $0) },
             uniquingKeysWith: { first, _ in first })
@@ -929,7 +1019,9 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
             fingerprint: fingerprint,
             estimatedCost: estimatedTableCost(
                 snapshot: snapshot,
-                profiles: profiles))
+                profiles: profiles,
+                limit: cacheConfiguration.value.maximumTableCost),
+            cacheConfigurationRevision: cacheConfiguration.revision)
         return core(
             table: cacheTable(prepared, for: tableKey) ?? prepared,
             tableKey: tableKey,
@@ -993,24 +1085,29 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
         for key: AutoChartRenderCacheKey,
         specification: AutoChartSpecification
     ) {
+        let cacheConfiguration = configurationSnapshot()
         let cost = estimatedCost(
             data: value.data,
             presentation: value.presentation,
             validation: value.validation,
-            specification: specification)
+            specification: specification,
+            limit: cacheConfiguration.value.maximumRenderCost)
         lock.lock()
         defer { lock.unlock() }
+        guard cacheConfiguration.revision == configurationRevision,
+            let cost
+        else { return }
         guard let cachedTable = cacheTableLocked(value.table, for: key.table),
             cachedTable === value.table
         else { return }
-        guard cost <= costCapacity else { return }
         if let previousCost = costs[key] { totalCost -= previousCost }
         entries[key] = value
         costs[key] = cost
         totalCost += cost
         recency.removeAll { $0 == key }
         recency.append(key)
-        while recency.count > capacity || totalCost > costCapacity {
+        while recency.count > activeConfiguration.maximumRenderEntries
+            || totalCost > activeConfiguration.maximumRenderCost {
             let evicted = recency.removeFirst()
             entries.removeValue(forKey: evicted)
             totalCost -= costs.removeValue(forKey: evicted) ?? 0
@@ -1030,19 +1127,21 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
         _ value: AutoChartPreparedTable,
         for key: AutoChartRenderTableCacheKey
     ) -> AutoChartPreparedTable? {
-        guard value.estimatedCost <= tableCostCapacity else { return nil }
         if let existing = tableEntries[key] {
             tableRecency.removeAll { $0 == key }
             tableRecency.append(key)
             return existing
         }
+        guard value.cacheConfigurationRevision == configurationRevision,
+            let estimatedCost = value.estimatedCost,
+            estimatedCost <= activeConfiguration.maximumTableCost
+        else { return nil }
         tableEntries[key] = value
-        tableTotalCost += value.estimatedCost
+        tableTotalCost += estimatedCost
         tableRecency.removeAll { $0 == key }
         tableRecency.append(key)
-        while tableRecency.count > tableCapacity
-            || tableTotalCost > tableCostCapacity
-        {
+        while tableRecency.count > activeConfiguration.maximumTableEntries
+            || tableTotalCost > activeConfiguration.maximumTableCost {
             removeTable(for: tableRecency.removeFirst())
         }
         return tableEntries[key]
@@ -1050,7 +1149,7 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
 
     private func removeTable(for key: AutoChartRenderTableCacheKey) {
         if let removed = tableEntries.removeValue(forKey: key) {
-            tableTotalCost -= removed.estimatedCost
+            tableTotalCost -= removed.estimatedCost ?? 0
         }
         let related = recency.filter { $0.table == key }
         for renderKey in related {
@@ -1062,36 +1161,37 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
 
     private func estimatedTableCost(
         snapshot: AutoChartSnapshot,
-        profiles: [AutoChartColumnID: AutoChartColumnProfile]
-    ) -> Int {
+        profiles: [AutoChartColumnID: AutoChartColumnProfile],
+        limit: Int
+    ) -> Int? {
         var cost = 256
         for column in snapshot.columns {
-            guard add(256, to: &cost, limit: tableCostCapacity),
-                add(column.id.rawValue.utf8.count, to: &cost, limit: tableCostCapacity),
-                add(column.name.utf8.count, to: &cost, limit: tableCostCapacity),
-                add(column.displayName?.utf8.count ?? 0, to: &cost, limit: tableCostCapacity),
-                add(column.hints.grain?.utf8.count ?? 0, to: &cost, limit: tableCostCapacity),
-                add(unitStringCost(column.hints.unit), to: &cost, limit: tableCostCapacity)
-            else { return tableCostCapacity + 1 }
+            guard add(256, to: &cost, limit: limit),
+                add(column.id.rawValue.utf8.count, to: &cost, limit: limit),
+                add(column.name.utf8.count, to: &cost, limit: limit),
+                add(column.displayName?.utf8.count ?? 0, to: &cost, limit: limit),
+                add(column.hints.grain?.utf8.count ?? 0, to: &cost, limit: limit),
+                add(unitStringCost(column.hints.unit), to: &cost, limit: limit)
+            else { return nil }
         }
         for row in snapshot.rows {
-            guard add(128, to: &cost, limit: tableCostCapacity),
-                add(row.id.rawValue.utf8.count, to: &cost, limit: tableCostCapacity)
-            else { return tableCostCapacity + 1 }
+            guard add(128, to: &cost, limit: limit),
+                add(row.id.rawValue.utf8.count, to: &cost, limit: limit)
+            else { return nil }
             for value in row.values.values {
-                guard add(96, to: &cost, limit: tableCostCapacity),
-                    add(payloadCost(value), to: &cost, limit: tableCostCapacity)
-                else { return tableCostCapacity + 1 }
+                guard add(96, to: &cost, limit: limit),
+                    add(payloadCost(value), to: &cost, limit: limit)
+                else { return nil }
             }
         }
         for profile in profiles.values {
-            guard add(160, to: &cost, limit: tableCostCapacity),
+            guard add(160, to: &cost, limit: limit),
                 add(
                     profile.temporalValues.count,
                     multipliedBy: MemoryLayout<Date>.stride,
                     to: &cost,
-                    limit: tableCostCapacity)
-            else { return tableCostCapacity + 1 }
+                    limit: limit)
+            else { return nil }
         }
         return cost
     }
@@ -1100,18 +1200,19 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
         data: [AutoChartDatum],
         presentation: AutoChartRenderPresentation,
         validation: AutoChartValidationResult,
-        specification: AutoChartSpecification
-    ) -> Int {
+        specification: AutoChartSpecification,
+        limit: Int
+    ) -> Int? {
         var cost = 256
         guard
             add(
                 specification.title.utf8.count,
                 to: &cost,
-                limit: costCapacity)
-        else { return costCapacity + 1 }
+                limit: limit)
+        else { return nil }
         for datum in data {
-            guard add(256, to: &cost, limit: costCapacity) else {
-                return costCapacity + 1
+            guard add(256, to: &cost, limit: limit) else {
+                return nil
             }
             let strings: [String?] = [
                 datum.id, datum.xIdentity, datum.xLabel, datum.yIdentity,
@@ -1119,14 +1220,14 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
                 datum.facetIdentity, datum.facet,
             ]
             for string in strings.compactMap({ $0 }) {
-                guard add(string.utf8.count, to: &cost, limit: costCapacity) else {
-                    return costCapacity + 1
+                guard add(string.utf8.count, to: &cost, limit: limit) else {
+                    return nil
                 }
             }
             for rowID in datum.sourceRowIDs {
-                guard add(32, to: &cost, limit: costCapacity),
-                    add(rowID.rawValue.utf8.count, to: &cost, limit: costCapacity)
-                else { return costCapacity + 1 }
+                guard add(32, to: &cost, limit: limit),
+                    add(rowID.rawValue.utf8.count, to: &cost, limit: limit)
+                else { return nil }
             }
         }
         let labelDictionaries = [
@@ -1135,26 +1236,29 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
         ]
         for labels in labelDictionaries {
             for (identity, label) in labels {
-                guard add(64, to: &cost, limit: costCapacity),
-                    add(identity.utf8.count, to: &cost, limit: costCapacity),
-                    add(label.utf8.count, to: &cost, limit: costCapacity)
-                else { return costCapacity + 1 }
+                guard add(64, to: &cost, limit: limit),
+                    add(identity.utf8.count, to: &cost, limit: limit),
+                    add(label.utf8.count, to: &cost, limit: limit)
+                else { return nil }
             }
         }
         for category in presentation.sharedXCategoryDomain {
-            guard add(32, to: &cost, limit: costCapacity),
-                add(category.utf8.count, to: &cost, limit: costCapacity)
-            else { return costCapacity + 1 }
+            guard add(32, to: &cost, limit: limit),
+                add(category.utf8.count, to: &cost, limit: limit)
+            else { return nil }
         }
         for issue in validation.issues {
-            guard add(64, to: &cost, limit: costCapacity),
-                add(issue.message.utf8.count, to: &cost, limit: costCapacity)
-            else { return costCapacity + 1 }
+            guard add(64, to: &cost, limit: limit),
+                add(issue.message.utf8.count, to: &cost, limit: limit)
+            else { return nil }
         }
         return cost
     }
 
-    private func payloadCost(_ value: AutoChartValue) -> Int {
+}
+
+private extension AutoChartRenderPreparationCache {
+    func payloadCost(_ value: AutoChartValue) -> Int {
         switch value {
         case .text(let value): value.utf8.count
         case .binary(let value): value.count
@@ -1162,7 +1266,7 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
         }
     }
 
-    private func unitStringCost(_ unit: AutoChartUnit?) -> Int {
+    func unitStringCost(_ unit: AutoChartUnit?) -> Int {
         switch unit {
         case .currency(let code): code.utf8.count
         case .duration(let unit), .area(let unit), .custom(let unit): unit.utf8.count
@@ -1170,13 +1274,13 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
         }
     }
 
-    private func add(_ amount: Int, to cost: inout Int, limit: Int) -> Bool {
+    func add(_ amount: Int, to cost: inout Int, limit: Int) -> Bool {
         guard amount >= 0, amount <= limit - cost else { return false }
         cost += amount
         return true
     }
 
-    private func add(
+    func add(
         _ count: Int,
         multipliedBy unitCost: Int,
         to cost: inout Int,
@@ -1187,6 +1291,57 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
         else { return false }
         cost += count * unitCost
         return true
+    }
+
+    var configuration: AutoChartRenderCacheConfiguration {
+        lock.lock()
+        defer { lock.unlock() }
+        return activeConfiguration
+    }
+
+    func configure(_ configuration: AutoChartRenderCacheConfiguration) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard configuration != activeConfiguration else { return }
+        activeConfiguration = configuration
+        configurationRevision &+= 1
+        trimLocked()
+    }
+
+    func removeAll() {
+        lock.lock()
+        defer { lock.unlock() }
+        // Prevent preparation already in flight from repopulating the cache after
+        // an explicit purge or memory-pressure notification.
+        configurationRevision &+= 1
+        tableEntries.removeAll(keepingCapacity: false)
+        tableRecency.removeAll(keepingCapacity: false)
+        tableTotalCost = 0
+        entries.removeAll(keepingCapacity: false)
+        costs.removeAll(keepingCapacity: false)
+        recency.removeAll(keepingCapacity: false)
+        totalCost = 0
+    }
+
+    private func configurationSnapshot() -> ConfigurationSnapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        return ConfigurationSnapshot(
+            value: activeConfiguration,
+            revision: configurationRevision)
+    }
+
+    func trimLocked() {
+        while tableRecency.count > activeConfiguration.maximumTableEntries
+            || tableTotalCost > activeConfiguration.maximumTableCost {
+            removeTable(for: tableRecency.removeFirst())
+        }
+        while recency.count > activeConfiguration.maximumRenderEntries
+            || totalCost > activeConfiguration.maximumRenderCost {
+            let evicted = recency.removeFirst()
+            entries.removeValue(forKey: evicted)
+            totalCost -= costs.removeValue(forKey: evicted) ?? 0
+        }
     }
 }
 

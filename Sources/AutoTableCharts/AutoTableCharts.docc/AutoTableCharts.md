@@ -75,6 +75,7 @@ explicit table fallback.
 ### Rendering and Selection
 
 - ``AutoChartView``
+- ``AutoChartRenderCache``
+- ``AutoChartRenderCacheConfiguration``
 - ``AutoChartInteraction``
 - ``AutoChartSelection``
-

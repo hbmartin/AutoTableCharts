@@ -34,6 +34,24 @@ stable and distinct for each logical table, and change the version whenever colu
 rows, values, or metadata change. A version without an identity deliberately falls
 back to content fingerprinting so two tables of the same Swift type cannot collide.
 
+Memory-constrained hosts can lower both cache layers during startup. A zero entry
+or byte limit disables that layer:
+
+```swift
+AutoChartRenderCache.configure(
+    AutoChartRenderCacheConfiguration(
+        maximumTableEntries: 2,
+        maximumTableCost: 4 * 1_024 * 1_024,
+        maximumRenderEntries: 4,
+        maximumRenderCost: 4 * 1_024 * 1_024
+    )
+)
+```
+
+Call ``AutoChartRenderCache/removeAll()`` to release retained preparation data on
+demand. On UIKit platforms that publish memory-warning notifications, the cache
+also clears itself automatically.
+
 #### Migrating version-only cache conformances
 
 Earlier revisions used ``AutoChartTable/chartDataVersion`` alone as a fast cache

@@ -8,6 +8,9 @@ import Charts
 import SwiftUI
 
 @MainActor
+// Reads the private stored `data` property of `AutoChartView` by reflection.
+// Update this helper if that storage changes. A nil result means reflection failed,
+// while an empty array means the view successfully prepared no marks.
 private func preparedData(in view: AutoChartView) -> [AutoChartDatum]? {
     Mirror(reflecting: view).children.first { $0.label == "data" }?.value
         as? [AutoChartDatum]
@@ -286,6 +289,9 @@ private let date = AutoChartColumn(
 
     @Test @MainActor func oversizedBinaryPayloadsAreNotRetainedByTheRenderCache() {
         let counter = ChartValueReadCounter()
+        // The renderer's standard table-cache budget is 32 MiB. This payload must
+        // exceed it so the prepared table is rejected from the process-wide cache.
+        let oversizedPayloadSize = 33 * 1_024 * 1_024
         let blob = AutoChartColumn(id: "blob", name: "blob")
         let input = VersionedCountingTable(
             chartColumns: [category, measure, blob],
@@ -295,7 +301,7 @@ private let date = AutoChartColumn(
                     values: [
                         category.id: .text("A"),
                         measure.id: .double(1),
-                        blob.id: .binary(Data(count: 33 * 1_024 * 1_024)),
+                        blob.id: .binary(Data(count: oversizedPayloadSize)),
                     ],
                     counter: counter)
             ],
@@ -314,6 +320,7 @@ private let date = AutoChartColumn(
 
         #expect(counter.count > 0)
     }
+
     #endif
 
     @Test func snapshotFingerprintTracksTableContent() {
@@ -435,6 +442,76 @@ private let date = AutoChartColumn(
                 valueDescription: datum.intervalAccessibilityDescription)
                 == "Lease, \(interval)")
     }
+}
+
+@Suite struct RenderCacheTests {
+    @Test func configurationClampsNegativeLimits() {
+        let configuration = AutoChartRenderCacheConfiguration(
+            maximumTableEntries: -1,
+            maximumTableCost: -1,
+            maximumRenderEntries: -1,
+            maximumRenderCost: -1)
+
+        #expect(configuration.maximumTableEntries == 0)
+        #expect(configuration.maximumTableCost == 0)
+        #expect(configuration.maximumRenderEntries == 0)
+        #expect(configuration.maximumRenderCost == 0)
+    }
+
+    #if canImport(Charts) && canImport(SwiftUI)
+    @Test @MainActor func cacheCanBeConfiguredAndPurged() {
+        let originalConfiguration = AutoChartRenderCache.configuration
+        defer {
+            AutoChartRenderCache.configure(originalConfiguration)
+            AutoChartRenderCache.removeAll()
+        }
+
+        AutoChartRenderCache.configure(.standard)
+        AutoChartRenderCache.removeAll()
+
+        let counter = ChartValueReadCounter()
+        let input = VersionedCountingTable(
+            chartColumns: [category, measure],
+            chartRows: [
+                CountingRow(
+                    chartRowID: "r0",
+                    values: [category.id: .text("A"), measure.id: .double(1)],
+                    counter: counter)
+            ],
+            chartDataIdentity: UUID().uuidString,
+            chartDataVersion: UUID().uuidString)
+        let recommendation = AutoChartRecommendation(
+            specification: AutoChartSpecification(
+                family: .bar,
+                encoding: .init(x: category.id, y: measure.id)),
+            score: 0,
+            rationale: ["Cache configuration test"])
+
+        _ = AutoChartView(table: input, recommendation: recommendation)
+        counter.reset()
+        _ = AutoChartView(table: input, recommendation: recommendation)
+        #expect(counter.count == 0)
+
+        AutoChartRenderCache.removeAll()
+        counter.reset()
+        _ = AutoChartView(table: input, recommendation: recommendation)
+        #expect(counter.count > 0)
+
+        let disabledConfiguration = AutoChartRenderCacheConfiguration(
+            maximumTableEntries: 0,
+            maximumTableCost: 0,
+            maximumRenderEntries: 0,
+            maximumRenderCost: 0)
+        AutoChartRenderCache.configure(disabledConfiguration)
+        #expect(AutoChartRenderCache.configuration == disabledConfiguration)
+
+        counter.reset()
+        _ = AutoChartView(table: input, recommendation: recommendation)
+        counter.reset()
+        _ = AutoChartView(table: input, recommendation: recommendation)
+        #expect(counter.count > 0)
+    }
+    #endif
 }
 
 @Suite struct ProfilingTests {
