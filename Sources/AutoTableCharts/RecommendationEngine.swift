@@ -1098,7 +1098,7 @@ public enum AutoChartEngine {
             let field = fields.first,
             droppingRowsMissing.contains(field),
             let profile = profiles[field],
-            profile.distinctCount == profile.renderableValueCount
+            profile.renderableDistinctCount == profile.renderableValueCount
         {
             return true
         }

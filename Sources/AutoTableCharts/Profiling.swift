@@ -118,6 +118,9 @@ struct AutoChartColumnProfile: Sendable {
     var numericTypeCount: Int
     var numericValueCount: Int
     var renderableValueCount: Int
+    /// Unique values after applying the column's inferred semantic identity.
+    var renderableDistinctCount: Int
+    /// Unique raw typed values used while inferring the column's semantic type.
     var distinctCount: Int
     var nullFraction: Double
     var numericMinimum: Double?
@@ -188,16 +191,16 @@ enum AutoChartProfiler {
             numericCount: numeric.count,
             dateCount: dates.count,
             distinctCount: distinct.count)
-        let renderableValueCount = values.reduce(into: 0) { count, value in
-            if identity(value, semanticType: type) != .missing { count += 1 }
-        }
+        let renderableIdentities = values.map { identity($0, semanticType: type) }
+            .filter { $0 != .missing }
         return AutoChartColumnProfile(
             column: column,
             semanticType: type,
             nonNullCount: nonNull.count,
             numericTypeCount: numericTyped.count,
             numericValueCount: numeric.count,
-            renderableValueCount: renderableValueCount,
+            renderableValueCount: renderableIdentities.count,
+            renderableDistinctCount: Set(renderableIdentities).count,
             distinctCount: distinct.count,
             nullFraction: values.isEmpty
                 ? 0 : Double(values.count - nonNull.count) / Double(values.count),

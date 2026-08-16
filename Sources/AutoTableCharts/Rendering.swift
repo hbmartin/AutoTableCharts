@@ -973,6 +973,7 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
     private var costs: [AutoChartRenderCacheKey: Int] = [:]
     private var recency: [AutoChartRenderCacheKey] = []
     private var totalCost = 0
+    // Retains the UIKit registration for the process lifetime of the shared cache.
     private var memoryWarningObserver: NSObjectProtocol?
 
     private struct ConfigurationSnapshot {
@@ -990,12 +991,6 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
             self?.removeAll()
         }
         #endif
-    }
-
-    deinit {
-        if let memoryWarningObserver {
-            NotificationCenter.default.removeObserver(memoryWarningObserver)
-        }
     }
 
     func core<Table: AutoChartTable>(
@@ -1888,31 +1883,13 @@ public struct AutoChartView: View {
         groupsSeries: Bool,
         stacking: MarkStackingMethod
     ) -> some ChartContent {
-        if groupsSeries {
+        styledBarMark(
             BarMark(
                 x: .value(yTitle, datum.yNumber ?? 0),
                 y: .value(xTitle, xCategoryValue(for: datum)),
-                stacking: .unstacked
-            )
-            .foregroundStyle(by: .value(seriesTitle, seriesValue(for: datum)))
-            .position(by: .value(seriesTitle, seriesValue(for: datum)))
-            .accessibilityLabel(markAccessibilityLabel(for: datum))
-        } else if specification.encoding.series != nil {
-            BarMark(
-                x: .value(yTitle, datum.yNumber ?? 0),
-                y: .value(xTitle, xCategoryValue(for: datum)),
-                stacking: stacking
-            )
-            .foregroundStyle(by: .value(seriesTitle, seriesValue(for: datum)))
-            .accessibilityLabel(markAccessibilityLabel(for: datum))
-        } else {
-            BarMark(
-                x: .value(yTitle, datum.yNumber ?? 0),
-                y: .value(xTitle, xCategoryValue(for: datum)),
-                stacking: stacking
-            )
-            .accessibilityLabel(markAccessibilityLabel(for: datum))
-        }
+                stacking: groupsSeries ? .unstacked : stacking),
+            for: datum,
+            groupsSeries: groupsSeries)
     }
 
     @ChartContentBuilder
@@ -1921,30 +1898,33 @@ public struct AutoChartView: View {
         groupsSeries: Bool,
         stacking: MarkStackingMethod
     ) -> some ChartContent {
+        styledBarMark(
+            BarMark(
+                x: .value(xTitle, xCategoryValue(for: datum)),
+                y: .value(yTitle, datum.yNumber ?? 0),
+                stacking: groupsSeries ? .unstacked : stacking),
+            for: datum,
+            groupsSeries: groupsSeries)
+    }
+
+    @ChartContentBuilder
+    private func styledBarMark(
+        _ mark: BarMark,
+        for datum: AutoChartDatum,
+        groupsSeries: Bool
+    ) -> some ChartContent {
         if groupsSeries {
-            BarMark(
-                x: .value(xTitle, xCategoryValue(for: datum)),
-                y: .value(yTitle, datum.yNumber ?? 0),
-                stacking: .unstacked
-            )
-            .foregroundStyle(by: .value(seriesTitle, seriesValue(for: datum)))
-            .position(by: .value(seriesTitle, seriesValue(for: datum)))
-            .accessibilityLabel(markAccessibilityLabel(for: datum))
+            mark
+                .foregroundStyle(by: .value(seriesTitle, seriesValue(for: datum)))
+                .position(by: .value(seriesTitle, seriesValue(for: datum)))
+                .accessibilityLabel(markAccessibilityLabel(for: datum))
         } else if specification.encoding.series != nil {
-            BarMark(
-                x: .value(xTitle, xCategoryValue(for: datum)),
-                y: .value(yTitle, datum.yNumber ?? 0),
-                stacking: stacking
-            )
-            .foregroundStyle(by: .value(seriesTitle, seriesValue(for: datum)))
-            .accessibilityLabel(markAccessibilityLabel(for: datum))
+            mark
+                .foregroundStyle(by: .value(seriesTitle, seriesValue(for: datum)))
+                .accessibilityLabel(markAccessibilityLabel(for: datum))
         } else {
-            BarMark(
-                x: .value(xTitle, xCategoryValue(for: datum)),
-                y: .value(yTitle, datum.yNumber ?? 0),
-                stacking: stacking
-            )
-            .accessibilityLabel(markAccessibilityLabel(for: datum))
+            mark
+                .accessibilityLabel(markAccessibilityLabel(for: datum))
         }
     }
 
