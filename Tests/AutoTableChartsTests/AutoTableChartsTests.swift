@@ -6,6 +6,12 @@ import Testing
 #if canImport(Charts) && canImport(SwiftUI)
 import Charts
 import SwiftUI
+
+@MainActor
+private func preparedData(in view: AutoChartView) -> [AutoChartDatum]? {
+    Mirror(reflecting: view).children.first { $0.label == "data" }?.value
+        as? [AutoChartDatum]
+}
 #endif
 
 private struct TestRow: AutoChartRow {
@@ -197,7 +203,7 @@ private let date = AutoChartColumn(
         #expect(counter.count == 0)
     }
 
-    @Test @MainActor func aVersionWithoutATableIdentityCannotCrossContaminateTables() {
+    @Test @MainActor func aVersionWithoutATableIdentityCannotCrossContaminateTables() throws {
         let counter = ChartValueReadCounter()
         func input(value: Double) -> VersionedCountingTable {
             VersionedCountingTable(
@@ -218,14 +224,95 @@ private let date = AutoChartColumn(
             score: 0,
             rationale: ["Test"])
 
-        let first = AutoChartRenderPreparationCache.shared.core(
+        let first = AutoChartView(
             table: input(value: 1), recommendation: recommendation)
-        let second = AutoChartRenderPreparationCache.shared.core(
+        let second = AutoChartView(
             table: input(value: 2), recommendation: recommendation)
+        let firstValue = try #require(preparedData(in: first)?.first?.yNumber)
+        let secondValue = try #require(preparedData(in: second)?.first?.yNumber)
 
-        #expect(first.data.first?.yNumber == 1)
-        #expect(second.data.first?.yNumber == 2)
-        #expect(first.data.first?.yNumber != second.data.first?.yNumber)
+        #expect(firstValue == 1)
+        #expect(secondValue == 2)
+        #expect(firstValue != secondValue)
+    }
+
+    @Test @MainActor func recommendationsShareOneVersionedTableSnapshot() {
+        let counter = ChartValueReadCounter()
+        let measures = (0..<9).map { index in
+            AutoChartColumn(
+                id: AutoChartColumnID(rawValue: "measure-\(index)"),
+                name: "measure_\(index)",
+                hints: AutoChartColumnHints(semanticType: .quantitative))
+        }
+        let columns = [category] + measures
+        let rows = (0..<5_000).map { rowIndex in
+            var values: [AutoChartColumnID: AutoChartValue] = [
+                category.id: .text("Category \(rowIndex)")
+            ]
+            for (measureIndex, measure) in measures.enumerated() {
+                values[measure.id] = .double(Double(rowIndex + measureIndex))
+            }
+            return CountingRow(
+                chartRowID: AutoChartRowID(rawValue: "r\(rowIndex)"),
+                values: values,
+                counter: counter)
+        }
+        let input = VersionedCountingTable(
+            chartColumns: columns,
+            chartRows: rows,
+            chartDataIdentity: UUID().uuidString,
+            chartDataVersion: UUID().uuidString)
+        let recommendations = measures.prefix(6).map { measure in
+            AutoChartRecommendation(
+                specification: AutoChartSpecification(
+                    family: .bar,
+                    encoding: .init(x: category.id, y: measure.id)),
+                score: 0,
+                rationale: ["Cache sharing test"])
+        }
+
+        counter.reset()
+        for recommendation in recommendations {
+            _ = AutoChartView(table: input, recommendation: recommendation)
+        }
+        #expect(counter.count == rows.count * columns.count)
+
+        counter.reset()
+        for recommendation in recommendations {
+            _ = AutoChartView(table: input, recommendation: recommendation)
+        }
+        #expect(counter.count == 0)
+    }
+
+    @Test @MainActor func oversizedBinaryPayloadsAreNotRetainedByTheRenderCache() {
+        let counter = ChartValueReadCounter()
+        let blob = AutoChartColumn(id: "blob", name: "blob")
+        let input = VersionedCountingTable(
+            chartColumns: [category, measure, blob],
+            chartRows: [
+                CountingRow(
+                    chartRowID: "r0",
+                    values: [
+                        category.id: .text("A"),
+                        measure.id: .double(1),
+                        blob.id: .binary(Data(count: 33 * 1_024 * 1_024)),
+                    ],
+                    counter: counter)
+            ],
+            chartDataIdentity: UUID().uuidString,
+            chartDataVersion: UUID().uuidString)
+        let recommendation = AutoChartRecommendation(
+            specification: AutoChartSpecification(
+                family: .bar,
+                encoding: .init(x: category.id, y: measure.id)),
+            score: 0,
+            rationale: ["Large payload test"])
+
+        _ = AutoChartView(table: input, recommendation: recommendation)
+        counter.reset()
+        _ = AutoChartView(table: input, recommendation: recommendation)
+
+        #expect(counter.count > 0)
     }
     #endif
 
@@ -289,6 +376,41 @@ private let date = AutoChartColumn(
                 xCategoryName: "Office",
                 seriesName: "North",
                 facetDescription: "Region: West") == "Office, North, Region: West, 2")
+    }
+
+    @Test func quantitativeAccessibilityDoesNotResolveAnUnusedCategoryLabel() {
+        var categoryLookupCount = 0
+        func categoryName() -> String {
+            categoryLookupCount += 1
+            return "Unused"
+        }
+        let datum = AutoChartDatum(
+            id: "number",
+            sourceRowIDs: ["r0"],
+            xNumber: 10,
+            yNumber: 2)
+
+        let label = AutoChartAccessibility.markLabel(
+            for: datum,
+            family: .scatter,
+            xSemanticType: .quantitative,
+            xCategoryName: categoryName())
+
+        #expect(label == "10, 2")
+        #expect(categoryLookupCount == 0)
+    }
+
+    @Test func heatmapAccessibilityIncludesBothCategoriesAndCount() {
+        let datum = AutoChartDatum(
+            id: "heatmap",
+            sourceRowIDs: ["r0", "r1", "r2"],
+            yNumber: 3)
+
+        #expect(
+            AutoChartAccessibility.heatmapLabel(
+                for: datum,
+                xCategoryName: "Office",
+                yCategoryName: "Boston") == "Office, Boston, 3")
     }
 
     @Test func rangeAccessibilityDescribesDates() throws {
@@ -1502,7 +1624,146 @@ private let date = AutoChartColumn(
             })
     }
 
-    @Test func duplicateValidationUsesTheSameTypedIdentityAsRendering() {
+    @Test func nonFiniteQuantitativeValuesAreOmittedWithoutInvalidatingCharts() throws {
+        let quantitative = AutoChartColumn(
+            id: "quantitative", name: "quantitative",
+            hints: AutoChartColumnHints(
+                semanticType: .quantitative,
+                role: .measure))
+        let input = table(
+            columns: [category, quantitative],
+            rows: [
+                [.text("A"), .double(1)],
+                [.text("B"), .double(.nan)],
+                [.text("C"), .double(3)],
+            ])
+        let recommendation = try #require(
+            AutoChartEngine.recommendations(for: input).chartRecommendations.first {
+                $0.specification.family == .bar
+            })
+        let validation = AutoChartEngine.validate(
+            specification: recommendation.specification,
+            for: input)
+        let prepared = AutoChartDataPreparation.data(
+            snapshot: AutoChartSnapshot(input),
+            specification: recommendation.specification)
+
+        #expect(validation.isValid)
+        #expect(!validation.issues.contains { $0.message.contains("non-numeric") })
+        #expect(prepared.map(\.xLabel) == ["A", "C"])
+    }
+
+    @Test func nonFiniteNumericStorageStillInfersQuantitativeSemantics() {
+        let quantitative = AutoChartColumn(
+            id: "quantitative", name: "quantitative",
+            hints: AutoChartColumnHints(role: .measure))
+        let snapshot = AutoChartSnapshot(
+            table(
+                columns: [quantitative],
+                rows: [[.double(1)], [.double(.infinity)]]))
+
+        #expect(AutoChartProfiler.profiles(snapshot).first?.semanticType == .quantitative)
+    }
+
+    @Test func quantitativeValidationIssuesFollowEncodingDeclarationOrder() {
+        func quantitative(_ id: String) -> AutoChartColumn {
+            AutoChartColumn(
+                id: AutoChartColumnID(rawValue: id),
+                name: id,
+                hints: AutoChartColumnHints(semanticType: .quantitative))
+        }
+        let x = quantitative("x")
+        let y = quantitative("y")
+        let size = quantitative("size")
+        let input = table(
+            columns: [x, y, size],
+            rows: [[.text("bad-x"), .text("bad-y"), .text("bad-size")]])
+        let specification = AutoChartSpecification(
+            family: .bubble,
+            encoding: .init(x: x.id, y: y.id, size: size.id))
+
+        let messages = AutoChartEngine.validate(
+            specification: specification,
+            for: input
+        ).issues.map(\.message).filter { $0.contains("contains non-numeric values") }
+
+        #expect(
+            messages == [
+                "Quantitative field x contains non-numeric values.",
+                "Quantitative field y contains non-numeric values.",
+                "Quantitative field size contains non-numeric values.",
+            ])
+    }
+
+    @Test func repeatedTemporalEncodingsProduceOneParseIssue() {
+        let temporal = AutoChartColumn(
+            id: "temporal", name: "temporal",
+            hints: AutoChartColumnHints(semanticType: .temporal))
+        let input = table(
+            columns: [category, temporal],
+            rows: [[.text("A"), .text("not-a-date")]])
+        let specification = AutoChartSpecification(
+            family: .range,
+            encoding: .init(
+                x: category.id,
+                start: temporal.id,
+                end: temporal.id))
+
+        let messages = AutoChartEngine.validate(
+            specification: specification,
+            for: input
+        ).issues.map(\.message).filter { $0.contains("contains unparseable values") }
+
+        #expect(messages == ["Temporal field temporal contains unparseable values."])
+    }
+
+    @Test func validationMemoSeparatesSnapshots() {
+        let firstSnapshot = AutoChartSnapshot(
+            table(
+                columns: [category, measure],
+                rows: [
+                    [.text("A"), .double(1)],
+                    [.text("B"), .double(2)],
+                ]))
+        let secondSnapshot = AutoChartSnapshot(
+            table(
+                columns: [category, measure],
+                rows: [
+                    [.text("A"), .double(1)],
+                    [.text("A"), .double(2)],
+                ]))
+        let specification = AutoChartSpecification(
+            family: .bar,
+            encoding: .init(x: category.id, y: measure.id))
+        let memo = AutoChartEngine.AutoChartValidationMemo()
+        func profiles(
+            _ snapshot: AutoChartSnapshot
+        ) -> [AutoChartColumnID: AutoChartColumnProfile] {
+            Dictionary(
+                uniqueKeysWithValues: AutoChartProfiler.profiles(snapshot).map {
+                    ($0.column.id, $0)
+                })
+        }
+
+        let first = AutoChartEngine.validate(
+            specification: specification,
+            snapshot: firstSnapshot,
+            profiles: profiles(firstSnapshot),
+            memo: memo)
+        let second = AutoChartEngine.validate(
+            specification: specification,
+            snapshot: secondSnapshot,
+            profiles: profiles(secondSnapshot),
+            memo: memo)
+
+        #expect(first.isValid)
+        #expect(
+            second.issues.contains {
+                $0.message == "Duplicate marks require an explicit safe aggregation."
+            })
+    }
+
+    @Test func signedZeroUsesTheSameIdentityForValidationAndRendering() {
         let mixed = AutoChartColumn(
             id: "mixed", name: "mixed",
             hints: AutoChartColumnHints(semanticType: .nominal))
@@ -1520,8 +1781,8 @@ private let date = AutoChartColumn(
             snapshot: snapshot,
             specification: specification)
 
-        #expect(Set(prepared.compactMap(\.xIdentity)).count == 2)
-        #expect(AutoChartEngine.validate(specification: specification, for: input).isValid)
+        #expect(Set(prepared.compactMap(\.xIdentity)).count == 1)
+        #expect(!AutoChartEngine.validate(specification: specification, for: input).isValid)
     }
 
     @Test func completeResultFamiliesRejectMissingEncodedValues() {

@@ -23,13 +23,24 @@ Use ``AutoChartInteraction/preview`` in a recommendation gallery. Preview mode
 uses compact typography and omits exploratory selection and zoom controls. Use
 ``AutoChartInteraction/explore`` for a chosen chart.
 
-`AutoChartView` caches snapshot profiling, validation, and mark preparation. By
-default it fingerprints table content before looking up the cache. Implement both
+`AutoChartView` caches one shared snapshot and profile set per table revision, then
+caches validation and mark preparation for each recommendation without copying the
+snapshot into every cache entry. Byte-aware limits exclude tables with oversized
+text or binary payloads from the process-wide cache. By default the renderer
+fingerprints table content before looking up the cache. Implement both
 ``AutoChartTable/chartDataIdentity`` and ``AutoChartTable/chartDataVersion`` to
 skip that repeated table scan during SwiftUI view reconstruction. Keep the identity
 stable and distinct for each logical table, and change the version whenever columns,
 rows, values, or metadata change. A version without an identity deliberately falls
 back to content fingerprinting so two tables of the same Swift type cannot collide.
+
+#### Migrating version-only cache conformances
+
+Earlier revisions used ``AutoChartTable/chartDataVersion`` alone as a fast cache
+key. Those conformances continue to compile, but now use content fingerprinting to
+prevent two same-typed tables with the same version from sharing prepared data.
+Add a stable, table-specific ``AutoChartTable/chartDataIdentity`` to restore the
+scan-free path.
 
 ### Link selections to source rows
 
