@@ -65,6 +65,7 @@ public enum AutoChartEngine {
         let quantitative = Array(
             profiles.filter {
                 $0.isQuantitative && $0.column.hints.role != .identifier
+                    && $0.numericValueCount > 0
             }.prefix(options.maximumCandidateColumns))
         let temporal = Array(
             profiles.filter(\.isTemporal).prefix(options.maximumCandidateColumns))
@@ -275,7 +276,9 @@ public enum AutoChartEngine {
         }
 
         for measure in quantitative {
-            let binCount = max(5, min(20, Int(Double(measure.nonNullCount).squareRoot().rounded())))
+            let binCount = max(
+                5,
+                min(20, Int(Double(measure.numericValueCount).squareRoot().rounded())))
             candidates.append(
                 candidate(
                     family: .histogram, x: measure, context: context,
@@ -435,12 +438,12 @@ public enum AutoChartEngine {
         memo: AutoChartValidationMemo? = nil
     ) -> AutoChartValidationResult {
         var issues: [AutoChartValidationIssue] = []
-        let referenced = [
+        let referenced = orderedUnique([
             specification.encoding.x, specification.encoding.y,
             specification.encoding.series, specification.encoding.size,
             specification.encoding.facet, specification.encoding.start,
             specification.encoding.end,
-        ].compactMap { $0 }
+        ])
         for id in referenced where profiles[id] == nil {
             issues.append(.init(severity: .error, message: "Unknown column \(id.rawValue)."))
         }
@@ -681,11 +684,11 @@ public enum AutoChartEngine {
                         "\(specification.family.displayName) does not support a facet base family."
                 ))
         }
-        let temporalReferences = [
+        let temporalReferences = orderedUnique([
             specification.encoding.x,
             specification.encoding.start,
             specification.encoding.end,
-        ].compactMap { $0 }
+        ])
         for id in temporalReferences {
             guard let profile = profiles[id], profile.isTemporal,
                 profile.temporalValues.count != profile.nonNullCount
@@ -695,9 +698,9 @@ public enum AutoChartEngine {
                     severity: .error,
                     message: "Temporal field \(id.rawValue) contains unparseable values."))
         }
-        for id in Set(referenced) {
+        for id in referenced {
             guard let profile = profiles[id], profile.isQuantitative,
-                profile.numericValueCount != profile.nonNullCount
+                profile.numericTypeCount != profile.nonNullCount
             else { continue }
             issues.append(
                 .init(
@@ -953,6 +956,16 @@ public enum AutoChartEngine {
         }
     }
 
+    private static func orderedUnique(
+        _ references: [AutoChartColumnID?]
+    ) -> [AutoChartColumnID] {
+        var seen: Set<AutoChartColumnID> = []
+        return references.compactMap { reference in
+            guard let reference, seen.insert(reference).inserted else { return nil }
+            return reference
+        }
+    }
+
     static func resolvedFacetBaseFamily(
         specification: AutoChartSpecification,
         profiles: [AutoChartColumnID: AutoChartColumnProfile]
@@ -970,6 +983,7 @@ public enum AutoChartEngine {
     }
 
     private struct AutoChartCombinationRequest: Hashable {
+        var snapshotIdentity: UUID
         var fields: [AutoChartColumnID]
         var measure: AutoChartColumnID
         var droppingRowsMissing: Set<AutoChartColumnID>
@@ -979,12 +993,14 @@ public enum AutoChartEngine {
         private var uniqueCombinations: [AutoChartCombinationRequest: Bool] = [:]
 
         func uniqueCombination(
+            snapshotIdentity: UUID,
             fields: [AutoChartColumnID],
             measure: AutoChartColumnID,
             droppingRowsMissing: Set<AutoChartColumnID>
         ) -> Bool? {
             uniqueCombinations[
                 AutoChartCombinationRequest(
+                    snapshotIdentity: snapshotIdentity,
                     fields: fields,
                     measure: measure,
                     droppingRowsMissing: droppingRowsMissing)
@@ -993,12 +1009,14 @@ public enum AutoChartEngine {
 
         func storeUniqueCombination(
             _ value: Bool,
+            snapshotIdentity: UUID,
             fields: [AutoChartColumnID],
             measure: AutoChartColumnID,
             droppingRowsMissing: Set<AutoChartColumnID>
         ) {
             uniqueCombinations[
                 AutoChartCombinationRequest(
+                    snapshotIdentity: snapshotIdentity,
                     fields: fields,
                     measure: measure,
                     droppingRowsMissing: droppingRowsMissing)
@@ -1016,6 +1034,7 @@ public enum AutoChartEngine {
     ) -> Bool {
         guard !fields.isEmpty else { return false }
         if let cached = memo?.uniqueCombination(
+            snapshotIdentity: snapshot.validationIdentity,
             fields: fields,
             measure: measure,
             droppingRowsMissing: droppingRowsMissing)
@@ -1041,6 +1060,7 @@ public enum AutoChartEngine {
         }
         memo?.storeUniqueCombination(
             isUnique,
+            snapshotIdentity: snapshot.validationIdentity,
             fields: fields,
             measure: measure,
             droppingRowsMissing: droppingRowsMissing)

@@ -73,7 +73,7 @@ enum AutoChartAccessibility {
         for datum: AutoChartDatum,
         family: AutoChartFamily,
         xSemanticType: AutoChartSemanticType?,
-        xCategoryName: String,
+        xCategoryName: @autoclosure () -> String,
         seriesName: String? = nil,
         facetDescription: String? = nil
     ) -> String {
@@ -83,7 +83,7 @@ enum AutoChartAccessibility {
                 return datum.xLabel ?? "Value"
             case .bar, .groupedBar, .stackedBar, .normalizedBar, .rankedDot,
                 .boxPlot, .donut, .range:
-                return xCategoryName
+                return xCategoryName()
             default:
                 switch xSemanticType {
                 case .temporal:
@@ -95,7 +95,7 @@ enum AutoChartAccessibility {
                 case .quantitative:
                     return datum.xNumber?.formatted() ?? "Value"
                 default:
-                    return xCategoryName
+                    return xCategoryName()
                 }
             }
         }()
@@ -105,6 +105,16 @@ enum AutoChartAccessibility {
             facet: facetDescription,
             valueDescription: family == .range
                 ? datum.intervalAccessibilityDescription : nil)
+    }
+
+    static func heatmapLabel(
+        for datum: AutoChartDatum,
+        xCategoryName: String,
+        yCategoryName: String
+    ) -> String {
+        datum.accessibilityLabel(
+            name: xCategoryName,
+            context: [yCategoryName])
     }
 }
 
@@ -798,32 +808,63 @@ private struct AutoChartRenderPresentation {
     }
 }
 
-private struct AutoChartRenderCore {
-    var snapshot: AutoChartSnapshot
-    var data: [AutoChartDatum]
-    var validation: AutoChartValidationResult
-    var presentation: AutoChartRenderPresentation
-    var fingerprint: Int
+private final class AutoChartPreparedTable: Sendable {
+    let snapshot: AutoChartSnapshot
+    let profiles: [AutoChartColumnID: AutoChartColumnProfile]
+    let fingerprint: Int
+    let estimatedCost: Int
+
+    init(
+        snapshot: AutoChartSnapshot,
+        profiles: [AutoChartColumnID: AutoChartColumnProfile],
+        fingerprint: Int,
+        estimatedCost: Int
+    ) {
+        self.snapshot = snapshot
+        self.profiles = profiles
+        self.fingerprint = fingerprint
+        self.estimatedCost = estimatedCost
+    }
 }
 
-private struct AutoChartRenderCacheKey: Hashable {
+private struct AutoChartRenderCore {
+    let table: AutoChartPreparedTable
+    let data: [AutoChartDatum]
+    let validation: AutoChartValidationResult
+    let presentation: AutoChartRenderPresentation
+
+    var snapshot: AutoChartSnapshot { table.snapshot }
+    var fingerprint: Int { table.fingerprint }
+}
+
+private struct AutoChartRenderTableCacheKey: Hashable {
     var tableType: String
     var tableIdentity: String?
     var contentIdentity: String
-    var recommendation: AutoChartRecommendation
+}
+
+private struct AutoChartRenderCacheKey: Hashable {
+    var table: AutoChartRenderTableCacheKey
+    var specification: AutoChartSpecification
 }
 
 private final class AutoChartRenderPreparationCache: @unchecked Sendable {
     static let shared = AutoChartRenderPreparationCache()
 
     private let lock = NSLock()
+    private var tableEntries: [AutoChartRenderTableCacheKey: AutoChartPreparedTable] = [:]
+    private var tableRecency: [AutoChartRenderTableCacheKey] = []
+    private var tableTotalCost = 0
     private var entries: [AutoChartRenderCacheKey: AutoChartRenderCore] = [:]
     private var costs: [AutoChartRenderCacheKey: Int] = [:]
     private var recency: [AutoChartRenderCacheKey] = []
     private var totalCost = 0
+    // Separate approximate retained-byte budgets keep shared tables and prepared
+    // recommendation data bounded without charging every chart for the same snapshot.
+    private let tableCapacity = 8
+    private let tableCostCapacity = 32 * 1_024 * 1_024
     private let capacity = 16
-    // Approximate snapshot cells plus prepared-datum storage, not a byte count.
-    private let costCapacity = 250_000
+    private let costCapacity = 32 * 1_024 * 1_024
 
     func core<Table: AutoChartTable>(
         table: Table,
@@ -833,67 +874,107 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
         if let tableIdentity = table.chartDataIdentity,
             let version = table.chartDataVersion
         {
-            let key = AutoChartRenderCacheKey(
+            let tableKey = AutoChartRenderTableCacheKey(
                 tableType: tableType,
                 tableIdentity: tableIdentity,
-                contentIdentity: "version:\(version)",
-                recommendation: recommendation)
-            if let cached = value(for: key) { return cached }
+                contentIdentity: "version:\(version)")
+            if let prepared = tableValue(for: tableKey) {
+                return core(
+                    table: prepared,
+                    tableKey: tableKey,
+                    recommendation: recommendation)
+            }
             var hasher = Hasher()
             hasher.combine(tableType)
             hasher.combine(tableIdentity)
             hasher.combine(version)
-            return build(
+            return core(
                 snapshot: AutoChartSnapshot(table),
+                tableKey: tableKey,
                 recommendation: recommendation,
-                fingerprint: hasher.finalize(),
-                key: key)
+                fingerprint: hasher.finalize())
         }
 
         let snapshot = AutoChartSnapshot(table)
         let fingerprint = snapshot.contentFingerprint
-        let key = AutoChartRenderCacheKey(
+        let tableKey = AutoChartRenderTableCacheKey(
             tableType: tableType,
             tableIdentity: nil,
-            contentIdentity: "fingerprint:\(fingerprint)",
-            recommendation: recommendation)
-        if let cached = value(for: key) { return cached }
-        return build(
+            contentIdentity: "fingerprint:\(fingerprint)")
+        if let prepared = tableValue(for: tableKey) {
+            return core(
+                table: prepared,
+                tableKey: tableKey,
+                recommendation: recommendation)
+        }
+        return core(
             snapshot: snapshot,
+            tableKey: tableKey,
             recommendation: recommendation,
-            fingerprint: fingerprint,
-            key: key)
+            fingerprint: fingerprint)
     }
 
-    private func build(
+    private func core(
         snapshot: AutoChartSnapshot,
+        tableKey: AutoChartRenderTableCacheKey,
         recommendation: AutoChartRecommendation,
-        fingerprint: Int,
-        key: AutoChartRenderCacheKey
+        fingerprint: Int
     ) -> AutoChartRenderCore {
         let profiles = Dictionary(
             AutoChartProfiler.profiles(snapshot).map { ($0.column.id, $0) },
             uniquingKeysWith: { first, _ in first })
+        let prepared = AutoChartPreparedTable(
+            snapshot: snapshot,
+            profiles: profiles,
+            fingerprint: fingerprint,
+            estimatedCost: estimatedTableCost(
+                snapshot: snapshot,
+                profiles: profiles))
+        return core(
+            table: cacheTable(prepared, for: tableKey) ?? prepared,
+            tableKey: tableKey,
+            recommendation: recommendation)
+    }
+
+    private func core(
+        table: AutoChartPreparedTable,
+        tableKey: AutoChartRenderTableCacheKey,
+        recommendation: AutoChartRecommendation
+    ) -> AutoChartRenderCore {
+        let key = AutoChartRenderCacheKey(
+            table: tableKey,
+            specification: recommendation.specification)
+        if let cached = value(for: key) { return cached }
         let specification = recommendation.specification
         let data = AutoChartDataPreparation.data(
-            snapshot: snapshot,
+            snapshot: table.snapshot,
             specification: specification,
-            profiles: profiles)
+            profiles: table.profiles)
         let core = AutoChartRenderCore(
-            snapshot: snapshot,
+            table: table,
             data: data,
             validation: AutoChartEngine.validate(
                 specification: specification,
-                snapshot: snapshot,
-                profiles: profiles),
+                snapshot: table.snapshot,
+                profiles: table.profiles),
             presentation: AutoChartRenderPresentation(
-                snapshot: snapshot,
+                snapshot: table.snapshot,
                 specification: specification,
-                profiles: profiles,
-                data: data),
-            fingerprint: fingerprint)
-        insert(core, for: key)
+                profiles: table.profiles,
+                data: data))
+        insert(core, for: key, specification: specification)
         return core
+    }
+
+    private func tableValue(
+        for key: AutoChartRenderTableCacheKey
+    ) -> AutoChartPreparedTable? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let value = tableEntries[key] else { return nil }
+        tableRecency.removeAll { $0 == key }
+        tableRecency.append(key)
+        return value
     }
 
     private func value(for key: AutoChartRenderCacheKey) -> AutoChartRenderCore? {
@@ -902,14 +983,27 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
         guard let value = entries[key] else { return nil }
         recency.removeAll { $0 == key }
         recency.append(key)
+        tableRecency.removeAll { $0 == key.table }
+        tableRecency.append(key.table)
         return value
     }
 
-    private func insert(_ value: AutoChartRenderCore, for key: AutoChartRenderCacheKey) {
-        let cost = estimatedCost(of: value)
-        guard cost <= costCapacity else { return }
+    private func insert(
+        _ value: AutoChartRenderCore,
+        for key: AutoChartRenderCacheKey,
+        specification: AutoChartSpecification
+    ) {
+        let cost = estimatedCost(
+            data: value.data,
+            presentation: value.presentation,
+            validation: value.validation,
+            specification: specification)
         lock.lock()
         defer { lock.unlock() }
+        guard let cachedTable = cacheTableLocked(value.table, for: key.table),
+            cachedTable === value.table
+        else { return }
+        guard cost <= costCapacity else { return }
         if let previousCost = costs[key] { totalCost -= previousCost }
         entries[key] = value
         costs[key] = cost
@@ -923,21 +1017,185 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
         }
     }
 
-    private func estimatedCost(of value: AutoChartRenderCore) -> Int {
-        var cost = value.snapshot.columns.count
-        for row in value.snapshot.rows {
-            if cost > costCapacity - row.values.count { return costCapacity + 1 }
-            cost += row.values.count
+    private func cacheTable(
+        _ value: AutoChartPreparedTable,
+        for key: AutoChartRenderTableCacheKey
+    ) -> AutoChartPreparedTable? {
+        lock.lock()
+        defer { lock.unlock() }
+        return cacheTableLocked(value, for: key)
+    }
+
+    private func cacheTableLocked(
+        _ value: AutoChartPreparedTable,
+        for key: AutoChartRenderTableCacheKey
+    ) -> AutoChartPreparedTable? {
+        guard value.estimatedCost <= tableCostCapacity else { return nil }
+        if let existing = tableEntries[key] {
+            tableRecency.removeAll { $0 == key }
+            tableRecency.append(key)
+            return existing
         }
-        let datumCost = 8
-        guard value.data.count <= (costCapacity - cost) / datumCost else {
-            return costCapacity + 1
+        tableEntries[key] = value
+        tableTotalCost += value.estimatedCost
+        tableRecency.removeAll { $0 == key }
+        tableRecency.append(key)
+        while tableRecency.count > tableCapacity
+            || tableTotalCost > tableCostCapacity
+        {
+            removeTable(for: tableRecency.removeFirst())
         }
-        return cost + value.data.count * datumCost
+        return tableEntries[key]
+    }
+
+    private func removeTable(for key: AutoChartRenderTableCacheKey) {
+        if let removed = tableEntries.removeValue(forKey: key) {
+            tableTotalCost -= removed.estimatedCost
+        }
+        let related = recency.filter { $0.table == key }
+        for renderKey in related {
+            entries.removeValue(forKey: renderKey)
+            totalCost -= costs.removeValue(forKey: renderKey) ?? 0
+        }
+        recency.removeAll { $0.table == key }
+    }
+
+    private func estimatedTableCost(
+        snapshot: AutoChartSnapshot,
+        profiles: [AutoChartColumnID: AutoChartColumnProfile]
+    ) -> Int {
+        var cost = 256
+        for column in snapshot.columns {
+            guard add(256, to: &cost, limit: tableCostCapacity),
+                add(column.id.rawValue.utf8.count, to: &cost, limit: tableCostCapacity),
+                add(column.name.utf8.count, to: &cost, limit: tableCostCapacity),
+                add(column.displayName?.utf8.count ?? 0, to: &cost, limit: tableCostCapacity),
+                add(column.hints.grain?.utf8.count ?? 0, to: &cost, limit: tableCostCapacity),
+                add(unitStringCost(column.hints.unit), to: &cost, limit: tableCostCapacity)
+            else { return tableCostCapacity + 1 }
+        }
+        for row in snapshot.rows {
+            guard add(128, to: &cost, limit: tableCostCapacity),
+                add(row.id.rawValue.utf8.count, to: &cost, limit: tableCostCapacity)
+            else { return tableCostCapacity + 1 }
+            for value in row.values.values {
+                guard add(96, to: &cost, limit: tableCostCapacity),
+                    add(payloadCost(value), to: &cost, limit: tableCostCapacity)
+                else { return tableCostCapacity + 1 }
+            }
+        }
+        for profile in profiles.values {
+            guard add(160, to: &cost, limit: tableCostCapacity),
+                add(
+                    profile.temporalValues.count,
+                    multipliedBy: MemoryLayout<Date>.stride,
+                    to: &cost,
+                    limit: tableCostCapacity)
+            else { return tableCostCapacity + 1 }
+        }
+        return cost
+    }
+
+    private func estimatedCost(
+        data: [AutoChartDatum],
+        presentation: AutoChartRenderPresentation,
+        validation: AutoChartValidationResult,
+        specification: AutoChartSpecification
+    ) -> Int {
+        var cost = 256
+        guard
+            add(
+                specification.title.utf8.count,
+                to: &cost,
+                limit: costCapacity)
+        else { return costCapacity + 1 }
+        for datum in data {
+            guard add(256, to: &cost, limit: costCapacity) else {
+                return costCapacity + 1
+            }
+            let strings: [String?] = [
+                datum.id, datum.xIdentity, datum.xLabel, datum.yIdentity,
+                datum.yLabel, datum.seriesIdentity, datum.series,
+                datum.facetIdentity, datum.facet,
+            ]
+            for string in strings.compactMap({ $0 }) {
+                guard add(string.utf8.count, to: &cost, limit: costCapacity) else {
+                    return costCapacity + 1
+                }
+            }
+            for rowID in datum.sourceRowIDs {
+                guard add(32, to: &cost, limit: costCapacity),
+                    add(rowID.rawValue.utf8.count, to: &cost, limit: costCapacity)
+                else { return costCapacity + 1 }
+            }
+        }
+        let labelDictionaries = [
+            presentation.xDisplayLabels, presentation.yDisplayLabels,
+            presentation.seriesDisplayLabels, presentation.facetDisplayLabels,
+        ]
+        for labels in labelDictionaries {
+            for (identity, label) in labels {
+                guard add(64, to: &cost, limit: costCapacity),
+                    add(identity.utf8.count, to: &cost, limit: costCapacity),
+                    add(label.utf8.count, to: &cost, limit: costCapacity)
+                else { return costCapacity + 1 }
+            }
+        }
+        for category in presentation.sharedXCategoryDomain {
+            guard add(32, to: &cost, limit: costCapacity),
+                add(category.utf8.count, to: &cost, limit: costCapacity)
+            else { return costCapacity + 1 }
+        }
+        for issue in validation.issues {
+            guard add(64, to: &cost, limit: costCapacity),
+                add(issue.message.utf8.count, to: &cost, limit: costCapacity)
+            else { return costCapacity + 1 }
+        }
+        return cost
+    }
+
+    private func payloadCost(_ value: AutoChartValue) -> Int {
+        switch value {
+        case .text(let value): value.utf8.count
+        case .binary(let value): value.count
+        default: 0
+        }
+    }
+
+    private func unitStringCost(_ unit: AutoChartUnit?) -> Int {
+        switch unit {
+        case .currency(let code): code.utf8.count
+        case .duration(let unit), .area(let unit), .custom(let unit): unit.utf8.count
+        case .number, .percent, nil: 0
+        }
+    }
+
+    private func add(_ amount: Int, to cost: inout Int, limit: Int) -> Bool {
+        guard amount >= 0, amount <= limit - cost else { return false }
+        cost += amount
+        return true
+    }
+
+    private func add(
+        _ count: Int,
+        multipliedBy unitCost: Int,
+        to cost: inout Int,
+        limit: Int
+    ) -> Bool {
+        guard count >= 0, unitCost >= 0,
+            count <= (limit - cost) / max(1, unitCost)
+        else { return false }
+        cost += count * unitCost
+        return true
     }
 }
 
 #if canImport(Charts) && canImport(SwiftUI)
+
+private enum AutoChartFacetSelectionAxis {
+    case x
+    case y
+}
 
 /// A native Swift Charts view for an AutoTableCharts recommendation or specification.
 ///
@@ -1577,17 +1835,16 @@ public struct AutoChartView: View {
             )
             .foregroundStyle(by: .value("Count", datum.yNumber ?? 0))
             .accessibilityLabel(
-                datum.accessibilityLabel(
-                    name: disambiguatedCategoryValue(
+                AutoChartAccessibility.heatmapLabel(
+                    for: datum,
+                    xCategoryName: disambiguatedCategoryValue(
                         identity: datum.xIdentity,
                         label: datum.xLabel,
                         labels: xLabels),
-                    context: [
-                        disambiguatedCategoryValue(
-                            identity: datum.yIdentity,
-                            label: datum.yLabel,
-                            labels: yLabels)
-                    ])
+                    yCategoryName: disambiguatedCategoryValue(
+                        identity: datum.yIdentity,
+                        label: datum.yLabel,
+                        labels: yLabels))
             )
         }
         .chartXAxisLabel(xTitle)
@@ -1727,7 +1984,7 @@ public struct AutoChartView: View {
                             .chartXScale(domain: dateDomain)
                             .chartYScale(domain: yDomain)
                             .environment(\.timeZone, .gmt)
-                            selectableFacetX(chart, as: Date.self) { value in
+                            selectableFacet(chart, axis: .x, as: Date.self) { value in
                                 select(date: value, in: facetData)
                             }
                         } else if facetBaseFamily == .line {
@@ -1776,7 +2033,7 @@ public struct AutoChartView: View {
                             }
                             .chartXScale(domain: sharedXCategoryDomain)
                             .chartYScale(domain: yDomain)
-                            selectableFacetX(chart, as: String.self) { value in
+                            selectableFacet(chart, axis: .x, as: String.self) { value in
                                 select(category: value, in: facetData)
                             }
                         } else if facetBaseFamily == .scatter,
@@ -1808,7 +2065,7 @@ public struct AutoChartView: View {
                             .chartXScale(domain: dateDomain)
                             .chartYScale(domain: yDomain)
                             .environment(\.timeZone, .gmt)
-                            selectableFacetX(chart, as: Date.self) { value in
+                            selectableFacet(chart, axis: .x, as: Date.self) { value in
                                 select(date: value, in: facetData)
                             }
                         } else if facetBaseFamily == .scatter {
@@ -1837,7 +2094,7 @@ public struct AutoChartView: View {
                             }
                             .chartXScale(domain: numberDomain)
                             .chartYScale(domain: yDomain)
-                            selectableFacetX(chart, as: Double.self) { value in
+                            selectableFacet(chart, axis: .x, as: Double.self) { value in
                                 select(number: value, in: facetData)
                             }
                         } else {
@@ -1868,7 +2125,7 @@ public struct AutoChartView: View {
                                 }
                                 .chartXScale(domain: yDomain)
                                 .chartYScale(domain: sharedXCategoryDomain)
-                                selectableFacetY(chart, as: String.self) { value in
+                                selectableFacet(chart, axis: .y, as: String.self) { value in
                                     select(category: value, in: facetData)
                                 }
                             } else {
@@ -1898,7 +2155,7 @@ public struct AutoChartView: View {
                                 }
                                 .chartXScale(domain: sharedXCategoryDomain)
                                 .chartYScale(domain: yDomain)
-                                selectableFacetX(chart, as: String.self) { value in
+                                selectableFacet(chart, axis: .x, as: String.self) { value in
                                     select(category: value, in: facetData)
                                 }
                             }
@@ -2069,8 +2326,9 @@ public struct AutoChartView: View {
     }
 
     @ViewBuilder
-    private func selectableFacetX<Content: View, Value: Plottable>(
+    private func selectableFacet<Content: View, Value: Plottable>(
         _ content: Content,
+        axis: AutoChartFacetSelectionAxis,
         as _: Value.Type,
         onSelect: @escaping (Value) -> Void
     ) -> some View {
@@ -2087,42 +2345,18 @@ public struct AutoChartView: View {
                                     let plotFrame = proxy.plotFrame
                                 else { return }
                                 let frame = geometry[plotFrame]
-                                let xPosition = value.location.x - frame.origin.x
-                                guard xPosition >= 0, xPosition <= frame.width,
-                                    let selected: Value = proxy.value(atX: xPosition)
+                                let location = CGPoint(
+                                    x: value.location.x - frame.origin.x,
+                                    y: value.location.y - frame.origin.y)
+                                guard location.x >= 0, location.x <= frame.width,
+                                    location.y >= 0, location.y <= frame.height
                                 else { return }
-                                onSelect(selected)
-                            })
-                }
-            }
-        } else {
-            content
-        }
-    }
-
-    @ViewBuilder
-    private func selectableFacetY<Content: View, Value: Plottable>(
-        _ content: Content,
-        as _: Value.Type,
-        onSelect: @escaping (Value) -> Void
-    ) -> some View {
-        if interaction == .explore {
-            content.chartOverlay { proxy in
-                GeometryReader { geometry in
-                    Rectangle()
-                        .fill(.clear)
-                        .contentShape(Rectangle())
-                        .simultaneousGesture(
-                            DragGesture(minimumDistance: 0).onEnded { value in
-                                guard abs(value.translation.width) < 8,
-                                    abs(value.translation.height) < 8,
-                                    let plotFrame = proxy.plotFrame
-                                else { return }
-                                let frame = geometry[plotFrame]
-                                let yPosition = value.location.y - frame.origin.y
-                                guard yPosition >= 0, yPosition <= frame.height,
-                                    let selected: Value = proxy.value(atY: yPosition)
-                                else { return }
+                                let selected: Value? =
+                                    switch axis {
+                                    case .x: proxy.value(atX: location.x)
+                                    case .y: proxy.value(atY: location.y)
+                                    }
+                                guard let selected else { return }
                                 onSelect(selected)
                             })
                 }

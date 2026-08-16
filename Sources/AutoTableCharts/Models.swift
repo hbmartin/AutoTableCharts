@@ -47,7 +47,8 @@ public enum AutoChartValue: Hashable, Codable, Sendable {
     case boolean(Bool)
     /// A signed integer value that can participate in quantitative encodings.
     case integer(Int64)
-    /// A finite floating-point value.
+    /// A floating-point value. Non-finite values are retained as typed input but
+    /// omitted from marks.
     case double(Double)
     /// A base-10 decimal value, useful when the source requires decimal semantics.
     case decimal(Decimal)
@@ -329,6 +330,8 @@ public protocol AutoChartTable: Sendable {
     /// Change this value whenever columns, rows, values, or metadata change. The
     /// default is `nil`. Supplying only a version, without a table identity, keeps
     /// content-derived invalidation behavior so distinct tables cannot collide.
+    /// Version-only conformances from earlier package revisions still compile but
+    /// must add ``chartDataIdentity`` to regain scan-free cache lookup.
     var chartDataVersion: String? { get }
 }
 

@@ -61,9 +61,10 @@ a bar chart can serve comparison and ranking—but one requested goal matches at
 most one of those terms.
 
 This base-score plus task-bonus formula is the policy-v1 scoring model. The
-package's public policy version is now 5 because later identity, missing-value,
-aggregation-safety, candidate-bound, and facet-semantics hardening can also change
-recommendation output; version 5 retains the same transparent scoring formula.
+package's public policy version is now 6 because later identity, missing-value,
+aggregation-safety, candidate-bound, facet-semantics, non-finite-number, and
+signed-zero hardening can also change recommendation output; version 6 retains
+the same transparent scoring formula.
 
 Scores are meaningful only within the candidate set produced for the same
 snapshot, options, context, and policy version. They aren't probabilities,

@@ -9,8 +9,10 @@ struct AutoChartSnapshot: Sendable {
     var columns: [AutoChartColumn]
     var rows: [Row]
     var metadata: AutoChartTableMetadata
+    let validationIdentity: UUID
 
     init<Table: AutoChartTable>(_ table: Table) {
+        validationIdentity = UUID()
         var seenColumnIDs: Set<AutoChartColumnID> = []
         let columns = table.chartColumns.filter { column in
             seenColumnIDs.insert(column.id).inserted
@@ -51,6 +53,7 @@ struct AutoChartColumnProfile: Sendable {
     var column: AutoChartColumn
     var semanticType: AutoChartSemanticType
     var nonNullCount: Int
+    var numericTypeCount: Int
     var numericValueCount: Int
     var distinctCount: Int
     var nullFraction: Double
@@ -84,6 +87,14 @@ enum AutoChartProfiler {
             if case .null = $0 { return false }
             return true
         }
+        let numericTyped = nonNull.filter { value in
+            switch value {
+            case .integer, .double, .decimal:
+                true
+            default:
+                false
+            }
+        }
         let numeric = nonNull.compactMap(\.numericValue)
         let dates = nonNull.compactMap(dateValue)
         let textLengths = nonNull.compactMap { value -> Int? in
@@ -94,6 +105,7 @@ enum AutoChartProfiler {
         let type = inferredSemanticType(
             column: column,
             values: nonNull,
+            numericTypeCount: numericTyped.count,
             numericCount: numeric.count,
             dateCount: dates.count,
             distinctCount: distinct.count)
@@ -101,6 +113,7 @@ enum AutoChartProfiler {
             column: column,
             semanticType: type,
             nonNullCount: nonNull.count,
+            numericTypeCount: numericTyped.count,
             numericValueCount: numeric.count,
             distinctCount: distinct.count,
             nullFraction: values.isEmpty
@@ -116,6 +129,7 @@ enum AutoChartProfiler {
     private static func inferredSemanticType(
         column: AutoChartColumn,
         values: [AutoChartValue],
+        numericTypeCount: Int,
         numericCount: Int,
         dateCount: Int,
         distinctCount: Int
@@ -134,8 +148,9 @@ enum AutoChartProfiler {
         if dateCount == values.count {
             return .temporal
         }
-        if numericCount == values.count {
-            if nameTokens.contains("year"), distinctCount <= 100,
+        if numericTypeCount == values.count {
+            if numericCount == values.count,
+                nameTokens.contains("year"), distinctCount <= 100,
                 values.allSatisfy({ value in
                     guard let number = value.numericValue, number.rounded() == number else {
                         return false
@@ -193,7 +208,9 @@ enum AutoChartProfiler {
         guard let value else { return .missing }
         if semanticType == .temporal {
             guard let date = dateValue(value) else { return .missing }
-            return .date(date.timeIntervalSinceReferenceDate.bitPattern)
+            let interval = date.timeIntervalSinceReferenceDate
+            let normalized = interval == 0 ? 0.0 : interval
+            return .date(normalized.bitPattern)
         }
         if semanticType == .quantitative {
             guard let number = value.numericValue else { return .missing }
@@ -209,7 +226,8 @@ enum AutoChartProfiler {
             return .integer(value)
         case .double(let value):
             guard value.isFinite else { return .missing }
-            return .double(value.bitPattern)
+            let normalized = value == 0 ? 0.0 : value
+            return .double(normalized.bitPattern)
         case .decimal(let value):
             let number = NSDecimalNumber(decimal: value)
             guard number.doubleValue.isFinite else { return .missing }
@@ -217,7 +235,9 @@ enum AutoChartProfiler {
         case .text(let value):
             return .text(value)
         case .date(let value):
-            return .date(value.timeIntervalSinceReferenceDate.bitPattern)
+            let interval = value.timeIntervalSinceReferenceDate
+            let normalized = interval == 0 ? 0.0 : interval
+            return .date(normalized.bitPattern)
         }
     }
 
