@@ -798,11 +798,11 @@ private struct AutoChartRenderPresentation {
     }
 }
 
-private struct AutoChartRenderCore {
+struct AutoChartRenderCore {
     var snapshot: AutoChartSnapshot
     var data: [AutoChartDatum]
     var validation: AutoChartValidationResult
-    var presentation: AutoChartRenderPresentation
+    fileprivate var presentation: AutoChartRenderPresentation
     var fingerprint: Int
 }
 
@@ -813,7 +813,7 @@ private struct AutoChartRenderCacheKey: Hashable {
     var recommendation: AutoChartRecommendation
 }
 
-private final class AutoChartRenderPreparationCache: @unchecked Sendable {
+final class AutoChartRenderPreparationCache: @unchecked Sendable {
     static let shared = AutoChartRenderPreparationCache()
 
     private let lock = NSLock()

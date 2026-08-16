@@ -218,11 +218,14 @@ private let date = AutoChartColumn(
             score: 0,
             rationale: ["Test"])
 
-        _ = AutoChartView(table: input(value: 1), recommendation: recommendation)
-        counter.reset()
-        _ = AutoChartView(table: input(value: 2), recommendation: recommendation)
+        let first = AutoChartRenderPreparationCache.shared.core(
+            table: input(value: 1), recommendation: recommendation)
+        let second = AutoChartRenderPreparationCache.shared.core(
+            table: input(value: 2), recommendation: recommendation)
 
-        #expect(counter.count > 0)
+        #expect(first.data.first?.yNumber == 1)
+        #expect(second.data.first?.yNumber == 2)
+        #expect(first.data.first?.yNumber != second.data.first?.yNumber)
     }
     #endif
 
