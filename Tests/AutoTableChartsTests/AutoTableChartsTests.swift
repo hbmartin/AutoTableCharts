@@ -340,6 +340,18 @@ private let date = AutoChartColumn(
         #expect(first.contentFingerprint != AutoChartSnapshot(changedRow).contentFingerprint)
     }
 
+    @Test func snapshotContentComparisonHandlesNonFiniteValues() {
+        let first = AutoChartSnapshot(
+            table(columns: [measure], rows: [[.double(.nan)], [.double(.infinity)]]))
+        let identical = AutoChartSnapshot(
+            table(columns: [measure], rows: [[.double(.nan)], [.double(.infinity)]]))
+        let changed = AutoChartSnapshot(
+            table(columns: [measure], rows: [[.double(.nan)], [.double(-.infinity)]]))
+
+        #expect(first.hasSameContent(as: identical))
+        #expect(!first.hasSameContent(as: changed))
+    }
+
     @Test func dateDisplayAndAccessibilityUseGMTLocalizedFormatting() throws {
         let value = try Date("2026-01-01T00:00:00Z", strategy: .iso8601)
         let expectedDate = value.formatted(
@@ -624,6 +636,23 @@ private let date = AutoChartColumn(
         let profile = AutoChartProfiler.profiles(snapshot)[0]
         #expect(profile.nonNullCount == 1)
         #expect(profile.nullFraction == 0.5)
+    }
+
+    @Test func nonFiniteValuesDoNotInflateChartableDistinctCounts() {
+        let nominalNumber = AutoChartColumn(
+            id: "nominal-number", name: "nominal_number",
+            hints: AutoChartColumnHints(semanticType: .nominal))
+        let snapshot = AutoChartSnapshot(
+            table(
+                columns: [nominalNumber],
+                rows: [
+                    [.double(.nan)], [.double(.nan)], [.double(.infinity)],
+                    [.decimal(.nan)], [.integer(1)],
+                ]))
+        let profile = AutoChartProfiler.profiles(snapshot)[0]
+
+        #expect(profile.distinctCount == 1)
+        #expect(profile.renderableValueCount == 1)
     }
 
     @Test func humanizedNamesReuseCamelCaseTokens() {
@@ -1727,7 +1756,148 @@ private let date = AutoChartColumn(
 
         #expect(validation.isValid)
         #expect(!validation.issues.contains { $0.message.contains("non-numeric") })
+        #expect(
+            validation.issues.contains {
+                $0.severity == .warning
+                    && $0.message
+                        == "Quantitative field quantitative contains non-finite values that will be omitted."
+            })
         #expect(prepared.map(\.xLabel) == ["A", "C"])
+    }
+
+    @Test func compositionRejectsNonFiniteMeasuresInsteadOfRenderingAPartialWhole() {
+        let series = AutoChartColumn(
+            id: "series", name: "series",
+            hints: AutoChartColumnHints(semanticType: .nominal))
+        let input = table(
+            columns: [category, series, measure],
+            rows: [
+                [.text("A"), .text("One"), .double(1)],
+                [.text("B"), .text("Two"), .double(.nan)],
+            ])
+        let specifications = [
+            AutoChartSpecification(
+                family: .donut,
+                encoding: .init(x: category.id, y: measure.id),
+                aggregation: .sum),
+            AutoChartSpecification(
+                family: .stackedBar,
+                encoding: .init(x: category.id, y: measure.id, series: series.id),
+                stacking: .standard),
+            AutoChartSpecification(
+                family: .normalizedBar,
+                encoding: .init(x: category.id, y: measure.id, series: series.id),
+                stacking: .normalized),
+        ]
+
+        for specification in specifications {
+            let validation = AutoChartEngine.validate(specification: specification, for: input)
+            #expect(!validation.isValid)
+            #expect(
+                validation.issues.contains {
+                    $0.severity == .error
+                        && $0.message == "Quantitative field measure contains non-finite values."
+                })
+            #expect(
+                validation.issues.contains {
+                    $0.message == "Composition measures must not contain missing values."
+                })
+        }
+    }
+
+    @Test func explicitNominalBinaryValuesFailCompletenessValidation() {
+        let binaryCategory = AutoChartColumn(
+            id: "binary-category", name: "binary_category",
+            hints: AutoChartColumnHints(semanticType: .nominal))
+        let input = table(
+            columns: [binaryCategory, category],
+            rows: [
+                [.binary(Data([1])), .text("A")],
+                [.text("Renderable"), .text("B")],
+            ])
+        let heatmap = AutoChartSpecification(
+            family: .heatmap,
+            encoding: .init(x: binaryCategory.id, y: category.id),
+            aggregation: .count)
+        let validation = AutoChartEngine.validate(specification: heatmap, for: input)
+
+        #expect(!validation.isValid)
+        #expect(
+            validation.issues.contains {
+                $0.message == "Heatmap x categories must not contain missing values."
+            })
+    }
+
+    @Test func nonFiniteNominalValuesAreNotPreparedAsMarks() {
+        let nominalNumber = AutoChartColumn(
+            id: "nominal-number", name: "nominal_number",
+            hints: AutoChartColumnHints(semanticType: .nominal))
+        let input = table(
+            columns: [nominalNumber, measure],
+            rows: [
+                [.double(.nan), .double(1)],
+                [.double(.nan), .double(2)],
+                [.integer(1), .double(3)],
+            ])
+        let specification = AutoChartSpecification(
+            family: .bar,
+            encoding: .init(x: nominalNumber.id, y: measure.id))
+        let prepared = AutoChartDataPreparation.data(
+            snapshot: AutoChartSnapshot(input),
+            specification: specification)
+
+        #expect(AutoChartEngine.validate(specification: specification, for: input).isValid)
+        #expect(prepared.count == 1)
+        #expect(prepared.first?.sourceRowIDs == ["r2"])
+        #expect(prepared.first?.xIdentity != nil)
+    }
+
+    @Test func valueSortsUseCanonicalIdentityAndSourceOrderForTies() {
+        let nominalNumber = AutoChartColumn(
+            id: "nominal-number", name: "nominal_number",
+            hints: AutoChartColumnHints(semanticType: .nominal))
+        let input = table(
+            columns: [nominalNumber, measure],
+            rows: [
+                [.double(2), .double(1)],
+                [.integer(2), .double(1)],
+                [.double(2), .double(1)],
+            ])
+        func prepared(_ sort: AutoChartSort) -> [AutoChartDatum] {
+            AutoChartDataPreparation.data(
+                snapshot: AutoChartSnapshot(input),
+                specification: AutoChartSpecification(
+                    family: .bar,
+                    encoding: .init(x: nominalNumber.id, y: measure.id),
+                    sort: sort))
+        }
+
+        #expect(prepared(.ascending).map(\.id) == ["row-0-r0", "row-2-r2", "row-1-r1"])
+        #expect(prepared(.descending).map(\.id) == ["row-0-r0", "row-2-r2", "row-1-r1"])
+    }
+
+    @Test func familySpecificChannelsAreRejectedWhenTheRendererWouldIgnoreThem() {
+        let input = table(
+            columns: [category, measure, date],
+            rows: [[.text("A"), .double(1), .text("2026-01-01")]])
+        let specification = AutoChartSpecification(
+            family: .bar,
+            encoding: .init(
+                x: category.id,
+                y: measure.id,
+                size: measure.id,
+                start: date.id,
+                end: date.id),
+            binCount: 5)
+        let messages = AutoChartEngine.validate(
+            specification: specification,
+            for: input
+        ).issues.map(\.message)
+
+        #expect(messages.contains("Bar does not support a size encoding."))
+        #expect(messages.contains("Bar does not support a start encoding."))
+        #expect(messages.contains("Bar does not support an end encoding."))
+        #expect(messages.contains("Bar does not support a histogram bin count."))
     }
 
     @Test func nonFiniteNumericStorageStillInfersQuantitativeSemantics() {
@@ -1816,10 +1986,7 @@ private let date = AutoChartColumn(
         func profiles(
             _ snapshot: AutoChartSnapshot
         ) -> [AutoChartColumnID: AutoChartColumnProfile] {
-            Dictionary(
-                uniqueKeysWithValues: AutoChartProfiler.profiles(snapshot).map {
-                    ($0.column.id, $0)
-                })
+            AutoChartProfiler.profileIndex(snapshot)
         }
 
         let first = AutoChartEngine.validate(

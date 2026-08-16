@@ -10,6 +10,8 @@ struct AutoChartSnapshot: Sendable {
     var rows: [Row]
     var metadata: AutoChartTableMetadata
     let validationIdentity: UUID
+    let contentFingerprint: Int
+    let estimatedStorageCost: Int
 
     init<Table: AutoChartTable>(_ table: Table) {
         validationIdentity = UUID()
@@ -19,14 +21,37 @@ struct AutoChartSnapshot: Sendable {
         }
         self.columns = columns
         metadata = table.chartMetadata
-        rows = table.chartRows.map { row in
-            Row(
-                id: row.chartRowID,
-                values: Dictionary(
-                    uniqueKeysWithValues: columns.map { column in
-                        (column.id, row.chartValue(for: column.id))
-                    }))
+        var hasher = Hasher()
+        hasher.combine(columns)
+        hasher.combine(metadata)
+        hasher.combine(table.chartRows.count)
+        var storageCost = 256
+        for column in columns {
+            Self.addStorageCost(256, to: &storageCost)
+            Self.addStorageCost(column.id.rawValue.utf8.count, to: &storageCost)
+            Self.addStorageCost(column.name.utf8.count, to: &storageCost)
+            Self.addStorageCost(column.displayName?.utf8.count ?? 0, to: &storageCost)
+            Self.addStorageCost(column.hints.grain?.utf8.count ?? 0, to: &storageCost)
+            Self.addStorageCost(Self.unitStringCost(column.hints.unit), to: &storageCost)
         }
+        rows = table.chartRows.map { row in
+            hasher.combine(row.chartRowID)
+            Self.addStorageCost(128, to: &storageCost)
+            Self.addStorageCost(row.chartRowID.rawValue.utf8.count, to: &storageCost)
+            let values = Dictionary(
+                uniqueKeysWithValues: columns.map { column in
+                    let value = row.chartValue(for: column.id)
+                    hasher.combine(value)
+                    Self.addStorageCost(96, to: &storageCost)
+                    Self.addStorageCost(Self.payloadCost(value), to: &storageCost)
+                    return (column.id, value)
+                })
+            return Row(
+                id: row.chartRowID,
+                values: values)
+        }
+        contentFingerprint = hasher.finalize()
+        estimatedStorageCost = storageCost
     }
 
     func column(_ id: AutoChartColumnID?) -> AutoChartColumn? {
@@ -34,18 +59,55 @@ struct AutoChartSnapshot: Sendable {
         return columns.first { $0.id == id }
     }
 
-    var contentFingerprint: Int {
-        var hasher = Hasher()
-        hasher.combine(columns)
-        hasher.combine(metadata)
-        hasher.combine(rows.count)
-        for row in rows {
-            hasher.combine(row.id)
-            for column in columns {
-                hasher.combine(row.values[column.id] ?? .null)
+    func hasSameContent(as other: AutoChartSnapshot) -> Bool {
+        guard columns == other.columns,
+            metadata == other.metadata,
+            rows.count == other.rows.count
+        else { return false }
+        return zip(rows, other.rows).allSatisfy { left, right in
+            guard left.id == right.id else { return false }
+            return columns.allSatisfy { column in
+                Self.valuesMatch(
+                    left.values[column.id] ?? .null,
+                    right.values[column.id] ?? .null)
             }
         }
-        return hasher.finalize()
+    }
+
+    private static func valuesMatch(_ left: AutoChartValue, _ right: AutoChartValue) -> Bool {
+        switch (left, right) {
+        case (.null, .null): true
+        case (.boolean(let left), .boolean(let right)): left == right
+        case (.integer(let left), .integer(let right)): left == right
+        case (.double(let left), .double(let right)): left.bitPattern == right.bitPattern
+        case (.decimal(let left), .decimal(let right)): left == right
+        case (.text(let left), .text(let right)): left == right
+        case (.date(let left), .date(let right)): left == right
+        case (.binary(let left), .binary(let right)): left == right
+        default: false
+        }
+    }
+
+    private static func addStorageCost(_ amount: Int, to cost: inout Int) {
+        guard cost != Int.max else { return }
+        let (result, overflow) = cost.addingReportingOverflow(amount)
+        cost = overflow ? Int.max : result
+    }
+
+    private static func payloadCost(_ value: AutoChartValue) -> Int {
+        switch value {
+        case .text(let value): value.utf8.count
+        case .binary(let value): value.count
+        default: 0
+        }
+    }
+
+    private static func unitStringCost(_ unit: AutoChartUnit?) -> Int {
+        switch unit {
+        case .currency(let code): code.utf8.count
+        case .duration(let unit), .area(let unit), .custom(let unit): unit.utf8.count
+        case .number, .percent, nil: 0
+        }
     }
 }
 
@@ -55,6 +117,7 @@ struct AutoChartColumnProfile: Sendable {
     var nonNullCount: Int
     var numericTypeCount: Int
     var numericValueCount: Int
+    var renderableValueCount: Int
     var distinctCount: Int
     var nullFraction: Double
     var numericMinimum: Double?
@@ -65,6 +128,7 @@ struct AutoChartColumnProfile: Sendable {
 
     var isQuantitative: Bool { semanticType == .quantitative }
     var isTemporal: Bool { semanticType == .temporal }
+    var hasNonFiniteNumericValues: Bool { numericValueCount != numericTypeCount }
     var isCategorical: Bool {
         semanticType == .nominal || semanticType == .ordinal
             || semanticType == .boolean
@@ -76,6 +140,20 @@ enum AutoChartProfiler {
         snapshot.columns.map { column in
             profile(column, rows: snapshot.rows)
         }
+    }
+
+    static func profileIndex(
+        _ profiles: [AutoChartColumnProfile]
+    ) -> [AutoChartColumnID: AutoChartColumnProfile] {
+        Dictionary(
+            profiles.map { ($0.column.id, $0) },
+            uniquingKeysWith: { first, _ in first })
+    }
+
+    static func profileIndex(
+        _ snapshot: AutoChartSnapshot
+    ) -> [AutoChartColumnID: AutoChartColumnProfile] {
+        profileIndex(profiles(snapshot))
     }
 
     static func profile(
@@ -101,7 +179,8 @@ enum AutoChartProfiler {
             if case .text(let text) = value { return text.count }
             return nil
         }
-        let distinct = Set(nonNull)
+        let distinct = Set(
+            nonNull.map { identity($0, semanticType: nil) }.filter { $0 != .missing })
         let type = inferredSemanticType(
             column: column,
             values: nonNull,
@@ -109,18 +188,24 @@ enum AutoChartProfiler {
             numericCount: numeric.count,
             dateCount: dates.count,
             distinctCount: distinct.count)
+        let renderableValueCount = values.reduce(into: 0) { count, value in
+            if identity(value, semanticType: type) != .missing { count += 1 }
+        }
         return AutoChartColumnProfile(
             column: column,
             semanticType: type,
             nonNullCount: nonNull.count,
             numericTypeCount: numericTyped.count,
             numericValueCount: numeric.count,
+            renderableValueCount: renderableValueCount,
             distinctCount: distinct.count,
             nullFraction: values.isEmpty
                 ? 0 : Double(values.count - nonNull.count) / Double(values.count),
             numericMinimum: numeric.min(),
             numericMaximum: numeric.max(),
-            allNumericValuesPositive: !numeric.isEmpty && numeric.allSatisfy { $0 > 0 },
+            allNumericValuesPositive: !numeric.isEmpty
+                && numeric.count == nonNull.count
+                && numeric.allSatisfy { $0 > 0 },
             averageTextLength: textLengths.isEmpty
                 ? 0 : Double(textLengths.reduce(0, +)) / Double(textLengths.count),
             temporalValues: dates)
