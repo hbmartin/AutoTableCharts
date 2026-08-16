@@ -399,16 +399,7 @@ public enum AutoChartEngine {
             candidates.append(faceted)
         }
 
-        var bestCandidateBySpecification: [AutoChartSpecification: AutoChartRecommendation] = [:]
-        for recommendation in candidates {
-            if let existing = bestCandidateBySpecification[recommendation.specification],
-                existing.score >= recommendation.score
-            {
-                continue
-            }
-            bestCandidateBySpecification[recommendation.specification] = recommendation
-        }
-        let unique = bestCandidateBySpecification.values.filter {
+        let unique = bestCandidatesByID(candidates).filter {
             cachedValidation($0.specification).isValid
         }
         let ranked = unique.sorted {
@@ -753,13 +744,15 @@ public enum AutoChartEngine {
                     message: "Quantitative field \(id.rawValue) contains non-numeric values."))
         }
         let requiresCompleteQuantitativeValues: Set<AutoChartFamily> = [
-            .kpi, .bubble, .donut, .stackedBar, .normalizedBar,
+            .kpi, .donut, .stackedBar, .normalizedBar,
         ]
         for id in referenced {
             guard let profile = profiles[id], profile.isQuantitative,
                 profile.hasNonFiniteNumericValues
             else { continue }
-            let isRequired = requiresCompleteQuantitativeValues.contains(specification.family)
+            let isRequired =
+                requiresCompleteQuantitativeValues.contains(specification.family)
+                || (specification.family == .bubble && id == specification.encoding.size)
             issues.append(
                 .init(
                     severity: isRequired ? .error : .warning,
@@ -1137,26 +1130,22 @@ public enum AutoChartEngine {
     }
 
     private static func familyPriority(_ family: AutoChartFamily) -> Int {
-        switch family {
-        case .table: 0
-        case .kpi: 1
-        case .bar: 2
-        case .rankedDot: 3
-        case .groupedBar: 4
-        case .stackedBar: 5
-        case .normalizedBar: 6
-        case .line: 7
-        case .pointLine: 8
-        case .area: 9
-        case .scatter: 10
-        case .bubble: 11
-        case .histogram: 12
-        case .boxPlot: 13
-        case .heatmap: 14
-        case .donut: 15
-        case .range: 16
-        case .faceted: 17
+        AutoChartFamily.allCases.firstIndex(of: family) ?? Int.max
+    }
+
+    static func bestCandidatesByID(
+        _ candidates: [AutoChartRecommendation]
+    ) -> [AutoChartRecommendation] {
+        var bestCandidateByID: [String: AutoChartRecommendation] = [:]
+        for recommendation in candidates {
+            if let existing = bestCandidateByID[recommendation.id],
+                existing.score >= recommendation.score
+            {
+                continue
+            }
+            bestCandidateByID[recommendation.id] = recommendation
         }
+        return Array(bestCandidateByID.values)
     }
 
     private static func diversify(

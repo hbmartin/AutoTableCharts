@@ -2,16 +2,14 @@ import Foundation
 
 struct AutoChartSnapshot: Sendable {
     struct Row: Sendable {
-        var id: AutoChartRowID
-        var values: [AutoChartColumnID: AutoChartValue]
+        let id: AutoChartRowID
+        let values: [AutoChartColumnID: AutoChartValue]
     }
 
-    var columns: [AutoChartColumn]
-    var rows: [Row]
-    var metadata: AutoChartTableMetadata
+    let columns: [AutoChartColumn]
+    let rows: [Row]
+    let metadata: AutoChartTableMetadata
     let validationIdentity: UUID
-    let contentFingerprint: Int
-    let estimatedStorageCost: Int
 
     init<Table: AutoChartTable>(_ table: Table) {
         validationIdentity = UUID()
@@ -21,10 +19,35 @@ struct AutoChartSnapshot: Sendable {
         }
         self.columns = columns
         metadata = table.chartMetadata
+        rows = table.chartRows.map { row in
+            let values = Dictionary(
+                uniqueKeysWithValues: columns.map { column in
+                    let value = row.chartValue(for: column.id)
+                    return (column.id, value)
+                })
+            return Row(
+                id: row.chartRowID,
+                values: values)
+        }
+    }
+
+    var contentFingerprint: Int {
         var hasher = Hasher()
         hasher.combine(columns)
         hasher.combine(metadata)
-        hasher.combine(table.chartRows.count)
+        hasher.combine(rows.count)
+        for row in rows {
+            hasher.combine(row.id)
+            for column in columns {
+                Self.combineContent(
+                    row.values[column.id] ?? .null,
+                    into: &hasher)
+            }
+        }
+        return hasher.finalize()
+    }
+
+    var estimatedStorageCost: Int {
         var storageCost = 256
         for column in columns {
             Self.addStorageCost(256, to: &storageCost)
@@ -34,24 +57,16 @@ struct AutoChartSnapshot: Sendable {
             Self.addStorageCost(column.hints.grain?.utf8.count ?? 0, to: &storageCost)
             Self.addStorageCost(Self.unitStringCost(column.hints.unit), to: &storageCost)
         }
-        rows = table.chartRows.map { row in
-            hasher.combine(row.chartRowID)
+        for row in rows {
             Self.addStorageCost(128, to: &storageCost)
-            Self.addStorageCost(row.chartRowID.rawValue.utf8.count, to: &storageCost)
-            let values = Dictionary(
-                uniqueKeysWithValues: columns.map { column in
-                    let value = row.chartValue(for: column.id)
-                    hasher.combine(value)
-                    Self.addStorageCost(96, to: &storageCost)
-                    Self.addStorageCost(Self.payloadCost(value), to: &storageCost)
-                    return (column.id, value)
-                })
-            return Row(
-                id: row.chartRowID,
-                values: values)
+            Self.addStorageCost(row.id.rawValue.utf8.count, to: &storageCost)
+            for column in columns {
+                let value = row.values[column.id] ?? .null
+                Self.addStorageCost(96, to: &storageCost)
+                Self.addStorageCost(Self.payloadCost(value), to: &storageCost)
+            }
         }
-        contentFingerprint = hasher.finalize()
-        estimatedStorageCost = storageCost
+        return storageCost
     }
 
     func column(_ id: AutoChartColumnID?) -> AutoChartColumn? {
@@ -85,6 +100,34 @@ struct AutoChartSnapshot: Sendable {
         case (.date(let left), .date(let right)): left == right
         case (.binary(let left), .binary(let right)): left == right
         default: false
+        }
+    }
+
+    private static func combineContent(_ value: AutoChartValue, into hasher: inout Hasher) {
+        switch value {
+        case .null:
+            hasher.combine(0 as UInt8)
+        case .boolean(let value):
+            hasher.combine(1 as UInt8)
+            hasher.combine(value)
+        case .integer(let value):
+            hasher.combine(2 as UInt8)
+            hasher.combine(value)
+        case .double(let value):
+            hasher.combine(3 as UInt8)
+            hasher.combine(value.bitPattern)
+        case .decimal(let value):
+            hasher.combine(4 as UInt8)
+            hasher.combine(value)
+        case .text(let value):
+            hasher.combine(5 as UInt8)
+            hasher.combine(value)
+        case .date(let value):
+            hasher.combine(6 as UInt8)
+            hasher.combine(value)
+        case .binary(let value):
+            hasher.combine(7 as UInt8)
+            hasher.combine(value)
         }
     }
 

@@ -198,6 +198,16 @@ private let date = AutoChartColumn(
         #expect(first.contentFingerprint != AutoChartSnapshot(changedRow).contentFingerprint)
     }
 
+    @Test func snapshotFingerprintDistinguishesSignedZero() {
+        let positiveZero = AutoChartSnapshot(
+            table(columns: [measure], rows: [[.double(0.0)]]))
+        let negativeZero = AutoChartSnapshot(
+            table(columns: [measure], rows: [[.double(-0.0)]]))
+
+        #expect(!positiveZero.hasSameContent(as: negativeZero))
+        #expect(positiveZero.contentFingerprint != negativeZero.contentFingerprint)
+    }
+
     @Test func snapshotContentComparisonHandlesNonFiniteValues() {
         let first = AutoChartSnapshot(
             table(columns: [measure], rows: [[.double(.nan)], [.double(.infinity)]]))
@@ -314,7 +324,7 @@ private let date = AutoChartColumn(
     }
 }
 
-@Suite struct RenderCacheTests {
+@Suite(.serialized) struct RenderCacheTests {
     @Test func configurationClampsNegativeLimits() {
         let configuration = AutoChartRenderCacheConfiguration(
             maximumTableEntries: -1,
@@ -384,6 +394,49 @@ private let date = AutoChartColumn(
         #expect(firstValue == 1)
         #expect(secondValue == 2)
         #expect(firstValue != secondValue)
+    }
+
+    @Test @MainActor func signedZeroContentCanReplaceAndReuseCachedRenderingData() throws {
+        let originalConfiguration = AutoChartRenderCache.configuration
+        defer {
+            AutoChartRenderCache.configure(originalConfiguration)
+            AutoChartRenderCache.removeAll()
+        }
+        AutoChartRenderCache.configure(.standard)
+        AutoChartRenderCache.removeAll()
+
+        let counter = ChartValueReadCounter()
+        func input(value: Double) -> VersionedCountingTable {
+            VersionedCountingTable(
+                chartColumns: [category, measure],
+                chartRows: [
+                    CountingRow(
+                        chartRowID: "r0",
+                        values: [category.id: .text("A"), measure.id: .double(value)],
+                        counter: counter)
+                ],
+                chartDataIdentity: nil,
+                chartDataVersion: nil)
+        }
+        let recommendation = AutoChartRecommendation(
+            specification: AutoChartSpecification(
+                family: .bar,
+                encoding: .init(x: category.id, y: measure.id)),
+            score: 0,
+            rationale: ["Signed-zero cache test"])
+
+        _ = AutoChartView(table: input(value: 0.0), recommendation: recommendation)
+        #expect(AutoChartRenderCache.retainedTableCount == 1)
+        let negative = AutoChartView(
+            table: input(value: -0.0), recommendation: recommendation)
+        let negativeValue = try #require(preparedData(in: negative)?.first?.yNumber)
+        #expect(negativeValue.bitPattern == (-0.0).bitPattern)
+        #expect(AutoChartRenderCache.retainedTableCount == 2)
+
+        counter.reset()
+        _ = AutoChartView(table: input(value: -0.0), recommendation: recommendation)
+        #expect(counter.count == 2)
+        #expect(AutoChartRenderCache.retainedTableCount == 2)
     }
 
     @Test @MainActor func recommendationsShareOneVersionedTableSnapshot() {
@@ -468,7 +521,7 @@ private let date = AutoChartColumn(
         #expect(counter.count > 0)
     }
 
-    @Test @MainActor func cacheCanBeConfiguredAndPurged() {
+    @Test @MainActor func cacheCanBeConfiguredAndMemoryPressurePurgesIt() {
         let originalConfiguration = AutoChartRenderCache.configuration
         defer {
             AutoChartRenderCache.configure(originalConfiguration)
@@ -501,7 +554,7 @@ private let date = AutoChartColumn(
         _ = AutoChartView(table: input, recommendation: recommendation)
         #expect(counter.count == 0)
 
-        AutoChartRenderCache.removeAll()
+        AutoChartRenderCache.handleMemoryPressure()
         counter.reset()
         _ = AutoChartView(table: input, recommendation: recommendation)
         #expect(counter.count > 0)
@@ -664,6 +717,29 @@ private let date = AutoChartColumn(
 }
 
 @Suite struct RecommendationTests {
+    @Test func candidateDeduplicationUsesStableSpecificationIDs() throws {
+        let first = AutoChartRecommendation(
+            specification: AutoChartSpecification(family: .bar, title: "First title"),
+            score: 10,
+            rationale: ["First"])
+        let higher = AutoChartRecommendation(
+            specification: AutoChartSpecification(family: .bar, title: "Higher title"),
+            score: 20,
+            rationale: ["Higher"])
+        let equal = AutoChartRecommendation(
+            specification: AutoChartSpecification(family: .bar, title: "Equal title"),
+            score: 10,
+            rationale: ["Equal"])
+
+        #expect(first.id == higher.id)
+        let highest = try #require(AutoChartEngine.bestCandidatesByID([first, higher]).first)
+        #expect(AutoChartEngine.bestCandidatesByID([first, higher]).count == 1)
+        #expect(highest.specification.title == "Higher title")
+
+        let stableTie = try #require(AutoChartEngine.bestCandidatesByID([first, equal]).first)
+        #expect(stableTie.specification.title == "First title")
+    }
+
     @Test func scalarUsesKPI() {
         let result = AutoChartEngine.recommendations(
             for: table(
@@ -1808,6 +1884,58 @@ private let date = AutoChartColumn(
                         == "Quantitative field quantitative contains non-finite values that will be omitted."
             })
         #expect(prepared.map(\.xLabel) == ["A", "C"])
+    }
+
+    @Test func bubbleOmitsNonFinitePositionsButRejectsNonFiniteSizes() {
+        func quantitative(_ id: String) -> AutoChartColumn {
+            AutoChartColumn(
+                id: AutoChartColumnID(rawValue: id),
+                name: id,
+                hints: AutoChartColumnHints(semanticType: .quantitative))
+        }
+        let x = quantitative("x")
+        let y = quantitative("y")
+        let size = quantitative("size")
+        let specification = AutoChartSpecification(
+            family: .bubble,
+            encoding: .init(x: x.id, y: y.id, size: size.id))
+        let positionsInput = table(
+            columns: [x, y, size],
+            rows: [
+                [.double(1), .double(2), .double(3)],
+                [.double(.nan), .double(4), .double(5)],
+                [.double(6), .double(.infinity), .double(7)],
+            ])
+        let positionValidation = AutoChartEngine.validate(
+            specification: specification,
+            for: positionsInput)
+        let prepared = AutoChartDataPreparation.data(
+            snapshot: AutoChartSnapshot(positionsInput),
+            specification: specification)
+
+        #expect(positionValidation.isValid)
+        #expect(
+            positionValidation.issues.filter { $0.severity == .warning }.map(\.message) == [
+                "Quantitative field x contains non-finite values that will be omitted.",
+                "Quantitative field y contains non-finite values that will be omitted.",
+            ])
+        #expect(prepared.count == 1)
+
+        let sizesInput = table(
+            columns: [x, y, size],
+            rows: [
+                [.double(1), .double(2), .double(3)],
+                [.double(4), .double(5), .double(.nan)],
+            ])
+        let sizeValidation = AutoChartEngine.validate(
+            specification: specification,
+            for: sizesInput)
+        #expect(!sizeValidation.isValid)
+        #expect(
+            sizeValidation.issues.contains {
+                $0.severity == .error
+                    && $0.message == "Quantitative field size contains non-finite values."
+            })
     }
 
     @Test func compositionRejectsNonFiniteMeasuresInsteadOfRenderingAPartialWhole() {

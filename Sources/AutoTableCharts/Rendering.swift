@@ -318,18 +318,11 @@ enum AutoChartDataPreparation {
                 specification.family != .kpi,
                 let x = encoding.x
             {
-                let isRenderable: Bool =
-                    switch profiles[x]?.semanticType {
-                    case .temporal:
-                        xValue.flatMap(AutoChartProfiler.dateValue) != nil
-                    case .quantitative:
-                        xValue?.numericValue != nil
-                    default:
-                        AutoChartProfiler.identity(
-                            xValue,
-                            semanticType: profiles[x]?.semanticType) != .missing
-                    }
-                guard isRenderable else { return nil }
+                guard
+                    AutoChartProfiler.identity(
+                        xValue,
+                        semanticType: profiles[x]?.semanticType) != .missing
+                else { return nil }
             }
             if specification.family != .table,
                 specification.family != .kpi,
@@ -947,6 +940,14 @@ public enum AutoChartRenderCache {
     public static func removeAll() {
         AutoChartRenderPreparationCache.shared.removeAll()
     }
+
+    static func handleMemoryPressure() {
+        AutoChartRenderPreparationCache.shared.removeAll()
+    }
+
+    static var retainedTableCount: Int {
+        AutoChartRenderPreparationCache.shared.tableEntryCount
+    }
 }
 
 private struct AutoChartRenderTableCacheKey: Hashable {
@@ -987,8 +988,8 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
             forName: UIApplication.didReceiveMemoryWarningNotification,
             object: nil,
             queue: nil
-        ) { [weak self] _ in
-            self?.removeAll()
+        ) { _ in
+            AutoChartRenderCache.handleMemoryPressure()
         }
         #endif
     }
@@ -1111,9 +1112,11 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
     ) -> AutoChartPreparedTable? {
         lock.lock()
         defer { lock.unlock() }
-        guard let value = tableEntries[key],
-            value.snapshot.hasSameContent(as: snapshot)
-        else { return nil }
+        guard let value = tableEntries[key] else { return nil }
+        guard value.snapshot.hasSameContent(as: snapshot) else {
+            removeTable(for: key)
+            return nil
+        }
         tableRecency.removeAll { $0 == key }
         tableRecency.append(key)
         return value
@@ -1126,7 +1129,7 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         guard let value = entries[key],
-            value.snapshot.hasSameContent(as: table.snapshot)
+            value.table === table
         else { return nil }
         recency.removeAll { $0 == key }
         recency.append(key)
@@ -1184,12 +1187,12 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
         for key: AutoChartRenderTableCacheKey
     ) -> AutoChartPreparedTable? {
         if let existing = tableEntries[key] {
-            guard existing.snapshot.hasSameContent(as: value.snapshot) else {
-                return nil
+            if existing.snapshot.hasSameContent(as: value.snapshot) {
+                tableRecency.removeAll { $0 == key }
+                tableRecency.append(key)
+                return existing
             }
-            tableRecency.removeAll { $0 == key }
-            tableRecency.append(key)
-            return existing
+            removeTable(for: key)
         }
         guard value.cacheConfigurationRevision == configurationRevision,
             let estimatedCost = value.estimatedCost,
@@ -1216,6 +1219,7 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
             entries.removeValue(forKey: renderKey)
             totalCost -= costs.removeValue(forKey: renderKey) ?? 0
         }
+        tableRecency.removeAll { $0 == key }
         recency.removeAll { $0.table == key }
     }
 
@@ -1323,6 +1327,12 @@ private extension AutoChartRenderPreparationCache {
         lock.lock()
         defer { lock.unlock() }
         return activeConfiguration
+    }
+
+    var tableEntryCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return tableEntries.count
     }
 
     func configure(_ configuration: AutoChartRenderCacheConfiguration) {
@@ -2107,7 +2117,7 @@ public struct AutoChartView: View {
                                     horizontalBarMark(
                                         for: datum,
                                         groupsSeries: specification.encoding.series != nil,
-                                        stacking: .unstacked)
+                                        stacking: .standard)
                                 }
                                 .chartXScale(domain: yDomain)
                                 .chartYScale(domain: sharedXCategoryDomain)
@@ -2119,7 +2129,7 @@ public struct AutoChartView: View {
                                     verticalBarMark(
                                         for: datum,
                                         groupsSeries: specification.encoding.series != nil,
-                                        stacking: .unstacked)
+                                        stacking: .standard)
                                 }
                                 .chartXScale(domain: sharedXCategoryDomain)
                                 .chartYScale(domain: yDomain)
