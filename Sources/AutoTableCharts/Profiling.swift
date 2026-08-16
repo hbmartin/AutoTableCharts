@@ -1,5 +1,14 @@
 import Foundation
 
+/// The canonical bits of a date's reference interval.
+///
+/// Signed zeros collapse so equal dates agree, and non-finite intervals keep
+/// their own pattern so hashing and equality can't disagree about them.
+private func dateBits(_ date: Date) -> UInt64 {
+    let interval = date.timeIntervalSinceReferenceDate
+    return (interval == 0 ? 0.0 : interval).bitPattern
+}
+
 struct AutoChartSnapshot: Sendable {
     struct Row: Sendable {
         let id: AutoChartRowID
@@ -60,8 +69,10 @@ struct AutoChartSnapshot: Sendable {
         for row in rows {
             Self.addStorageCost(128, to: &storageCost)
             Self.addStorageCost(row.id.rawValue.utf8.count, to: &storageCost)
-            for column in columns {
-                let value = row.values[column.id] ?? .null
+            // Rows always carry exactly one value per column and the total is
+            // order independent, so iterate storage directly rather than
+            // looking every cell up by column.
+            for value in row.values.values {
                 Self.addStorageCost(96, to: &storageCost)
                 Self.addStorageCost(Self.payloadCost(value), to: &storageCost)
             }
@@ -97,7 +108,7 @@ struct AutoChartSnapshot: Sendable {
         case (.double(let left), .double(let right)): left.bitPattern == right.bitPattern
         case (.decimal(let left), .decimal(let right)): left == right
         case (.text(let left), .text(let right)): left == right
-        case (.date(let left), .date(let right)): left == right
+        case (.date(let left), .date(let right)): dateBits(left) == dateBits(right)
         case (.binary(let left), .binary(let right)): left == right
         default: false
         }
@@ -124,7 +135,7 @@ struct AutoChartSnapshot: Sendable {
             hasher.combine(value)
         case .date(let value):
             hasher.combine(6 as UInt8)
-            hasher.combine(value)
+            hasher.combine(dateBits(value))
         case .binary(let value):
             hasher.combine(7 as UInt8)
             hasher.combine(value)
@@ -165,9 +176,11 @@ struct AutoChartColumnProfile: Sendable {
     var renderableDistinctCount: Int
     /// Unique raw typed values used while inferring the column's semantic type.
     var distinctCount: Int
-    var nullFraction: Double
     var numericMinimum: Double?
     var numericMaximum: Double?
+    /// Whether every value is a positive number, counting a missing or non-finite
+    /// value as disqualifying. Recommendation uses this to avoid proposing a
+    /// composition that could only ever render part of a whole.
     var allNumericValuesPositive: Bool
     var averageTextLength: Double
     var temporalValues: [Date]
@@ -175,6 +188,10 @@ struct AutoChartColumnProfile: Sendable {
     var isQuantitative: Bool { semanticType == .quantitative }
     var isTemporal: Bool { semanticType == .temporal }
     var hasNonFiniteNumericValues: Bool { numericValueCount != numericTypeCount }
+    /// Whether every renderable value is distinct, so marks keyed by this column
+    /// alone can't collide. Recommendation and validation share this rule so they
+    /// can't disagree about whether an aggregation is required.
+    var isUniqueAtRowGrain: Bool { renderableDistinctCount == renderableValueCount }
     var isCategorical: Bool {
         semanticType == .nominal || semanticType == .ordinal
             || semanticType == .boolean
@@ -225,28 +242,25 @@ enum AutoChartProfiler {
             if case .text(let text) = value { return text.count }
             return nil
         }
-        let distinct = Set(
-            nonNull.map { identity($0, semanticType: nil) }.filter { $0 != .missing })
+        let raw = identitySummary(values, semanticType: nil)
         let type = inferredSemanticType(
             column: column,
             values: nonNull,
             numericTypeCount: numericTyped.count,
             numericCount: numeric.count,
             dateCount: dates.count,
-            distinctCount: distinct.count)
-        let renderableIdentities = values.map { identity($0, semanticType: type) }
-            .filter { $0 != .missing }
+            distinctCount: raw.distinct.count)
+        let renderable =
+            resolvesToRawIdentity(type) ? raw : identitySummary(values, semanticType: type)
         return AutoChartColumnProfile(
             column: column,
             semanticType: type,
             nonNullCount: nonNull.count,
             numericTypeCount: numericTyped.count,
             numericValueCount: numeric.count,
-            renderableValueCount: renderableIdentities.count,
-            renderableDistinctCount: Set(renderableIdentities).count,
-            distinctCount: distinct.count,
-            nullFraction: values.isEmpty
-                ? 0 : Double(values.count - nonNull.count) / Double(values.count),
+            renderableValueCount: renderable.valueCount,
+            renderableDistinctCount: renderable.distinct.count,
+            distinctCount: raw.distinct.count,
             numericMinimum: numeric.min(),
             numericMaximum: numeric.max(),
             allNumericValuesPositive: !numeric.isEmpty
@@ -255,6 +269,35 @@ enum AutoChartProfiler {
             averageTextLength: textLengths.isEmpty
                 ? 0 : Double(textLengths.reduce(0, +)) / Double(textLengths.count),
             temporalValues: dates)
+    }
+
+    /// The renderable values of a column, counted and deduplicated in one pass.
+    private struct IdentitySummary {
+        var valueCount = 0
+        var distinct: Set<AutoChartValueIdentity> = []
+    }
+
+    private static func identitySummary(
+        _ values: [AutoChartValue],
+        semanticType: AutoChartSemanticType?
+    ) -> IdentitySummary {
+        var summary = IdentitySummary()
+        for value in values {
+            let identity = identity(value, semanticType: semanticType)
+            guard identity != .missing else { continue }
+            summary.valueCount += 1
+            summary.distinct.insert(identity)
+        }
+        return summary
+    }
+
+    /// Whether ``identity(_:semanticType:)`` ignores this semantic type, so the
+    /// identities gathered while inferring it can stand in for the renderable ones.
+    private static func resolvesToRawIdentity(_ type: AutoChartSemanticType) -> Bool {
+        switch type {
+        case .quantitative, .temporal, .ordinal, .boolean: false
+        case .nominal, .identifier, .unsupported: true
+        }
     }
 
     private static func inferredSemanticType(
@@ -337,16 +380,20 @@ enum AutoChartProfiler {
         semanticType: AutoChartSemanticType?
     ) -> AutoChartValueIdentity {
         guard let value else { return .missing }
-        if semanticType == .temporal {
+        switch semanticType {
+        case .temporal:
             guard let date = dateValue(value) else { return .missing }
-            let interval = date.timeIntervalSinceReferenceDate
-            let normalized = interval == 0 ? 0.0 : interval
-            return .date(normalized.bitPattern)
-        }
-        if semanticType == .quantitative {
+            return dateIdentity(date)
+        case .quantitative:
             guard let number = value.numericValue else { return .missing }
-            let normalized = number == 0 ? 0.0 : number
-            return .number(normalized.bitPattern)
+            return numberIdentity(number)
+        case .ordinal, .boolean:
+            // Numeric categories resolve equality the same way quantitative
+            // columns do, so values that measure the same can't split into
+            // duplicate marks that validation would then miss.
+            if let number = value.numericValue { return numberIdentity(number) }
+        case .nominal, .identifier, .unsupported, nil:
+            break
         }
         switch value {
         case .null, .binary:
@@ -366,10 +413,19 @@ enum AutoChartProfiler {
         case .text(let value):
             return .text(value)
         case .date(let value):
-            let interval = value.timeIntervalSinceReferenceDate
-            let normalized = interval == 0 ? 0.0 : interval
-            return .date(normalized.bitPattern)
+            return dateIdentity(value)
         }
+    }
+
+    /// The identity of a date, or `.missing` when its interval isn't finite and
+    /// so can't position a mark or bound an axis.
+    private static func dateIdentity(_ date: Date) -> AutoChartValueIdentity {
+        guard date.timeIntervalSinceReferenceDate.isFinite else { return .missing }
+        return .date(dateBits(date))
+    }
+
+    private static func numberIdentity(_ number: Double) -> AutoChartValueIdentity {
+        .number((number == 0 ? 0.0 : number).bitPattern)
     }
 
     static func identityString(

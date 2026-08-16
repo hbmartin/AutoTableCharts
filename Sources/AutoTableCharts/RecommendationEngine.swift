@@ -151,8 +151,7 @@ public enum AutoChartEngine {
             && dimension.distinctCount <= options.maximumCategories
         {
             for measure in quantitative {
-                let uniqueAtResultGrain =
-                    dimension.distinctCount == dimension.renderableValueCount
+                let uniqueAtResultGrain = dimension.isUniqueAtRowGrain
                 guard
                     let categoryAggregation = uniqueAtResultGrain
                         ? AutoChartAggregation.none
@@ -467,6 +466,15 @@ public enum AutoChartEngine {
             guard let id, let profile = profiles[id],
                 profile.renderableValueCount != snapshot.rows.count
             else {
+                return
+            }
+            // Present-but-non-finite numbers aren't missing; they get their own,
+            // more specific error below, so don't report the same cell twice.
+            if profile.isQuantitative,
+                profile.nonNullCount == snapshot.rows.count,
+                profile.numericTypeCount == profile.nonNullCount,
+                profile.hasNonFiniteNumericValues
+            {
                 return
             }
             issues.append(
@@ -838,10 +846,12 @@ public enum AutoChartEngine {
                         severity: .error,
                         message: "Composition requires an explicitly additive measure."))
             }
+            // Missing and non-finite measures are already reported above, so this
+            // error is reserved for a value that really is zero or negative.
             if specification.aggregation != .count,
                 let y = specification.encoding.y,
                 let profile = profiles[y],
-                !profile.allNumericValuesPositive
+                (profile.numericMinimum ?? 0) <= 0
             {
                 issues.append(
                     .init(
@@ -1091,7 +1101,7 @@ public enum AutoChartEngine {
             let field = fields.first,
             droppingRowsMissing.contains(field),
             let profile = profiles[field],
-            profile.renderableDistinctCount == profile.renderableValueCount
+            profile.isUniqueAtRowGrain
         {
             return true
         }

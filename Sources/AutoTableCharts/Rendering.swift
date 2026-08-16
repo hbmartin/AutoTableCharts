@@ -311,8 +311,8 @@ enum AutoChartDataPreparation {
             let start = encoding.start.flatMap { row.values[$0] }
             let end = encoding.end.flatMap { row.values[$0] }
             if specification.family == .range {
-                guard start.flatMap(AutoChartProfiler.dateValue) != nil,
-                    end.flatMap(AutoChartProfiler.dateValue) != nil
+                guard AutoChartProfiler.identity(start, semanticType: .temporal) != .missing,
+                    AutoChartProfiler.identity(end, semanticType: .temporal) != .missing
                 else { return nil }
             } else if specification.family != .table,
                 specification.family != .kpi,
@@ -590,22 +590,32 @@ enum AutoChartDataPreparation {
                 let leftValue = lhs.element.yNumber ?? 0
                 let rightValue = rhs.element.yNumber ?? 0
                 if leftValue != rightValue { return leftValue < rightValue }
-                let leftIdentity = lhs.element.xIdentity ?? ""
-                let rightIdentity = rhs.element.xIdentity ?? ""
-                if leftIdentity != rightIdentity { return leftIdentity < rightIdentity }
-                return lhs.offset < rhs.offset
+                return breaksTie(lhs, rhs)
             }.map(\.element)
         case .descending:
             data.enumerated().sorted { lhs, rhs in
                 let leftValue = lhs.element.yNumber ?? 0
                 let rightValue = rhs.element.yNumber ?? 0
                 if leftValue != rightValue { return leftValue > rightValue }
-                let leftIdentity = lhs.element.xIdentity ?? ""
-                let rightIdentity = rhs.element.xIdentity ?? ""
-                if leftIdentity != rightIdentity { return leftIdentity < rightIdentity }
-                return lhs.offset < rhs.offset
+                return breaksTie(lhs, rhs)
             }.map(\.element)
         }
+    }
+
+    /// Orders categories that measure the same by their visible label, falling
+    /// back to identity and then source order so the result stays deterministic
+    /// when two distinct categories share a label.
+    private static func breaksTie(
+        _ lhs: (offset: Int, element: AutoChartDatum),
+        _ rhs: (offset: Int, element: AutoChartDatum)
+    ) -> Bool {
+        let leftLabel = lhs.element.xLabel ?? ""
+        let rightLabel = rhs.element.xLabel ?? ""
+        if leftLabel != rightLabel { return leftLabel < rightLabel }
+        let leftIdentity = lhs.element.xIdentity ?? ""
+        let rightIdentity = rhs.element.xIdentity ?? ""
+        if leftIdentity != rightIdentity { return leftIdentity < rightIdentity }
+        return lhs.offset < rhs.offset
     }
 }
 
@@ -734,6 +744,9 @@ private struct AutoChartRenderPresentation {
             return (minimum - padding)...(maximum + padding)
         }
         func dateDomain(_ values: [Date]) -> ClosedRange<Date>? {
+            // A non-finite date can't bound an axis — it collapses the whole
+            // domain to NaN — so drop it the way the numeric domains drop theirs.
+            let values = values.filter { $0.timeIntervalSinceReferenceDate.isFinite }
             guard let minimum = values.min(), let maximum = values.max() else { return nil }
             if minimum == maximum {
                 let lower = minimum.addingTimeInterval(-43_200)
@@ -1187,6 +1200,14 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
         for key: AutoChartRenderTableCacheKey
     ) -> AutoChartPreparedTable? {
         if let existing = tableEntries[key] {
+            // Storing a render entry re-caches the table it was prepared from, so
+            // the common case is the entry we already hold. Comparing it against
+            // itself would scan every cell for no possible difference.
+            if existing === value {
+                tableRecency.removeAll { $0 == key }
+                tableRecency.append(key)
+                return existing
+            }
             if existing.snapshot.hasSameContent(as: value.snapshot) {
                 tableRecency.removeAll { $0 == key }
                 tableRecency.append(key)
@@ -1228,8 +1249,9 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
         profiles: [AutoChartColumnID: AutoChartColumnProfile],
         limit: Int
     ) -> Int? {
-        guard snapshot.estimatedStorageCost <= limit else { return nil }
-        var cost = snapshot.estimatedStorageCost
+        let storageCost = snapshot.estimatedStorageCost
+        guard storageCost <= limit else { return nil }
+        var cost = storageCost
         for profile in profiles.values {
             guard add(160, to: &cost, limit: limit),
                 add(
