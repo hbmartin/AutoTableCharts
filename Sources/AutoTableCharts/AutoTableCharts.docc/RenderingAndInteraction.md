@@ -24,10 +24,12 @@ uses compact typography and omits exploratory selection and zoom controls. Use
 ``AutoChartInteraction/explore`` for a chosen chart.
 
 `AutoChartView` caches snapshot profiling, validation, and mark preparation. By
-default it fingerprints table content before looking up the cache. Implement
-``AutoChartTable/chartDataVersion`` with a stable version, revision, or content
-identifier to skip that repeated table scan during SwiftUI view reconstruction.
-Change the version whenever columns, rows, values, or metadata change.
+default it fingerprints table content before looking up the cache. Implement both
+``AutoChartTable/chartDataIdentity`` and ``AutoChartTable/chartDataVersion`` to
+skip that repeated table scan during SwiftUI view reconstruction. Keep the identity
+stable and distinct for each logical table, and change the version whenever columns,
+rows, values, or metadata change. A version without an identity deliberately falls
+back to content fingerprinting so two tables of the same Swift type cannot collide.
 
 ### Link selections to source rows
 

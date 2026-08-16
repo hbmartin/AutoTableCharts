@@ -51,6 +51,7 @@ struct AutoChartColumnProfile: Sendable {
     var column: AutoChartColumn
     var semanticType: AutoChartSemanticType
     var nonNullCount: Int
+    var numericValueCount: Int
     var distinctCount: Int
     var nullFraction: Double
     var numericMinimum: Double?
@@ -100,6 +101,7 @@ enum AutoChartProfiler {
             column: column,
             semanticType: type,
             nonNullCount: nonNull.count,
+            numericValueCount: numeric.count,
             distinctCount: distinct.count,
             nullFraction: values.isEmpty
                 ? 0 : Double(values.count - nonNull.count) / Double(values.count),
@@ -184,39 +186,46 @@ enum AutoChartProfiler {
         return Int(component)
     }
 
+    static func identity(
+        _ value: AutoChartValue?,
+        semanticType: AutoChartSemanticType?
+    ) -> AutoChartValueIdentity {
+        guard let value else { return .missing }
+        if semanticType == .temporal {
+            guard let date = dateValue(value) else { return .missing }
+            return .date(date.timeIntervalSinceReferenceDate.bitPattern)
+        }
+        if semanticType == .quantitative {
+            guard let number = value.numericValue else { return .missing }
+            let normalized = number == 0 ? 0.0 : number
+            return .number(normalized.bitPattern)
+        }
+        switch value {
+        case .null, .binary:
+            return .missing
+        case .boolean(let value):
+            return .boolean(value)
+        case .integer(let value):
+            return .integer(value)
+        case .double(let value):
+            guard value.isFinite else { return .missing }
+            return .double(value.bitPattern)
+        case .decimal(let value):
+            let number = NSDecimalNumber(decimal: value)
+            guard number.doubleValue.isFinite else { return .missing }
+            return .decimal(number.stringValue)
+        case .text(let value):
+            return .text(value)
+        case .date(let value):
+            return .date(value.timeIntervalSinceReferenceDate.bitPattern)
+        }
+    }
+
     static func identityString(
         _ value: AutoChartValue?,
         semanticType: AutoChartSemanticType?
     ) -> String? {
-        guard let value else { return nil }
-        if semanticType == .temporal {
-            guard let date = dateValue(value) else { return nil }
-            return "date:\(date.timeIntervalSinceReferenceDate.bitPattern)"
-        }
-        if semanticType == .quantitative {
-            guard let number = value.numericValue else { return nil }
-            let normalized = number == 0 ? 0.0 : number
-            return "number:\(normalized.bitPattern)"
-        }
-        switch value {
-        case .null, .binary:
-            return nil
-        case .boolean(let value):
-            return value ? "boolean:1" : "boolean:0"
-        case .integer(let value):
-            return "integer:\(value)"
-        case .double(let value):
-            guard value.isFinite else { return nil }
-            return "double:\(value.bitPattern)"
-        case .decimal(let value):
-            let number = NSDecimalNumber(decimal: value)
-            guard number.doubleValue.isFinite else { return nil }
-            return "decimal:\(number.stringValue)"
-        case .text(let value):
-            return "text:\(value.utf8.count):\(value)"
-        case .date(let value):
-            return "date:\(value.timeIntervalSinceReferenceDate.bitPattern)"
-        }
+        identity(value, semanticType: semanticType).stringValue
     }
 
     private static func nameTokens(_ name: String) -> [String] {
@@ -263,6 +272,38 @@ enum AutoChartProfiler {
             return override
         }
         return humanized(column.name)
+    }
+}
+
+enum AutoChartValueIdentity: Hashable, Sendable {
+    case missing
+    case boolean(Bool)
+    case integer(Int64)
+    case number(UInt64)
+    case double(UInt64)
+    case decimal(String)
+    case text(String)
+    case date(UInt64)
+
+    var stringValue: String? {
+        switch self {
+        case .missing:
+            nil
+        case .boolean(let value):
+            value ? "boolean:1" : "boolean:0"
+        case .integer(let value):
+            "integer:\(value)"
+        case .number(let value):
+            "number:\(value)"
+        case .double(let value):
+            "double:\(value)"
+        case .decimal(let value):
+            "decimal:\(value)"
+        case .text(let value):
+            "text:\(value.utf8.count):\(value)"
+        case .date(let value):
+            "date:\(value)"
+        }
     }
 }
 

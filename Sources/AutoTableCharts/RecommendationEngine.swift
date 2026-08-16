@@ -73,6 +73,20 @@ public enum AutoChartEngine {
                 $0.isCategorical && $0.column.hints.role != .identifier
                     && $0.distinctCount > 0
             }.prefix(options.maximumCandidateColumns))
+        let validationMemo = AutoChartValidationMemo()
+        var validationResults: [AutoChartSpecification: AutoChartValidationResult] = [:]
+        func cachedValidation(
+            _ specification: AutoChartSpecification
+        ) -> AutoChartValidationResult {
+            if let cached = validationResults[specification] { return cached }
+            let result = validate(
+                specification: specification,
+                snapshot: snapshot,
+                profiles: profileIndex,
+                memo: validationMemo)
+            validationResults[specification] = result
+            return result
+        }
         var candidates: [AutoChartRecommendation] = []
         let warnings =
             snapshot.metadata.isTruncated
@@ -193,7 +207,8 @@ public enum AutoChartEngine {
                         fields: [dimension.column.id, series.column.id],
                         measure: measure.column.id,
                         profiles: profileIndex,
-                        droppingRowsMissing: [dimension.column.id])
+                        droppingRowsMissing: [dimension.column.id],
+                        memo: validationMemo)
                     guard
                         let seriesAggregation = uniqueAtSeriesGrain
                             ? AutoChartAggregation.none
@@ -362,11 +377,7 @@ public enum AutoChartEngine {
                     && recommendation.specification.encoding.x != facet.column.id
                     && recommendation.specification.encoding.y != facet.column.id
                     && recommendation.specification.encoding.series != facet.column.id
-                    && validate(
-                        specification: recommendation.specification,
-                        snapshot: snapshot,
-                        profiles: profileIndex
-                    ).isValid
+                    && cachedValidation(recommendation.specification).isValid
             }
             guard let base else { continue }
             facetProfile = facet
@@ -384,13 +395,7 @@ public enum AutoChartEngine {
             candidates.append(faceted)
         }
 
-        let valid = candidates.filter {
-            validate(
-                specification: $0.specification,
-                snapshot: snapshot,
-                profiles: profileIndex
-            ).isValid
-        }
+        let valid = candidates.filter { cachedValidation($0.specification).isValid }
         let unique = Dictionary(grouping: valid, by: \.id)
             .compactMap { $0.value.max { $0.score < $1.score } }
         let ranked = unique.sorted {
@@ -426,7 +431,8 @@ public enum AutoChartEngine {
     static func validate(
         specification: AutoChartSpecification,
         snapshot: AutoChartSnapshot,
-        profiles: [AutoChartColumnID: AutoChartColumnProfile]
+        profiles: [AutoChartColumnID: AutoChartColumnProfile],
+        memo: AutoChartValidationMemo? = nil
     ) -> AutoChartValidationResult {
         var issues: [AutoChartValidationIssue] = []
         let referenced = [
@@ -689,6 +695,15 @@ public enum AutoChartEngine {
                     severity: .error,
                     message: "Temporal field \(id.rawValue) contains unparseable values."))
         }
+        for id in Set(referenced) {
+            guard let profile = profiles[id], profile.isQuantitative,
+                profile.numericValueCount != profile.nonNullCount
+            else { continue }
+            issues.append(
+                .init(
+                    severity: .error,
+                    message: "Quantitative field \(id.rawValue) contains non-numeric values."))
+        }
         let expectedAggregation: AutoChartAggregation? =
             switch specification.family {
             case .histogram, .heatmap:
@@ -823,7 +838,8 @@ public enum AutoChartEngine {
                 fields: markFields.compactMap { $0 },
                 measure: y,
                 profiles: profiles,
-                droppingRowsMissing: Set([specification.encoding.x].compactMap { $0 }))
+                droppingRowsMissing: Set([specification.encoding.x].compactMap { $0 }),
+                memo: memo)
         {
             issues.append(
                 .init(
@@ -953,31 +969,40 @@ public enum AutoChartEngine {
         return nil
     }
 
-    private enum CombinationValue: Hashable {
-        case missing
-        case number(UInt64)
-        case date(UInt64)
-        case value(AutoChartValue)
+    private struct AutoChartCombinationRequest: Hashable {
+        var fields: [AutoChartColumnID]
+        var measure: AutoChartColumnID
+        var droppingRowsMissing: Set<AutoChartColumnID>
     }
 
-    private static func combinationValue(
-        _ value: AutoChartValue?,
-        semanticType: AutoChartSemanticType?
-    ) -> CombinationValue {
-        guard let value else { return .missing }
-        if semanticType == .temporal {
-            guard let date = AutoChartProfiler.dateValue(value) else { return .missing }
-            return .date(date.timeIntervalSinceReferenceDate.bitPattern)
+    final class AutoChartValidationMemo {
+        private var uniqueCombinations: [AutoChartCombinationRequest: Bool] = [:]
+
+        func uniqueCombination(
+            fields: [AutoChartColumnID],
+            measure: AutoChartColumnID,
+            droppingRowsMissing: Set<AutoChartColumnID>
+        ) -> Bool? {
+            uniqueCombinations[
+                AutoChartCombinationRequest(
+                    fields: fields,
+                    measure: measure,
+                    droppingRowsMissing: droppingRowsMissing)
+            ]
         }
-        if semanticType == .quantitative {
-            guard let number = value.numericValue else { return .missing }
-            return .number((number == 0 ? 0.0 : number).bitPattern)
-        }
-        switch value {
-        case .null, .binary:
-            return .missing
-        default:
-            return .value(value)
+
+        func storeUniqueCombination(
+            _ value: Bool,
+            fields: [AutoChartColumnID],
+            measure: AutoChartColumnID,
+            droppingRowsMissing: Set<AutoChartColumnID>
+        ) {
+            uniqueCombinations[
+                AutoChartCombinationRequest(
+                    fields: fields,
+                    measure: measure,
+                    droppingRowsMissing: droppingRowsMissing)
+            ] = value
         }
     }
 
@@ -986,23 +1011,40 @@ public enum AutoChartEngine {
         fields: [AutoChartColumnID],
         measure: AutoChartColumnID,
         profiles: [AutoChartColumnID: AutoChartColumnProfile],
-        droppingRowsMissing: Set<AutoChartColumnID> = []
+        droppingRowsMissing: Set<AutoChartColumnID> = [],
+        memo: AutoChartValidationMemo? = nil
     ) -> Bool {
         guard !fields.isEmpty else { return false }
-        var seen: Set<[CombinationValue]> = []
+        if let cached = memo?.uniqueCombination(
+            fields: fields,
+            measure: measure,
+            droppingRowsMissing: droppingRowsMissing)
+        {
+            return cached
+        }
+        var seen: Set<[AutoChartValueIdentity]> = []
+        var isUnique = true
         for row in snapshot.rows {
             guard row.values[measure]?.numericValue != nil else { continue }
             let values = fields.map { field in
-                combinationValue(
+                AutoChartProfiler.identity(
                     row.values[field], semanticType: profiles[field]?.semanticType)
             }
             let dropsRow = zip(fields, values).contains { field, value in
                 droppingRowsMissing.contains(field) && value == .missing
             }
             if dropsRow { continue }
-            if !seen.insert(values).inserted { return false }
+            if !seen.insert(values).inserted {
+                isUnique = false
+                break
+            }
         }
-        return true
+        memo?.storeUniqueCombination(
+            isUnique,
+            fields: fields,
+            measure: measure,
+            droppingRowsMissing: droppingRowsMissing)
+        return isUnique
     }
 
     private static func familyPriority(_ family: AutoChartFamily) -> Int {

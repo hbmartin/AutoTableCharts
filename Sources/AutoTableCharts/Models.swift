@@ -315,15 +315,25 @@ public protocol AutoChartTable: Sendable {
     var chartRows: ChartRows { get }
     /// Result-level completeness, grain, and provenance metadata.
     var chartMetadata: AutoChartTableMetadata { get }
-    /// A caller-managed identifier for the exact table contents, used to reuse
-    /// prepared rendering data across SwiftUI view reconstruction.
+    /// A caller-managed identifier for this logical table or result.
+    ///
+    /// Keep this value stable while the same logical table is updated, and make it
+    /// distinct from other tables of the same Swift type. When both this value and
+    /// ``chartDataVersion`` are non-`nil`, the renderer can reuse prepared data
+    /// without first reading every cell. The default is `nil`.
+    var chartDataIdentity: String? { get }
+    /// A caller-managed revision for the exact table contents, used with
+    /// ``chartDataIdentity`` to reuse prepared rendering data across SwiftUI view
+    /// reconstruction.
     ///
     /// Change this value whenever columns, rows, values, or metadata change. The
-    /// default is `nil`, which keeps content-derived invalidation behavior.
+    /// default is `nil`. Supplying only a version, without a table identity, keeps
+    /// content-derived invalidation behavior so distinct tables cannot collide.
     var chartDataVersion: String? { get }
 }
 
 extension AutoChartTable {
+    public var chartDataIdentity: String? { nil }
     public var chartDataVersion: String? { nil }
 }
 

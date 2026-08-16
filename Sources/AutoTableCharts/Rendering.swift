@@ -28,17 +28,6 @@ struct AutoChartDatum: Identifiable, Sendable {
     var quartile3: Double?
     var upper: Double?
 
-    var accessibilityLabel: String {
-        let name =
-            xDate?.formatted(
-                Date.FormatStyle(
-                    date: .abbreviated,
-                    time: .shortened,
-                    timeZone: TimeZone.gmt)) ?? xLabel
-            ?? xNumber?.formatted() ?? yLabel ?? "Value"
-        return accessibilityLabel(name: name, series: series)
-    }
-
     var intervalAccessibilityDescription: String? {
         guard let startDate else { return nil }
         let style = Date.FormatStyle(
@@ -76,6 +65,46 @@ struct AutoChartDatum: Identifiable, Sendable {
             name: name,
             context: [series, facet],
             valueDescription: valueDescription)
+    }
+}
+
+enum AutoChartAccessibility {
+    static func markLabel(
+        for datum: AutoChartDatum,
+        family: AutoChartFamily,
+        xSemanticType: AutoChartSemanticType?,
+        xCategoryName: String,
+        seriesName: String? = nil,
+        facetDescription: String? = nil
+    ) -> String {
+        let name: String = {
+            switch family {
+            case .histogram:
+                return datum.xLabel ?? "Value"
+            case .bar, .groupedBar, .stackedBar, .normalizedBar, .rankedDot,
+                .boxPlot, .donut, .range:
+                return xCategoryName
+            default:
+                switch xSemanticType {
+                case .temporal:
+                    return datum.xDate?.formatted(
+                        Date.FormatStyle(
+                            date: .abbreviated,
+                            time: .shortened,
+                            timeZone: TimeZone.gmt)) ?? "Value"
+                case .quantitative:
+                    return datum.xNumber?.formatted() ?? "Value"
+                default:
+                    return xCategoryName
+                }
+            }
+        }()
+        return datum.accessibilityLabel(
+            name: name,
+            series: seriesName,
+            facet: facetDescription,
+            valueDescription: family == .range
+                ? datum.intervalAccessibilityDescription : nil)
     }
 }
 
@@ -616,16 +645,170 @@ func disambiguatedCategoryValue(
     return labels[identity] ?? label ?? identity
 }
 
+private struct AutoChartRenderPresentation {
+    var sizeBounds: (minimum: Double, maximum: Double)?
+    var sharedYDomain: ClosedRange<Double>?
+    var sharedXDateDomain: ClosedRange<Date>?
+    var sharedXNumberDomain: ClosedRange<Double>?
+    var sharedXCategoryDomain: [String]
+    var facetBaseFamily: AutoChartFamily?
+    var xTitle: String
+    var yTitle: String
+    var seriesTitle: String
+    var facetTitle: String
+    var xSemanticType: AutoChartSemanticType?
+    var xDisplayLabels: [String: String]
+    var yDisplayLabels: [String: String]
+    var seriesDisplayLabels: [String: String]
+    var facetDisplayLabels: [String: String]
+    var uniqueXCount: Int
+
+    init(
+        snapshot: AutoChartSnapshot,
+        specification: AutoChartSpecification,
+        profiles: [AutoChartColumnID: AutoChartColumnProfile],
+        data: [AutoChartDatum]
+    ) {
+        func categoryLabels(
+            identity: KeyPath<AutoChartDatum, String?>,
+            label: KeyPath<AutoChartDatum, String?>
+        ) -> [String: String] {
+            disambiguatedCategoryLabels(
+                data.compactMap { datum -> (identity: String, label: String)? in
+                    guard let identity = datum[keyPath: identity],
+                        let label = datum[keyPath: label]
+                    else { return nil }
+                    return (identity, label)
+                })
+        }
+        func numericDomain(
+            _ values: [Double],
+            includingZero: Bool
+        ) -> ClosedRange<Double>? {
+            guard let minimum = values.min(), let maximum = values.max() else { return nil }
+            let lower = includingZero ? min(0, minimum) : minimum
+            let upper = includingZero ? max(0, maximum) : maximum
+            if lower == upper {
+                let padding = max(1, abs(lower) * 0.05)
+                return (lower - padding)...(upper + padding)
+            }
+            if includingZero { return lower...upper }
+            let padding = max(abs(lower), abs(upper)) * 0.05
+            return (lower - padding)...(upper + padding)
+        }
+        func xNumberDomain(_ values: [Double]) -> ClosedRange<Double>? {
+            guard let minimum = values.min(), let maximum = values.max() else { return nil }
+            if minimum == maximum {
+                let padding = max(1, abs(minimum) * 0.05)
+                return (minimum - padding)...(maximum + padding)
+            }
+            let padding = (maximum - minimum) * 0.05
+            return (minimum - padding)...(maximum + padding)
+        }
+        func dateDomain(_ values: [Date]) -> ClosedRange<Date>? {
+            guard let minimum = values.min(), let maximum = values.max() else { return nil }
+            if minimum == maximum {
+                let lower = minimum.addingTimeInterval(-43_200)
+                let upper = maximum.addingTimeInterval(43_200)
+                return lower...upper
+            }
+            let padding = maximum.timeIntervalSince(minimum) * 0.05
+            let lower = minimum.addingTimeInterval(-padding)
+            let upper = maximum.addingTimeInterval(padding)
+            return lower...upper
+        }
+
+        let xSemanticType = specification.encoding.x.flatMap { profiles[$0]?.semanticType }
+        let xIsCategorical = specification.encoding.x.flatMap {
+            profiles[$0]?.isCategorical
+        } ?? false
+        let xUsesIdentityLabels =
+            xIsCategorical
+            || (specification.family == .boxPlot && specification.encoding.x == nil)
+        let xDisplayLabels = xUsesIdentityLabels
+            ? categoryLabels(identity: \.xIdentity, label: \.xLabel) : [:]
+        let yDisplayLabels = specification.family == .heatmap
+            ? categoryLabels(identity: \.yIdentity, label: \.yLabel) : [:]
+        let seriesDisplayLabels = specification.encoding.series != nil
+            ? categoryLabels(identity: \.seriesIdentity, label: \.series) : [:]
+        let facetDisplayLabels = specification.encoding.facet != nil
+            ? categoryLabels(identity: \.facetIdentity, label: \.facet) : [:]
+        let facetBaseFamily = AutoChartEngine.resolvedFacetBaseFamily(
+            specification: specification,
+            profiles: profiles)
+
+        if specification.family == .bubble {
+            let sizes = data.compactMap(\.size).filter(\.isFinite)
+            if let minimum = sizes.min(), let maximum = sizes.max() {
+                sizeBounds = (minimum, maximum)
+            } else {
+                sizeBounds = nil
+            }
+        } else {
+            sizeBounds = nil
+        }
+
+        if specification.family == .faceted {
+            sharedYDomain = numericDomain(
+                data.compactMap(\.yNumber).filter(\.isFinite),
+                includingZero: xIsCategorical)
+            sharedXDateDomain = xSemanticType == .temporal
+                ? dateDomain(data.compactMap(\.xDate)) : nil
+            sharedXNumberDomain = xSemanticType == .quantitative
+                ? xNumberDomain(data.compactMap(\.xNumber).filter(\.isFinite)) : nil
+        } else {
+            sharedYDomain = nil
+            sharedXDateDomain = nil
+            sharedXNumberDomain = nil
+        }
+
+        if specification.family == .faceted, xIsCategorical {
+            var seen: Set<String> = []
+            sharedXCategoryDomain = data.compactMap { datum in
+                let category = disambiguatedCategoryValue(
+                    identity: datum.xIdentity,
+                    label: datum.xLabel,
+                    labels: xDisplayLabels)
+                return seen.insert(category).inserted ? category : nil
+            }
+        } else {
+            sharedXCategoryDomain = []
+        }
+
+        self.facetBaseFamily = facetBaseFamily
+        self.xSemanticType = xSemanticType
+        self.xDisplayLabels = xDisplayLabels
+        self.yDisplayLabels = yDisplayLabels
+        self.seriesDisplayLabels = seriesDisplayLabels
+        self.facetDisplayLabels = facetDisplayLabels
+        uniqueXCount = Set(data.compactMap { $0.xIdentity ?? $0.xLabel }).count
+        xTitle = specification.encoding.x.flatMap { snapshot.column($0) }
+            .map(AutoChartProfiler.displayName) ?? "Category"
+        let usesStructuralCountTitle =
+            specification.aggregation == .count
+            && ![.histogram, .heatmap].contains(specification.family)
+        yTitle = usesStructuralCountTitle
+            ? "Count"
+            : specification.encoding.y.flatMap { snapshot.column($0) }
+                .map(AutoChartProfiler.displayName) ?? "Value"
+        seriesTitle = specification.encoding.series.flatMap { snapshot.column($0) }
+            .map(AutoChartProfiler.displayName) ?? "Series"
+        facetTitle = specification.encoding.facet.flatMap { snapshot.column($0) }
+            .map(AutoChartProfiler.displayName) ?? "Facet"
+    }
+}
+
 private struct AutoChartRenderCore {
     var snapshot: AutoChartSnapshot
-    var profiles: [AutoChartColumnID: AutoChartColumnProfile]
     var data: [AutoChartDatum]
     var validation: AutoChartValidationResult
+    var presentation: AutoChartRenderPresentation
     var fingerprint: Int
 }
 
 private struct AutoChartRenderCacheKey: Hashable {
     var tableType: String
+    var tableIdentity: String?
     var contentIdentity: String
     var recommendation: AutoChartRecommendation
 }
@@ -635,56 +818,80 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
 
     private let lock = NSLock()
     private var entries: [AutoChartRenderCacheKey: AutoChartRenderCore] = [:]
+    private var costs: [AutoChartRenderCacheKey: Int] = [:]
     private var recency: [AutoChartRenderCacheKey] = []
+    private var totalCost = 0
     private let capacity = 16
+    // Approximate snapshot cells plus prepared-datum storage, not a byte count.
+    private let costCapacity = 250_000
 
     func core<Table: AutoChartTable>(
         table: Table,
         recommendation: AutoChartRecommendation
     ) -> AutoChartRenderCore {
         let tableType = String(reflecting: Table.self)
-        if let version = table.chartDataVersion {
+        if let tableIdentity = table.chartDataIdentity,
+            let version = table.chartDataVersion
+        {
             let key = AutoChartRenderCacheKey(
                 tableType: tableType,
+                tableIdentity: tableIdentity,
                 contentIdentity: "version:\(version)",
                 recommendation: recommendation)
             if let cached = value(for: key) { return cached }
+            var hasher = Hasher()
+            hasher.combine(tableType)
+            hasher.combine(tableIdentity)
+            hasher.combine(version)
             return build(
                 snapshot: AutoChartSnapshot(table),
                 recommendation: recommendation,
+                fingerprint: hasher.finalize(),
                 key: key)
         }
 
         let snapshot = AutoChartSnapshot(table)
+        let fingerprint = snapshot.contentFingerprint
         let key = AutoChartRenderCacheKey(
             tableType: tableType,
-            contentIdentity: "fingerprint:\(snapshot.contentFingerprint)",
+            tableIdentity: nil,
+            contentIdentity: "fingerprint:\(fingerprint)",
             recommendation: recommendation)
         if let cached = value(for: key) { return cached }
-        return build(snapshot: snapshot, recommendation: recommendation, key: key)
+        return build(
+            snapshot: snapshot,
+            recommendation: recommendation,
+            fingerprint: fingerprint,
+            key: key)
     }
 
     private func build(
         snapshot: AutoChartSnapshot,
         recommendation: AutoChartRecommendation,
+        fingerprint: Int,
         key: AutoChartRenderCacheKey
     ) -> AutoChartRenderCore {
         let profiles = Dictionary(
             AutoChartProfiler.profiles(snapshot).map { ($0.column.id, $0) },
             uniquingKeysWith: { first, _ in first })
         let specification = recommendation.specification
+        let data = AutoChartDataPreparation.data(
+            snapshot: snapshot,
+            specification: specification,
+            profiles: profiles)
         let core = AutoChartRenderCore(
             snapshot: snapshot,
-            profiles: profiles,
-            data: AutoChartDataPreparation.data(
-                snapshot: snapshot,
-                specification: specification,
-                profiles: profiles),
+            data: data,
             validation: AutoChartEngine.validate(
                 specification: specification,
                 snapshot: snapshot,
                 profiles: profiles),
-            fingerprint: snapshot.contentFingerprint)
+            presentation: AutoChartRenderPresentation(
+                snapshot: snapshot,
+                specification: specification,
+                profiles: profiles,
+                data: data),
+            fingerprint: fingerprint)
         insert(core, for: key)
         return core
     }
@@ -699,14 +906,34 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
     }
 
     private func insert(_ value: AutoChartRenderCore, for key: AutoChartRenderCacheKey) {
+        let cost = estimatedCost(of: value)
+        guard cost <= costCapacity else { return }
         lock.lock()
         defer { lock.unlock() }
+        if let previousCost = costs[key] { totalCost -= previousCost }
         entries[key] = value
+        costs[key] = cost
+        totalCost += cost
         recency.removeAll { $0 == key }
         recency.append(key)
-        while recency.count > capacity {
-            entries.removeValue(forKey: recency.removeFirst())
+        while recency.count > capacity || totalCost > costCapacity {
+            let evicted = recency.removeFirst()
+            entries.removeValue(forKey: evicted)
+            totalCost -= costs.removeValue(forKey: evicted) ?? 0
         }
+    }
+
+    private func estimatedCost(of value: AutoChartRenderCore) -> Int {
+        var cost = value.snapshot.columns.count
+        for row in value.snapshot.rows {
+            if cost > costCapacity - row.values.count { return costCapacity + 1 }
+            cost += row.values.count
+        }
+        let datumCost = 8
+        guard value.data.count <= (costCapacity - cost) / datumCost else {
+            return costCapacity + 1
+        }
+        return cost + value.data.count * datumCost
     }
 }
 
@@ -771,130 +998,31 @@ public struct AutoChartView: View {
         let core = AutoChartRenderPreparationCache.shared.core(
             table: table,
             recommendation: recommendation)
-        let snapshot = core.snapshot
-        let profiles = core.profiles
-        let specification = recommendation.specification
-        let data = core.data
-        let sizes = data.compactMap(\.size).filter(\.isFinite)
-        let yValues = data.compactMap(\.yNumber).filter(\.isFinite)
-        let xDates = data.compactMap(\.xDate)
-        let xNumbers = data.compactMap(\.xNumber).filter(\.isFinite)
-        func categoryLabels(
-            identity: KeyPath<AutoChartDatum, String?>,
-            label: KeyPath<AutoChartDatum, String?>
-        ) -> [String: String] {
-            disambiguatedCategoryLabels(
-                data.compactMap { datum -> (identity: String, label: String)? in
-                    guard let identity = datum[keyPath: identity],
-                        let label = datum[keyPath: label]
-                    else { return nil }
-                    return (identity, label)
-                })
-        }
-        let xIsCategorical =
-            specification.encoding.x.flatMap {
-                profiles[$0]?.isCategorical
-            } ?? false
-        let xUsesIdentityLabels =
-            xIsCategorical
-            || (specification.family == .boxPlot && specification.encoding.x == nil)
-        let xDisplayLabels =
-            xUsesIdentityLabels
-            ? categoryLabels(identity: \.xIdentity, label: \.xLabel) : [:]
-        let yDisplayLabels =
-            specification.family == .heatmap
-            ? categoryLabels(identity: \.yIdentity, label: \.yLabel) : [:]
-        let seriesDisplayLabels =
-            specification.encoding.series != nil
-            ? categoryLabels(identity: \.seriesIdentity, label: \.series) : [:]
-        let facetDisplayLabels =
-            specification.encoding.facet != nil
-            ? categoryLabels(identity: \.facetIdentity, label: \.facet) : [:]
-        self.snapshot = snapshot
+        let presentation = core.presentation
+        self.snapshot = core.snapshot
         self.recommendation = recommendation
         validation = core.validation
-        self.data = data
-        if let minimum = sizes.min(), let maximum = sizes.max() {
-            sizeBounds = (minimum, maximum)
-        } else {
-            sizeBounds = nil
-        }
-        if let minimum = yValues.min(), let maximum = yValues.max() {
-            let lower = xIsCategorical ? min(0, minimum) : minimum
-            let upper = xIsCategorical ? max(0, maximum) : maximum
-            if lower == upper {
-                let padding = max(1, abs(lower) * 0.05)
-                sharedYDomain = (lower - padding)...(upper + padding)
-            } else if xIsCategorical {
-                sharedYDomain = lower...upper
-            } else {
-                let padding = max(abs(lower), abs(upper)) * 0.05
-                sharedYDomain = (lower - padding)...(upper + padding)
-            }
-        } else {
-            sharedYDomain = nil
-        }
-        if let minimum = xDates.min(), let maximum = xDates.max() {
-            if minimum == maximum {
-                sharedXDateDomain =
-                    (minimum.addingTimeInterval(-43_200))...(maximum.addingTimeInterval(43_200))
-            } else {
-                let padding = maximum.timeIntervalSince(minimum) * 0.05
-                let lower = minimum.addingTimeInterval(-padding)
-                let upper = maximum.addingTimeInterval(padding)
-                sharedXDateDomain = lower...upper
-            }
-        } else {
-            sharedXDateDomain = nil
-        }
-        if let minimum = xNumbers.min(), let maximum = xNumbers.max() {
-            if minimum == maximum {
-                let padding = max(1, abs(minimum) * 0.05)
-                sharedXNumberDomain = (minimum - padding)...(maximum + padding)
-            } else {
-                let padding = (maximum - minimum) * 0.05
-                sharedXNumberDomain = (minimum - padding)...(maximum + padding)
-            }
-        } else {
-            sharedXNumberDomain = nil
-        }
-        sharedXCategoryDomain = data.reduce(into: []) { domain, datum in
-            let category = disambiguatedCategoryValue(
-                identity: datum.xIdentity,
-                label: datum.xLabel,
-                labels: xDisplayLabels)
-            if !domain.contains(category) { domain.append(category) }
-        }
-        facetBaseFamily = AutoChartEngine.resolvedFacetBaseFamily(
-            specification: specification,
-            profiles: profiles)
+        data = core.data
+        sizeBounds = presentation.sizeBounds
+        sharedYDomain = presentation.sharedYDomain
+        sharedXDateDomain = presentation.sharedXDateDomain
+        sharedXNumberDomain = presentation.sharedXNumberDomain
+        sharedXCategoryDomain = presentation.sharedXCategoryDomain
+        facetBaseFamily = presentation.facetBaseFamily
         self._selection = selection
         self.interaction = interaction
         chartHeight = height
         snapshotFingerprint = core.fingerprint
-        xTitle =
-            specification.encoding.x.flatMap { snapshot.column($0) }
-            .map(AutoChartProfiler.displayName) ?? "Category"
-        let usesStructuralCountTitle =
-            specification.aggregation == .count
-            && ![.histogram, .heatmap].contains(specification.family)
-        yTitle =
-            usesStructuralCountTitle
-            ? "Count"
-            : specification.encoding.y.flatMap { snapshot.column($0) }
-                .map(AutoChartProfiler.displayName) ?? "Value"
-        seriesTitle =
-            specification.encoding.series.flatMap { snapshot.column($0) }
-            .map(AutoChartProfiler.displayName) ?? "Series"
-        facetTitle =
-            specification.encoding.facet.flatMap { snapshot.column($0) }
-            .map(AutoChartProfiler.displayName) ?? "Facet"
-        xSemanticType = specification.encoding.x.flatMap { profiles[$0]?.semanticType }
-        self.xDisplayLabels = xDisplayLabels
-        self.yDisplayLabels = yDisplayLabels
-        self.seriesDisplayLabels = seriesDisplayLabels
-        self.facetDisplayLabels = facetDisplayLabels
-        uniqueXCount = Set(data.compactMap { $0.xIdentity ?? $0.xLabel }).count
+        xTitle = presentation.xTitle
+        yTitle = presentation.yTitle
+        seriesTitle = presentation.seriesTitle
+        facetTitle = presentation.facetTitle
+        xSemanticType = presentation.xSemanticType
+        xDisplayLabels = presentation.xDisplayLabels
+        yDisplayLabels = presentation.yDisplayLabels
+        seriesDisplayLabels = presentation.seriesDisplayLabels
+        facetDisplayLabels = presentation.facetDisplayLabels
+        uniqueXCount = presentation.uniqueXCount
     }
 
     /// Creates a chart from a caller-provided specification.
@@ -1147,11 +1275,12 @@ public struct AutoChartView: View {
     @ViewBuilder
     private var lineChart: some View {
         if xSemanticType == .temporal {
+            let xValue: (AutoChartDatum) -> Date = { $0.xDate ?? .distantPast }
             let chart = Chart(data) { datum in
                 if specification.encoding.series != nil {
                     if specification.family == .area {
                         AreaMark(
-                            x: .value(xTitle, datum.xDate ?? .distantPast),
+                            x: .value(xTitle, xValue(datum)),
                             y: .value(yTitle, datum.yNumber ?? 0),
                             stacking: .unstacked
                         )
@@ -1162,7 +1291,7 @@ public struct AutoChartView: View {
                         .accessibilityLabel(markAccessibilityLabel(for: datum))
                     }
                     LineMark(
-                        x: .value(xTitle, datum.xDate ?? .distantPast),
+                        x: .value(xTitle, xValue(datum)),
                         y: .value(yTitle, datum.yNumber ?? 0),
                         series: .value(seriesTitle, seriesValue(for: datum))
                     )
@@ -1171,7 +1300,7 @@ public struct AutoChartView: View {
                     .accessibilityLabel(markAccessibilityLabel(for: datum))
                     if specification.family == .pointLine {
                         PointMark(
-                            x: .value(xTitle, datum.xDate ?? .distantPast),
+                            x: .value(xTitle, xValue(datum)),
                             y: .value(yTitle, datum.yNumber ?? 0)
                         )
                         .foregroundStyle(
@@ -1183,7 +1312,7 @@ public struct AutoChartView: View {
                 } else {
                     if specification.family == .area {
                         AreaMark(
-                            x: .value(xTitle, xCategoryValue(for: datum)),
+                            x: .value(xTitle, xValue(datum)),
                             y: .value(yTitle, datum.yNumber ?? 0),
                             stacking: .unstacked
                         )
@@ -1191,13 +1320,13 @@ public struct AutoChartView: View {
                         .accessibilityLabel(markAccessibilityLabel(for: datum))
                     }
                     LineMark(
-                        x: .value(xTitle, xCategoryValue(for: datum)),
+                        x: .value(xTitle, xValue(datum)),
                         y: .value(yTitle, datum.yNumber ?? 0)
                     )
                     .accessibilityLabel(markAccessibilityLabel(for: datum))
                     if specification.family == .pointLine {
                         PointMark(
-                            x: .value(xTitle, xCategoryValue(for: datum)),
+                            x: .value(xTitle, xValue(datum)),
                             y: .value(yTitle, datum.yNumber ?? 0)
                         )
                         .accessibilityLabel(markAccessibilityLabel(for: datum))
@@ -1209,11 +1338,12 @@ public struct AutoChartView: View {
             .environment(\.timeZone, .gmt)
             selectableDateX(timeZoom(chart))
         } else if xSemanticType == .quantitative {
+            let xValue: (AutoChartDatum) -> Double = { $0.xNumber ?? 0 }
             let chart = Chart(data) { datum in
                 if specification.encoding.series != nil {
                     if specification.family == .area {
                         AreaMark(
-                            x: .value(xTitle, datum.xNumber ?? 0),
+                            x: .value(xTitle, xValue(datum)),
                             y: .value(yTitle, datum.yNumber ?? 0),
                             stacking: .unstacked
                         )
@@ -1224,7 +1354,7 @@ public struct AutoChartView: View {
                         .accessibilityLabel(markAccessibilityLabel(for: datum))
                     }
                     LineMark(
-                        x: .value(xTitle, datum.xNumber ?? 0),
+                        x: .value(xTitle, xValue(datum)),
                         y: .value(yTitle, datum.yNumber ?? 0),
                         series: .value(seriesTitle, seriesValue(for: datum))
                     )
@@ -1233,7 +1363,7 @@ public struct AutoChartView: View {
                     .accessibilityLabel(markAccessibilityLabel(for: datum))
                     if specification.family == .pointLine {
                         PointMark(
-                            x: .value(xTitle, datum.xNumber ?? 0),
+                            x: .value(xTitle, xValue(datum)),
                             y: .value(yTitle, datum.yNumber ?? 0)
                         )
                         .foregroundStyle(
@@ -1245,7 +1375,7 @@ public struct AutoChartView: View {
                 } else {
                     if specification.family == .area {
                         AreaMark(
-                            x: .value(xTitle, datum.xNumber ?? 0),
+                            x: .value(xTitle, xValue(datum)),
                             y: .value(yTitle, datum.yNumber ?? 0),
                             stacking: .unstacked
                         )
@@ -1253,13 +1383,13 @@ public struct AutoChartView: View {
                         .accessibilityLabel(markAccessibilityLabel(for: datum))
                     }
                     LineMark(
-                        x: .value(xTitle, datum.xNumber ?? 0),
+                        x: .value(xTitle, xValue(datum)),
                         y: .value(yTitle, datum.yNumber ?? 0)
                     )
                     .accessibilityLabel(markAccessibilityLabel(for: datum))
                     if specification.family == .pointLine {
                         PointMark(
-                            x: .value(xTitle, datum.xNumber ?? 0),
+                            x: .value(xTitle, xValue(datum)),
                             y: .value(yTitle, datum.yNumber ?? 0)
                         )
                         .accessibilityLabel(markAccessibilityLabel(for: datum))
@@ -1270,11 +1400,12 @@ public struct AutoChartView: View {
             .chartYAxisLabel(yTitle)
             selectableNumberX(numberZoom(chart))
         } else {
+            let xValue: (AutoChartDatum) -> String = { xCategoryValue(for: $0) }
             let chart = Chart(data) { datum in
                 if specification.encoding.series != nil {
                     if specification.family == .area {
                         AreaMark(
-                            x: .value(xTitle, xCategoryValue(for: datum)),
+                            x: .value(xTitle, xValue(datum)),
                             y: .value(yTitle, datum.yNumber ?? 0),
                             stacking: .unstacked
                         )
@@ -1285,7 +1416,7 @@ public struct AutoChartView: View {
                         .accessibilityLabel(markAccessibilityLabel(for: datum))
                     }
                     LineMark(
-                        x: .value(xTitle, xCategoryValue(for: datum)),
+                        x: .value(xTitle, xValue(datum)),
                         y: .value(yTitle, datum.yNumber ?? 0),
                         series: .value(seriesTitle, seriesValue(for: datum))
                     )
@@ -1294,7 +1425,7 @@ public struct AutoChartView: View {
                     .accessibilityLabel(markAccessibilityLabel(for: datum))
                     if specification.family == .pointLine {
                         PointMark(
-                            x: .value(xTitle, xCategoryValue(for: datum)),
+                            x: .value(xTitle, xValue(datum)),
                             y: .value(yTitle, datum.yNumber ?? 0)
                         )
                         .foregroundStyle(
@@ -1306,7 +1437,7 @@ public struct AutoChartView: View {
                 } else {
                     if specification.family == .area {
                         AreaMark(
-                            x: .value(xTitle, datum.xDate ?? .distantPast),
+                            x: .value(xTitle, xValue(datum)),
                             y: .value(yTitle, datum.yNumber ?? 0),
                             stacking: .unstacked
                         )
@@ -1314,13 +1445,13 @@ public struct AutoChartView: View {
                         .accessibilityLabel(markAccessibilityLabel(for: datum))
                     }
                     LineMark(
-                        x: .value(xTitle, datum.xDate ?? .distantPast),
+                        x: .value(xTitle, xValue(datum)),
                         y: .value(yTitle, datum.yNumber ?? 0)
                     )
                     .accessibilityLabel(markAccessibilityLabel(for: datum))
                     if specification.family == .pointLine {
                         PointMark(
-                            x: .value(xTitle, datum.xDate ?? .distantPast),
+                            x: .value(xTitle, xValue(datum)),
                             y: .value(yTitle, datum.yNumber ?? 0)
                         )
                         .accessibilityLabel(markAccessibilityLabel(for: datum))
@@ -1336,10 +1467,11 @@ public struct AutoChartView: View {
     @ViewBuilder
     private var scatterChart: some View {
         if xSemanticType == .temporal {
+            let xValue: (AutoChartDatum) -> Date = { $0.xDate ?? .distantPast }
             let chart = Chart(data) { datum in
                 if specification.encoding.series != nil {
                     PointMark(
-                        x: .value(xTitle, datum.xDate ?? .distantPast),
+                        x: .value(xTitle, xValue(datum)),
                         y: .value(yTitle, datum.yNumber ?? 0)
                     )
                     .symbolSize(symbolSize(for: datum.size))
@@ -1348,7 +1480,7 @@ public struct AutoChartView: View {
                     .accessibilityLabel(markAccessibilityLabel(for: datum))
                 } else {
                     PointMark(
-                        x: .value(xTitle, datum.xNumber ?? 0),
+                        x: .value(xTitle, xValue(datum)),
                         y: .value(yTitle, datum.yNumber ?? 0)
                     )
                     .symbolSize(symbolSize(for: datum.size))
@@ -1360,10 +1492,11 @@ public struct AutoChartView: View {
             .environment(\.timeZone, .gmt)
             selectableDateX(timeZoom(chart))
         } else {
+            let xValue: (AutoChartDatum) -> Double = { $0.xNumber ?? 0 }
             let chart = Chart(data) { datum in
                 if specification.encoding.series != nil {
                     PointMark(
-                        x: .value(xTitle, datum.xNumber ?? 0),
+                        x: .value(xTitle, xValue(datum)),
                         y: .value(yTitle, datum.yNumber ?? 0)
                     )
                     .symbolSize(symbolSize(for: datum.size))
@@ -1372,7 +1505,7 @@ public struct AutoChartView: View {
                     .accessibilityLabel(markAccessibilityLabel(for: datum))
                 } else {
                     PointMark(
-                        x: .value(xTitle, datum.xDate ?? .distantPast),
+                        x: .value(xTitle, xValue(datum)),
                         y: .value(yTitle, datum.yNumber ?? 0)
                     )
                     .symbolSize(symbolSize(for: datum.size))
@@ -1708,34 +1841,66 @@ public struct AutoChartView: View {
                                 select(number: value, in: facetData)
                             }
                         } else {
-                            let chart = Chart(facetData) { datum in
-                                if specification.encoding.series != nil {
-                                    BarMark(
-                                        x: .value(xTitle, xCategoryValue(for: datum)),
-                                        y: .value(yTitle, datum.yNumber ?? 0),
-                                        stacking: .unstacked
-                                    )
-                                    .foregroundStyle(
-                                        by: .value(
-                                            seriesTitle, seriesValue(for: datum))
-                                    )
-                                    .position(
-                                        by: .value(
-                                            seriesTitle, seriesValue(for: datum))
-                                    )
-                                    .accessibilityLabel(markAccessibilityLabel(for: datum))
-                                } else {
-                                    BarMark(
-                                        x: .value(xTitle, xCategoryValue(for: datum)),
-                                        y: .value(yTitle, datum.yNumber ?? 0)
-                                    )
-                                    .accessibilityLabel(markAccessibilityLabel(for: datum))
+                            if specification.orientation == .horizontal {
+                                let chart = Chart(facetData) { datum in
+                                    if specification.encoding.series != nil {
+                                        BarMark(
+                                            x: .value(yTitle, datum.yNumber ?? 0),
+                                            y: .value(xTitle, xCategoryValue(for: datum)),
+                                            stacking: .unstacked
+                                        )
+                                        .foregroundStyle(
+                                            by: .value(
+                                                seriesTitle, seriesValue(for: datum))
+                                        )
+                                        .position(
+                                            by: .value(
+                                                seriesTitle, seriesValue(for: datum))
+                                        )
+                                        .accessibilityLabel(markAccessibilityLabel(for: datum))
+                                    } else {
+                                        BarMark(
+                                            x: .value(yTitle, datum.yNumber ?? 0),
+                                            y: .value(xTitle, xCategoryValue(for: datum))
+                                        )
+                                        .accessibilityLabel(markAccessibilityLabel(for: datum))
+                                    }
                                 }
-                            }
-                            .chartXScale(domain: sharedXCategoryDomain)
-                            .chartYScale(domain: yDomain)
-                            selectableFacetX(chart, as: String.self) { value in
-                                select(category: value, in: facetData)
+                                .chartXScale(domain: yDomain)
+                                .chartYScale(domain: sharedXCategoryDomain)
+                                selectableFacetY(chart, as: String.self) { value in
+                                    select(category: value, in: facetData)
+                                }
+                            } else {
+                                let chart = Chart(facetData) { datum in
+                                    if specification.encoding.series != nil {
+                                        BarMark(
+                                            x: .value(xTitle, xCategoryValue(for: datum)),
+                                            y: .value(yTitle, datum.yNumber ?? 0),
+                                            stacking: .unstacked
+                                        )
+                                        .foregroundStyle(
+                                            by: .value(
+                                                seriesTitle, seriesValue(for: datum))
+                                        )
+                                        .position(
+                                            by: .value(
+                                                seriesTitle, seriesValue(for: datum))
+                                        )
+                                        .accessibilityLabel(markAccessibilityLabel(for: datum))
+                                    } else {
+                                        BarMark(
+                                            x: .value(xTitle, xCategoryValue(for: datum)),
+                                            y: .value(yTitle, datum.yNumber ?? 0)
+                                        )
+                                        .accessibilityLabel(markAccessibilityLabel(for: datum))
+                                    }
+                                }
+                                .chartXScale(domain: sharedXCategoryDomain)
+                                .chartYScale(domain: yDomain)
+                                selectableFacetX(chart, as: String.self) { value in
+                                    select(category: value, in: facetData)
+                                }
                             }
                         }
                     }
@@ -1770,35 +1935,15 @@ public struct AutoChartView: View {
     }
 
     private func markAccessibilityLabel(for datum: AutoChartDatum) -> String {
-        let name: String = {
-            switch specification.family {
-            case .histogram:
-                return datum.xLabel ?? "Value"
-            case .bar, .groupedBar, .stackedBar, .normalizedBar, .rankedDot,
-                .boxPlot, .donut, .range:
-                return xCategoryValue(for: datum)
-            default:
-                switch xSemanticType {
-                case .temporal:
-                    return datum.xDate?.formatted(
-                        Date.FormatStyle(
-                            date: .abbreviated,
-                            time: .shortened,
-                            timeZone: TimeZone.gmt)) ?? "Value"
-                case .quantitative:
-                    return datum.xNumber?.formatted() ?? "Value"
-                default:
-                    return xCategoryValue(for: datum)
-                }
-            }
-        }()
-        return datum.accessibilityLabel(
-            name: name,
-            series: specification.encoding.series == nil ? nil : seriesValue(for: datum),
-            facet: specification.encoding.facet == nil
-                ? nil : "\(facetTitle): \(facetValue(for: datum))",
-            valueDescription: specification.family == .range
-                ? datum.intervalAccessibilityDescription : nil)
+        AutoChartAccessibility.markLabel(
+            for: datum,
+            family: specification.family,
+            xSemanticType: xSemanticType,
+            xCategoryName: xCategoryValue(for: datum),
+            seriesName: specification.encoding.series == nil
+                ? nil : seriesValue(for: datum),
+            facetDescription: specification.encoding.facet == nil
+                ? nil : "\(facetTitle): \(facetValue(for: datum))")
     }
 
     private func selectionLabel(
@@ -1945,6 +2090,38 @@ public struct AutoChartView: View {
                                 let xPosition = value.location.x - frame.origin.x
                                 guard xPosition >= 0, xPosition <= frame.width,
                                     let selected: Value = proxy.value(atX: xPosition)
+                                else { return }
+                                onSelect(selected)
+                            })
+                }
+            }
+        } else {
+            content
+        }
+    }
+
+    @ViewBuilder
+    private func selectableFacetY<Content: View, Value: Plottable>(
+        _ content: Content,
+        as _: Value.Type,
+        onSelect: @escaping (Value) -> Void
+    ) -> some View {
+        if interaction == .explore {
+            content.chartOverlay { proxy in
+                GeometryReader { geometry in
+                    Rectangle()
+                        .fill(.clear)
+                        .contentShape(Rectangle())
+                        .simultaneousGesture(
+                            DragGesture(minimumDistance: 0).onEnded { value in
+                                guard abs(value.translation.width) < 8,
+                                    abs(value.translation.height) < 8,
+                                    let plotFrame = proxy.plotFrame
+                                else { return }
+                                let frame = geometry[plotFrame]
+                                let yPosition = value.location.y - frame.origin.y
+                                guard yPosition >= 0, yPosition <= frame.height,
+                                    let selected: Value = proxy.value(atY: yPosition)
                                 else { return }
                                 onSelect(selected)
                             })
