@@ -12,6 +12,8 @@ public enum AutoChartEngine {
     /// Explicit column hints take precedence over inferred semantics. If no chart
     /// can represent the supplied rows without changing their meaning, the result
     /// contains a table fallback and a ``AutoChartRecommendationSet/fallbackReason``.
+    /// Profiling and candidate validation are synchronous; call this method away
+    /// from the main actor for large tables or unusually high candidate limits.
     ///
     /// - Parameters:
     ///   - table: The typed rows, columns, and completeness metadata to profile.
@@ -59,9 +61,7 @@ public enum AutoChartEngine {
         }
 
         let profiles = AutoChartProfiler.profiles(snapshot)
-        let profileIndex = Dictionary(
-            profiles.map { ($0.column.id, $0) },
-            uniquingKeysWith: { first, _ in first })
+        let profileIndex = AutoChartProfiler.profileIndex(profiles)
         let quantitative = Array(
             profiles.filter {
                 $0.isQuantitative && $0.column.hints.role != .identifier
@@ -151,7 +151,7 @@ public enum AutoChartEngine {
             && dimension.distinctCount <= options.maximumCategories
         {
             for measure in quantitative {
-                let uniqueAtResultGrain = dimension.distinctCount == dimension.nonNullCount
+                let uniqueAtResultGrain = dimension.isUniqueAtRowGrain
                 guard
                     let categoryAggregation = uniqueAtResultGrain
                         ? AutoChartAggregation.none
@@ -398,9 +398,9 @@ public enum AutoChartEngine {
             candidates.append(faceted)
         }
 
-        let valid = candidates.filter { cachedValidation($0.specification).isValid }
-        let unique = Dictionary(grouping: valid, by: \.id)
-            .compactMap { $0.value.max { $0.score < $1.score } }
+        let unique = bestCandidatesByID(candidates).filter {
+            cachedValidation($0.specification).isValid
+        }
         let ranked = unique.sorted {
             if $0.score != $1.score { return $0.score > $1.score }
             let lhs = familyPriority($0.specification.family)
@@ -422,9 +422,7 @@ public enum AutoChartEngine {
         specification: AutoChartSpecification,
         snapshot: AutoChartSnapshot
     ) -> AutoChartValidationResult {
-        let profiles = Dictionary(
-            AutoChartProfiler.profiles(snapshot).map { ($0.column.id, $0) },
-            uniquingKeysWith: { first, _ in first })
+        let profiles = AutoChartProfiler.profileIndex(snapshot)
         return validate(
             specification: specification,
             snapshot: snapshot,
@@ -465,7 +463,18 @@ public enum AutoChartEngine {
             }
         }
         func rejectMissing(_ id: AutoChartColumnID?, _ label: String) {
-            guard let id, let profile = profiles[id], profile.nullFraction > 0 else {
+            guard let id, let profile = profiles[id],
+                profile.renderableValueCount != snapshot.rows.count
+            else {
+                return
+            }
+            // Present-but-non-finite numbers aren't missing; they get their own,
+            // more specific error below, so don't report the same cell twice.
+            if profile.isQuantitative,
+                profile.nonNullCount == snapshot.rows.count,
+                profile.numericTypeCount == profile.nonNullCount,
+                profile.hasNonFiniteNumericValues
+            {
                 return
             }
             issues.append(
@@ -523,6 +532,7 @@ public enum AutoChartEngine {
             require(specification.encoding.y, .quantitative, "Measure")
             if specification.family == .bubble {
                 require(specification.encoding.size, .quantitative, "Size")
+                rejectMissing(specification.encoding.size, "Bubble sizes")
                 if let size = specification.encoding.size,
                     let minimum = profiles[size]?.numericMinimum,
                     minimum < 0
@@ -668,6 +678,40 @@ public enum AutoChartEngine {
                     ))
             }
         }
+        func rejectUnsupportedChannel(
+            _ isPresent: Bool,
+            name: String,
+            supportedFamilies: Set<AutoChartFamily>
+        ) {
+            guard isPresent, !supportedFamilies.contains(specification.family) else { return }
+            let article = name.first.map { "aeiou".contains($0) } == true ? "an" : "a"
+            issues.append(
+                .init(
+                    severity: .error,
+                    message:
+                        "\(specification.family.displayName) does not support \(article) \(name) encoding."
+                ))
+        }
+        rejectUnsupportedChannel(
+            specification.encoding.size != nil,
+            name: "size",
+            supportedFamilies: [.bubble])
+        rejectUnsupportedChannel(
+            specification.encoding.start != nil,
+            name: "start",
+            supportedFamilies: [.range])
+        rejectUnsupportedChannel(
+            specification.encoding.end != nil,
+            name: "end",
+            supportedFamilies: [.range])
+        if specification.binCount != nil, specification.family != .histogram {
+            issues.append(
+                .init(
+                    severity: .error,
+                    message:
+                        "\(specification.family.displayName) does not support a histogram bin count."
+                ))
+        }
         if specification.encoding.facet != nil, specification.family != .faceted {
             issues.append(
                 .init(
@@ -706,6 +750,24 @@ public enum AutoChartEngine {
                 .init(
                     severity: .error,
                     message: "Quantitative field \(id.rawValue) contains non-numeric values."))
+        }
+        let requiresCompleteQuantitativeValues: Set<AutoChartFamily> = [
+            .kpi, .donut, .stackedBar, .normalizedBar,
+        ]
+        for id in referenced {
+            guard let profile = profiles[id], profile.isQuantitative,
+                profile.hasNonFiniteNumericValues
+            else { continue }
+            let isRequired =
+                requiresCompleteQuantitativeValues.contains(specification.family)
+                || (specification.family == .bubble && id == specification.encoding.size)
+            issues.append(
+                .init(
+                    severity: isRequired ? .error : .warning,
+                    message: isRequired
+                        ? "Quantitative field \(id.rawValue) contains non-finite values."
+                        : "Quantitative field \(id.rawValue) contains non-finite values that will be omitted."
+                ))
         }
         let expectedAggregation: AutoChartAggregation? =
             switch specification.family {
@@ -784,10 +846,15 @@ public enum AutoChartEngine {
                         severity: .error,
                         message: "Composition requires an explicitly additive measure."))
             }
+            // Missing, non-numeric, and non-finite measures all shrink the
+            // renderable count and are reported above, so this error is reserved
+            // for a complete measure that really is zero or negative — including
+            // one with no values at all to compose.
             if specification.aggregation != .count,
                 let y = specification.encoding.y,
                 let profile = profiles[y],
-                !profile.allNumericValuesPositive
+                profile.renderableValueCount == snapshot.rows.count,
+                (profile.numericMinimum ?? 0) <= 0
             {
                 issues.append(
                     .init(
@@ -1033,6 +1100,14 @@ public enum AutoChartEngine {
         memo: AutoChartValidationMemo? = nil
     ) -> Bool {
         guard !fields.isEmpty else { return false }
+        if fields.count == 1,
+            let field = fields.first,
+            droppingRowsMissing.contains(field),
+            let profile = profiles[field],
+            profile.isUniqueAtRowGrain
+        {
+            return true
+        }
         if let cached = memo?.uniqueCombination(
             snapshotIdentity: snapshot.validationIdentity,
             fields: fields,
@@ -1069,6 +1144,21 @@ public enum AutoChartEngine {
 
     private static func familyPriority(_ family: AutoChartFamily) -> Int {
         AutoChartFamily.allCases.firstIndex(of: family) ?? Int.max
+    }
+
+    static func bestCandidatesByID(
+        _ candidates: [AutoChartRecommendation]
+    ) -> [AutoChartRecommendation] {
+        var bestCandidateByID: [String: AutoChartRecommendation] = [:]
+        for recommendation in candidates {
+            if let existing = bestCandidateByID[recommendation.id],
+                existing.score >= recommendation.score
+            {
+                continue
+            }
+            bestCandidateByID[recommendation.id] = recommendation
+        }
+        return Array(bestCandidateByID.values)
     }
 
     private static func diversify(

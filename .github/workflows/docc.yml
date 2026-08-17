@@ -23,6 +23,15 @@ jobs:
       - name: Run tests
         run: swift test
 
+      - name: Compile UIKit integration
+        run: |
+          xcodebuild \
+            -scheme AutoTableCharts \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath "$RUNNER_TEMP/autotablecharts-ios" \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
       - name: Generate static DocC archive
         env:
           DOCC_OUTPUT: ${{ runner.temp }}/autotablecharts-docc

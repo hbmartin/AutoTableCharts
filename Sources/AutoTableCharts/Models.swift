@@ -551,9 +551,11 @@ public enum AutoChartStacking: String, Codable, Sendable {
 public enum AutoChartSort: String, Codable, Sendable {
     /// Preserve the order in which data or grouped marks are prepared.
     case source
-    /// Sort by increasing quantitative value with labels as a stable tie-breaker.
+    /// Sort by increasing quantitative value, then category label, then canonical
+    /// category identity and source order.
     case ascending
-    /// Sort by decreasing quantitative value with labels as a stable tie-breaker.
+    /// Sort by decreasing quantitative value, then category label, then canonical
+    /// category identity and source order.
     case descending
 }
 
