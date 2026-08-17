@@ -1295,7 +1295,9 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
         _ value: AutoChartPreparedTable,
         for key: AutoChartRenderTableCacheKey
     ) -> AutoChartPreparedTable? {
-        while true {
+        let maximumAttempts = 3
+        var attempts = 0
+        while attempts < maximumAttempts {
             lock.lock()
             if let existing = tableEntries[key] {
                 // Storing a render entry commonly reuses the same prepared table.
@@ -1314,6 +1316,7 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
                     let current = tableEntries[key], current === existing
                 else {
                     lock.unlock()
+                    attempts += 1
                     continue
                 }
                 if matches {
@@ -1346,6 +1349,7 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
             lock.unlock()
             return result
         }
+        return nil
     }
 
     private func removeTable(for key: AutoChartRenderTableCacheKey) {
