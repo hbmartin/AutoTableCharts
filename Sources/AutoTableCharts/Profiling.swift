@@ -199,6 +199,8 @@ struct AutoChartColumnProfile: Sendable {
 }
 
 enum AutoChartProfiler {
+    private static let posixLocale = Locale(identifier: "en_US_POSIX")
+
     static func profiles(_ snapshot: AutoChartSnapshot) -> [AutoChartColumnProfile] {
         snapshot.columns.map { column in
             profile(column, rows: snapshot.rows)
@@ -344,7 +346,8 @@ enum AutoChartProfiler {
 
     static func dateValue(_ value: AutoChartValue) -> Date? {
         switch value {
-        case .date(let date): date
+        case .date(let date):
+            date.timeIntervalSinceReferenceDate.isFinite ? date : nil
         case .text(let text): parseISODate(text)
         default: nil
         }
@@ -388,10 +391,10 @@ enum AutoChartProfiler {
             guard let number = value.numericValue else { return .missing }
             return numberIdentity(number)
         case .ordinal, .boolean:
-            // Numeric categories resolve equality the same way quantitative
-            // columns do, so values that measure the same can't split into
-            // duplicate marks that validation would then miss.
-            if let number = value.numericValue { return numberIdentity(number) }
+            // Categorical numeric identities must remain exact. Passing an
+            // Int64 or Decimal through Double would merge distinct values once
+            // they exceed binary floating-point precision.
+            if let identity = exactNumberIdentity(value) { return identity }
         case .nominal, .identifier, .unsupported, nil:
             break
         }
@@ -426,6 +429,40 @@ enum AutoChartProfiler {
 
     private static func numberIdentity(_ number: Double) -> AutoChartValueIdentity {
         .number((number == 0 ? 0.0 : number).bitPattern)
+    }
+
+    /// A canonical, lossless identity for a numeric category.
+    ///
+    /// Finite Doubles use their shortest round-tripping decimal representation
+    /// when Foundation's Decimal can preserve it. Very large Doubles that Decimal
+    /// cannot represent retain their normalized bit pattern instead.
+    private static func exactNumberIdentity(
+        _ value: AutoChartValue
+    ) -> AutoChartValueIdentity? {
+        switch value {
+        case .integer(let value):
+            return .exactNumber(String(value))
+        case .double(let value):
+            guard value.isFinite else { return nil }
+            let normalized = value == 0 ? 0.0 : value
+            let text = String(normalized)
+            guard
+                let decimal = Decimal(
+                    string: text,
+                    locale: posixLocale),
+                !decimal.isNaN
+            else { return .double(normalized.bitPattern) }
+            let canonical = NSDecimalNumber(decimal: decimal).stringValue
+            guard Double(canonical) == normalized else {
+                return .double(normalized.bitPattern)
+            }
+            return .exactNumber(canonical)
+        case .decimal(let value):
+            guard !value.isNaN else { return nil }
+            return .exactNumber(NSDecimalNumber(decimal: value).stringValue)
+        default:
+            return nil
+        }
     }
 
     static func identityString(
@@ -487,6 +524,7 @@ enum AutoChartValueIdentity: Hashable, Sendable {
     case boolean(Bool)
     case integer(Int64)
     case number(UInt64)
+    case exactNumber(String)
     case double(UInt64)
     case decimal(String)
     case text(String)
@@ -502,6 +540,8 @@ enum AutoChartValueIdentity: Hashable, Sendable {
             "integer:\(value)"
         case .number(let value):
             "number:\(value)"
+        case .exactNumber(let value):
+            "exact-number:\(value.utf8.count):\(value)"
         case .double(let value):
             "double:\(value)"
         case .decimal(let value):
