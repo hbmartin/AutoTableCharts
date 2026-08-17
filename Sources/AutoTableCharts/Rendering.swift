@@ -310,19 +310,19 @@ enum AutoChartDataPreparation {
             let yValue = encoding.y.flatMap { row.values[$0] }
             let start = encoding.start.flatMap { row.values[$0] }
             let end = encoding.end.flatMap { row.values[$0] }
+            let xIdentity = encoding.x.flatMap { id in
+                AutoChartProfiler.identityString(
+                    xValue, semanticType: profiles[id]?.semanticType)
+            }
+            let startDate = start.flatMap(AutoChartProfiler.dateValue)
+            let endDate = end.flatMap(AutoChartProfiler.dateValue)
             if specification.family == .range {
-                guard AutoChartProfiler.identity(start, semanticType: .temporal) != .missing,
-                    AutoChartProfiler.identity(end, semanticType: .temporal) != .missing
-                else { return nil }
+                guard startDate != nil, endDate != nil else { return nil }
             } else if specification.family != .table,
                 specification.family != .kpi,
-                let x = encoding.x
+                encoding.x != nil
             {
-                guard
-                    AutoChartProfiler.identity(
-                        xValue,
-                        semanticType: profiles[x]?.semanticType) != .missing
-                else { return nil }
+                guard xIdentity != nil else { return nil }
             }
             if specification.family != .table,
                 specification.family != .kpi,
@@ -334,8 +334,7 @@ enum AutoChartDataPreparation {
             return AutoChartDatum(
                 id: "row-\(index)-\(row.id.rawValue)",
                 sourceRowIDs: [row.id],
-                xIdentity: AutoChartProfiler.identityString(
-                    xValue, semanticType: encoding.x.flatMap { profiles[$0]?.semanticType }),
+                xIdentity: xIdentity,
                 xLabel: xValue?.categoryString(),
                 xNumber: xValue?.numericValue,
                 xDate: xValue.flatMap(AutoChartProfiler.dateValue),
@@ -352,8 +351,8 @@ enum AutoChartDataPreparation {
                         row.values[id], semanticType: profiles[id]?.semanticType)
                 },
                 facet: encoding.facet.flatMap { row.values[$0]?.categoryString() },
-                startDate: start.flatMap(AutoChartProfiler.dateValue),
-                endDate: end.flatMap(AutoChartProfiler.dateValue))
+                startDate: startDate,
+                endDate: endDate)
         }
     }
 
@@ -731,7 +730,9 @@ private struct AutoChartRenderPresentation {
                 let padding = max(1, abs(lower) * 0.05)
                 return expandedFiniteRange(lower...upper, padding: padding)
             }
-            if includingZero { return lower...upper }
+            if includingZero {
+                return expandedFiniteRange(lower...upper, padding: 0)
+            }
             let padding = max(abs(lower), abs(upper)) * 0.05
             return expandedFiniteRange(lower...upper, padding: padding)
         }
@@ -783,7 +784,17 @@ private struct AutoChartRenderPresentation {
             let paddedUpper = range.upperBound + padding
             let lower = paddedLower.isFinite ? paddedLower : range.lowerBound
             let upper = paddedUpper.isFinite ? paddedUpper : range.upperBound
-            if lower < upper { return lower...upper }
+            if lower < upper {
+                if (upper - lower).isFinite { return lower...upper }
+                // Padding near a finite limit can make an otherwise usable span
+                // overflow. Prefer the unpadded range in that case.
+                if range.lowerBound < range.upperBound,
+                    (range.upperBound - range.lowerBound).isFinite
+                {
+                    return range
+                }
+                return nil
+            }
 
             // A zero or underflowed padding can leave a singleton. Move by one
             // representable value where possible without creating infinity.
@@ -791,7 +802,10 @@ private struct AutoChartRenderPresentation {
             let next = range.upperBound.nextUp
             let finiteLower = previous.isFinite ? previous : range.lowerBound
             let finiteUpper = next.isFinite ? next : range.upperBound
-            return finiteLower < finiteUpper ? finiteLower...finiteUpper : nil
+            guard finiteLower < finiteUpper,
+                (finiteUpper - finiteLower).isFinite
+            else { return nil }
+            return finiteLower...finiteUpper
         }
 
         let xSemanticType = specification.encoding.x.flatMap { profiles[$0]?.semanticType }
@@ -865,14 +879,7 @@ private struct AutoChartRenderPresentation {
         self.seriesDisplayLabels = seriesDisplayLabels
         self.facetDisplayLabels = facetDisplayLabels
         uniqueXCount = Set(data.compactMap { $0.xIdentity ?? $0.xLabel }).count
-        let needsTimeZoom =
-            specification.family == .range
-            || ([.line, .pointLine, .area, .scatter, .bubble].contains(
-                specification.family) && xSemanticType == .temporal)
-        let needsNumberZoom =
-            specification.family == .histogram
-            || ([.line, .pointLine, .area, .scatter, .bubble].contains(
-                specification.family) && xSemanticType == .quantitative)
+        let zoomSource = specification.family.zoomSource(for: xSemanticType)
         var minimumZoomDate: Date?
         var maximumZoomDate: Date?
         var zoomDateCount = 0
@@ -885,20 +892,22 @@ private struct AutoChartRenderPresentation {
             minimumZoomDate = min(minimumZoomDate ?? date, date)
             maximumZoomDate = max(maximumZoomDate ?? date, date)
         }
-        if needsTimeZoom || needsNumberZoom {
+        if zoomSource != .none {
             for datum in data {
-                if needsTimeZoom {
-                    if specification.family == .range {
-                        includeZoomDate(datum.startDate)
-                        includeZoomDate(datum.endDate)
-                    } else {
-                        includeZoomDate(datum.xDate)
+                switch zoomSource {
+                case .intervalDates:
+                    includeZoomDate(datum.startDate)
+                    includeZoomDate(datum.endDate)
+                case .temporalX:
+                    includeZoomDate(datum.xDate)
+                case .numericX:
+                    if let number = datum.xNumber, number.isFinite {
+                        zoomNumberCount += 1
+                        minimumZoomNumber = min(minimumZoomNumber ?? number, number)
+                        maximumZoomNumber = max(maximumZoomNumber ?? number, number)
                     }
-                }
-                if needsNumberZoom, let number = datum.xNumber, number.isFinite {
-                    zoomNumberCount += 1
-                    minimumZoomNumber = min(minimumZoomNumber ?? number, number)
-                    maximumZoomNumber = max(maximumZoomNumber ?? number, number)
+                case .none:
+                    break
                 }
             }
         }
@@ -935,6 +944,30 @@ private struct AutoChartRenderPresentation {
         facetTitle =
             specification.encoding.facet.flatMap { snapshot.column($0) }
             .map(AutoChartProfiler.displayName) ?? "Facet"
+    }
+}
+
+private enum AutoChartZoomSource: Equatable {
+    case none
+    case temporalX
+    case numericX
+    case intervalDates
+}
+
+private extension AutoChartFamily {
+    func zoomSource(for semanticType: AutoChartSemanticType?) -> AutoChartZoomSource {
+        switch self {
+        case .range:
+            return .intervalDates
+        case .histogram:
+            return .numericX
+        case .line, .pointLine, .area, .scatter, .bubble:
+            if semanticType == .temporal { return .temporalX }
+            if semanticType == .quantitative { return .numericX }
+            return .none
+        default:
+            return .none
+        }
     }
 }
 
@@ -1007,6 +1040,16 @@ public struct AutoChartRenderCacheConfiguration: Equatable, Sendable {
         self.maximumTableCost = max(0, maximumTableCost)
         self.maximumRenderEntries = max(0, maximumRenderEntries)
         self.maximumRenderCost = max(0, maximumRenderCost)
+    }
+}
+
+private extension AutoChartRenderCacheConfiguration {
+    var isTableCachingEnabled: Bool {
+        maximumTableEntries > 0 && maximumTableCost > 0
+    }
+
+    var isRenderCachingEnabled: Bool {
+        maximumRenderEntries > 0 && maximumRenderCost > 0
     }
 }
 
@@ -1144,15 +1187,12 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
     ) -> AutoChartRenderCore {
         let cacheConfiguration = configurationSnapshot()
         let profiles = AutoChartProfiler.profileIndex(snapshot)
-        let tableCachingEnabled =
-            cacheConfiguration.value.maximumTableEntries > 0
-            && cacheConfiguration.value.maximumTableCost > 0
         let prepared = AutoChartPreparedTable(
             snapshot: snapshot,
             profiles: profiles,
             fingerprint: fingerprint,
             estimatedCost:
-                tableCachingEnabled
+                cacheConfiguration.value.isTableCachingEnabled
                 ? estimatedTableCost(
                     snapshot: snapshot,
                     profiles: profiles,
@@ -1216,14 +1256,12 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
             lock.unlock()
             return nil
         }
-        let revision = configurationRevision
         lock.unlock()
 
         let matches = value.snapshot.hasSameContent(as: snapshot)
         lock.lock()
         defer { lock.unlock() }
-        guard revision == configurationRevision,
-            let current = tableEntries[key], current === value
+        guard let current = tableEntries[key], current === value
         else { return nil }
         guard matches else {
             removeTable(for: key)
@@ -1256,23 +1294,27 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
         specification: AutoChartSpecification
     ) {
         let cacheConfiguration = configurationSnapshot()
-        guard cacheConfiguration.value.maximumRenderEntries > 0,
-            cacheConfiguration.value.maximumRenderCost > 0
+        guard cacheConfiguration.value.isRenderCachingEnabled,
+            cacheConfiguration.value.isTableCachingEnabled,
+            let tableCost = value.table.estimatedCost,
+            tableCost <= cacheConfiguration.value.maximumTableCost
         else { return }
-        let cost = estimatedCost(
+        guard let cost = estimatedCost(
             data: value.data,
             presentation: value.presentation,
             validation: value.validation,
             specification: specification,
             limit: cacheConfiguration.value.maximumRenderCost)
-        guard let cachedTable = cacheTable(value.table, for: key.table),
+        else { return }
+        guard let cachedTable = cacheTable(
+            value.table,
+            for: key.table,
+            expectedConfigurationRevision: cacheConfiguration.revision),
             cachedTable === value.table
         else { return }
         lock.lock()
         defer { lock.unlock() }
-        guard cacheConfiguration.revision == configurationRevision,
-            let cost
-        else { return }
+        guard cacheConfiguration.revision == configurationRevision else { return }
         guard let currentTable = tableEntries[key.table],
             currentTable === value.table
         else { return }
@@ -1293,12 +1335,19 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
 
     private func cacheTable(
         _ value: AutoChartPreparedTable,
-        for key: AutoChartRenderTableCacheKey
+        for key: AutoChartRenderTableCacheKey,
+        expectedConfigurationRevision: UInt64? = nil
     ) -> AutoChartPreparedTable? {
         let maximumAttempts = 3
         var attempts = 0
         while attempts < maximumAttempts {
             lock.lock()
+            if let expectedConfigurationRevision,
+                expectedConfigurationRevision != configurationRevision
+            {
+                lock.unlock()
+                return nil
+            }
             if let existing = tableEntries[key] {
                 // Storing a render entry commonly reuses the same prepared table.
                 if existing === value {
@@ -1307,12 +1356,12 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
                     lock.unlock()
                     return existing
                 }
-                let revision = configurationRevision
                 lock.unlock()
 
                 let matches = existing.snapshot.hasSameContent(as: value.snapshot)
                 lock.lock()
-                guard revision == configurationRevision,
+                guard expectedConfigurationRevision == nil
+                        || expectedConfigurationRevision == configurationRevision,
                     let current = tableEntries[key], current === existing
                 else {
                     lock.unlock()
@@ -1327,8 +1376,7 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
                 }
                 removeTable(for: key)
             }
-            guard activeConfiguration.maximumTableEntries > 0,
-                activeConfiguration.maximumTableCost > 0,
+            guard activeConfiguration.isTableCachingEnabled,
                 value.cacheConfigurationRevision == configurationRevision,
                 let estimatedCost = value.estimatedCost,
                 estimatedCost <= activeConfiguration.maximumTableCost
@@ -1405,6 +1453,13 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
                 to: &cost,
                 limit: limit)
         else { return nil }
+        let presentationTitles = [
+            presentation.xTitle, presentation.yTitle,
+            presentation.seriesTitle, presentation.facetTitle,
+        ]
+        for title in presentationTitles {
+            guard add(title.utf8.count, to: &cost, limit: limit) else { return nil }
+        }
         let encodingIDs = [
             specification.encoding.x, specification.encoding.y,
             specification.encoding.series, specification.encoding.size,

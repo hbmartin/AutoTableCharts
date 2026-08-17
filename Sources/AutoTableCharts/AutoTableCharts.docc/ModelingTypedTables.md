@@ -31,7 +31,7 @@ Use the narrowest appropriate ``AutoChartValue`` case:
 | Floating point | ``AutoChartValue/double(_:)`` | Non-finite values aren't chartable |
 | Decimal | ``AutoChartValue/decimal(_:)`` | Converted for native chart positioning |
 | Text | ``AutoChartValue/text(_:)`` | Nominal by default; ISO dates can be temporal |
-| Date | ``AutoChartValue/date(_:)`` | Temporal |
+| Date | ``AutoChartValue/date(_:)`` | Temporal; non-finite intervals are omitted |
 | Binary | ``AutoChartValue/binary(_:)`` | Unsupported |
 
 Text is parsed as temporal only when every non-null value parses as ISO 8601 or
@@ -40,6 +40,16 @@ silently discards the non-date rows. Numeric columns are inferred as ordinal yea
 only when `year` is a complete name token, every value is an integer from 1000
 through 3000, and there are at most 100 distinct values. Identifier detection
 recognizes a final `id` token in snake case, spaced names, and camel case.
+
+Ordinal and Boolean numeric categories use exact identities across integer,
+floating-point, and decimal storage. Values merge only when their mathematical
+values are equal; a nearby decimal that merely rounds to the same `Double` remains
+a separate category.
+
+Typed date columns remain temporal when they contain a non-finite `Date` interval.
+Those values produce a validation warning and are omitted from marks, matching the
+row-level handling of non-finite floating-point values. Text that does not parse as
+a supported date remains a validation error for an explicitly temporal field.
 
 ### Override inference with hints
 

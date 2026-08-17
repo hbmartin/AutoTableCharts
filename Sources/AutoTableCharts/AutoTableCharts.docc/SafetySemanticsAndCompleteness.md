@@ -44,6 +44,11 @@ This is intentionally conservative. A price, percentage, median, inventory
 balance, or distinct count can be numeric and still be non-additive across a new
 dimension.
 
+Finite endpoints do not guarantee a renderable axis: subtracting two extreme
+finite numbers can still overflow. Validation rejects quantitative and temporal
+fields whose observed span is not finite, and domain padding falls back to the
+unmodified finite-span range when padding alone would overflow.
+
 ### Mark incomplete results
 
 Set ``AutoChartTableMetadata/isTruncated`` whenever the table is a page, preview,

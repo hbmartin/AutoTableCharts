@@ -452,6 +452,40 @@ private let date = AutoChartColumn(
         #expect(AutoChartRenderCache.retainedRenderCount == 0)
     }
 
+    @Test @MainActor func presentationTitlesCountAgainstTheRenderBudget() {
+        let originalConfiguration = AutoChartRenderCache.configuration
+        defer {
+            AutoChartRenderCache.configure(originalConfiguration)
+            AutoChartRenderCache.removeAll()
+        }
+        AutoChartRenderCache.configure(
+            AutoChartRenderCacheConfiguration(
+                maximumTableEntries: 8,
+                maximumTableCost: 1_024 * 1_024,
+                maximumRenderEntries: 8,
+                maximumRenderCost: 4_096))
+        AutoChartRenderCache.removeAll()
+
+        let oversizedDisplayName = String(repeating: "Presentation title", count: 512)
+        let titledCategory = AutoChartColumn(
+            id: "category", name: "category", displayName: oversizedDisplayName,
+            hints: AutoChartColumnHints(semanticType: .nominal, role: .dimension))
+        let input = table(
+            columns: [titledCategory, measure],
+            rows: [[.text("A"), .double(1)]])
+        let recommendation = AutoChartRecommendation(
+            specification: AutoChartSpecification(
+                family: .bar,
+                encoding: .init(x: titledCategory.id, y: measure.id)),
+            score: 0,
+            rationale: ["Oversized presentation-title test"])
+
+        _ = AutoChartView(table: input, recommendation: recommendation)
+
+        #expect(AutoChartRenderCache.retainedTableCount == 1)
+        #expect(AutoChartRenderCache.retainedRenderCount == 0)
+    }
+
     @Test @MainActor func versionedTablesReusePreparedRenderingData() throws {
         let counter = ChartValueReadCounter()
         let input = VersionedCountingTable(
@@ -717,6 +751,22 @@ private let date = AutoChartColumn(
         #expect(AutoChartProfiler.profiles(snapshot)[0].semanticType == .temporal)
     }
 
+    @Test func typedDateColumnsRemainTemporalWithANonFiniteValue() {
+        let inferred = AutoChartColumn(id: "observed", name: "observed")
+        let snapshot = AutoChartSnapshot(
+            table(
+                columns: [inferred],
+                rows: [
+                    [.date(Date(timeIntervalSinceReferenceDate: 0))],
+                    [.date(Date(timeIntervalSinceReferenceDate: .nan))],
+                ]))
+        let profile = AutoChartProfiler.profiles(snapshot)[0]
+
+        #expect(profile.semanticType == .temporal)
+        #expect(profile.temporalValues.count == 1)
+        #expect(profile.nonFiniteDateCount == 1)
+    }
+
     @Test func invalidCalendarDatesAreRejected() {
         #expect(AutoChartProfiler.parseISODate("2026-02-29") == nil)
         #expect(AutoChartProfiler.parseISODate("2024-02-29") != nil)
@@ -932,6 +982,24 @@ private let date = AutoChartColumn(
                 ]),
             context: AutoChartContext(goal: .trend))
         #expect(result.chartRecommendations.first?.specification.family == .line)
+    }
+
+    @Test func nonFiniteTypedDatesDoNotSuppressTemporalRecommendations() {
+        let inferredDate = AutoChartColumn(id: "observed", name: "observed")
+        let input = table(
+            columns: [inferredDate, measure],
+            rows: [
+                [.date(Date(timeIntervalSinceReferenceDate: 0)), .double(1)],
+                [.date(Date(timeIntervalSinceReferenceDate: .nan)), .double(2)],
+            ])
+
+        let result = AutoChartEngine.recommendations(for: input)
+
+        #expect(
+            result.chartRecommendations.contains {
+                $0.specification.family == .line
+                    && $0.specification.encoding.x == inferredDate.id
+            })
     }
 
     @Test func twoMeasuresUseScatter() {
@@ -1581,6 +1649,44 @@ private let date = AutoChartColumn(
         #expect(profile.renderableDistinctCount == 2)
         #expect(profile.isUniqueAtRowGrain)
         #expect(AutoChartEngine.validate(specification: specification, for: input).isValid)
+    }
+
+    @Test func equivalentLargeOrdinalStorageValuesShareAnExactIdentity() throws {
+        let ordinal = AutoChartColumn(
+            id: "large-ordinal", name: "large_ordinal",
+            hints: AutoChartColumnHints(semanticType: .ordinal, role: .dimension))
+        let exactInteger = Int64(36_028_797_018_963_968)
+        let exactDecimal = try #require(Decimal(string: "36028797018963968"))
+        let nearbyDecimal = try #require(Decimal(string: "36028797018963970"))
+        let input = table(
+            columns: [ordinal, measure],
+            rows: [
+                [.integer(exactInteger), .double(1)],
+                [.double(Double(exactInteger)), .double(2)],
+                [.decimal(exactDecimal), .double(3)],
+                [.decimal(nearbyDecimal), .double(4)],
+            ])
+        let specification = AutoChartSpecification(
+            family: .bar,
+            encoding: .init(x: ordinal.id, y: measure.id))
+        let snapshot = AutoChartSnapshot(input)
+        let prepared = AutoChartDataPreparation.data(
+            snapshot: snapshot,
+            specification: specification)
+        let profile = AutoChartProfiler.profiles(snapshot)[0]
+
+        #expect(prepared.count == 4)
+        #expect(Set(prepared.compactMap(\.xIdentity)).count == 2)
+        #expect(profile.renderableDistinctCount == 2)
+        #expect(!profile.isUniqueAtRowGrain)
+        #expect(
+            AutoChartEngine.validate(
+                specification: specification,
+                snapshot: snapshot,
+                profiles: AutoChartProfiler.profileIndex(snapshot)
+            ).issues.contains {
+                $0.message == "Duplicate marks require an explicit safe aggregation."
+            })
     }
 
     @Test func truncatedCompositionReportsOneCompletenessIssue() {
@@ -2242,7 +2348,7 @@ private let date = AutoChartColumn(
         #expect(prepared.first?.xIdentity != nil)
     }
 
-    @Test func nonFiniteDatesAreNotRenderableInAnySemanticType() {
+    @Test func nonFiniteDatesAreWarnedAndNotRenderableInAnySemanticType() {
         let nonFinite = Date(timeIntervalSinceReferenceDate: .nan)
         let nominalDate = AutoChartColumn(
             id: "nominal-date", name: "nominal_date",
@@ -2267,14 +2373,20 @@ private let date = AutoChartColumn(
         let specification = AutoChartSpecification(
             family: .line,
             encoding: .init(x: date.id, y: measure.id))
+        let validation = AutoChartEngine.validate(
+            specification: specification,
+            snapshot: snapshot,
+            profiles: profiles
+        )
+        let issues = validation.issues
+        #expect(validation.isValid)
         #expect(
-            AutoChartEngine.validate(
-                specification: specification,
-                snapshot: snapshot,
-                profiles: profiles
-            ).issues.contains {
-                $0.message == "Temporal field date contains unparseable values."
+            issues.contains {
+                $0.severity == .warning
+                    && $0.message
+                        == "Temporal field date contains non-finite dates that will be omitted."
             })
+        #expect(!issues.contains { $0.message.contains("unparseable") })
     }
 
     #if canImport(Charts) && canImport(SwiftUI)
@@ -2297,8 +2409,8 @@ private let date = AutoChartColumn(
             specification: specification)
 
         #expect(prepared.count == 1)
-        // Building the view computes the shared date domain across facets, which
-        // a retained non-finite date collapses to a NaN-bounded axis.
+        // Building the view computes the shared date domain after the non-finite
+        // row has been omitted.
         let view = AutoChartView(
             table: input,
             recommendation: AutoChartRecommendation(
@@ -2313,7 +2425,7 @@ private let date = AutoChartColumn(
         #expect(domain?.upperBound.timeIntervalSinceReferenceDate.isFinite == true)
     }
 
-    @Test @MainActor func extremeFiniteValuesProduceFiniteSharedDomainsAndDisableZoom() {
+    @Test @MainActor func extremeFiniteSpansAreRejectedAndDisableDomainsAndZoom() {
         let facet = AutoChartColumn(
             id: "facet", name: "region",
             hints: AutoChartColumnHints(semanticType: .nominal))
@@ -2340,8 +2452,32 @@ private let date = AutoChartColumn(
         let domain: ClosedRange<Double>? = reflectedOptionalStoredValue(
             named: "sharedXNumberDomain",
             in: facetedView)
-        #expect(domain?.lowerBound.isFinite == true)
-        #expect(domain?.upperBound.isFinite == true)
+        #expect(domain == nil)
+        #expect(
+            AutoChartEngine.validate(specification: faceted, for: input).issues.contains {
+                $0.message
+                    == "Quantitative field quantitative-x spans a range too large to render safely."
+            })
+
+        let oneSidedInput = table(
+            columns: [facet, quantitativeX, measure],
+            rows: [
+                [.text("West"), .double(-finiteExtreme), .double(1)],
+                [.text("East"), .double(0), .double(2)],
+            ])
+        let oneSidedView = AutoChartView(
+            table: oneSidedInput,
+            recommendation: AutoChartRecommendation(
+                specification: faceted,
+                score: 0,
+                rationale: ["Finite unpadded-domain test"]))
+        let oneSidedDomain: ClosedRange<Double>? = reflectedOptionalStoredValue(
+            named: "sharedXNumberDomain",
+            in: oneSidedView)
+        #expect(oneSidedDomain != nil)
+        #expect(
+            oneSidedDomain.map { ($0.upperBound - $0.lowerBound).isFinite } == true)
+        #expect(AutoChartEngine.validate(specification: faceted, for: oneSidedInput).isValid)
 
         let scatter = AutoChartSpecification(
             family: .scatter,
@@ -2388,8 +2524,13 @@ private let date = AutoChartColumn(
         let dateDomain: ClosedRange<Date>? = reflectedOptionalStoredValue(
             named: "sharedXDateDomain",
             in: dateFacetView)
-        #expect(dateDomain?.lowerBound.timeIntervalSinceReferenceDate.isFinite == true)
-        #expect(dateDomain?.upperBound.timeIntervalSinceReferenceDate.isFinite == true)
+        #expect(dateDomain == nil)
+        #expect(
+            AutoChartEngine.validate(
+                specification: facetedDates, for: dateInput
+            ).issues.contains {
+                $0.message == "Temporal field date spans a range too large to render safely."
+            })
 
         let line = AutoChartSpecification(
             family: .line,

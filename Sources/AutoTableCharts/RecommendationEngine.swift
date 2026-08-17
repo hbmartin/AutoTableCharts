@@ -477,6 +477,17 @@ public enum AutoChartEngine {
             {
                 return
             }
+            // A typed non-finite date is present but cannot position a mark. It
+            // receives the temporal omission warning below rather than also being
+            // reported as a missing value.
+            if profile.isTemporal,
+                profile.nonNullCount == snapshot.rows.count,
+                profile.temporalValues.count + profile.nonFiniteDateCount
+                    == profile.nonNullCount,
+                profile.hasNonFiniteDateValues
+            {
+                return
+            }
             issues.append(
                 .init(
                     severity: .error,
@@ -735,12 +746,24 @@ public enum AutoChartEngine {
         ])
         for id in temporalReferences {
             guard let profile = profiles[id], profile.isTemporal,
-                profile.temporalValues.count != profile.nonNullCount
+                profile.temporalValues.count + profile.nonFiniteDateCount
+                    != profile.nonNullCount
             else { continue }
             issues.append(
                 .init(
                     severity: .error,
                     message: "Temporal field \(id.rawValue) contains unparseable values."))
+        }
+        for id in temporalReferences {
+            guard let profile = profiles[id], profile.isTemporal,
+                profile.hasNonFiniteDateValues
+            else { continue }
+            issues.append(
+                .init(
+                    severity: .warning,
+                    message:
+                        "Temporal field \(id.rawValue) contains non-finite dates that will be omitted."
+                ))
         }
         for id in referenced {
             guard let profile = profiles[id], profile.isQuantitative,
@@ -768,6 +791,27 @@ public enum AutoChartEngine {
                         ? "Quantitative field \(id.rawValue) contains non-finite values."
                         : "Quantitative field \(id.rawValue) contains non-finite values that will be omitted."
                 ))
+        }
+        if specification.family != .table {
+            for id in referenced {
+                guard let profile = profiles[id] else { continue }
+                if profile.isQuantitative, !profile.hasFiniteNumericSpan {
+                    issues.append(
+                        .init(
+                            severity: .error,
+                            message:
+                                "Quantitative field \(id.rawValue) spans a range too large to render safely."
+                        ))
+                }
+                if profile.isTemporal, !profile.hasFiniteTemporalSpan {
+                    issues.append(
+                        .init(
+                            severity: .error,
+                            message:
+                                "Temporal field \(id.rawValue) spans a range too large to render safely."
+                        ))
+                }
+            }
         }
         let expectedAggregation: AutoChartAggregation? =
             switch specification.family {
