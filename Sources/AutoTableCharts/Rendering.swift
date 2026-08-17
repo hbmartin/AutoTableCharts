@@ -641,6 +641,7 @@ func disambiguatedCategoryLabels(
             case "boolean": "Boolean"
             case "integer": "Integer"
             case "number": "Number"
+            case "exact-number": "Number"
             case "double": "Number"
             case "decimal": "Decimal"
             case "text": "Text"
@@ -728,35 +729,69 @@ private struct AutoChartRenderPresentation {
             let upper = includingZero ? max(0, maximum) : maximum
             if lower == upper {
                 let padding = max(1, abs(lower) * 0.05)
-                return (lower - padding)...(upper + padding)
+                return expandedFiniteRange(lower...upper, padding: padding)
             }
             if includingZero { return lower...upper }
             let padding = max(abs(lower), abs(upper)) * 0.05
-            return (lower - padding)...(upper + padding)
+            return expandedFiniteRange(lower...upper, padding: padding)
         }
         func xNumberDomain(_ values: [Double]) -> ClosedRange<Double>? {
             guard let minimum = values.min(), let maximum = values.max() else { return nil }
             if minimum == maximum {
                 let padding = max(1, abs(minimum) * 0.05)
-                return (minimum - padding)...(maximum + padding)
+                return expandedFiniteRange(minimum...maximum, padding: padding)
             }
-            let padding = (maximum - minimum) * 0.05
-            return (minimum - padding)...(maximum + padding)
+            let span = maximum - minimum
+            let padding = span.isFinite ? span * 0.05 : 0
+            return expandedFiniteRange(minimum...maximum, padding: padding)
         }
         func dateDomain(_ values: [Date]) -> ClosedRange<Date>? {
             // A non-finite date can't bound an axis — it collapses the whole
             // domain to NaN — so drop it the way the numeric domains drop theirs.
             let values = values.filter { $0.timeIntervalSinceReferenceDate.isFinite }
             guard let minimum = values.min(), let maximum = values.max() else { return nil }
+            let lowerInterval = minimum.timeIntervalSinceReferenceDate
+            let upperInterval = maximum.timeIntervalSinceReferenceDate
+            let intervalRange: ClosedRange<Double>
             if minimum == maximum {
-                let lower = minimum.addingTimeInterval(-43_200)
-                let upper = maximum.addingTimeInterval(43_200)
-                return lower...upper
+                guard let expanded = expandedFiniteRange(
+                    lowerInterval...upperInterval,
+                    padding: 43_200)
+                else { return nil }
+                intervalRange = expanded
+            } else {
+                let span = upperInterval - lowerInterval
+                let padding = span.isFinite ? span * 0.05 : 0
+                guard let expanded = expandedFiniteRange(
+                    lowerInterval...upperInterval,
+                    padding: padding)
+                else { return nil }
+                intervalRange = expanded
             }
-            let padding = maximum.timeIntervalSince(minimum) * 0.05
-            let lower = minimum.addingTimeInterval(-padding)
-            let upper = maximum.addingTimeInterval(padding)
+            let lower = Date(timeIntervalSinceReferenceDate: intervalRange.lowerBound)
+            let upper = Date(timeIntervalSinceReferenceDate: intervalRange.upperBound)
             return lower...upper
+        }
+        func expandedFiniteRange(
+            _ range: ClosedRange<Double>,
+            padding: Double
+        ) -> ClosedRange<Double>? {
+            guard range.lowerBound.isFinite, range.upperBound.isFinite,
+                padding.isFinite, padding >= 0
+            else { return nil }
+            let paddedLower = range.lowerBound - padding
+            let paddedUpper = range.upperBound + padding
+            let lower = paddedLower.isFinite ? paddedLower : range.lowerBound
+            let upper = paddedUpper.isFinite ? paddedUpper : range.upperBound
+            if lower < upper { return lower...upper }
+
+            // A zero or underflowed padding can leave a singleton. Move by one
+            // representable value where possible without creating infinity.
+            let previous = range.lowerBound.nextDown
+            let next = range.upperBound.nextUp
+            let finiteLower = previous.isFinite ? previous : range.lowerBound
+            let finiteUpper = next.isFinite ? next : range.upperBound
+            return finiteLower < finiteUpper ? finiteLower...finiteUpper : nil
         }
 
         let xSemanticType = specification.encoding.x.flatMap { profiles[$0]?.semanticType }
@@ -830,17 +865,59 @@ private struct AutoChartRenderPresentation {
         self.seriesDisplayLabels = seriesDisplayLabels
         self.facetDisplayLabels = facetDisplayLabels
         uniqueXCount = Set(data.compactMap { $0.xIdentity ?? $0.xLabel }).count
-        let zoomDates = data.flatMap { datum in
-            [datum.xDate, datum.startDate, datum.endDate].compactMap { $0 }
+        let needsTimeZoom =
+            specification.family == .range
+            || ([.line, .pointLine, .area, .scatter, .bubble].contains(
+                specification.family) && xSemanticType == .temporal)
+        let needsNumberZoom =
+            specification.family == .histogram
+            || ([.line, .pointLine, .area, .scatter, .bubble].contains(
+                specification.family) && xSemanticType == .quantitative)
+        var minimumZoomDate: Date?
+        var maximumZoomDate: Date?
+        var zoomDateCount = 0
+        var minimumZoomNumber: Double?
+        var maximumZoomNumber: Double?
+        var zoomNumberCount = 0
+        func includeZoomDate(_ date: Date?) {
+            guard let date, date.timeIntervalSinceReferenceDate.isFinite else { return }
+            zoomDateCount += 1
+            minimumZoomDate = min(minimumZoomDate ?? date, date)
+            maximumZoomDate = max(maximumZoomDate ?? date, date)
         }
-        timeZoomValueCount = zoomDates.count
-        timeZoomSpan = max(
-            86_400,
-            (zoomDates.max() ?? .distantPast).timeIntervalSince(
-                zoomDates.min() ?? .distantPast))
-        let zoomNumbers = data.compactMap(\.xNumber)
-        numberZoomValueCount = zoomNumbers.count
-        numberZoomSpan = max(1, (zoomNumbers.max() ?? 1) - (zoomNumbers.min() ?? 0))
+        if needsTimeZoom || needsNumberZoom {
+            for datum in data {
+                if needsTimeZoom {
+                    if specification.family == .range {
+                        includeZoomDate(datum.startDate)
+                        includeZoomDate(datum.endDate)
+                    } else {
+                        includeZoomDate(datum.xDate)
+                    }
+                }
+                if needsNumberZoom, let number = datum.xNumber, number.isFinite {
+                    zoomNumberCount += 1
+                    minimumZoomNumber = min(minimumZoomNumber ?? number, number)
+                    maximumZoomNumber = max(maximumZoomNumber ?? number, number)
+                }
+            }
+        }
+        if let minimumZoomDate, let maximumZoomDate {
+            let span = maximumZoomDate.timeIntervalSince(minimumZoomDate)
+            timeZoomValueCount = span.isFinite ? zoomDateCount : 0
+            timeZoomSpan = span.isFinite ? max(86_400, span) : 86_400
+        } else {
+            timeZoomValueCount = 0
+            timeZoomSpan = 86_400
+        }
+        if let minimumZoomNumber, let maximumZoomNumber {
+            let span = maximumZoomNumber - minimumZoomNumber
+            numberZoomValueCount = span.isFinite ? zoomNumberCount : 0
+            numberZoomSpan = span.isFinite ? max(1, span) : 1
+        } else {
+            numberZoomValueCount = 0
+            numberZoomSpan = 1
+        }
         xTitle =
             specification.encoding.x.flatMap { snapshot.column($0) }
             .map(AutoChartProfiler.displayName) ?? "Category"
@@ -961,6 +1038,10 @@ public enum AutoChartRenderCache {
     static var retainedTableCount: Int {
         AutoChartRenderPreparationCache.shared.tableEntryCount
     }
+
+    static var retainedRenderCount: Int {
+        AutoChartRenderPreparationCache.shared.renderEntryCount
+    }
 }
 
 private struct AutoChartRenderTableCacheKey: Hashable {
@@ -1063,14 +1144,21 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
     ) -> AutoChartRenderCore {
         let cacheConfiguration = configurationSnapshot()
         let profiles = AutoChartProfiler.profileIndex(snapshot)
+        let tableCachingEnabled =
+            cacheConfiguration.value.maximumTableEntries > 0
+            && cacheConfiguration.value.maximumTableCost > 0
         let prepared = AutoChartPreparedTable(
             snapshot: snapshot,
             profiles: profiles,
             fingerprint: fingerprint,
-            estimatedCost: estimatedTableCost(
-                snapshot: snapshot,
-                profiles: profiles,
-                limit: cacheConfiguration.value.maximumTableCost),
+            estimatedCost:
+                tableCachingEnabled
+                ? estimatedTableCost(
+                    snapshot: snapshot,
+                    profiles: profiles,
+                    key: tableKey,
+                    limit: cacheConfiguration.value.maximumTableCost)
+                : nil,
             cacheConfigurationRevision: cacheConfiguration.revision)
         return core(
             table: cacheTable(prepared, for: tableKey) ?? prepared,
@@ -1124,9 +1212,20 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
         matching snapshot: AutoChartSnapshot
     ) -> AutoChartPreparedTable? {
         lock.lock()
+        guard let value = tableEntries[key] else {
+            lock.unlock()
+            return nil
+        }
+        let revision = configurationRevision
+        lock.unlock()
+
+        let matches = value.snapshot.hasSameContent(as: snapshot)
+        lock.lock()
         defer { lock.unlock() }
-        guard let value = tableEntries[key] else { return nil }
-        guard value.snapshot.hasSameContent(as: snapshot) else {
+        guard revision == configurationRevision,
+            let current = tableEntries[key], current === value
+        else { return nil }
+        guard matches else {
             removeTable(for: key)
             return nil
         }
@@ -1157,19 +1256,25 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
         specification: AutoChartSpecification
     ) {
         let cacheConfiguration = configurationSnapshot()
+        guard cacheConfiguration.value.maximumRenderEntries > 0,
+            cacheConfiguration.value.maximumRenderCost > 0
+        else { return }
         let cost = estimatedCost(
             data: value.data,
             presentation: value.presentation,
             validation: value.validation,
             specification: specification,
             limit: cacheConfiguration.value.maximumRenderCost)
+        guard let cachedTable = cacheTable(value.table, for: key.table),
+            cachedTable === value.table
+        else { return }
         lock.lock()
         defer { lock.unlock() }
         guard cacheConfiguration.revision == configurationRevision,
             let cost
         else { return }
-        guard let cachedTable = cacheTableLocked(value.table, for: key.table),
-            cachedTable === value.table
+        guard let currentTable = tableEntries[key.table],
+            currentTable === value.table
         else { return }
         if let previousCost = costs[key] { totalCost -= previousCost }
         entries[key] = value
@@ -1190,45 +1295,57 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
         _ value: AutoChartPreparedTable,
         for key: AutoChartRenderTableCacheKey
     ) -> AutoChartPreparedTable? {
-        lock.lock()
-        defer { lock.unlock() }
-        return cacheTableLocked(value, for: key)
-    }
+        while true {
+            lock.lock()
+            if let existing = tableEntries[key] {
+                // Storing a render entry commonly reuses the same prepared table.
+                if existing === value {
+                    tableRecency.removeAll { $0 == key }
+                    tableRecency.append(key)
+                    lock.unlock()
+                    return existing
+                }
+                let revision = configurationRevision
+                lock.unlock()
 
-    private func cacheTableLocked(
-        _ value: AutoChartPreparedTable,
-        for key: AutoChartRenderTableCacheKey
-    ) -> AutoChartPreparedTable? {
-        if let existing = tableEntries[key] {
-            // Storing a render entry re-caches the table it was prepared from, so
-            // the common case is the entry we already hold. Comparing it against
-            // itself would scan every cell for no possible difference.
-            if existing === value {
-                tableRecency.removeAll { $0 == key }
-                tableRecency.append(key)
-                return existing
+                let matches = existing.snapshot.hasSameContent(as: value.snapshot)
+                lock.lock()
+                guard revision == configurationRevision,
+                    let current = tableEntries[key], current === existing
+                else {
+                    lock.unlock()
+                    continue
+                }
+                if matches {
+                    tableRecency.removeAll { $0 == key }
+                    tableRecency.append(key)
+                    lock.unlock()
+                    return existing
+                }
+                removeTable(for: key)
             }
-            if existing.snapshot.hasSameContent(as: value.snapshot) {
-                tableRecency.removeAll { $0 == key }
-                tableRecency.append(key)
-                return existing
+            guard activeConfiguration.maximumTableEntries > 0,
+                activeConfiguration.maximumTableCost > 0,
+                value.cacheConfigurationRevision == configurationRevision,
+                let estimatedCost = value.estimatedCost,
+                estimatedCost <= activeConfiguration.maximumTableCost
+            else {
+                lock.unlock()
+                return nil
             }
-            removeTable(for: key)
+            tableEntries[key] = value
+            tableTotalCost += estimatedCost
+            tableRecency.removeAll { $0 == key }
+            tableRecency.append(key)
+            while tableRecency.count > activeConfiguration.maximumTableEntries
+                || tableTotalCost > activeConfiguration.maximumTableCost
+            {
+                removeTable(for: tableRecency.removeFirst())
+            }
+            let result = tableEntries[key]
+            lock.unlock()
+            return result
         }
-        guard value.cacheConfigurationRevision == configurationRevision,
-            let estimatedCost = value.estimatedCost,
-            estimatedCost <= activeConfiguration.maximumTableCost
-        else { return nil }
-        tableEntries[key] = value
-        tableTotalCost += estimatedCost
-        tableRecency.removeAll { $0 == key }
-        tableRecency.append(key)
-        while tableRecency.count > activeConfiguration.maximumTableEntries
-            || tableTotalCost > activeConfiguration.maximumTableCost
-        {
-            removeTable(for: tableRecency.removeFirst())
-        }
-        return tableEntries[key]
     }
 
     private func removeTable(for key: AutoChartRenderTableCacheKey) {
@@ -1247,11 +1364,17 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
     private func estimatedTableCost(
         snapshot: AutoChartSnapshot,
         profiles: [AutoChartColumnID: AutoChartColumnProfile],
+        key: AutoChartRenderTableCacheKey,
         limit: Int
     ) -> Int? {
         let storageCost = snapshot.estimatedStorageCost
         guard storageCost <= limit else { return nil }
         var cost = storageCost
+        guard add(128, to: &cost, limit: limit),
+            add(key.tableType.utf8.count, to: &cost, limit: limit),
+            add(key.tableIdentity?.utf8.count ?? 0, to: &cost, limit: limit),
+            add(key.contentIdentity.utf8.count, to: &cost, limit: limit)
+        else { return nil }
         for profile in profiles.values {
             guard add(160, to: &cost, limit: limit),
                 add(
@@ -1278,6 +1401,17 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
                 to: &cost,
                 limit: limit)
         else { return nil }
+        let encodingIDs = [
+            specification.encoding.x, specification.encoding.y,
+            specification.encoding.series, specification.encoding.size,
+            specification.encoding.facet, specification.encoding.start,
+            specification.encoding.end,
+        ]
+        for id in encodingIDs.compactMap({ $0 }) {
+            guard add(id.rawValue.utf8.count, to: &cost, limit: limit) else {
+                return nil
+            }
+        }
         for datum in data {
             guard add(256, to: &cost, limit: limit) else {
                 return nil
@@ -1355,6 +1489,12 @@ private extension AutoChartRenderPreparationCache {
         lock.lock()
         defer { lock.unlock() }
         return tableEntries.count
+    }
+
+    var renderEntryCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return entries.count
     }
 
     func configure(_ configuration: AutoChartRenderCacheConfiguration) {

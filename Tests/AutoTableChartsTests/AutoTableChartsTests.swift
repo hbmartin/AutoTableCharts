@@ -15,6 +15,25 @@ private func preparedData(in view: AutoChartView) -> [AutoChartDatum]? {
     Mirror(reflecting: view).children.first { $0.label == "data" }?.value
         as? [AutoChartDatum]
 }
+
+@MainActor
+private func reflectedStoredValue<Value>(
+    named name: String,
+    in view: AutoChartView
+) -> Value? {
+    Mirror(reflecting: view).children.first { $0.label == name }?.value as? Value
+}
+
+@MainActor
+private func reflectedOptionalStoredValue<Value>(
+    named name: String,
+    in view: AutoChartView
+) -> Value? {
+    guard
+        let stored = Mirror(reflecting: view).children.first(where: { $0.label == name })?.value
+    else { return nil }
+    return Mirror(reflecting: stored).children.first?.value as? Value
+}
 #endif
 
 private struct TestRow: AutoChartRow {
@@ -358,6 +377,81 @@ private let date = AutoChartColumn(
     }
 
     #if canImport(Charts) && canImport(SwiftUI)
+    @Test @MainActor func oversizedTableCacheKeysCountAgainstTheByteBudget() {
+        let originalConfiguration = AutoChartRenderCache.configuration
+        defer {
+            AutoChartRenderCache.configure(originalConfiguration)
+            AutoChartRenderCache.removeAll()
+        }
+        AutoChartRenderCache.configure(
+            AutoChartRenderCacheConfiguration(
+                maximumTableEntries: 8,
+                maximumTableCost: 4_096,
+                maximumRenderEntries: 0,
+                maximumRenderCost: 0))
+        AutoChartRenderCache.removeAll()
+
+        let counter = ChartValueReadCounter()
+        let oversizedKey = String(repeating: "identity", count: 1_024)
+        let input = VersionedCountingTable(
+            chartColumns: [category, measure],
+            chartRows: [
+                CountingRow(
+                    chartRowID: "r0",
+                    values: [category.id: .text("A"), measure.id: .double(1)],
+                    counter: counter)
+            ],
+            chartDataIdentity: oversizedKey,
+            chartDataVersion: oversizedKey)
+        let recommendation = AutoChartRecommendation(
+            specification: AutoChartSpecification(
+                family: .bar,
+                encoding: .init(x: category.id, y: measure.id)),
+            score: 0,
+            rationale: ["Oversized table-key test"])
+
+        _ = AutoChartView(table: input, recommendation: recommendation)
+
+        #expect(AutoChartRenderCache.retainedTableCount == 0)
+        #expect(AutoChartRenderCache.retainedRenderCount == 0)
+    }
+
+    @Test @MainActor func specificationEncodingIDsCountAgainstTheRenderBudget() {
+        let originalConfiguration = AutoChartRenderCache.configuration
+        defer {
+            AutoChartRenderCache.configure(originalConfiguration)
+            AutoChartRenderCache.removeAll()
+        }
+        AutoChartRenderCache.configure(
+            AutoChartRenderCacheConfiguration(
+                maximumTableEntries: 8,
+                maximumTableCost: 1_024 * 1_024,
+                maximumRenderEntries: 8,
+                maximumRenderCost: 4_096))
+        AutoChartRenderCache.removeAll()
+
+        let oversizedID = AutoChartColumnID(
+            rawValue: String(repeating: "encoding", count: 1_024))
+        let oversizedCategory = AutoChartColumn(
+            id: oversizedID,
+            name: "oversized_category",
+            hints: AutoChartColumnHints(semanticType: .nominal, role: .dimension))
+        let input = table(
+            columns: [oversizedCategory, measure],
+            rows: [[.text("A"), .double(1)]])
+        let recommendation = AutoChartRecommendation(
+            specification: AutoChartSpecification(
+                family: .bar,
+                encoding: .init(x: oversizedID, y: measure.id)),
+            score: 0,
+            rationale: ["Oversized render-key test"])
+
+        _ = AutoChartView(table: input, recommendation: recommendation)
+
+        #expect(AutoChartRenderCache.retainedTableCount == 1)
+        #expect(AutoChartRenderCache.retainedRenderCount == 0)
+    }
+
     @Test @MainActor func versionedTablesReusePreparedRenderingData() throws {
         let counter = ChartValueReadCounter()
         let input = VersionedCountingTable(
@@ -1394,6 +1488,7 @@ private let date = AutoChartColumn(
             specification: specification)
         let validation = AutoChartEngine.validate(specification: specification, for: input)
 
+        #expect(prepared.count == 2)
         #expect(Set(prepared.compactMap(\.xIdentity)).count == 1)
         #expect(
             validation.issues.contains {
@@ -1420,6 +1515,7 @@ private let date = AutoChartColumn(
             specification: specification)
         let validation = AutoChartEngine.validate(specification: specification, for: input)
 
+        #expect(prepared.count == 2)
         #expect(Set(prepared.compactMap(\.xIdentity)).count == 1)
         #expect(
             validation.issues.contains {
@@ -1450,12 +1546,41 @@ private let date = AutoChartColumn(
         // Ordinal years accept mixed integer and floating-point storage, so two
         // spellings of the same year must collapse into one category rather than
         // render as two bars labeled "2,020 (Integer)" and "2,020 (Number)".
+        #expect(prepared.count == 2)
         #expect(Set(prepared.compactMap(\.xIdentity)).count == 1)
         #expect(!profile.isUniqueAtRowGrain)
         #expect(
             validation.issues.contains {
                 $0.message == "Duplicate marks require an explicit safe aggregation."
             })
+    }
+
+    @Test func largeOrdinalIntegersRemainDistinct() {
+        let ordinal = AutoChartColumn(
+            id: "large-ordinal", name: "large_ordinal",
+            hints: AutoChartColumnHints(semanticType: .ordinal, role: .dimension))
+        let first = Int64(9_007_199_254_740_992)
+        let second = first + 1
+        let input = table(
+            columns: [ordinal, measure],
+            rows: [
+                [.integer(first), .double(1)],
+                [.integer(second), .double(2)],
+            ])
+        let specification = AutoChartSpecification(
+            family: .bar,
+            encoding: .init(x: ordinal.id, y: measure.id))
+        let snapshot = AutoChartSnapshot(input)
+        let prepared = AutoChartDataPreparation.data(
+            snapshot: snapshot,
+            specification: specification)
+        let profile = AutoChartProfiler.profiles(snapshot)[0]
+
+        #expect(prepared.count == 2)
+        #expect(Set(prepared.compactMap(\.xIdentity)).count == 2)
+        #expect(profile.renderableDistinctCount == 2)
+        #expect(profile.isUniqueAtRowGrain)
+        #expect(AutoChartEngine.validate(specification: specification, for: input).isValid)
     }
 
     @Test func truncatedCompositionReportsOneCompletenessIssue() {
@@ -2134,8 +2259,22 @@ private let date = AutoChartColumn(
         #expect(
             AutoChartProfiler.identity(.date(nonFinite), semanticType: .temporal) == .missing)
         #expect(AutoChartProfiler.identity(.date(nonFinite), semanticType: nil) == .missing)
+        #expect(profiles[date.id]?.nonNullCount == 2)
+        #expect(profiles[date.id]?.temporalValues.count == 1)
         #expect(profiles[date.id]?.renderableValueCount == 1)
         #expect(profiles[nominalDate.id]?.renderableValueCount == 1)
+
+        let specification = AutoChartSpecification(
+            family: .line,
+            encoding: .init(x: date.id, y: measure.id))
+        #expect(
+            AutoChartEngine.validate(
+                specification: specification,
+                snapshot: snapshot,
+                profiles: profiles
+            ).issues.contains {
+                $0.message == "Temporal field date contains unparseable values."
+            })
     }
 
     #if canImport(Charts) && canImport(SwiftUI)
@@ -2167,6 +2306,108 @@ private let date = AutoChartColumn(
                 score: 0,
                 rationale: ["Non-finite date test"]))
         #expect(preparedData(in: view)?.count == 1)
+        let domain: ClosedRange<Date>? = reflectedOptionalStoredValue(
+            named: "sharedXDateDomain",
+            in: view)
+        #expect(domain?.lowerBound.timeIntervalSinceReferenceDate.isFinite == true)
+        #expect(domain?.upperBound.timeIntervalSinceReferenceDate.isFinite == true)
+    }
+
+    @Test @MainActor func extremeFiniteValuesProduceFiniteSharedDomainsAndDisableZoom() {
+        let facet = AutoChartColumn(
+            id: "facet", name: "region",
+            hints: AutoChartColumnHints(semanticType: .nominal))
+        let quantitativeX = AutoChartColumn(
+            id: "quantitative-x", name: "quantitative_x",
+            hints: AutoChartColumnHints(semanticType: .quantitative, role: .dimension))
+        let finiteExtreme = Double.greatestFiniteMagnitude
+        let input = table(
+            columns: [facet, quantitativeX, measure],
+            rows: [
+                [.text("West"), .double(-finiteExtreme), .double(1)],
+                [.text("East"), .double(finiteExtreme), .double(2)],
+            ])
+        let faceted = AutoChartSpecification(
+            family: .faceted,
+            encoding: .init(x: quantitativeX.id, y: measure.id, facet: facet.id),
+            facetBaseFamily: .scatter)
+        let facetedView = AutoChartView(
+            table: input,
+            recommendation: AutoChartRecommendation(
+                specification: faceted,
+                score: 0,
+                rationale: ["Finite-domain test"]))
+        let domain: ClosedRange<Double>? = reflectedOptionalStoredValue(
+            named: "sharedXNumberDomain",
+            in: facetedView)
+        #expect(domain?.lowerBound.isFinite == true)
+        #expect(domain?.upperBound.isFinite == true)
+
+        let scatter = AutoChartSpecification(
+            family: .scatter,
+            encoding: .init(x: quantitativeX.id, y: measure.id))
+        let scatterView = AutoChartView(
+            table: input,
+            recommendation: AutoChartRecommendation(
+                specification: scatter,
+                score: 0,
+                rationale: ["Finite-zoom test"]))
+        let zoomCount: Int? = reflectedStoredValue(
+            named: "numberZoomValueCount",
+            in: scatterView)
+        let zoomSpan: Double? = reflectedStoredValue(
+            named: "numberZoomSpan",
+            in: scatterView)
+        #expect(zoomCount == 0)
+        #expect(zoomSpan?.isFinite == true)
+
+        let dateInput = table(
+            columns: [facet, date, measure],
+            rows: [
+                [
+                    .text("West"),
+                    .date(Date(timeIntervalSinceReferenceDate: -finiteExtreme)),
+                    .double(1),
+                ],
+                [
+                    .text("East"),
+                    .date(Date(timeIntervalSinceReferenceDate: finiteExtreme)),
+                    .double(2),
+                ],
+            ])
+        let facetedDates = AutoChartSpecification(
+            family: .faceted,
+            encoding: .init(x: date.id, y: measure.id, facet: facet.id),
+            facetBaseFamily: .line)
+        let dateFacetView = AutoChartView(
+            table: dateInput,
+            recommendation: AutoChartRecommendation(
+                specification: facetedDates,
+                score: 0,
+                rationale: ["Finite date-domain test"]))
+        let dateDomain: ClosedRange<Date>? = reflectedOptionalStoredValue(
+            named: "sharedXDateDomain",
+            in: dateFacetView)
+        #expect(dateDomain?.lowerBound.timeIntervalSinceReferenceDate.isFinite == true)
+        #expect(dateDomain?.upperBound.timeIntervalSinceReferenceDate.isFinite == true)
+
+        let line = AutoChartSpecification(
+            family: .line,
+            encoding: .init(x: date.id, y: measure.id))
+        let lineView = AutoChartView(
+            table: dateInput,
+            recommendation: AutoChartRecommendation(
+                specification: line,
+                score: 0,
+                rationale: ["Finite date-zoom test"]))
+        let timeZoomCount: Int? = reflectedStoredValue(
+            named: "timeZoomValueCount",
+            in: lineView)
+        let timeZoomSpan: TimeInterval? = reflectedStoredValue(
+            named: "timeZoomSpan",
+            in: lineView)
+        #expect(timeZoomCount == 0)
+        #expect(timeZoomSpan?.isFinite == true)
     }
     #endif
 
