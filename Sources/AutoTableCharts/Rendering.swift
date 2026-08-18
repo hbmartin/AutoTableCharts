@@ -1021,7 +1021,7 @@ public struct AutoChartRenderCacheConfiguration: Equatable, Sendable {
     /// The approximate retained-byte budget for prepared recommendation results.
     /// Defaults to 32 MiB. A table snapshot shared through the table cache is
     /// excluded; a snapshot retained only through render entries counts against
-    /// this budget.
+    /// this budget once, however many render entries share it.
     public let maximumRenderCost: Int
 
     /// Creates process-wide rendering cache limits.
@@ -1031,8 +1031,8 @@ public struct AutoChartRenderCacheConfiguration: Equatable, Sendable {
     ///   - maximumTableCost: Approximate retained-byte budget for snapshots and profiles.
     ///   - maximumRenderEntries: Maximum retained prepared recommendation results.
     ///   - maximumRenderCost: Approximate retained-byte budget for prepared results.
-    ///     Table-cache snapshots are excluded, while snapshots retained only through
-    ///     render entries are included.
+    ///     Table-cache snapshots are excluded, while a snapshot retained only through
+    ///     render entries is counted once no matter how many share it.
     public init(
         maximumTableEntries: Int = 8,
         maximumTableCost: Int = 32 * 1_024 * 1_024,
@@ -1088,6 +1088,12 @@ public enum AutoChartRenderCache {
     static var retainedRenderCount: Int {
         AutoChartRenderPreparationCache.shared.renderEntryCount
     }
+
+    /// The bytes currently charged against the render budget, counting a shared
+    /// render-owned snapshot once.
+    static var retainedRenderCost: Int {
+        AutoChartRenderPreparationCache.shared.renderCost
+    }
 }
 
 private struct AutoChartRenderTableCacheKey: Hashable {
@@ -1114,6 +1120,14 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
     private var costs: [AutoChartRenderCacheKey: Int] = [:]
     private var recency: [AutoChartRenderCacheKey] = []
     private var totalCost = 0
+    /// Byte cost of each render-owned prepared table, charged to the budget once
+    /// however many render entries share it.
+    private var renderTableCosts: [ObjectIdentifier: Int] = [:]
+    /// Render entries retaining each render-owned prepared table. A table is
+    /// charged while this is non-empty and released when the last entry goes.
+    private var renderTableRetainers: [ObjectIdentifier: Set<AutoChartRenderCacheKey>] = [:]
+    /// Reverse index from a render entry to the render-owned table it retains.
+    private var renderEntryTables: [AutoChartRenderCacheKey: ObjectIdentifier] = [:]
     // Retains the UIKit registration for the process lifetime of the shared cache.
     private var memoryWarningObserver: NSObjectProtocol?
 
@@ -1291,7 +1305,9 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
         guard let current = tableEntries[key], current === value
         else { return nil }
         guard matches else {
-            removeTable(for: key)
+            // Content no longer matches this key, so every render entry under
+            // it, render-owned snapshots included, was built from stale data.
+            removeTable(for: key, invalidatingRenderEntries: true)
             return nil
         }
         tableRecency.removeAll { $0 == key }
@@ -1306,12 +1322,17 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
     ) -> AutoChartPreparedTable? {
         lock.lock()
         defer { lock.unlock() }
-        guard !activeConfiguration.isTableCachingEnabled,
-            let renderKey = recency.last(where: { $0.table == key }),
-            let value = entries[renderKey],
-            tableEntries[key] !== value.table
-        else { return nil }
-        return value.table
+        guard !activeConfiguration.isTableCachingEnabled else { return nil }
+        let shared = tableEntries[key]
+        // Most recent first, and past the newest entry when that one happens to
+        // hold the shared table rather than a render-owned snapshot.
+        for renderKey in recency.reversed() {
+            guard renderKey.table == key, let value = entries[renderKey],
+                value.table !== shared
+            else { continue }
+            return value.table
+        }
+        return nil
     }
 
     /// Reuses render-owned storage after fingerprint lookup confirms the key and
@@ -1426,19 +1447,30 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         guard cacheConfiguration.revision == configurationRevision else { return }
-        var cost = renderCost
+        var ownedTable: (table: AutoChartPreparedTable, cost: Int)?
         if tableEntries[key.table] !== value.table {
-            guard let tableCost = value.table.estimatedCost,
-                add(
-                    tableCost,
-                    to: &cost,
-                    limit: activeConfiguration.maximumRenderCost)
-            else { return }
+            guard let tableCost = value.table.estimatedCost else { return }
+            // Only a table this entry would newly introduce has to fit the
+            // budget; joining an already-charged snapshot costs the entry alone.
+            if renderTableRetainers[ObjectIdentifier(value.table)] == nil {
+                var projected = renderCost
+                guard
+                    add(
+                        tableCost,
+                        to: &projected,
+                        limit: activeConfiguration.maximumRenderCost)
+                else { return }
+            }
+            ownedTable = (value.table, tableCost)
         }
+        releaseRenderTable(for: key)
         if let previousCost = costs[key] { totalCost -= previousCost }
         entries[key] = value
-        costs[key] = cost
-        totalCost += cost
+        costs[key] = renderCost
+        totalCost += renderCost
+        if let ownedTable {
+            retainRenderTable(ownedTable.table, cost: ownedTable.cost, for: key)
+        }
         recency.removeAll { $0 == key }
         recency.append(key)
         trimRenderLocked()
@@ -1485,7 +1517,9 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
                     lock.unlock()
                     return existing
                 }
-                removeTable(for: key)
+                // Content no longer matches this key, so every render entry under
+                // it, render-owned snapshots included, was built from stale data.
+                removeTable(for: key, invalidatingRenderEntries: true)
             }
             guard activeConfiguration.isTableCachingEnabled,
                 value.cacheConfigurationRevision == configurationRevision,
@@ -1511,11 +1545,25 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
         return nil
     }
 
-    private func removeTable(for key: AutoChartRenderTableCacheKey) {
-        if let removed = tableEntries.removeValue(forKey: key) {
+    /// Removes the shared table entry for `key`.
+    ///
+    /// - Parameter invalidatingRenderEntries: Pass `true` when `key` has been
+    ///   found to no longer describe the data behind it, so every render entry
+    ///   under that key is stale — including render-owned snapshots this cache
+    ///   would otherwise keep. Plain eviction passes `false` and preserves
+    ///   independently owned renders.
+    private func removeTable(
+        for key: AutoChartRenderTableCacheKey,
+        invalidatingRenderEntries: Bool = false
+    ) {
+        let removed = tableEntries.removeValue(forKey: key)
+        if let removed {
             tableTotalCost -= removed.estimatedCost ?? 0
+        }
+        if removed != nil || invalidatingRenderEntries {
             let related = recency.filter { renderKey in
-                renderKey.table == key && entries[renderKey]?.table === removed
+                guard renderKey.table == key else { return false }
+                return invalidatingRenderEntries || entries[renderKey]?.table === removed
             }
             for renderKey in related {
                 removeRender(for: renderKey)
@@ -1530,7 +1578,43 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
     private func removeRender(for key: AutoChartRenderCacheKey) {
         entries.removeValue(forKey: key)
         totalCost -= costs.removeValue(forKey: key) ?? 0
+        releaseRenderTable(for: key)
         recency.removeAll { $0 == key }
+    }
+
+    /// Charges `table` to the render budget on first retention only.
+    ///
+    /// - Precondition: The caller already holds `lock`.
+    private func retainRenderTable(
+        _ table: AutoChartPreparedTable,
+        cost: Int,
+        for key: AutoChartRenderCacheKey
+    ) {
+        let id = ObjectIdentifier(table)
+        renderEntryTables[key] = id
+        if renderTableRetainers[id] == nil {
+            renderTableRetainers[id] = []
+            renderTableCosts[id] = cost
+            totalCost += cost
+        }
+        renderTableRetainers[id]?.insert(key)
+    }
+
+    /// Drops `key` from its render-owned table, refunding the table once the
+    /// last retaining entry is gone.
+    ///
+    /// - Precondition: The caller already holds `lock`.
+    private func releaseRenderTable(for key: AutoChartRenderCacheKey) {
+        guard let id = renderEntryTables.removeValue(forKey: key),
+            var retainers = renderTableRetainers[id]
+        else { return }
+        retainers.remove(key)
+        if retainers.isEmpty {
+            renderTableRetainers.removeValue(forKey: id)
+            totalCost -= renderTableCosts.removeValue(forKey: id) ?? 0
+        } else {
+            renderTableRetainers[id] = retainers
+        }
     }
 
     private func estimatedTableCost(
@@ -1670,6 +1754,12 @@ private extension AutoChartRenderPreparationCache {
         return entries.count
     }
 
+    var renderCost: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return totalCost
+    }
+
     func configure(_ configuration: AutoChartRenderCacheConfiguration) {
         lock.lock()
         defer { lock.unlock() }
@@ -1691,6 +1781,9 @@ private extension AutoChartRenderPreparationCache {
         entries.removeAll(keepingCapacity: false)
         costs.removeAll(keepingCapacity: false)
         recency.removeAll(keepingCapacity: false)
+        renderTableCosts.removeAll(keepingCapacity: false)
+        renderTableRetainers.removeAll(keepingCapacity: false)
+        renderEntryTables.removeAll(keepingCapacity: false)
         totalCost = 0
     }
 
@@ -1718,8 +1811,9 @@ private extension AutoChartRenderPreparationCache {
     ///
     /// - Precondition: The caller already holds `lock`.
     private func trimRenderLocked() {
-        while recency.count > activeConfiguration.maximumRenderEntries
-            || totalCost > activeConfiguration.maximumRenderCost
+        while !recency.isEmpty,
+            recency.count > activeConfiguration.maximumRenderEntries
+                || totalCost > activeConfiguration.maximumRenderCost
         {
             removeRender(for: recency[0])
         }

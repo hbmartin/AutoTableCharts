@@ -38,8 +38,8 @@ Memory-constrained hosts can lower both cache layers during startup. A zero entr
 or byte limit disables that layer, and the two layers can be enabled independently.
 When render caching is enabled without table caching, renders for the same stable
 table revision reuse a render-owned snapshot and profile set when possible. Its
-estimated size is conservatively charged to each retaining render entry's byte
-budget:
+estimated size is charged to the render byte budget once, however many render
+entries share it, and refunded when the last of them is evicted:
 
 ```swift
 AutoChartRenderCache.configure(
