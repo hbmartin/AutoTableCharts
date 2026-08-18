@@ -61,11 +61,12 @@ a bar chart can serve comparison and ranking—but one requested goal matches at
 most one of those terms.
 
 This base-score plus task-bonus formula is the policy-v1 scoring model. The
-package's public policy version is now 7 because later identity, missing-value,
+package's public policy version is now 8 because later identity, missing-value,
 aggregation-safety, candidate-bound, facet-semantics, non-finite-number,
 signed-zero, renderability-aware completeness, and channel-compatibility
-hardening can also change recommendation output; version 7 retains the same
-transparent scoring formula.
+hardening can also change recommendation output. Version 8 adds exact categorical
+numeric identity, typed non-finite-date handling, and finite-span validation while
+retaining the same transparent scoring formula.
 
 Scores are meaningful only within the candidate set produced for the same
 snapshot, options, context, and policy version. They aren't probabilities,

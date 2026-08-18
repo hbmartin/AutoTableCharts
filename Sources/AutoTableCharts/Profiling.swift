@@ -184,10 +184,23 @@ struct AutoChartColumnProfile: Sendable {
     var allNumericValuesPositive: Bool
     var averageTextLength: Double
     var temporalValues: [Date]
+    /// Typed dates whose interval cannot be positioned on a finite chart axis.
+    var nonFiniteDateCount: Int
 
     var isQuantitative: Bool { semanticType == .quantitative }
     var isTemporal: Bool { semanticType == .temporal }
     var hasNonFiniteNumericValues: Bool { numericValueCount != numericTypeCount }
+    var hasNonFiniteDateValues: Bool { nonFiniteDateCount > 0 }
+    var hasFiniteNumericSpan: Bool {
+        guard let numericMinimum, let numericMaximum else { return true }
+        return (numericMaximum - numericMinimum).isFinite
+    }
+    var hasFiniteTemporalSpan: Bool {
+        guard let minimum = temporalValues.min(), let maximum = temporalValues.max() else {
+            return true
+        }
+        return maximum.timeIntervalSince(minimum).isFinite
+    }
     /// Whether every renderable value is distinct, so marks keyed by this column
     /// alone can't collide. Recommendation and validation share this rule so they
     /// can't disagree about whether an aggregation is required.
@@ -240,6 +253,12 @@ enum AutoChartProfiler {
         }
         let numeric = nonNull.compactMap(\.numericValue)
         let dates = nonNull.compactMap(dateValue)
+        let nonFiniteDateCount = nonNull.reduce(into: 0) { count, value in
+            guard case .date(let date) = value,
+                !date.timeIntervalSinceReferenceDate.isFinite
+            else { return }
+            count += 1
+        }
         let textLengths = nonNull.compactMap { value -> Int? in
             if case .text(let text) = value { return text.count }
             return nil
@@ -250,7 +269,7 @@ enum AutoChartProfiler {
             values: nonNull,
             numericTypeCount: numericTyped.count,
             numericCount: numeric.count,
-            dateCount: dates.count,
+            temporalTypeCount: dates.count + nonFiniteDateCount,
             distinctCount: raw.distinct.count)
         let renderable =
             resolvesToRawIdentity(type) ? raw : identitySummary(values, semanticType: type)
@@ -270,7 +289,8 @@ enum AutoChartProfiler {
                 && numeric.allSatisfy { $0 > 0 },
             averageTextLength: textLengths.isEmpty
                 ? 0 : Double(textLengths.reduce(0, +)) / Double(textLengths.count),
-            temporalValues: dates)
+            temporalValues: dates,
+            nonFiniteDateCount: nonFiniteDateCount)
     }
 
     /// The renderable values of a column, counted and deduplicated in one pass.
@@ -307,7 +327,7 @@ enum AutoChartProfiler {
         values: [AutoChartValue],
         numericTypeCount: Int,
         numericCount: Int,
-        dateCount: Int,
+        temporalTypeCount: Int,
         distinctCount: Int
     ) -> AutoChartSemanticType {
         if let explicit = column.hints.semanticType { return explicit }
@@ -321,7 +341,7 @@ enum AutoChartProfiler {
         if values.allSatisfy({ if case .boolean = $0 { true } else { false } }) {
             return .boolean
         }
-        if dateCount == values.count {
+        if temporalTypeCount == values.count {
             return .temporal
         }
         if numericTypeCount == values.count {
@@ -410,9 +430,8 @@ enum AutoChartProfiler {
             let normalized = value == 0 ? 0.0 : value
             return .double(normalized.bitPattern)
         case .decimal(let value):
-            let number = NSDecimalNumber(decimal: value)
-            guard number.doubleValue.isFinite else { return .missing }
-            return .decimal(number.stringValue)
+            guard let canonical = decimalString(value) else { return .missing }
+            return .decimal(canonical)
         case .text(let value):
             return .text(value)
         case .date(let value):
@@ -433,36 +452,140 @@ enum AutoChartProfiler {
 
     /// A canonical, lossless identity for a numeric category.
     ///
-    /// Finite Doubles use their shortest round-tripping decimal representation
-    /// when Foundation's Decimal can preserve it. Very large Doubles that Decimal
-    /// cannot represent retain their normalized bit pattern instead.
+    /// Finite Doubles use their exact decimal value when Foundation's Decimal can
+    /// preserve it. Other Doubles retain their normalized bit pattern instead of
+    /// being merged with a nearby integer or decimal that rounds to the same Double.
     private static func exactNumberIdentity(
         _ value: AutoChartValue
     ) -> AutoChartValueIdentity? {
         switch value {
         case .integer(let value):
-            return .exactNumber(String(value))
+            return canonicalDecimalIdentity(String(value)).map(
+                AutoChartValueIdentity.exactNumber)
         case .double(let value):
             guard value.isFinite else { return nil }
             let normalized = value == 0 ? 0.0 : value
-            let text = String(normalized)
-            guard
-                let decimal = Decimal(
-                    string: text,
-                    locale: posixLocale),
-                !decimal.isNaN
-            else { return .double(normalized.bitPattern) }
-            let canonical = NSDecimalNumber(decimal: decimal).stringValue
-            guard Double(canonical) == normalized else {
-                return .double(normalized.bitPattern)
-            }
-            return .exactNumber(canonical)
+            return exactDecimalIdentity(normalized).map(AutoChartValueIdentity.exactNumber)
         case .decimal(let value):
-            guard !value.isNaN else { return nil }
-            return .exactNumber(NSDecimalNumber(decimal: value).stringValue)
+            guard let text = decimalString(value) else { return nil }
+            return canonicalDecimalIdentity(text).map(AutoChartValueIdentity.exactNumber)
         default:
             return nil
         }
+    }
+
+    /// Returns an exact, normalized decimal identity for a Double when it fits
+    /// Foundation Decimal's 38 significant digits.
+    private static func exactDecimalIdentity(_ value: Double) -> String? {
+        if value == 0 { return "0e0" }
+        if let integer = Int64(exactly: value) {
+            return canonicalDecimalIdentity(String(integer))
+        }
+
+        let bits = value.bitPattern
+        let isNegative = bits >> 63 == 1
+        let exponentBits = Int((bits >> 52) & 0x7ff)
+        let fraction = bits & ((UInt64(1) << 52) - 1)
+        var significand: UInt64
+        var binaryExponent: Int
+        if exponentBits == 0 {
+            significand = fraction
+            binaryExponent = -1_074
+        } else {
+            significand = (UInt64(1) << 52) | fraction
+            binaryExponent = exponentBits - 1_023 - 52
+        }
+        while significand.isMultiple(of: 2) {
+            significand /= 2
+            binaryExponent += 1
+        }
+
+        var coefficient: String
+        var decimalExponent: Int
+        if binaryExponent >= 0 {
+            var decimalZeroCount = 0
+            while decimalZeroCount < binaryExponent, significand.isMultiple(of: 5) {
+                significand /= 5
+                decimalZeroCount += 1
+            }
+            let remainingPower = binaryExponent - decimalZeroCount
+            guard let product = decimalProduct(
+                String(significand), multiplier: 2, power: remainingPower)
+            else { return nil }
+            coefficient = product
+            decimalExponent = decimalZeroCount
+        } else {
+            let denominatorPower = -binaryExponent
+            guard let product = decimalProduct(
+                String(significand), multiplier: 5, power: denominatorPower)
+            else { return nil }
+            coefficient = product
+            decimalExponent = -denominatorPower
+        }
+        if isNegative { coefficient.insert("-", at: coefficient.startIndex) }
+
+        let identity = "\(coefficient)e\(decimalExponent)"
+        guard let decimal = Decimal(string: identity, locale: posixLocale),
+            canonicalDecimalIdentity(NSDecimalNumber(decimal: decimal).stringValue) == identity
+        else { return nil }
+        return identity
+    }
+
+    private static func decimalProduct(
+        _ value: String,
+        multiplier: Int,
+        power: Int
+    ) -> String? {
+        var digits = value.utf8.map { Int($0 - 48) }
+        for _ in 0..<power {
+            var carry = 0
+            for index in digits.indices.reversed() {
+                let product = digits[index] * multiplier + carry
+                digits[index] = product % 10
+                carry = product / 10
+            }
+            while carry > 0 {
+                digits.insert(carry % 10, at: 0)
+                carry /= 10
+            }
+            guard digits.count <= 38 else { return nil }
+        }
+        return String(digits.map { Character(String($0)) })
+    }
+
+    private static func decimalString(_ value: Decimal) -> String? {
+        let number = NSDecimalNumber(decimal: value)
+        guard number.doubleValue.isFinite else { return nil }
+        return number.stringValue
+    }
+
+    private static func canonicalDecimalIdentity(_ text: String) -> String? {
+        let components = text.split(
+            omittingEmptySubsequences: false,
+            whereSeparator: { $0 == "e" || $0 == "E" })
+        guard components.count <= 2,
+            let explicitExponent = components.count == 2 ? Int(components[1]) : 0
+        else { return nil }
+
+        var mantissa = String(components[0])
+        let isNegative = mantissa.first == "-"
+        if isNegative { mantissa.removeFirst() }
+        let decimalParts = mantissa.split(separator: ".", omittingEmptySubsequences: false)
+        guard decimalParts.count <= 2 else { return nil }
+        let fractionalCount = decimalParts.count == 2 ? decimalParts[1].utf8.count : 0
+        var digits = decimalParts.joined()
+        guard !digits.isEmpty, digits.utf8.allSatisfy({ (48...57).contains($0) }) else {
+            return nil
+        }
+        while digits.first == "0" { digits.removeFirst() }
+        guard !digits.isEmpty else { return "0e0" }
+
+        var exponent = explicitExponent - fractionalCount
+        while digits.last == "0" {
+            digits.removeLast()
+            exponent += 1
+        }
+        return "\(isNegative ? "-" : "")\(digits)e\(exponent)"
     }
 
     static func identityString(

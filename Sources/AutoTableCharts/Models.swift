@@ -54,7 +54,8 @@ public enum AutoChartValue: Hashable, Codable, Sendable {
     case decimal(Decimal)
     /// A textual value, which may also be recognized as an ISO-formatted date.
     case text(String)
-    /// A date value used by temporal encodings.
+    /// A date value used by temporal encodings. Non-finite intervals are retained
+    /// as typed input but omitted from marks.
     case date(Date)
     /// An opaque value that is deliberately unsupported as a chart encoding.
     case binary(Data)
