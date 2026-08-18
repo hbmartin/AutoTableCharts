@@ -35,7 +35,10 @@ rows, values, or metadata change. A version without an identity deliberately fal
 back to content fingerprinting so two tables of the same Swift type cannot collide.
 
 Memory-constrained hosts can lower both cache layers during startup. A zero entry
-or byte limit disables that layer:
+or byte limit disables that layer, and the two layers can be enabled independently.
+When render caching is enabled without table caching, each retained render owns its
+required snapshot and profile set, whose estimated size counts against the render
+byte budget:
 
 ```swift
 AutoChartRenderCache.configure(

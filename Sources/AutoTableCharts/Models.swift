@@ -609,6 +609,17 @@ public struct AutoChartEncoding: Hashable, Codable, Sendable {
     }
 }
 
+extension AutoChartEncoding {
+    /// Every assigned column in channel order.
+    ///
+    /// Keeping this list next to the channel declarations prevents validation,
+    /// cache accounting, and future cross-channel checks from drifting when a
+    /// channel is added.
+    var columnIDs: [AutoChartColumnID] {
+        [x, y, series, size, facet, start, end].compactMap { $0 }
+    }
+}
+
 /// A declarative, renderer-independent description of one supported chart.
 ///
 /// Validate caller-authored specifications before rendering. Engine-generated
