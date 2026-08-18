@@ -1020,7 +1020,8 @@ public struct AutoChartRenderCacheConfiguration: Equatable, Sendable {
     public let maximumRenderEntries: Int
     /// The approximate retained-byte budget for prepared recommendation results.
     /// Defaults to 32 MiB. A table snapshot shared through the table cache is
-    /// excluded; a snapshot owned only by a render entry counts against this budget.
+    /// excluded; a snapshot retained only through render entries counts against
+    /// this budget.
     public let maximumRenderCost: Int
 
     /// Creates process-wide rendering cache limits.
@@ -1030,8 +1031,8 @@ public struct AutoChartRenderCacheConfiguration: Equatable, Sendable {
     ///   - maximumTableCost: Approximate retained-byte budget for snapshots and profiles.
     ///   - maximumRenderEntries: Maximum retained prepared recommendation results.
     ///   - maximumRenderCost: Approximate retained-byte budget for prepared results.
-    ///     Shared table-cache snapshots are excluded, while snapshots retained only
-    ///     by render entries are included.
+    ///     Table-cache snapshots are excluded, while snapshots retained only through
+    ///     render entries are included.
     public init(
         maximumTableEntries: Int = 8,
         maximumTableCost: Int = 32 * 1_024 * 1_024,
@@ -1157,6 +1158,12 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
                     tableKey: tableKey,
                     recommendation: recommendation)
             }
+            if let prepared = renderOwnedTableValue(for: tableKey) {
+                return core(
+                    table: prepared,
+                    tableKey: tableKey,
+                    recommendation: recommendation)
+            }
             var hasher = Hasher()
             hasher.combine(tableType)
             hasher.combine(tableIdentity)
@@ -1175,6 +1182,12 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
             tableIdentity: nil,
             contentIdentity: "fingerprint:\(fingerprint)")
         if let prepared = tableValue(for: tableKey, matching: snapshot) {
+            return core(
+                table: prepared,
+                tableKey: tableKey,
+                recommendation: recommendation)
+        }
+        if let prepared = renderOwnedTableValue(for: tableKey, matching: snapshot) {
             return core(
                 table: prepared,
                 tableKey: tableKey,
@@ -1284,6 +1297,55 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
         tableRecency.removeAll { $0 == key }
         tableRecency.append(key)
         return value
+    }
+
+    /// Reuses a snapshot already retained and budgeted by the render layer.
+    /// Identity and version are the caller's content-stability contract.
+    private func renderOwnedTableValue(
+        for key: AutoChartRenderTableCacheKey
+    ) -> AutoChartPreparedTable? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !activeConfiguration.isTableCachingEnabled,
+            let renderKey = recency.last(where: { $0.table == key }),
+            let value = entries[renderKey],
+            tableEntries[key] !== value.table
+        else { return nil }
+        return value.table
+    }
+
+    /// Reuses render-owned storage after fingerprint lookup confirms the key and
+    /// a full comparison confirms the snapshot content.
+    private func renderOwnedTableValue(
+        for key: AutoChartRenderTableCacheKey,
+        matching snapshot: AutoChartSnapshot
+    ) -> AutoChartPreparedTable? {
+        lock.lock()
+        guard !activeConfiguration.isTableCachingEnabled else {
+            lock.unlock()
+            return nil
+        }
+        var seen: Set<ObjectIdentifier> = []
+        let candidates = recency.reversed().compactMap { renderKey -> AutoChartPreparedTable? in
+            guard renderKey.table == key,
+                let table = entries[renderKey]?.table,
+                tableEntries[key] !== table,
+                seen.insert(ObjectIdentifier(table)).inserted
+            else { return nil }
+            return table
+        }
+        lock.unlock()
+
+        for candidate in candidates where candidate.snapshot.hasSameContent(as: snapshot) {
+            lock.lock()
+            let isRetained = !activeConfiguration.isTableCachingEnabled
+                && entries.contains { renderKey, value in
+                    renderKey.table == key && value.table === candidate
+                }
+            lock.unlock()
+            if isRetained { return candidate }
+        }
+        return nil
     }
 
     private func value(
@@ -1452,14 +1514,14 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
     private func removeTable(for key: AutoChartRenderTableCacheKey) {
         if let removed = tableEntries.removeValue(forKey: key) {
             tableTotalCost -= removed.estimatedCost ?? 0
-        }
-        let related = recency.filter { $0.table == key }
-        for renderKey in related {
-            entries.removeValue(forKey: renderKey)
-            totalCost -= costs.removeValue(forKey: renderKey) ?? 0
+            let related = recency.filter { renderKey in
+                renderKey.table == key && entries[renderKey]?.table === removed
+            }
+            for renderKey in related {
+                removeRender(for: renderKey)
+            }
         }
         tableRecency.removeAll { $0 == key }
-        recency.removeAll { $0.table == key }
     }
 
     /// Removes one render entry and its accounted cost.

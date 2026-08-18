@@ -36,9 +36,10 @@ back to content fingerprinting so two tables of the same Swift type cannot colli
 
 Memory-constrained hosts can lower both cache layers during startup. A zero entry
 or byte limit disables that layer, and the two layers can be enabled independently.
-When render caching is enabled without table caching, each retained render owns its
-required snapshot and profile set, whose estimated size counts against the render
-byte budget:
+When render caching is enabled without table caching, renders for the same stable
+table revision reuse a render-owned snapshot and profile set when possible. Its
+estimated size is conservatively charged to each retaining render entry's byte
+budget:
 
 ```swift
 AutoChartRenderCache.configure(

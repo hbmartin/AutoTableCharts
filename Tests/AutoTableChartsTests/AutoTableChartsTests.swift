@@ -563,6 +563,117 @@ private let date = AutoChartColumn(
         #expect(AutoChartRenderCache.retainedRenderCount == 1)
     }
 
+    @Test @MainActor func distinctSpecificationsReuseARenderOwnedVersionedSnapshot() {
+        let originalConfiguration = AutoChartRenderCache.configuration
+        defer {
+            AutoChartRenderCache.configure(originalConfiguration)
+            AutoChartRenderCache.removeAll()
+        }
+        AutoChartRenderCache.configure(
+            AutoChartRenderCacheConfiguration(
+                maximumTableEntries: 0,
+                maximumTableCost: 0,
+                maximumRenderEntries: 8,
+                maximumRenderCost: 1_024 * 1_024))
+        AutoChartRenderCache.removeAll()
+
+        let counter = ChartValueReadCounter()
+        let input = VersionedCountingTable(
+            chartColumns: [category, measure],
+            chartRows: (0..<100).map { index in
+                CountingRow(
+                    chartRowID: AutoChartRowID(rawValue: "r\(index)"),
+                    values: [
+                        category.id: .text("Category \(index)"),
+                        measure.id: .double(Double(index)),
+                    ],
+                    counter: counter)
+            },
+            chartDataIdentity: UUID().uuidString,
+            chartDataVersion: UUID().uuidString)
+        let bar = AutoChartRecommendation(
+            specification: AutoChartSpecification(
+                family: .bar,
+                encoding: .init(x: category.id, y: measure.id)),
+            score: 0,
+            rationale: ["Render-owned sharing test"])
+        let dots = AutoChartRecommendation(
+            specification: AutoChartSpecification(
+                family: .rankedDot,
+                encoding: .init(x: category.id, y: measure.id)),
+            score: 0,
+            rationale: ["Render-owned sharing test"])
+
+        _ = AutoChartView(table: input, recommendation: bar)
+        #expect(counter.count > 0)
+
+        counter.reset()
+        _ = AutoChartView(table: input, recommendation: dots)
+        #expect(counter.count == 0)
+        #expect(AutoChartRenderCache.retainedTableCount == 0)
+        #expect(AutoChartRenderCache.retainedRenderCount == 2)
+    }
+
+    @Test @MainActor func disablingTableCachingPreservesIndependentlyOwnedRenders() {
+        let originalConfiguration = AutoChartRenderCache.configuration
+        defer {
+            AutoChartRenderCache.configure(originalConfiguration)
+            AutoChartRenderCache.removeAll()
+        }
+        let renderOnly = AutoChartRenderCacheConfiguration(
+            maximumTableEntries: 0,
+            maximumTableCost: 0,
+            maximumRenderEntries: 8,
+            maximumRenderCost: 1_024 * 1_024)
+        AutoChartRenderCache.configure(renderOnly)
+        AutoChartRenderCache.removeAll()
+
+        let counter = ChartValueReadCounter()
+        let identity = UUID().uuidString
+        let version = UUID().uuidString
+        let input = VersionedCountingTable(
+            chartColumns: [category, measure],
+            chartRows: [
+                CountingRow(
+                    chartRowID: "r0",
+                    values: [category.id: .text("A"), measure.id: .double(1)],
+                    counter: counter)
+            ],
+            chartDataIdentity: identity,
+            chartDataVersion: version)
+        let bar = AutoChartRecommendation(
+            specification: AutoChartSpecification(
+                family: .bar,
+                encoding: .init(x: category.id, y: measure.id)),
+            score: 0,
+            rationale: ["Independent render preservation test"])
+        let dots = AutoChartRecommendation(
+            specification: AutoChartSpecification(
+                family: .rankedDot,
+                encoding: .init(x: category.id, y: measure.id)),
+            score: 0,
+            rationale: ["Independent render preservation test"])
+
+        _ = AutoChartView(table: input, recommendation: bar)
+        AutoChartRenderCache.configure(
+            AutoChartRenderCacheConfiguration(
+                maximumTableEntries: 8,
+                maximumTableCost: 1_024 * 1_024,
+                maximumRenderEntries: 8,
+                maximumRenderCost: 1_024 * 1_024))
+        _ = AutoChartView(table: input, recommendation: dots)
+        #expect(AutoChartRenderCache.retainedTableCount == 1)
+        #expect(AutoChartRenderCache.retainedRenderCount == 2)
+
+        AutoChartRenderCache.configure(renderOnly)
+        #expect(AutoChartRenderCache.retainedTableCount == 0)
+        #expect(AutoChartRenderCache.retainedRenderCount == 1)
+
+        counter.reset()
+        _ = AutoChartView(table: input, recommendation: bar)
+        #expect(counter.count == 0)
+    }
+
     @Test @MainActor func aVersionWithoutATableIdentityCannotCrossContaminateTables() throws {
         let counter = ChartValueReadCounter()
         func input(value: Double) -> VersionedCountingTable {
@@ -2486,13 +2597,11 @@ private let date = AutoChartColumn(
         #expect(
             validation.issues.contains {
                 $0.severity == .error
-                    && $0.message == "Range starts must not contain missing values."
+                    && $0.message == "Temporal field date contains non-finite dates."
             })
         #expect(
-            validation.issues.contains {
-                $0.severity == .warning
-                    && $0.message
-                        == "Temporal field date contains non-finite dates that will be omitted."
+            !validation.issues.contains {
+                $0.message == "Range starts must not contain missing values."
             })
     }
 
@@ -2516,6 +2625,118 @@ private let date = AutoChartColumn(
             validation.issues.contains {
                 $0.message
                     == "Aggregation of quantitative field measure produces non-finite values."
+            })
+    }
+
+    @Test func stackedTotalsMustRemainFiniteBeforeRendering() {
+        let series = AutoChartColumn(
+            id: "series", name: "series",
+            hints: AutoChartColumnHints(semanticType: .nominal))
+        let halfExtreme = Double.greatestFiniteMagnitude / 2
+        let input = table(
+            columns: [category, series, measure],
+            rows: [
+                [.text("A"), .text("One"), .double(halfExtreme)],
+                [.text("A"), .text("Two"), .double(halfExtreme)],
+                [.text("A"), .text("Three"), .double(halfExtreme)],
+            ])
+        let specifications = [
+            AutoChartSpecification(
+                family: .stackedBar,
+                encoding: .init(x: category.id, y: measure.id, series: series.id),
+                stacking: .standard),
+            AutoChartSpecification(
+                family: .normalizedBar,
+                encoding: .init(x: category.id, y: measure.id, series: series.id),
+                stacking: .normalized),
+        ]
+
+        for specification in specifications {
+            let validation = AutoChartEngine.validate(
+                specification: specification,
+                for: input)
+            #expect(!validation.isValid)
+            #expect(
+                validation.issues.contains {
+                    $0.message
+                        == "Stacking quantitative field measure produces non-finite totals."
+                })
+        }
+    }
+
+    @Test func donutPreparationIsCheckedEvenWhenAggregationIsNone() {
+        let halfExtreme = Double.greatestFiniteMagnitude / 2
+        let input = table(
+            columns: [category, measure],
+            rows: [
+                [.text("A"), .double(halfExtreme)],
+                [.text("A"), .double(halfExtreme)],
+                [.text("A"), .double(halfExtreme)],
+            ])
+        let specification = AutoChartSpecification(
+            family: .donut,
+            encoding: .init(x: category.id, y: measure.id))
+        let validation = AutoChartEngine.validate(
+            specification: specification,
+            for: input)
+
+        #expect(!validation.isValid)
+        #expect(
+            validation.issues.contains {
+                $0.message
+                    == "Aggregation of quantitative field measure produces non-finite values."
+            })
+    }
+
+    @Test func donutSectorTotalMustRemainFinite() {
+        let halfExtreme = Double.greatestFiniteMagnitude / 2
+        let input = table(
+            columns: [category, measure],
+            rows: [
+                [.text("A"), .double(halfExtreme)],
+                [.text("B"), .double(halfExtreme)],
+                [.text("C"), .double(halfExtreme)],
+            ])
+        let specification = AutoChartSpecification(
+            family: .donut,
+            encoding: .init(x: category.id, y: measure.id),
+            aggregation: .sum)
+        let validation = AutoChartEngine.validate(
+            specification: specification,
+            for: input)
+
+        #expect(!validation.isValid)
+        #expect(
+            validation.issues.contains {
+                $0.message
+                    == "Composition of quantitative field measure produces a non-finite total."
+            })
+    }
+
+    @Test func recommendationsFullyValidatePreparedDomainsBeforeReturning() {
+        let series = AutoChartColumn(
+            id: "series", name: "series",
+            hints: AutoChartColumnHints(semanticType: .nominal))
+        let halfExtreme = Double.greatestFiniteMagnitude / 2
+        let input = table(
+            columns: [category, series, measure],
+            rows: [
+                [.text("A"), .text("One"), .double(halfExtreme)],
+                [.text("A"), .text("Two"), .double(halfExtreme)],
+                [.text("A"), .text("Three"), .double(halfExtreme)],
+            ])
+        let recommendations = AutoChartEngine.recommendations(for: input)
+
+        for recommendation in recommendations.chartRecommendations {
+            #expect(
+                AutoChartEngine.validate(
+                    specification: recommendation.specification,
+                    for: input
+                ).isValid)
+        }
+        #expect(
+            !recommendations.chartRecommendations.contains {
+                [.stackedBar, .normalizedBar].contains($0.specification.family)
             })
     }
 

@@ -75,17 +75,42 @@ public enum AutoChartEngine {
                     && $0.distinctCount > 0
             }.prefix(options.maximumCandidateColumns))
         let validationMemo = AutoChartValidationMemo()
-        var validationResults: [AutoChartSpecification: AutoChartValidationResult] = [:]
-        func cachedValidation(
+        var structuralValidationResults: [AutoChartSpecification: AutoChartValidationResult] = [:]
+        func cachedStructuralValidation(
             _ specification: AutoChartSpecification
         ) -> AutoChartValidationResult {
-            if let cached = validationResults[specification] { return cached }
+            if let cached = structuralValidationResults[specification] { return cached }
             let result = validate(
                 specification: specification,
                 snapshot: snapshot,
                 profiles: profileIndex,
-                memo: validationMemo)
-            validationResults[specification] = result
+                memo: validationMemo,
+                validatesPreparedNumericDomain: false)
+            structuralValidationResults[specification] = result
+            return result
+        }
+        var preparedValidationResults: [AutoChartSpecification: AutoChartValidationResult] = [:]
+        func cachedPreparedValidation(
+            _ specification: AutoChartSpecification
+        ) -> AutoChartValidationResult {
+            guard requiresPreparedNumericDomainValidation(
+                specification: specification,
+                profiles: profileIndex)
+            else {
+                return cachedStructuralValidation(specification)
+            }
+            if let cached = preparedValidationResults[specification] { return cached }
+            let data = AutoChartDataPreparation.data(
+                snapshot: snapshot,
+                specification: specification,
+                profiles: profileIndex)
+            let result = validate(
+                specification: specification,
+                snapshot: snapshot,
+                profiles: profileIndex,
+                memo: validationMemo,
+                preparedData: data)
+            preparedValidationResults[specification] = result
             return result
         }
         var candidates: [AutoChartRecommendation] = []
@@ -380,7 +405,7 @@ public enum AutoChartEngine {
                     && recommendation.specification.encoding.x != facet.column.id
                     && recommendation.specification.encoding.y != facet.column.id
                     && recommendation.specification.encoding.series != facet.column.id
-                    && cachedValidation(recommendation.specification).isValid
+                    && cachedStructuralValidation(recommendation.specification).isValid
             }
             guard let base else { continue }
             facetProfile = facet
@@ -399,7 +424,7 @@ public enum AutoChartEngine {
         }
 
         let unique = bestCandidatesByID(candidates).filter {
-            cachedValidation($0.specification).isValid
+            cachedStructuralValidation($0.specification).isValid
         }
         let ranked = unique.sorted {
             if $0.score != $1.score { return $0.score > $1.score }
@@ -408,7 +433,10 @@ public enum AutoChartEngine {
             if lhs != rhs { return lhs < rhs }
             return $0.id < $1.id
         }
-        let diverse = diversify(ranked, limit: options.maximumRecommendations)
+        let diverse = diversify(
+            ranked,
+            limit: options.maximumRecommendations,
+            isValid: { cachedPreparedValidation($0.specification).isValid })
         guard !diverse.isEmpty else {
             let reason = "No safe chart can represent this result without changing its meaning."
             return AutoChartRecommendationSet(
@@ -434,7 +462,8 @@ public enum AutoChartEngine {
         snapshot: AutoChartSnapshot,
         profiles: [AutoChartColumnID: AutoChartColumnProfile],
         memo: AutoChartValidationMemo? = nil,
-        preparedData: [AutoChartDatum]? = nil
+        preparedData: [AutoChartDatum]? = nil,
+        validatesPreparedNumericDomain: Bool = true
     ) -> AutoChartValidationResult {
         var issues: [AutoChartValidationIssue] = []
         let referenced = orderedUnique(specification.encoding.columnIDs)
@@ -474,10 +503,9 @@ public enum AutoChartEngine {
                 return
             }
             // A typed non-finite date is present but cannot position a mark. It
-            // receives the temporal omission warning below rather than also being
-            // reported as a missing value.
-            if specification.family != .range,
-                profile.isTemporal,
+            // receives the specific temporal diagnostic below rather than also
+            // being reported as a missing value.
+            if profile.isTemporal,
                 profile.nonNullCount == snapshot.rows.count,
                 profile.temporalValues.count + profile.nonFiniteDateCount
                     == profile.nonNullCount,
@@ -756,11 +784,14 @@ public enum AutoChartEngine {
             guard let profile = profiles[id], profile.isTemporal,
                 profile.hasNonFiniteDateValues
             else { continue }
+            let isRequiredRangeEndpoint = specification.family == .range
+                && (id == specification.encoding.start || id == specification.encoding.end)
             issues.append(
                 .init(
-                    severity: .warning,
-                    message:
-                        "Temporal field \(id.rawValue) contains non-finite dates that will be omitted."
+                    severity: isRequiredRangeEndpoint ? .error : .warning,
+                    message: isRequiredRangeEndpoint
+                        ? "Temporal field \(id.rawValue) contains non-finite dates."
+                        : "Temporal field \(id.rawValue) contains non-finite dates that will be omitted."
                 ))
         }
         for id in referenced {
@@ -811,36 +842,23 @@ public enum AutoChartEngine {
                 }
             }
         }
-        if specification.family != .table,
-            specification.aggregation != .none,
+        if validatesPreparedNumericDomain,
+            requiresPreparedNumericDomainValidation(
+                specification: specification,
+                profiles: profiles),
             let y = specification.encoding.y,
-            let profile = profiles[y],
-            profile.isQuantitative,
-            profile.hasFiniteNumericSpan
+            profiles[y]?.hasFiniteNumericSpan == true
         {
             let data = preparedData
                 ?? AutoChartDataPreparation.data(
                     snapshot: snapshot,
                     specification: specification,
                     profiles: profiles)
-            let values = data.compactMap(\.yNumber)
-            if values.contains(where: { !$0.isFinite }) {
-                issues.append(
-                    .init(
-                        severity: .error,
-                        message:
-                            "Aggregation of quantitative field \(y.rawValue) produces non-finite values."
-                    ))
-            } else if let minimum = values.min(), let maximum = values.max(),
-                !(maximum - minimum).isFinite
-            {
-                issues.append(
-                    .init(
-                        severity: .error,
-                        message:
-                            "Aggregated quantitative field \(y.rawValue) spans a range too large to render safely."
-                    ))
-            }
+            issues.append(
+                contentsOf: preparedNumericDomainIssues(
+                    specification: specification,
+                    data: data,
+                    y: y))
         }
         let expectedAggregation: AutoChartAggregation? =
             switch specification.family {
@@ -1096,6 +1114,104 @@ public enum AutoChartEngine {
         }
     }
 
+    /// Whether preparation can create a numeric domain that is not bounded by the
+    /// source column's individual values.
+    private static func requiresPreparedNumericDomainValidation(
+        specification: AutoChartSpecification,
+        profiles: [AutoChartColumnID: AutoChartColumnProfile]
+    ) -> Bool {
+        guard specification.family != .table,
+            let y = specification.encoding.y,
+            profiles[y]?.isQuantitative == true
+        else { return false }
+        if [.donut, .stackedBar, .normalizedBar].contains(specification.family) {
+            return true
+        }
+        return specification.aggregation != .none
+            && ![.histogram, .heatmap].contains(specification.family)
+    }
+
+    private struct PreparedStackKey: Hashable {
+        var x: String?
+        var facet: String?
+    }
+
+    private static func preparedNumericDomainIssues(
+        specification: AutoChartSpecification,
+        data: [AutoChartDatum],
+        y: AutoChartColumnID
+    ) -> [AutoChartValidationIssue] {
+        let values = data.compactMap(\.yNumber)
+        if values.contains(where: { !$0.isFinite }) {
+            return [
+                .init(
+                    severity: .error,
+                    message:
+                        "Aggregation of quantitative field \(y.rawValue) produces non-finite values."
+                )
+            ]
+        }
+
+        if specification.family == .donut {
+            guard finiteSum(values) != nil else {
+                return [
+                    .init(
+                        severity: .error,
+                        message:
+                            "Composition of quantitative field \(y.rawValue) produces a non-finite total."
+                    )
+                ]
+            }
+            return []
+        }
+
+        var domainValues = values
+        if [.stackedBar, .normalizedBar].contains(specification.family) {
+            var totals: [PreparedStackKey: Double] = [:]
+            for datum in data {
+                guard let value = datum.yNumber else { continue }
+                let key = PreparedStackKey(
+                    x: datum.xIdentity ?? datum.xLabel,
+                    facet: datum.facetIdentity ?? datum.facet)
+                let total = (totals[key] ?? 0) + value
+                guard total.isFinite else {
+                    return [
+                        .init(
+                            severity: .error,
+                            message:
+                                "Stacking quantitative field \(y.rawValue) produces non-finite totals."
+                        )
+                    ]
+                }
+                totals[key] = total
+            }
+            if specification.family == .normalizedBar { return [] }
+            domainValues = Array(totals.values)
+        }
+
+        if let minimum = domainValues.min(), let maximum = domainValues.max(),
+            !(maximum - minimum).isFinite
+        {
+            return [
+                .init(
+                    severity: .error,
+                    message:
+                        "Aggregated quantitative field \(y.rawValue) spans a range too large to render safely."
+                )
+            ]
+        }
+        return []
+    }
+
+    private static func finiteSum(_ values: [Double]) -> Double? {
+        var total = 0.0
+        for value in values {
+            total += value
+            guard total.isFinite else { return nil }
+        }
+        return total
+    }
+
     private static func orderedUnique(
         _ references: [AutoChartColumnID]
     ) -> [AutoChartColumnID] {
@@ -1236,18 +1352,24 @@ public enum AutoChartEngine {
 
     private static func diversify(
         _ ranked: [AutoChartRecommendation],
-        limit: Int
+        limit: Int,
+        isValid: (AutoChartRecommendation) -> Bool
     ) -> [AutoChartRecommendation] {
         var output: [AutoChartRecommendation] = []
         var seenFamilies: Set<AutoChartFamily> = []
         for recommendation in ranked where output.count < limit {
-            if seenFamilies.insert(recommendation.specification.family).inserted {
-                output.append(recommendation)
-            }
+            guard !seenFamilies.contains(recommendation.specification.family),
+                isValid(recommendation)
+            else { continue }
+            seenFamilies.insert(recommendation.specification.family)
+            output.append(recommendation)
         }
         if output.count < limit {
             for recommendation in ranked
-            where output.count < limit && !output.contains(where: { $0.id == recommendation.id }) {
+            where output.count < limit
+                && !output.contains(where: { $0.id == recommendation.id })
+                && isValid(recommendation)
+            {
                 output.append(recommendation)
             }
         }
