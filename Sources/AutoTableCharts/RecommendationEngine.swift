@@ -1167,14 +1167,20 @@ public enum AutoChartEngine {
 
         var domainValues = values
         if [.stackedBar, .normalizedBar].contains(specification.family) {
-            var totals: [PreparedStackKey: Double] = [:]
+            var groups: [PreparedStackKey: [Double]] = [:]
             for datum in data {
                 guard let value = datum.yNumber else { continue }
                 let key = PreparedStackKey(
                     x: datum.xIdentity ?? datum.xLabel,
                     facet: datum.facetIdentity ?? datum.facet)
-                let total = (totals[key] ?? 0) + value
-                guard total.isFinite else {
+                groups[key, default: []].append(value)
+            }
+            // Each stack is summed as a whole so that a segment order which
+            // overflows midway cannot reject a total the axis can represent.
+            var totals: [Double] = []
+            totals.reserveCapacity(groups.count)
+            for segments in groups.values {
+                guard let total = finiteSum(segments) else {
                     return [
                         .init(
                             severity: .error,
@@ -1183,10 +1189,10 @@ public enum AutoChartEngine {
                         )
                     ]
                 }
-                totals[key] = total
+                totals.append(total)
             }
             if specification.family == .normalizedBar { return [] }
-            domainValues = Array(totals.values)
+            domainValues = totals
         }
 
         if let minimum = domainValues.min(), let maximum = domainValues.max(),
@@ -1203,13 +1209,20 @@ public enum AutoChartEngine {
         return []
     }
 
+    /// Sums `values` and returns the total only when it is representable.
+    ///
+    /// Values are divided by the largest magnitude before being accumulated, so
+    /// a running total cannot overflow on the way to a finite sum. Rejection
+    /// therefore depends on the values themselves rather than the order
+    /// preparation happened to emit them in.
     private static func finiteSum(_ values: [Double]) -> Double? {
-        var total = 0.0
-        for value in values {
-            total += value
-            guard total.isFinite else { return nil }
-        }
-        return total
+        let scale = values.lazy.map { abs($0) }.max() ?? 0
+        guard scale.isFinite else { return nil }
+        guard scale > 0 else { return 0 }
+        var scaled = 0.0
+        for value in values { scaled += value / scale }
+        let total = scaled * scale
+        return total.isFinite ? total : nil
     }
 
     private static func orderedUnique(

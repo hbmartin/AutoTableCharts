@@ -614,6 +614,123 @@ private let date = AutoChartColumn(
         #expect(AutoChartRenderCache.retainedRenderCount == 2)
     }
 
+    @Test @MainActor func aSharedRenderOwnedSnapshotIsChargedToTheBudgetOnce() {
+        let originalConfiguration = AutoChartRenderCache.configuration
+        defer {
+            AutoChartRenderCache.configure(originalConfiguration)
+            AutoChartRenderCache.removeAll()
+        }
+        let renderOnly = AutoChartRenderCacheConfiguration(
+            maximumTableEntries: 0,
+            maximumTableCost: 0,
+            maximumRenderEntries: 8,
+            maximumRenderCost: 8 * 1_024 * 1_024)
+        let counter = ChartValueReadCounter()
+        func rows() -> [CountingRow] {
+            (0..<200).map { index in
+                CountingRow(
+                    chartRowID: AutoChartRowID(rawValue: "r\(index)"),
+                    values: [
+                        category.id: .text("Category \(index)"),
+                        measure.id: .double(Double(index)),
+                    ],
+                    counter: counter)
+            }
+        }
+        func versionedTable() -> VersionedCountingTable {
+            VersionedCountingTable(
+                chartColumns: [category, measure],
+                chartRows: rows(),
+                chartDataIdentity: UUID().uuidString,
+                chartDataVersion: UUID().uuidString)
+        }
+        let families: [AutoChartFamily] = [.bar, .rankedDot]
+        func render(_ family: AutoChartFamily, _ input: VersionedCountingTable) {
+            _ = AutoChartView(
+                table: input,
+                recommendation: AutoChartRecommendation(
+                    specification: AutoChartSpecification(
+                        family: family,
+                        encoding: .init(x: category.id, y: measure.id)),
+                    score: 0,
+                    rationale: ["Shared snapshot budget test"]))
+        }
+
+        // Both specifications over one table identity share a single
+        // render-owned snapshot.
+        AutoChartRenderCache.configure(renderOnly)
+        AutoChartRenderCache.removeAll()
+        let shared = versionedTable()
+        for family in families { render(family, shared) }
+        let sharedCost = AutoChartRenderCache.retainedRenderCost
+        #expect(AutoChartRenderCache.retainedRenderCount == 2)
+
+        // The same two specifications over two identities cannot share, so a
+        // second snapshot is charged. The render entries themselves are alike,
+        // so the difference is the snapshot that sharing avoids paying twice.
+        AutoChartRenderCache.removeAll()
+        for family in families { render(family, versionedTable()) }
+        let unsharedCost = AutoChartRenderCache.retainedRenderCost
+        #expect(AutoChartRenderCache.retainedRenderCount == 2)
+
+        #expect(sharedCost > 0)
+        #expect(sharedCost < unsharedCost)
+    }
+
+    @Test @MainActor func evictingEveryRenderEntryRefundsTheSharedSnapshot() {
+        let originalConfiguration = AutoChartRenderCache.configuration
+        defer {
+            AutoChartRenderCache.configure(originalConfiguration)
+            AutoChartRenderCache.removeAll()
+        }
+        AutoChartRenderCache.configure(
+            AutoChartRenderCacheConfiguration(
+                maximumTableEntries: 0,
+                maximumTableCost: 0,
+                maximumRenderEntries: 8,
+                maximumRenderCost: 8 * 1_024 * 1_024))
+        AutoChartRenderCache.removeAll()
+
+        let counter = ChartValueReadCounter()
+        let input = VersionedCountingTable(
+            chartColumns: [category, measure],
+            chartRows: (0..<50).map { index in
+                CountingRow(
+                    chartRowID: AutoChartRowID(rawValue: "r\(index)"),
+                    values: [
+                        category.id: .text("Category \(index)"),
+                        measure.id: .double(Double(index)),
+                    ],
+                    counter: counter)
+            },
+            chartDataIdentity: UUID().uuidString,
+            chartDataVersion: UUID().uuidString)
+        for family in [AutoChartFamily.bar, .rankedDot] {
+            _ = AutoChartView(
+                table: input,
+                recommendation: AutoChartRecommendation(
+                    specification: AutoChartSpecification(
+                        family: family,
+                        encoding: .init(x: category.id, y: measure.id)),
+                    score: 0,
+                    rationale: ["Shared snapshot refund test"]))
+        }
+        #expect(AutoChartRenderCache.retainedRenderCount == 2)
+        #expect(AutoChartRenderCache.retainedRenderCost > 0)
+
+        // Evict through the entry-removal path rather than a blunt purge, so a
+        // snapshot that was never refunded would still be charged afterwards.
+        AutoChartRenderCache.configure(
+            AutoChartRenderCacheConfiguration(
+                maximumTableEntries: 0,
+                maximumTableCost: 0,
+                maximumRenderEntries: 0,
+                maximumRenderCost: 8 * 1_024 * 1_024))
+
+        #expect(AutoChartRenderCache.retainedRenderCount == 0)
+        #expect(AutoChartRenderCache.retainedRenderCost == 0)
+    }
+
     @Test @MainActor func disablingTableCachingPreservesIndependentlyOwnedRenders() {
         let originalConfiguration = AutoChartRenderCache.configuration
         defer {
@@ -2711,6 +2828,38 @@ private let date = AutoChartColumn(
                 $0.message
                     == "Composition of quantitative field measure produces a non-finite total."
             })
+    }
+
+    @Test func stackedTotalsSurviveASegmentOrderThatOverflowsMidway() {
+        let series = AutoChartColumn(
+            id: "series", name: "series",
+            hints: AutoChartColumnHints(semanticType: .nominal))
+        // The column span stays finite, so preparation validates the stack, and
+        // the stack sums to a representable 1.4e308. Accumulating the three
+        // positive segments first overflows on the way to that total.
+        let step = 7e307
+        let segments: [(String, Double)] = [
+            ("One", step), ("Two", step), ("Three", step), ("Four", -step),
+        ]
+        let specification = AutoChartSpecification(
+            family: .stackedBar,
+            encoding: .init(x: category.id, y: measure.id, series: series.id),
+            stacking: .standard)
+
+        for ordering in [segments, segments.reversed().map { $0 }] {
+            let input = table(
+                columns: [category, series, measure],
+                rows: ordering.map { [.text("A"), .text($0.0), .double($0.1)] })
+            let validation = AutoChartEngine.validate(
+                specification: specification,
+                for: input)
+
+            #expect(
+                !validation.issues.contains {
+                    $0.message
+                        == "Stacking quantitative field measure produces non-finite totals."
+                })
+        }
     }
 
     @Test func recommendationsFullyValidatePreparedDomainsBeforeReturning() {
