@@ -2727,6 +2727,7 @@ private let date = AutoChartColumn(
             ])
         let recommendations = AutoChartEngine.recommendations(for: input)
 
+        #expect(!recommendations.chartRecommendations.isEmpty)
         for recommendation in recommendations.chartRecommendations {
             #expect(
                 AutoChartEngine.validate(
