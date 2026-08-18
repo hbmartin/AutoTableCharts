@@ -184,6 +184,8 @@ struct AutoChartColumnProfile: Sendable {
     var allNumericValuesPositive: Bool
     var averageTextLength: Double
     var temporalValues: [Date]
+    var temporalMinimum: Date?
+    var temporalMaximum: Date?
     /// Typed dates whose interval cannot be positioned on a finite chart axis.
     var nonFiniteDateCount: Int
 
@@ -196,10 +198,10 @@ struct AutoChartColumnProfile: Sendable {
         return (numericMaximum - numericMinimum).isFinite
     }
     var hasFiniteTemporalSpan: Bool {
-        guard let minimum = temporalValues.min(), let maximum = temporalValues.max() else {
+        guard let temporalMinimum, let temporalMaximum else {
             return true
         }
-        return maximum.timeIntervalSince(minimum).isFinite
+        return temporalMaximum.timeIntervalSince(temporalMinimum).isFinite
     }
     /// Whether every renderable value is distinct, so marks keyed by this column
     /// alone can't collide. Recommendation and validation share this rule so they
@@ -252,12 +254,21 @@ enum AutoChartProfiler {
             }
         }
         let numeric = nonNull.compactMap(\.numericValue)
-        let dates = nonNull.compactMap(dateValue)
-        let nonFiniteDateCount = nonNull.reduce(into: 0) { count, value in
-            guard case .date(let date) = value,
+        var dates: [Date] = []
+        var temporalMinimum: Date?
+        var temporalMaximum: Date?
+        var nonFiniteDateCount = 0
+        for value in nonNull {
+            if case .date(let date) = value,
                 !date.timeIntervalSinceReferenceDate.isFinite
-            else { return }
-            count += 1
+            {
+                nonFiniteDateCount += 1
+                continue
+            }
+            guard let date = dateValue(value) else { continue }
+            dates.append(date)
+            temporalMinimum = min(temporalMinimum ?? date, date)
+            temporalMaximum = max(temporalMaximum ?? date, date)
         }
         let textLengths = nonNull.compactMap { value -> Int? in
             if case .text(let text) = value { return text.count }
@@ -290,6 +301,8 @@ enum AutoChartProfiler {
             averageTextLength: textLengths.isEmpty
                 ? 0 : Double(textLengths.reduce(0, +)) / Double(textLengths.count),
             temporalValues: dates,
+            temporalMinimum: temporalMinimum,
+            temporalMaximum: temporalMaximum,
             nonFiniteDateCount: nonFiniteDateCount)
     }
 

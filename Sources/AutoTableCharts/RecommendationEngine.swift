@@ -433,15 +433,11 @@ public enum AutoChartEngine {
         specification: AutoChartSpecification,
         snapshot: AutoChartSnapshot,
         profiles: [AutoChartColumnID: AutoChartColumnProfile],
-        memo: AutoChartValidationMemo? = nil
+        memo: AutoChartValidationMemo? = nil,
+        preparedData: [AutoChartDatum]? = nil
     ) -> AutoChartValidationResult {
         var issues: [AutoChartValidationIssue] = []
-        let referenced = orderedUnique([
-            specification.encoding.x, specification.encoding.y,
-            specification.encoding.series, specification.encoding.size,
-            specification.encoding.facet, specification.encoding.start,
-            specification.encoding.end,
-        ])
+        let referenced = orderedUnique(specification.encoding.columnIDs)
         for id in referenced where profiles[id] == nil {
             issues.append(.init(severity: .error, message: "Unknown column \(id.rawValue)."))
         }
@@ -480,7 +476,8 @@ public enum AutoChartEngine {
             // A typed non-finite date is present but cannot position a mark. It
             // receives the temporal omission warning below rather than also being
             // reported as a missing value.
-            if profile.isTemporal,
+            if specification.family != .range,
+                profile.isTemporal,
                 profile.nonNullCount == snapshot.rows.count,
                 profile.temporalValues.count + profile.nonFiniteDateCount
                     == profile.nonNullCount,
@@ -739,11 +736,12 @@ public enum AutoChartEngine {
                         "\(specification.family.displayName) does not support a facet base family."
                 ))
         }
-        let temporalReferences = orderedUnique([
-            specification.encoding.x,
-            specification.encoding.start,
-            specification.encoding.end,
-        ])
+        let temporalReferences = orderedUnique(
+            [
+                specification.encoding.x,
+                specification.encoding.start,
+                specification.encoding.end,
+            ].compactMap { $0 })
         for id in temporalReferences {
             guard let profile = profiles[id], profile.isTemporal,
                 profile.temporalValues.count + profile.nonFiniteDateCount
@@ -811,6 +809,37 @@ public enum AutoChartEngine {
                                 "Temporal field \(id.rawValue) spans a range too large to render safely."
                         ))
                 }
+            }
+        }
+        if specification.family != .table,
+            specification.aggregation != .none,
+            let y = specification.encoding.y,
+            let profile = profiles[y],
+            profile.isQuantitative,
+            profile.hasFiniteNumericSpan
+        {
+            let data = preparedData
+                ?? AutoChartDataPreparation.data(
+                    snapshot: snapshot,
+                    specification: specification,
+                    profiles: profiles)
+            let values = data.compactMap(\.yNumber)
+            if values.contains(where: { !$0.isFinite }) {
+                issues.append(
+                    .init(
+                        severity: .error,
+                        message:
+                            "Aggregation of quantitative field \(y.rawValue) produces non-finite values."
+                    ))
+            } else if let minimum = values.min(), let maximum = values.max(),
+                !(maximum - minimum).isFinite
+            {
+                issues.append(
+                    .init(
+                        severity: .error,
+                        message:
+                            "Aggregated quantitative field \(y.rawValue) spans a range too large to render safely."
+                    ))
             }
         }
         let expectedAggregation: AutoChartAggregation? =
@@ -1068,11 +1097,11 @@ public enum AutoChartEngine {
     }
 
     private static func orderedUnique(
-        _ references: [AutoChartColumnID?]
+        _ references: [AutoChartColumnID]
     ) -> [AutoChartColumnID] {
         var seen: Set<AutoChartColumnID> = []
         return references.compactMap { reference in
-            guard let reference, seen.insert(reference).inserted else { return nil }
+            guard seen.insert(reference).inserted else { return nil }
             return reference
         }
     }
