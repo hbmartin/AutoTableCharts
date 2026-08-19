@@ -1092,7 +1092,7 @@ public enum AutoChartRenderCache {
     /// The bytes currently charged against the render budget, counting a shared
     /// render-owned snapshot once.
     static var retainedRenderCost: Int {
-        AutoChartRenderPreparationCache.shared.renderCost
+        AutoChartRenderPreparationCache.shared.totalRenderCost
     }
 }
 
@@ -1305,9 +1305,10 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
         guard let current = tableEntries[key], current === value
         else { return nil }
         guard matches else {
-            // Content no longer matches this key, so every render entry under
-            // it, render-owned snapshots included, was built from stale data.
-            removeTable(for: key, invalidatingRenderEntries: true)
+            // A fingerprint collision, so only entries sharing this table are
+            // stale. Render-owned snapshots under the key are compared against
+            // the caller's content before they are reused.
+            removeTable(for: key)
             return nil
         }
         tableRecency.removeAll { $0 == key }
@@ -1322,17 +1323,13 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
     ) -> AutoChartPreparedTable? {
         lock.lock()
         defer { lock.unlock() }
-        guard !activeConfiguration.isTableCachingEnabled else { return nil }
-        let shared = tableEntries[key]
-        // Most recent first, and past the newest entry when that one happens to
-        // hold the shared table rather than a render-owned snapshot.
-        for renderKey in recency.reversed() {
-            guard renderKey.table == key, let value = entries[renderKey],
-                value.table !== shared
-            else { continue }
-            return value.table
-        }
-        return nil
+        // Disabling table caching drains `tableEntries`, so every entry under
+        // this key holds a render-owned snapshot.
+        guard !activeConfiguration.isTableCachingEnabled,
+            let renderKey = recency.last(where: { $0.table == key }),
+            let value = entries[renderKey]
+        else { return nil }
+        return value.table
     }
 
     /// Reuses render-owned storage after fingerprint lookup confirms the key and
@@ -1449,18 +1446,14 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
         guard cacheConfiguration.revision == configurationRevision else { return }
         var ownedTable: (table: AutoChartPreparedTable, cost: Int)?
         if tableEntries[key.table] !== value.table {
-            guard let tableCost = value.table.estimatedCost else { return }
-            // Only a table this entry would newly introduce has to fit the
-            // budget; joining an already-charged snapshot costs the entry alone.
-            if renderTableRetainers[ObjectIdentifier(value.table)] == nil {
-                var projected = renderCost
-                guard
-                    add(
-                        tableCost,
-                        to: &projected,
-                        limit: activeConfiguration.maximumRenderCost)
-                else { return }
-            }
+            // Sharing an already-charged snapshot only defers the charge: this
+            // entry keeps that snapshot alive once the entries it joined are
+            // evicted, so it has to fit the budget alongside it either way.
+            // Admitting one that cannot would drain the cache on the trim below
+            // instead of leaving the entries already resident alone.
+            guard let tableCost = value.table.estimatedCost, tableCost >= 0,
+                tableCost <= activeConfiguration.maximumRenderCost - renderCost
+            else { return }
             ownedTable = (value.table, tableCost)
         }
         releaseRenderTable(for: key)
@@ -1517,8 +1510,9 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
                     lock.unlock()
                     return existing
                 }
-                // Content no longer matches this key, so every render entry under
-                // it, render-owned snapshots included, was built from stale data.
+                // Identity and version promised stable content and did not
+                // deliver it, so every render entry under this key is stale —
+                // including render-owned snapshots served without a comparison.
                 removeTable(for: key, invalidatingRenderEntries: true)
             }
             guard activeConfiguration.isTableCachingEnabled,
@@ -1533,11 +1527,7 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
             tableTotalCost += estimatedCost
             tableRecency.removeAll { $0 == key }
             tableRecency.append(key)
-            while tableRecency.count > activeConfiguration.maximumTableEntries
-                || tableTotalCost > activeConfiguration.maximumTableCost
-            {
-                removeTable(for: tableRecency.removeFirst())
-            }
+            trimTableLocked()
             let result = tableEntries[key]
             lock.unlock()
             return result
@@ -1547,29 +1537,25 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
 
     /// Removes the shared table entry for `key`.
     ///
-    /// - Parameter invalidatingRenderEntries: Pass `true` when `key` has been
-    ///   found to no longer describe the data behind it, so every render entry
-    ///   under that key is stale — including render-owned snapshots this cache
-    ///   would otherwise keep. Plain eviction passes `false` and preserves
-    ///   independently owned renders.
+    /// - Parameter invalidatingRenderEntries: Pass `true` when the caller broke
+    ///   the identity and version contract `key` was built from, so every render
+    ///   entry under it is stale — the identity-keyed lookups serve those
+    ///   entries without comparing content. Plain eviction passes `false` and
+    ///   preserves render-owned snapshots, which every other lookup verifies.
     private func removeTable(
         for key: AutoChartRenderTableCacheKey,
         invalidatingRenderEntries: Bool = false
     ) {
-        let removed = tableEntries.removeValue(forKey: key)
-        if let removed {
-            tableTotalCost -= removed.estimatedCost ?? 0
-        }
-        if removed != nil || invalidatingRenderEntries {
-            let related = recency.filter { renderKey in
-                guard renderKey.table == key else { return false }
-                return invalidatingRenderEntries || entries[renderKey]?.table === removed
-            }
-            for renderKey in related {
-                removeRender(for: renderKey)
-            }
-        }
         tableRecency.removeAll { $0 == key }
+        guard let removed = tableEntries.removeValue(forKey: key) else { return }
+        tableTotalCost -= removed.estimatedCost ?? 0
+        let related = recency.filter { renderKey in
+            renderKey.table == key
+                && (invalidatingRenderEntries || entries[renderKey]?.table === removed)
+        }
+        for renderKey in related {
+            removeRender(for: renderKey)
+        }
     }
 
     /// Removes one render entry and its accounted cost.
@@ -1754,7 +1740,7 @@ private extension AutoChartRenderPreparationCache {
         return entries.count
     }
 
-    var renderCost: Int {
+    var totalRenderCost: Int {
         lock.lock()
         defer { lock.unlock() }
         return totalCost
@@ -1799,12 +1785,20 @@ private extension AutoChartRenderPreparationCache {
     ///
     /// - Precondition: The caller already holds `lock`, which is not recursive.
     func trimLocked() {
-        while tableRecency.count > activeConfiguration.maximumTableEntries
-            || tableTotalCost > activeConfiguration.maximumTableCost
+        trimTableLocked()
+        trimRenderLocked()
+    }
+
+    /// Evicts table entries beyond the active limits.
+    ///
+    /// - Precondition: The caller already holds `lock`.
+    private func trimTableLocked() {
+        while !tableRecency.isEmpty,
+            tableRecency.count > activeConfiguration.maximumTableEntries
+                || tableTotalCost > activeConfiguration.maximumTableCost
         {
             removeTable(for: tableRecency.removeFirst())
         }
-        trimRenderLocked()
     }
 
     /// Evicts render entries beyond the active limits.
