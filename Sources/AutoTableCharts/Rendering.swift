@@ -1571,11 +1571,19 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
     /// Charges `table` to the render budget on first retention only.
     ///
     /// - Precondition: The caller already holds `lock`.
+    /// - Precondition: `key` retains no render-owned table yet. Callers release
+    ///   before retaining because the release also covers the entry that shares
+    ///   a table-cache entry and so retains nothing here. Overwriting a live
+    ///   mapping instead would leave `key` in the previous table's retainer set,
+    ///   so that table would never be refunded.
     private func retainRenderTable(
         _ table: AutoChartPreparedTable,
         cost: Int,
         for key: AutoChartRenderCacheKey
     ) {
+        assert(
+            renderEntryTables[key] == nil,
+            "retainRenderTable requires a key released from its previous table")
         let id = ObjectIdentifier(table)
         renderEntryTables[key] = id
         if renderTableRetainers[id] == nil {
