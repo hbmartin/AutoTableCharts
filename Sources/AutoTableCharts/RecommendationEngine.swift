@@ -1136,24 +1136,85 @@ public enum AutoChartEngine {
         var facet: String?
     }
 
+    /// A running total that leaves the representable range only when the terms
+    /// it was given really do.
+    ///
+    /// Terms accumulate in units of the largest power of two any of them has
+    /// reached, so the running total is bounded by the number of terms however
+    /// they are ordered and no intermediate can overflow ahead of the total
+    /// itself. Scaling by a power of two is exact, and `compensation` carries
+    /// the rounding each addition drops, so the total reported for a set of
+    /// terms stays within an ulp of their exact sum whatever order they arrived
+    /// in — near enough that only a sum sitting within that ulp of the edge of
+    /// the range could still be decided by ordering.
+    private struct ScaledSum {
+        /// The exponent the running total is expressed in.
+        private var unit = 0
+        private var scaled = 0.0
+        private var compensation = 0.0
+
+        mutating func add(_ term: Double) {
+            guard term.isFinite else {
+                scaled += term
+                return
+            }
+            guard term != 0 else { return }
+            if term.exponent > unit { restate(in: term.exponent) }
+            let scaledTerm = Self.shifted(term, by: -unit)
+            let updated = scaled + scaledTerm
+            // Whichever addend is the larger keeps the low bits the sum drops.
+            compensation +=
+                scaled.magnitude >= scaledTerm.magnitude
+                ? (scaled - updated) + scaledTerm
+                : (scaledTerm - updated) + scaled
+            scaled = updated
+        }
+
+        /// The total in ordinary units, non-finite exactly when the terms
+        /// reached beyond what a `Double` can hold.
+        var value: Double { Self.shifted(scaled + compensation, by: unit) }
+
+        /// Restates the running total in larger units. A power of two makes
+        /// that exact until the old total falls below what the new unit can
+        /// represent, by which point it sits far beneath the total's last bit.
+        private mutating func restate(in newUnit: Int) {
+            let shift = unit - newUnit
+            scaled = Self.shifted(scaled, by: shift)
+            compensation = Self.shifted(compensation, by: shift)
+            unit = newUnit
+        }
+
+        private static func shifted(_ value: Double, by exponent: Int) -> Double {
+            guard value != 0, value.isFinite else { return value }
+            return Double(
+                sign: value.sign,
+                exponent: value.exponent + exponent,
+                significand: value.significand)
+        }
+    }
+
     /// The subtotals one stack contributes to its value axis.
     ///
     /// `.standard` stacking grows each sign away from zero independently, so
     /// both subtotals bound the axis and the net difference between them bounds
-    /// nothing. Accumulating a single sign is monotonic, so a subtotal is
-    /// unrepresentable only when the segments really do leave the range,
-    /// whatever order preparation happened to emit them in.
+    /// nothing. Each sign is accumulated on its own, so cancellation cannot
+    /// hide a segment the axis has to reach, and each subtotal is a `ScaledSum`
+    /// so that a segment order which overflows midway cannot reject a subtotal
+    /// the axis can represent.
     private struct PreparedStackTotals {
-        private(set) var positive = 0.0
-        private(set) var negative = 0.0
+        private var positiveTotal = ScaledSum()
+        private var negativeTotal = ScaledSum()
 
         mutating func add(_ value: Double) {
             if value < 0 {
-                negative += value
+                negativeTotal.add(value)
             } else {
-                positive += value
+                positiveTotal.add(value)
             }
         }
+
+        var positive: Double { positiveTotal.value }
+        var negative: Double { negativeTotal.value }
 
         var isFinite: Bool { positive.isFinite && negative.isFinite }
 
