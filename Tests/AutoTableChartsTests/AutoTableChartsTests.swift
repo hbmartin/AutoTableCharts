@@ -2915,6 +2915,86 @@ private let date = AutoChartColumn(
             })
     }
 
+    // Every ordering of the same segments, so that a subtotal cannot depend on
+    // the order preparation happened to emit them in.
+    private static let segmentOrders: [[Int]] = [
+        [0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0],
+    ]
+
+    @Test func stackSubtotalsDoNotDependOnSegmentOrder() {
+        let series = AutoChartColumn(
+            id: "series", name: "series",
+            hints: AutoChartColumnHints(semanticType: .nominal))
+        // These three segments total a quarter of an ulp beyond the representable
+        // range, which rounds back onto its largest value, so the stack lands on
+        // the axis and every ordering has to say so. Adding them in the order they
+        // arrive does not: two of them round up to a subtotal whose own last bit
+        // then carries the third past the range.
+        let extreme = Double.greatestFiniteMagnitude
+        let segments = [0.4 * extreme, 0.4 * extreme, 0.2 * extreme]
+        let specifications = [
+            AutoChartSpecification(
+                family: .stackedBar,
+                encoding: .init(x: category.id, y: measure.id, series: series.id),
+                stacking: .standard),
+            AutoChartSpecification(
+                family: .normalizedBar,
+                encoding: .init(x: category.id, y: measure.id, series: series.id),
+                stacking: .normalized),
+        ]
+
+        for order in Self.segmentOrders {
+            let input = table(
+                columns: [category, series, measure],
+                rows: order.map { segment in
+                    [.text("A"), .text("Segment \(segment)"), .double(segments[segment])]
+                })
+            for specification in specifications {
+                let validation = AutoChartEngine.validate(
+                    specification: specification,
+                    for: input)
+
+                #expect(validation.isValid, "order \(order) rejected \(specification.family)")
+                #expect(
+                    !validation.issues.contains {
+                        $0.message
+                            == "Stacking quantitative field measure produces non-finite totals."
+                    })
+            }
+        }
+    }
+
+    @Test func donutCompositionDoesNotDependOnSectorOrder() {
+        // The same total as the stacked segments above, in sectors this time.
+        let extreme = Double.greatestFiniteMagnitude
+        let sectors = [0.4 * extreme, 0.4 * extreme, 0.2 * extreme]
+        var verdicts: Set<Bool> = []
+
+        for order in Self.segmentOrders {
+            let input = table(
+                columns: [category, measure],
+                rows: order.map { sector in
+                    [.text("Sector \(sector)"), .double(sectors[sector])]
+                })
+            let specification = AutoChartSpecification(
+                family: .donut,
+                encoding: .init(x: category.id, y: measure.id),
+                aggregation: .sum)
+            let validation = AutoChartEngine.validate(
+                specification: specification,
+                for: input)
+
+            verdicts.insert(validation.isValid)
+            #expect(
+                !validation.issues.contains {
+                    $0.message
+                        == "Composition of quantitative field measure produces a non-finite total."
+                }, "order \(order) reported a non-finite composition")
+        }
+
+        #expect(verdicts == [true])
+    }
+
     @Test func recommendationsFullyValidatePreparedDomainsBeforeReturning() {
         let series = AutoChartColumn(
             id: "series", name: "series",
