@@ -90,6 +90,10 @@ private struct DocumentationHoldingsTable: AutoChartTable {
         #expect(selection.sourceRowIDs == ["office"])
 
         #if canImport(SwiftUI) && canImport(Charts)
+        // Building the view mutates the process-wide render preparation cache
+        // that `RenderCacheTests` asserts exact counts on. Keeping the touch
+        // inside one `MainActor.run` body is what keeps the two suites from
+        // interleaving — see the note above `RenderCacheTests`.
         await MainActor.run {
             let view = AutoChartView(
                 table: table,

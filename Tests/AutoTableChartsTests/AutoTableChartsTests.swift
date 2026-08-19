@@ -372,6 +372,16 @@ private let date = AutoChartColumn(
     }
 }
 
+// The render preparation cache is process-wide, and Swift Testing runs sibling
+// suites in parallel, so `.serialized` orders this suite only against itself.
+// What keeps the other suites that touch the cache — `ValidationAndLineageTests`
+// and `DocumentationExamplesTests` — from mutating it mid-assertion is that
+// every touch is main-actor isolated (`AutoChartView.init` inherits SwiftUI's
+// `View` isolation) and every body here is a synchronous `@MainActor` function,
+// which runs as one job that cannot suspend between a `configure`/`removeAll`
+// and the counts it asserts. Keep it that way: making one of these bodies
+// `async`, or awaiting anything mid-body, reopens that window and the exact
+// counts below start to flake.
 @Suite(.serialized) struct RenderCacheTests {
     @Test func configurationClampsNegativeLimits() {
         let configuration = AutoChartRenderCacheConfiguration(
@@ -3064,6 +3074,10 @@ private let date = AutoChartColumn(
     }
 
     #if canImport(Charts) && canImport(SwiftUI)
+    // Every test in this block builds `AutoChartView`, which mutates the
+    // process-wide render preparation cache that `RenderCacheTests` asserts
+    // exact counts on. Synchronous `@MainActor` bodies are what keep the two
+    // suites from interleaving — see the note above `RenderCacheTests`.
     @Test @MainActor func nonFiniteDatesCannotBoundASharedFacetAxis() throws {
         AutoChartRenderCache.removeAll()
         defer { AutoChartRenderCache.removeAll() }
