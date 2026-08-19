@@ -1136,6 +1136,32 @@ public enum AutoChartEngine {
         var facet: String?
     }
 
+    /// The subtotals one stack contributes to its value axis.
+    ///
+    /// `.standard` stacking grows each sign away from zero independently, so
+    /// both subtotals bound the axis and the net difference between them bounds
+    /// nothing. Accumulating a single sign is monotonic, so a subtotal is
+    /// unrepresentable only when the segments really do leave the range,
+    /// whatever order preparation happened to emit them in.
+    private struct PreparedStackTotals {
+        private(set) var positive = 0.0
+        private(set) var negative = 0.0
+
+        mutating func add(_ value: Double) {
+            if value < 0 {
+                negative += value
+            } else {
+                positive += value
+            }
+        }
+
+        var isFinite: Bool { positive.isFinite && negative.isFinite }
+
+        /// The combined total, or `nil` when either side left the range. Adding
+        /// two finite subtotals of opposite sign cannot leave it.
+        var total: Double? { isFinite ? positive + negative : nil }
+    }
+
     private static func preparedNumericDomainIssues(
         specification: AutoChartSpecification,
         data: [AutoChartDatum],
@@ -1153,7 +1179,9 @@ public enum AutoChartEngine {
         }
 
         if specification.family == .donut {
-            guard finiteSum(values) != nil else {
+            var composition = PreparedStackTotals()
+            for value in values { composition.add(value) }
+            guard composition.total != nil else {
                 return [
                     .init(
                         severity: .error,
@@ -1167,20 +1195,20 @@ public enum AutoChartEngine {
 
         var domainValues = values
         if [.stackedBar, .normalizedBar].contains(specification.family) {
-            var groups: [PreparedStackKey: [Double]] = [:]
+            var stacks: [PreparedStackKey: PreparedStackTotals] = [:]
             for datum in data {
                 guard let value = datum.yNumber else { continue }
                 let key = PreparedStackKey(
                     x: datum.xIdentity ?? datum.xLabel,
                     facet: datum.facetIdentity ?? datum.facet)
-                groups[key, default: []].append(value)
+                stacks[key, default: PreparedStackTotals()].add(value)
             }
-            // Each stack is summed as a whole so that a segment order which
-            // overflows midway cannot reject a total the axis can represent.
-            var totals: [Double] = []
-            totals.reserveCapacity(groups.count)
-            for segments in groups.values {
-                guard let total = finiteSum(segments) else {
+            // Both ends of every stack have to land on the axis, so each stack
+            // contributes the extent it reaches in each direction.
+            var extents: [Double] = []
+            extents.reserveCapacity(stacks.count * 2)
+            for totals in stacks.values {
+                guard totals.isFinite else {
                     return [
                         .init(
                             severity: .error,
@@ -1189,10 +1217,11 @@ public enum AutoChartEngine {
                         )
                     ]
                 }
-                totals.append(total)
+                extents.append(totals.positive)
+                extents.append(totals.negative)
             }
             if specification.family == .normalizedBar { return [] }
-            domainValues = totals
+            domainValues = extents
         }
 
         if let minimum = domainValues.min(), let maximum = domainValues.max(),
@@ -1207,22 +1236,6 @@ public enum AutoChartEngine {
             ]
         }
         return []
-    }
-
-    /// Sums `values` and returns the total only when it is representable.
-    ///
-    /// Values are divided by the largest magnitude before being accumulated, so
-    /// a running total cannot overflow on the way to a finite sum. Rejection
-    /// therefore depends on the values themselves rather than the order
-    /// preparation happened to emit them in.
-    private static func finiteSum(_ values: [Double]) -> Double? {
-        let scale = values.lazy.map { abs($0) }.max() ?? 0
-        guard scale.isFinite else { return nil }
-        guard scale > 0 else { return 0 }
-        var scaled = 0.0
-        for value in values { scaled += value / scale }
-        let total = scaled * scale
-        return total.isFinite ? total : nil
     }
 
     private static func orderedUnique(
