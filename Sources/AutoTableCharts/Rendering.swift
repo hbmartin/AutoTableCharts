@@ -1456,14 +1456,11 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
             else { return }
             ownedTable = (value.table, tableCost)
         }
-        releaseRenderTable(for: key)
+        replaceRenderTableRetention(with: ownedTable, for: key)
         if let previousCost = costs[key] { totalCost -= previousCost }
         entries[key] = value
         costs[key] = renderCost
         totalCost += renderCost
-        if let ownedTable {
-            retainRenderTable(ownedTable.table, cost: ownedTable.cost, for: key)
-        }
         recency.removeAll { $0 == key }
         recency.append(key)
         trimRenderLocked()
@@ -1568,28 +1565,23 @@ private final class AutoChartRenderPreparationCache: @unchecked Sendable {
         recency.removeAll { $0 == key }
     }
 
-    /// Charges `table` to the render budget on first retention only.
+    /// Replaces the render-owned table retained by `key`, refunding its previous
+    /// table and charging the replacement on first retention only. Passing
+    /// `nil` leaves `key` with no render-owned table.
     ///
     /// - Precondition: The caller already holds `lock`.
-    /// - Precondition: `key` retains no render-owned table yet. Callers release
-    ///   before retaining because the release also covers the entry that shares
-    ///   a table-cache entry and so retains nothing here. Overwriting a live
-    ///   mapping instead would leave `key` in the previous table's retainer set,
-    ///   so that table would never be refunded.
-    private func retainRenderTable(
-        _ table: AutoChartPreparedTable,
-        cost: Int,
+    private func replaceRenderTableRetention(
+        with ownedTable: (table: AutoChartPreparedTable, cost: Int)?,
         for key: AutoChartRenderCacheKey
     ) {
-        assert(
-            renderEntryTables[key] == nil,
-            "retainRenderTable requires a key released from its previous table")
-        let id = ObjectIdentifier(table)
+        releaseRenderTable(for: key)
+        guard let ownedTable else { return }
+        let id = ObjectIdentifier(ownedTable.table)
         renderEntryTables[key] = id
         if renderTableRetainers[id] == nil {
             renderTableRetainers[id] = []
-            renderTableCosts[id] = cost
-            totalCost += cost
+            renderTableCosts[id] = ownedTable.cost
+            totalCost += ownedTable.cost
         }
         renderTableRetainers[id]?.insert(key)
     }
