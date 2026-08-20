@@ -24,13 +24,13 @@ or mutates consumer-owned table storage.
 
 ## Installation
 
-Until a versioned release exists, depend on the repository's `main` branch:
+Depend on version `0.1.0` or later:
 
 ```swift
 dependencies: [
     .package(
         url: "https://github.com/hbmartin/AutoTableCharts.git",
-        branch: "main"
+        from: "0.1.0"
     )
 ]
 ```
