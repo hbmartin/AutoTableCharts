@@ -1,30 +1,41 @@
-# ``AutoChartRecommendationSet``
+# Outcomes, Identity, and Resolution
 
-Consume a bounded, deterministic recommendation result and its fallback state.
+Persist a typed choice and resolve it against a fresh analysis.
 
 ## Overview
 
-The result preserves rank order in ``recommendations`` and records why only a
-table was safe in ``fallbackReason``. Use ``chartRecommendations`` when a UI
-should omit the table fallback, but keep the fallback reason and original table
-available so an empty chart gallery remains explainable.
+``AutoChartRecommendationOutcome`` is either `.charts`, containing a ranked
+list of renderable recommendations, or `.tableFallback`, containing a typed
+fallback message and diagnostics. A table is host UI, not a chart family.
 
-Scores are relative within one input, context, option set, and recommendation
-policy version. Read each recommendation's rationale and warnings alongside its
-score rather than treating the score as confidence.
+``AutoChartSpecification/id`` is structural and excludes policy and title.
+``AutoChartRecommendationID`` adds the policy version and is `Codable`, making
+it the value to persist for a user's selected recommendation.
+
+```swift
+switch analysis.resolve(savedRecommendationID) {
+case .exact(let recommendation):
+    // The same policy and specification are available.
+case .defaulted(let primary, let reason):
+    // No preference, policy change, or unavailable specification.
+case .unavailable(let fallback):
+    // Keep the host's table visible.
+}
+```
+
+The decoder also accepts the legacy length-prefixed string representation. New
+encodings use the typed keyed representation.
+
+Recommendation rationale, diagnostics, and fallback text are
+``AutoChartMessage`` values with stable category, code, and typed arguments.
+Resolve package text through ``AutoChartTextResolver``; returning `nil` uses the
+English fallback.
 
 ## Topics
 
-### Consume Results
-
-- ``recommendations``
-- ``chartRecommendations``
-- ``fallbackReason``
-- ``AutoChartRecommendation``
-
-### Interpret Behavior
-
-- <doc:GeneratingRecommendations>
-- <doc:RecommendationPipeline>
-- <doc:SafetySemanticsAndCompleteness>
-
+- ``AutoChartRecommendationResolution``
+- ``AutoChartRecommendationID``
+- ``AutoChartSpecificationID``
+- ``AutoChartFallback``
+- ``AutoChartDiagnostic``
+- ``AutoChartMessage``

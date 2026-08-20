@@ -6,43 +6,20 @@ import Foundation
 /// violate hard constraints, ranks the survivors for the requested task, and
 /// returns a bounded set with diverse chart families. It runs synchronously and
 /// entirely offline.
-public enum AutoChartEngine {
-    /// Generates ranked chart recommendations for a typed table.
-    ///
-    /// Explicit column hints take precedence over inferred semantics. If no chart
-    /// can represent the supplied rows without changing their meaning, the result
-    /// contains a table fallback and a ``AutoChartRecommendationSet/fallbackReason``.
-    /// Profiling and candidate validation are synchronous; call this method away
-    /// from the main actor for large tables or unusually high candidate limits.
-    ///
-    /// - Parameters:
-    ///   - table: The typed rows, columns, and completeness metadata to profile.
-    ///   - context: The analytical task and optional title used during ranking.
-    ///   - options: Limits for result count and visual density.
-    /// - Returns: A deterministic, ranked set of recommendations.
-    public static func recommendations<Table: AutoChartTable>(
+enum AutoChartRecommendationEngine {
+
+    static func recommendations<Table: AutoChartTable>(
         for table: Table,
-        context: AutoChartContext = AutoChartContext(),
-        options: AutoChartOptions = AutoChartOptions()
-    ) -> AutoChartRecommendationSet {
+        context: AutoChartContext = .init(),
+        options: AutoChartOptions = .init()
+    ) -> AutoChartCandidateResults {
         recommendations(
             snapshot: AutoChartSnapshot(table),
             context: context,
             options: options)
     }
 
-    /// Checks whether a caller-provided specification safely represents a table.
-    ///
-    /// Validation covers column existence, required channel semantics, complete-
-    /// result requirements, additive aggregation, duplicate marks, and interval
-    /// ordering. Validate before using the specification initializer of
-    /// ``AutoChartView`` when invalid input should be handled outside the view.
-    ///
-    /// - Parameters:
-    ///   - specification: The proposed chart family, encodings, and transforms.
-    ///   - table: The data and metadata the specification will represent.
-    /// - Returns: All discovered validation diagnostics.
-    public static func validate<Table: AutoChartTable>(
+    static func validate<Table: AutoChartTable>(
         specification: AutoChartSpecification,
         for table: Table
     ) -> AutoChartValidationResult {
@@ -53,10 +30,10 @@ public enum AutoChartEngine {
         snapshot: AutoChartSnapshot,
         context: AutoChartContext,
         options: AutoChartOptions
-    ) -> AutoChartRecommendationSet {
+    ) -> AutoChartCandidateResults {
         guard !snapshot.rows.isEmpty, !snapshot.columns.isEmpty else {
-            return AutoChartRecommendationSet(
-                recommendations: [tableFallback(reason: "The result has no chartable rows.")],
+            return AutoChartCandidateResults(
+                recommendations: [],
                 fallbackReason: "The result has no chartable rows.")
         }
 
@@ -419,11 +396,17 @@ public enum AutoChartEngine {
             faceted.specification.facetBaseFamily = baseFamily
             faceted.specification.encoding.facet = facet.column.id
             faceted.score -= 4
-            faceted.rationale = ["Small multiples separate a low-cardinality dimension."]
+            faceted.rationale = [
+                AutoChartMessage(
+                    category: .rationale,
+                    code: .recommendationRationale,
+                    defaultText: "Small multiples separate a low-cardinality dimension.")
+            ]
             candidates.append(faceted)
         }
 
-        let unique = bestCandidatesByID(candidates).filter {
+        let best = bestCandidatesByID(candidates)
+        let unique = best.filter {
             cachedStructuralValidation($0.specification).isValid
         }
         let ranked = unique.sorted {
@@ -437,13 +420,39 @@ public enum AutoChartEngine {
             ranked,
             limit: options.maximumRecommendations,
             isValid: { cachedPreparedValidation($0.specification).isValid })
+        let rankedIDs = Dictionary(
+            uniqueKeysWithValues: diverse.enumerated().map { ($0.element.id, $0.offset) })
+        let decisions: [AutoChartCandidateDecision] = options.includesDecisionTrace
+            ? best.map { candidate in
+                let structural = cachedStructuralValidation(candidate.specification)
+                if let rank = rankedIDs[candidate.id] {
+                    return AutoChartCandidateDecision(
+                        specificationID: candidate.specification.id,
+                        family: candidate.specification.family,
+                        disposition: .recommended(rank: rank, score: candidate.score))
+                }
+                if !structural.isValid {
+                    return AutoChartCandidateDecision(
+                        specificationID: candidate.specification.id,
+                        family: candidate.specification.family,
+                        disposition: .rejected(
+                            structural.issues.filter { $0.severity == .error }
+                                .map { $0.messageValue.code }))
+                }
+                return AutoChartCandidateDecision(
+                    specificationID: candidate.specification.id,
+                    family: candidate.specification.family,
+                    disposition: .pruned(.candidateLimit))
+            }
+            : []
         guard !diverse.isEmpty else {
             let reason = "No safe chart can represent this result without changing its meaning."
-            return AutoChartRecommendationSet(
-                recommendations: [tableFallback(reason: reason)],
-                fallbackReason: reason)
+            return AutoChartCandidateResults(
+                recommendations: [],
+                fallbackReason: reason,
+                decisions: decisions)
         }
-        return AutoChartRecommendationSet(recommendations: diverse)
+        return AutoChartCandidateResults(recommendations: diverse, decisions: decisions)
     }
 
     static func validate(
@@ -465,7 +474,7 @@ public enum AutoChartEngine {
         preparedData: [AutoChartDatum]? = nil,
         validatesPreparedNumericDomain: Bool = true
     ) -> AutoChartValidationResult {
-        var issues: [AutoChartValidationIssue] = []
+        var issues: [AutoChartDiagnostic] = []
         let referenced = orderedUnique(specification.encoding.columnIDs)
         for id in referenced where profiles[id] == nil {
             issues.append(.init(severity: .error, message: "Unknown column \(id.rawValue)."))
@@ -519,8 +528,6 @@ public enum AutoChartEngine {
                     message: "\(label) must not contain missing values."))
         }
         switch specification.family {
-        case .table:
-            break
         case .kpi:
             require(specification.encoding.y, .quantitative, "Value")
             rejectMissing(specification.encoding.y, "Value")
@@ -821,8 +828,7 @@ public enum AutoChartEngine {
                         : "Quantitative field \(id.rawValue) contains non-finite values that will be omitted."
                 ))
         }
-        if specification.family != .table {
-            for id in referenced {
+        for id in referenced {
                 guard let profile = profiles[id] else { continue }
                 if profile.isQuantitative, !profile.hasFiniteNumericSpan {
                     issues.append(
@@ -840,7 +846,6 @@ public enum AutoChartEngine {
                                 "Temporal field \(id.rawValue) spans a range too large to render safely."
                         ))
                 }
-            }
         }
         if validatesPreparedNumericDomain,
             requiresPreparedNumericDomainValidation(
@@ -868,7 +873,7 @@ public enum AutoChartEngine {
                 specification.encoding.y.flatMap { profiles[$0] }.flatMap {
                     safeRollupAggregation($0.column.hints)
                 }
-            case .table, .kpi, .boxPlot, .scatter, .bubble, .range:
+            case .kpi, .boxPlot, .scatter, .bubble, .range:
                 AutoChartAggregation.none
             default:
                 nil
@@ -1087,29 +1092,19 @@ public enum AutoChartEngine {
     }
 
     private static func compositionIsSafe(_ hints: AutoChartColumnHints) -> Bool {
-        let additiveAggregations: Set<AutoChartAggregation> = [
-            .sum, .count,
-        ]
-        if hints.aggregationSafety == .safe {
-            return hints.aggregation == nil
-                || hints.aggregation.map(additiveAggregations.contains) == true
-        }
-        guard hints.aggregationSafety == .alreadyAggregated else { return false }
-        return hints.aggregation.map(additiveAggregations.contains) == true
+        guard let semantics = hints.measureSemantics else { return false }
+        return semantics.rollup == .additive
     }
 
     private static func safeRollupAggregation(
         _ hints: AutoChartColumnHints
     ) -> AutoChartAggregation? {
-        switch hints.aggregationSafety {
-        case .safe:
-            return hints.aggregation ?? .sum
-        case .alreadyAggregated:
-            guard hints.aggregation == .sum || hints.aggregation == .count else {
-                return nil
-            }
+        switch hints.measureSemantics?.rollup {
+        case .additive:
             return .sum
-        case .unknown, .rowLevel, .unsafe:
+        case .safe(let operation):
+            return operation
+        case .nonAdditive, .unknown, nil:
             return nil
         }
     }
@@ -1120,8 +1115,7 @@ public enum AutoChartEngine {
         specification: AutoChartSpecification,
         profiles: [AutoChartColumnID: AutoChartColumnProfile]
     ) -> Bool {
-        guard specification.family != .table,
-            let y = specification.encoding.y,
+        guard let y = specification.encoding.y,
             profiles[y]?.isQuantitative == true
         else { return false }
         if [.donut, .stackedBar, .normalizedBar].contains(specification.family) {
@@ -1227,7 +1221,7 @@ public enum AutoChartEngine {
         specification: AutoChartSpecification,
         data: [AutoChartDatum],
         y: AutoChartColumnID
-    ) -> [AutoChartValidationIssue] {
+    ) -> [AutoChartDiagnostic] {
         let values = data.compactMap(\.yNumber)
         if values.contains(where: { !$0.isFinite }) {
             return [
@@ -1425,7 +1419,7 @@ public enum AutoChartEngine {
     static func bestCandidatesByID(
         _ candidates: [AutoChartRecommendation]
     ) -> [AutoChartRecommendation] {
-        var bestCandidateByID: [String: AutoChartRecommendation] = [:]
+        var bestCandidateByID: [AutoChartRecommendationID: AutoChartRecommendation] = [:]
         for recommendation in candidates {
             if let existing = bestCandidateByID[recommendation.id],
                 existing.score >= recommendation.score
@@ -1461,12 +1455,5 @@ public enum AutoChartEngine {
             }
         }
         return output
-    }
-
-    private static func tableFallback(reason: String) -> AutoChartRecommendation {
-        AutoChartRecommendation(
-            specification: AutoChartSpecification(family: .table, title: "Result Table"),
-            score: 0,
-            rationale: [reason])
     }
 }

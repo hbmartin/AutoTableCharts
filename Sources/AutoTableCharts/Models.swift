@@ -18,22 +18,19 @@ public struct AutoChartColumnID: RawRepresentable, Hashable, Codable, Sendable,
     public var description: String { rawValue }
 }
 
-/// A stable identifier for a source row.
+/// A caller-managed identity and revision for immutable chart data.
 ///
-/// The renderer preserves these identifiers through grouping and binning so a
-/// selection can identify every contributing source row.
-public struct AutoChartRowID: RawRepresentable, Hashable, Codable, Sendable,
-    ExpressibleByStringLiteral, CustomStringConvertible
-{
-    /// The caller-defined identifier value.
-    public var rawValue: String
+/// Keep `identity` stable for one logical result and change `revision` whenever
+/// columns, values, row identifiers, hints, or metadata change. An analyzer can
+/// use this contract to find prepared state without rescanning every cell.
+public struct AutoChartDataKey: Hashable, Codable, Sendable {
+    public var identity: String
+    public var revision: String
 
-    /// Creates an identifier from its stored representation.
-    public init(rawValue: String) { self.rawValue = rawValue }
-    /// Creates an identifier from a string literal.
-    public init(stringLiteral value: String) { self.rawValue = value }
-    /// The unmodified identifier value.
-    public var description: String { rawValue }
+    public init(identity: String, revision: String) {
+        self.identity = identity
+        self.revision = revision
+    }
 }
 
 /// A typed cell value supplied by an ``AutoChartRow``.
@@ -173,17 +170,40 @@ public enum AutoChartAggregation: String, CaseIterable, Codable, Sendable {
 /// Recommendation safety is conservative: unknown or unsafe aggregation blocks
 /// implicit rollups, and already-aggregated measures are additive only for
 /// upstream sums and ordinary counts. Both roll up by summing their values.
-public enum AutoChartAggregationSafety: String, Codable, Sendable {
-    /// The caller hasn't established whether aggregation is semantically valid.
-    case unknown
-    /// Values occur at the table's row grain but aren't explicitly declared additive.
+/// How values in a measure column were produced.
+public enum AutoChartMeasureSource: Hashable, Codable, Sendable {
     case rowLevel
-    /// Values may use the declared aggregation, or sum when none is declared.
-    case safe
-    /// Values were aggregated upstream; only sums and ordinary counts may be summed again.
-    case alreadyAggregated
-    /// Values must never be aggregated automatically.
-    case unsafe
+    case aggregated(AutoChartAggregation)
+    case derived
+}
+
+/// Whether and how values may be rolled up into one visual mark.
+public enum AutoChartRollupPolicy: Hashable, Codable, Sendable {
+    /// Values may be summed, including values already aggregated upstream.
+    case additive
+    /// Values must not be combined automatically.
+    case nonAdditive
+    /// Values may be combined only with the named operation.
+    case safe(AutoChartAggregation)
+    /// The host has not established safe rollup behavior.
+    case unknown
+}
+
+/// Explicit provenance and rollup behavior for a measure column.
+public struct AutoChartMeasureSemantics: Hashable, Codable, Sendable {
+    public var source: AutoChartMeasureSource
+    public var rollup: AutoChartRollupPolicy
+    public var preferredTransform: AutoChartAggregation?
+
+    public init(
+        source: AutoChartMeasureSource = .rowLevel,
+        rollup: AutoChartRollupPolicy = .unknown,
+        preferredTransform: AutoChartAggregation? = nil
+    ) {
+        self.source = source
+        self.rollup = rollup
+        self.preferredTransform = preferredTransform
+    }
 }
 
 /// Caller-supplied semantic metadata for a column.
@@ -198,10 +218,8 @@ public struct AutoChartColumnHints: Hashable, Codable, Sendable {
     public var role: AutoChartAnalyticRole?
     /// Unit metadata used for formatting and semantic context.
     public var unit: AutoChartUnit?
-    /// The aggregation already applied upstream or preferred by the caller.
-    public var aggregation: AutoChartAggregation?
-    /// Whether further aggregation is safe.
-    public var aggregationSafety: AutoChartAggregationSafety
+    /// Provenance and safe rollup behavior for a measure.
+    public var measureSemantics: AutoChartMeasureSemantics?
     /// A caller-defined description of the entity or grouping level represented.
     public var grain: String?
 
@@ -211,23 +229,19 @@ public struct AutoChartColumnHints: Hashable, Codable, Sendable {
     ///   - semanticType: An explicit type, or `nil` to use inference.
     ///   - role: The column's analytical role.
     ///   - unit: Formatting and domain unit metadata.
-    ///   - aggregation: An upstream or preferred aggregation.
-    ///   - aggregationSafety: Whether the engine may roll values up. Defaults to
-    ///     the conservative ``AutoChartAggregationSafety/unknown`` state.
+    ///   - measureSemantics: Provenance and safe rollup behavior for a measure.
     ///   - grain: A human-readable description of the value grain.
     public init(
         semanticType: AutoChartSemanticType? = nil,
         role: AutoChartAnalyticRole? = nil,
         unit: AutoChartUnit? = nil,
-        aggregation: AutoChartAggregation? = nil,
-        aggregationSafety: AutoChartAggregationSafety = .unknown,
+        measureSemantics: AutoChartMeasureSemantics? = nil,
         grain: String? = nil
     ) {
         self.semanticType = semanticType
         self.role = role
         self.unit = unit
-        self.aggregation = aggregation
-        self.aggregationSafety = aggregationSafety
+        self.measureSemantics = measureSemantics
         self.grain = grain
     }
 }
@@ -293,9 +307,11 @@ public struct AutoChartTableMetadata: Hashable, Codable, Sendable {
 }
 
 /// A source row that provides stable identity and typed values by column.
-public protocol AutoChartRow: Sendable {
+public protocol AutoChartRow<RowID>: Sendable {
+    associatedtype RowID: Hashable & Sendable
+
     /// A stable identifier preserved by selections, grouping, and binning.
-    var chartRowID: AutoChartRowID { get }
+    var chartRowID: RowID { get }
     /// Returns the typed value associated with a column.
     ///
     /// Return ``AutoChartValue/null`` when the row has no value for the column.
@@ -306,10 +322,11 @@ public protocol AutoChartRow: Sendable {
 ///
 /// The engine copies the declared columns and supplied rows into an immutable
 /// snapshot. It never samples, reorders, or mutates consumer-owned storage.
-public protocol AutoChartTable: Sendable {
+public protocol AutoChartTable<RowID>: Sendable {
+    associatedtype RowID: Hashable & Sendable
     /// The random-access collection that stores this table's rows.
     associatedtype ChartRows: RandomAccessCollection & Sendable
-    where ChartRows.Element: AutoChartRow
+    where ChartRows.Element: AutoChartRow, ChartRows.Element.RowID == RowID
 
     /// Column descriptions in source order.
     var chartColumns: [AutoChartColumn] { get }
@@ -317,28 +334,12 @@ public protocol AutoChartTable: Sendable {
     var chartRows: ChartRows { get }
     /// Result-level completeness, grain, and provenance metadata.
     var chartMetadata: AutoChartTableMetadata { get }
-    /// A caller-managed identifier for this logical table or result.
-    ///
-    /// Keep this value stable while the same logical table is updated, and make it
-    /// distinct from other tables of the same Swift type. When both this value and
-    /// ``chartDataVersion`` are non-`nil`, the renderer can reuse prepared data
-    /// without first reading every cell. The default is `nil`.
-    var chartDataIdentity: String? { get }
-    /// A caller-managed revision for the exact table contents, used with
-    /// ``chartDataIdentity`` to reuse prepared rendering data across SwiftUI view
-    /// reconstruction.
-    ///
-    /// Change this value whenever columns, rows, values, or metadata change. The
-    /// default is `nil`. Supplying only a version, without a table identity, keeps
-    /// content-derived invalidation behavior so distinct tables cannot collide.
-    /// Version-only conformances from earlier package revisions still compile but
-    /// must add ``chartDataIdentity`` to regain scan-free cache lookup.
-    var chartDataVersion: String? { get }
+    /// An optional caller-managed identity and content revision for cache lookup.
+    var chartDataKey: AutoChartDataKey? { get }
 }
 
 extension AutoChartTable {
-    public var chartDataIdentity: String? { nil }
-    public var chartDataVersion: String? { nil }
+    public var chartDataKey: AutoChartDataKey? { nil }
 }
 
 /// The analytical task used to favor otherwise valid recommendations.
@@ -389,6 +390,8 @@ public struct AutoChartContext: Hashable, Codable, Sendable {
 /// recommendation and at least two categories, sectors, series, facets, or
 /// candidate columns per semantic type.
 public struct AutoChartOptions: Hashable, Codable, Sendable {
+    /// Whether candidate acceptance and rejection decisions are retained.
+    public var includesDecisionTrace: Bool
     /// The maximum number of diverse recommendations returned. Defaults to five.
     public var maximumRecommendations: Int {
         didSet { maximumRecommendations = max(1, maximumRecommendations) }
@@ -423,6 +426,7 @@ public struct AutoChartOptions: Hashable, Codable, Sendable {
         case maximumSeries
         case maximumFacets
         case maximumCandidateColumns
+        case includesDecisionTrace
     }
 
     /// Creates recommendation and density limits.
@@ -434,13 +438,15 @@ public struct AutoChartOptions: Hashable, Codable, Sendable {
     ///   - maximumSeries: Maximum series cardinality.
     ///   - maximumFacets: Maximum facet cardinality.
     ///   - maximumCandidateColumns: Maximum candidate columns per semantic type.
+    ///   - includesDecisionTrace: Whether to retain candidate decisions and exclusions.
     public init(
         maximumRecommendations: Int = 5,
         maximumCategories: Int = 20,
         maximumDonutSectors: Int = 6,
         maximumSeries: Int = 6,
         maximumFacets: Int = 6,
-        maximumCandidateColumns: Int = 24
+        maximumCandidateColumns: Int = 24,
+        includesDecisionTrace: Bool = false
     ) {
         self.maximumRecommendations = max(1, maximumRecommendations)
         self.maximumCategories = max(2, maximumCategories)
@@ -448,6 +454,7 @@ public struct AutoChartOptions: Hashable, Codable, Sendable {
         self.maximumSeries = max(2, maximumSeries)
         self.maximumFacets = max(2, maximumFacets)
         self.maximumCandidateColumns = max(2, maximumCandidateColumns)
+        self.includesDecisionTrace = includesDecisionTrace
     }
 
     /// Decodes recommendation limits and applies the same safe minimums as the initializer.
@@ -462,14 +469,14 @@ public struct AutoChartOptions: Hashable, Codable, Sendable {
             maximumSeries: try container.decode(Int.self, forKey: .maximumSeries),
             maximumFacets: try container.decode(Int.self, forKey: .maximumFacets),
             maximumCandidateColumns: try container.decodeIfPresent(
-                Int.self, forKey: .maximumCandidateColumns) ?? 24)
+                Int.self, forKey: .maximumCandidateColumns) ?? 24,
+            includesDecisionTrace: try container.decodeIfPresent(
+                Bool.self, forKey: .includesDecisionTrace) ?? false)
     }
 }
 
 /// A visualization family supported by recommendation, validation, and rendering.
 public enum AutoChartFamily: String, CaseIterable, Codable, Sendable {
-    /// A tabular fallback when no safe chart is available.
-    case table
     /// A single quantitative key value from a complete one-row result.
     case kpi
     /// Length-encoded categorical comparison.
@@ -508,7 +515,6 @@ public enum AutoChartFamily: String, CaseIterable, Codable, Sendable {
     /// A concise localized-ready family label used by fallback UI and accessibility.
     public var displayName: String {
         switch self {
-        case .table: "Table"
         case .kpi: "Key value"
         case .bar: "Bar"
         case .rankedDot: "Ranked dot"
@@ -563,7 +569,7 @@ public enum AutoChartSort: String, Codable, Sendable {
 /// Column-to-channel assignments used by a chart specification.
 ///
 /// Required channels depend on ``AutoChartFamily`` and are checked by
-/// ``AutoChartEngine/validate(specification:for:)``.
+/// ``AutoChartAnalysis/validate(_:)``.
 public struct AutoChartEncoding: Hashable, Codable, Sendable {
     /// The primary horizontal, categorical, temporal, or quantitative field.
     public var x: AutoChartColumnID?
@@ -681,12 +687,8 @@ public struct AutoChartSpecification: Identifiable, Hashable, Codable, Sendable 
         self.title = title
     }
 
-    /// A deterministic identity derived from the recommendation policy and visual fields.
-    ///
-    /// The title is intentionally excluded. Use
-    /// ``AutoTableCharts/recommendationPolicyVersion`` when deciding whether to
-    /// invalidate persisted identifiers after a policy update.
-    public var id: String {
+    /// A deterministic structural identity. Policy version and title are excluded.
+    public var id: AutoChartSpecificationID {
         func optionalColumn(_ id: AutoChartColumnID?) -> String {
             id.map { "value:\($0.rawValue)" } ?? "nil"
         }
@@ -694,7 +696,6 @@ public struct AutoChartSpecification: Identifiable, Hashable, Codable, Sendable 
             "\(component.utf8.count):\(component)"
         }
         let components = [
-            String(AutoTableCharts.recommendationPolicyVersion),
             family.rawValue,
             optionalColumn(encoding.x),
             optionalColumn(encoding.y),
@@ -710,7 +711,458 @@ public struct AutoChartSpecification: Identifiable, Hashable, Codable, Sendable 
             facetBaseFamily.map { "value:\($0.rawValue)" } ?? "nil",
             sort.rawValue,
         ]
-        return components.map(encode).joined(separator: "|")
+        return AutoChartSpecificationID(
+            rawValue: components.map(encode).joined(separator: "|"))
+    }
+}
+
+extension AutoChartSpecification {
+    public static func kpi(
+        measure: AutoChartColumnID,
+        title: String = ""
+    ) -> Self {
+        Self(family: .kpi, encoding: .init(y: measure), title: title)
+    }
+
+    public static func bar(
+        category: AutoChartColumnID,
+        measure: AutoChartColumnID,
+        aggregation: AutoChartAggregation = .none,
+        orientation: AutoChartOrientation = .vertical,
+        sort: AutoChartSort = .source,
+        title: String = ""
+    ) -> Self {
+        Self(
+            family: .bar,
+            encoding: .init(x: category, y: measure),
+            aggregation: aggregation,
+            orientation: orientation,
+            sort: sort,
+            title: title)
+    }
+
+    public static func rankedDot(
+        category: AutoChartColumnID,
+        measure: AutoChartColumnID,
+        aggregation: AutoChartAggregation = .none,
+        sort: AutoChartSort = .descending,
+        title: String = ""
+    ) -> Self {
+        Self(
+            family: .rankedDot,
+            encoding: .init(x: category, y: measure),
+            aggregation: aggregation,
+            orientation: .horizontal,
+            sort: sort,
+            title: title)
+    }
+
+    public static func groupedBar(
+        category: AutoChartColumnID,
+        measure: AutoChartColumnID,
+        series: AutoChartColumnID,
+        aggregation: AutoChartAggregation = .none,
+        orientation: AutoChartOrientation = .vertical,
+        title: String = ""
+    ) -> Self {
+        Self(
+            family: .groupedBar,
+            encoding: .init(x: category, y: measure, series: series),
+            aggregation: aggregation,
+            orientation: orientation,
+            title: title)
+    }
+
+    public static func stackedBar(
+        category: AutoChartColumnID,
+        measure: AutoChartColumnID,
+        series: AutoChartColumnID,
+        aggregation: AutoChartAggregation = .sum,
+        orientation: AutoChartOrientation = .vertical,
+        title: String = ""
+    ) -> Self {
+        Self(
+            family: .stackedBar,
+            encoding: .init(x: category, y: measure, series: series),
+            aggregation: aggregation,
+            orientation: orientation,
+            stacking: .standard,
+            title: title)
+    }
+
+    public static func normalizedBar(
+        category: AutoChartColumnID,
+        measure: AutoChartColumnID,
+        series: AutoChartColumnID,
+        aggregation: AutoChartAggregation = .sum,
+        orientation: AutoChartOrientation = .vertical,
+        title: String = ""
+    ) -> Self {
+        Self(
+            family: .normalizedBar,
+            encoding: .init(x: category, y: measure, series: series),
+            aggregation: aggregation,
+            orientation: orientation,
+            stacking: .normalized,
+            title: title)
+    }
+
+    public static func line(
+        x: AutoChartColumnID,
+        measure: AutoChartColumnID,
+        series: AutoChartColumnID? = nil,
+        aggregation: AutoChartAggregation = .none,
+        title: String = ""
+    ) -> Self {
+        Self(
+            family: .line,
+            encoding: .init(x: x, y: measure, series: series),
+            aggregation: aggregation,
+            title: title)
+    }
+
+    public static func pointLine(
+        x: AutoChartColumnID,
+        measure: AutoChartColumnID,
+        series: AutoChartColumnID? = nil,
+        aggregation: AutoChartAggregation = .none,
+        title: String = ""
+    ) -> Self {
+        Self(
+            family: .pointLine,
+            encoding: .init(x: x, y: measure, series: series),
+            aggregation: aggregation,
+            title: title)
+    }
+
+    public static func area(
+        x: AutoChartColumnID,
+        measure: AutoChartColumnID,
+        series: AutoChartColumnID? = nil,
+        aggregation: AutoChartAggregation = .none,
+        title: String = ""
+    ) -> Self {
+        Self(
+            family: .area,
+            encoding: .init(x: x, y: measure, series: series),
+            aggregation: aggregation,
+            title: title)
+    }
+
+    public static func scatter(
+        x: AutoChartColumnID,
+        y: AutoChartColumnID,
+        series: AutoChartColumnID? = nil,
+        title: String = ""
+    ) -> Self {
+        Self(
+            family: .scatter,
+            encoding: .init(x: x, y: y, series: series),
+            title: title)
+    }
+
+    public static func bubble(
+        x: AutoChartColumnID,
+        y: AutoChartColumnID,
+        size: AutoChartColumnID,
+        series: AutoChartColumnID? = nil,
+        title: String = ""
+    ) -> Self {
+        Self(
+            family: .bubble,
+            encoding: .init(x: x, y: y, series: series, size: size),
+            title: title)
+    }
+
+    public static func histogram(
+        value: AutoChartColumnID,
+        binCount: Int? = nil,
+        title: String = ""
+    ) -> Self {
+        Self(
+            family: .histogram,
+            encoding: .init(x: value),
+            aggregation: .count,
+            binCount: binCount,
+            title: title)
+    }
+
+    public static func boxPlot(
+        measure: AutoChartColumnID,
+        category: AutoChartColumnID? = nil,
+        title: String = ""
+    ) -> Self {
+        Self(family: .boxPlot, encoding: .init(x: category, y: measure), title: title)
+    }
+
+    public static func heatmap(
+        x: AutoChartColumnID,
+        y: AutoChartColumnID,
+        title: String = ""
+    ) -> Self {
+        Self(
+            family: .heatmap,
+            encoding: .init(x: x, y: y),
+            aggregation: .count,
+            title: title)
+    }
+
+    public static func donut(
+        category: AutoChartColumnID,
+        measure: AutoChartColumnID,
+        aggregation: AutoChartAggregation = .sum,
+        title: String = ""
+    ) -> Self {
+        Self(
+            family: .donut,
+            encoding: .init(x: category, y: measure),
+            aggregation: aggregation,
+            title: title)
+    }
+
+    public static func range(
+        label: AutoChartColumnID,
+        start: AutoChartColumnID,
+        end: AutoChartColumnID? = nil,
+        series: AutoChartColumnID? = nil,
+        title: String = ""
+    ) -> Self {
+        Self(
+            family: .range,
+            encoding: .init(x: label, series: series, start: start, end: end),
+            orientation: .horizontal,
+            title: title)
+    }
+
+    public static func faceted(
+        baseFamily: AutoChartFamily,
+        x: AutoChartColumnID,
+        y: AutoChartColumnID,
+        facet: AutoChartColumnID,
+        series: AutoChartColumnID? = nil,
+        aggregation: AutoChartAggregation = .none,
+        orientation: AutoChartOrientation = .vertical,
+        title: String = ""
+    ) -> Self {
+        Self(
+            family: .faceted,
+            encoding: .init(x: x, y: y, series: series, facet: facet),
+            aggregation: aggregation,
+            orientation: orientation,
+            facetBaseFamily: baseFamily,
+            title: title)
+    }
+}
+
+/// Stable structural identity for a specification.
+public struct AutoChartSpecificationID: RawRepresentable, Hashable, Codable, Sendable,
+    CustomStringConvertible
+{
+    public var rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public var description: String { rawValue }
+}
+
+/// Persistable identity for one recommendation policy and specification.
+public struct AutoChartRecommendationID: Hashable, Sendable, CustomStringConvertible {
+    public var policyVersion: Int
+    public var specificationID: AutoChartSpecificationID
+
+    public init(policyVersion: Int, specificationID: AutoChartSpecificationID) {
+        self.policyVersion = policyVersion
+        self.specificationID = specificationID
+    }
+
+    public var description: String {
+        "v\(policyVersion):\(specificationID.rawValue)"
+    }
+}
+
+extension AutoChartRecommendationID: Comparable {
+    public static func < (lhs: Self, rhs: Self) -> Bool {
+        if lhs.policyVersion != rhs.policyVersion {
+            return lhs.policyVersion < rhs.policyVersion
+        }
+        return lhs.specificationID.rawValue < rhs.specificationID.rawValue
+    }
+}
+
+extension AutoChartRecommendationID: Codable {
+    private enum CodingKeys: String, CodingKey { case policyVersion, specificationID }
+
+    public init(from decoder: any Decoder) throws {
+        if let legacy = try? decoder.singleValueContainer().decode(String.self) {
+            guard let decoded = Self.decodeLegacy(legacy) else {
+                throw DecodingError.dataCorrupted(
+                    .init(codingPath: decoder.codingPath, debugDescription: "Invalid recommendation ID."))
+            }
+            self = decoded
+            return
+        }
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            policyVersion: try values.decode(Int.self, forKey: .policyVersion),
+            specificationID: try values.decode(
+                AutoChartSpecificationID.self, forKey: .specificationID))
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(policyVersion, forKey: .policyVersion)
+        try values.encode(specificationID, forKey: .specificationID)
+    }
+
+    private static func decodeLegacy(_ rawValue: String) -> Self? {
+        var remainder = rawValue[...]
+        var components: [String] = []
+        while !remainder.isEmpty {
+            guard let colon = remainder.firstIndex(of: ":"),
+                let length = Int(remainder[..<colon])
+            else { return nil }
+            let valueStart = remainder.index(after: colon)
+            guard let valueEnd = remainder.index(
+                valueStart, offsetBy: length, limitedBy: remainder.endIndex)
+            else { return nil }
+            components.append(String(remainder[valueStart..<valueEnd]))
+            remainder = remainder[valueEnd...]
+            if remainder.first == "|" { remainder.removeFirst() }
+        }
+        guard let versionText = components.first,
+            let version = Int(versionText), components.count > 1
+        else { return nil }
+        func encode(_ component: String) -> String { "\(component.utf8.count):\(component)" }
+        return Self(
+            policyVersion: version,
+            specificationID: AutoChartSpecificationID(
+                rawValue: components.dropFirst().map(encode).joined(separator: "|")))
+    }
+}
+
+/// A typed value interpolated into package-authored copy.
+public enum AutoChartMessageArgument: Hashable, Codable, Sendable {
+    case string(String)
+    case integer(Int)
+    case number(Double)
+    case column(AutoChartColumnID)
+    case family(AutoChartFamily)
+    case aggregation(AutoChartAggregation)
+}
+
+/// A stable, localizable package message.
+public struct AutoChartMessage: Hashable, Codable, Sendable {
+    public enum Category: String, Hashable, Codable, Sendable {
+        case diagnostic, rationale, fallback, accessibility, interface
+    }
+
+    public enum Code: String, Hashable, Codable, Sendable {
+        case recommendationRationale
+        case incompleteResult
+        case noChartableRows
+        case noSafeChart
+        case invalidInput
+        case validationFailed
+        case nonFiniteValueOmitted
+        case missingValue
+        case unsafeAggregation
+        case duplicateMark
+        case invalidTemporalRange
+        case chartUnavailable
+        case clearSelection
+        case resetZoom
+        case selectionSummary
+        case candidateLimit
+        case markAccessibility
+    }
+
+    public var category: Category
+    public var code: Code
+    public var arguments: [String: AutoChartMessageArgument]
+    public var defaultText: String
+
+    public init(
+        category: Category,
+        code: Code,
+        arguments: [String: AutoChartMessageArgument] = [:],
+        defaultText: String
+    ) {
+        self.category = category
+        self.code = code
+        self.arguments = arguments
+        self.defaultText = defaultText
+    }
+}
+
+/// Host override for package-authored text. Return `nil` to use `defaultText`.
+public struct AutoChartTextResolver: Sendable {
+    private let resolveValue: @Sendable (AutoChartMessage) -> String?
+
+    public init(_ resolve: @escaping @Sendable (AutoChartMessage) -> String?) {
+        self.resolveValue = resolve
+    }
+
+    public func callAsFunction(_ message: AutoChartMessage) -> String {
+        resolveValue(message) ?? message.defaultText
+    }
+
+    public static let `default` = AutoChartTextResolver { _ in nil }
+}
+
+/// The impact of an analysis or specification diagnostic.
+public enum AutoChartValidationSeverity: String, Codable, Sendable {
+    case warning
+    case error
+}
+
+/// A stable diagnostic with structured chart context and fallback copy.
+public struct AutoChartDiagnostic: Hashable, Codable, Sendable {
+    public var severity: AutoChartValidationSeverity
+    public var messageValue: AutoChartMessage
+    public var family: AutoChartFamily?
+    public var columnIDs: [AutoChartColumnID]
+
+    public var message: String { messageValue.defaultText }
+
+    public init(
+        severity: AutoChartValidationSeverity,
+        code: AutoChartMessage.Code = .validationFailed,
+        message: String,
+        family: AutoChartFamily? = nil,
+        columnIDs: [AutoChartColumnID] = []
+    ) {
+        self.severity = severity
+        let resolvedCode: AutoChartMessage.Code
+        if code == .validationFailed {
+            let lowercased = message.lowercased()
+            if lowercased.contains("missing") {
+                resolvedCode = .missingValue
+            } else if lowercased.contains("aggregation")
+                || lowercased.contains("additive")
+                || lowercased.contains("composition")
+            {
+                resolvedCode = .unsafeAggregation
+            } else if lowercased.contains("duplicate") {
+                resolvedCode = .duplicateMark
+            } else if lowercased.contains("temporal")
+                || lowercased.contains("date")
+                || lowercased.contains("range")
+            {
+                resolvedCode = .invalidTemporalRange
+            } else if lowercased.contains("non-finite") {
+                resolvedCode = .nonFiniteValueOmitted
+            } else if lowercased.contains("complete result")
+                || lowercased.contains("truncated")
+            {
+                resolvedCode = .incompleteResult
+            } else {
+                resolvedCode = code
+            }
+        } else {
+            resolvedCode = code
+        }
+        self.messageValue = AutoChartMessage(
+            category: .diagnostic, code: resolvedCode, defaultText: message)
+        self.family = family
+        self.columnIDs = columnIDs
     }
 }
 
@@ -723,10 +1175,10 @@ public struct AutoChartRecommendation: Identifiable, Hashable, Codable, Sendable
     /// Scores are useful for ordering but aren't probabilities and shouldn't be
     /// compared across policy versions.
     public var score: Double
-    /// Human-readable reasons the candidate fits the data and task.
-    public var rationale: [String]
-    /// Human-readable limitations, including incomplete-result warnings.
-    public var warnings: [String]
+    /// Typed reasons the candidate fits the data and task.
+    public var rationale: [AutoChartMessage]
+    /// Candidate-specific limitations and omissions.
+    public var diagnostics: [AutoChartDiagnostic]
 
     /// Creates a recommendation record.
     ///
@@ -734,29 +1186,57 @@ public struct AutoChartRecommendation: Identifiable, Hashable, Codable, Sendable
     ///   - specification: A chart specification.
     ///   - score: Its relative policy score.
     ///   - rationale: Reasons for the recommendation.
-    ///   - warnings: Limitations the UI should present with the chart.
+    ///   - diagnostics: Limitations and cautions associated with the candidate.
     public init(
+        specification: AutoChartSpecification,
+        score: Double,
+        rationale: [AutoChartMessage],
+        diagnostics: [AutoChartDiagnostic] = []
+    ) {
+        self.specification = specification
+        self.score = score
+        self.rationale = rationale
+        self.diagnostics = diagnostics
+    }
+
+    /// The deterministic identifier of the enclosed specification.
+    public var id: AutoChartRecommendationID {
+        AutoChartRecommendationID(
+            policyVersion: AutoTableCharts.recommendationPolicyVersion,
+            specificationID: specification.id)
+    }
+}
+
+extension AutoChartRecommendation {
+    init(
         specification: AutoChartSpecification,
         score: Double,
         rationale: [String],
         warnings: [String] = []
     ) {
-        self.specification = specification
-        self.score = score
-        self.rationale = rationale
-        self.warnings = warnings
+        self.init(
+            specification: specification,
+            score: score,
+            rationale: rationale.map {
+                AutoChartMessage(
+                    category: .rationale,
+                    code: .recommendationRationale,
+                    defaultText: $0)
+            },
+            diagnostics: warnings.map {
+                AutoChartDiagnostic(
+                    severity: .warning,
+                    code: .incompleteResult,
+                    message: $0,
+                    family: specification.family)
+            })
     }
-
-    /// The deterministic identifier of the enclosed specification.
-    public var id: String { specification.id }
 }
 
-/// The bounded, diverse output of one recommendation request.
-public struct AutoChartRecommendationSet: Hashable, Codable, Sendable {
-    /// Recommendations in deterministic rank order, including a possible table fallback.
+struct AutoChartCandidateResults: Sendable {
     public var recommendations: [AutoChartRecommendation]
-    /// Why no safe chart was available, or `nil` when chart recommendations exist.
     public var fallbackReason: String?
+    var decisions: [AutoChartCandidateDecision]
 
     /// Creates a recommendation result.
     ///
@@ -765,89 +1245,193 @@ public struct AutoChartRecommendationSet: Hashable, Codable, Sendable {
     ///   - fallbackReason: The reason only a table can safely represent the data.
     public init(
         recommendations: [AutoChartRecommendation],
-        fallbackReason: String? = nil
+        fallbackReason: String? = nil,
+        decisions: [AutoChartCandidateDecision] = []
     ) {
         self.recommendations = recommendations
         self.fallbackReason = fallbackReason
+        self.decisions = decisions
     }
 
-    /// Recommendations that render charts, excluding the table fallback family.
     public var chartRecommendations: [AutoChartRecommendation] {
-        recommendations.filter { $0.specification.family != .table }
+        recommendations
     }
 }
 
-/// The exact source rows represented by a selected mark or group of marks.
-public struct AutoChartSelection: Hashable, Codable, Sendable {
-    /// Every source-row identifier contributing to the selection.
-    public var sourceRowIDs: Set<AutoChartRowID>
-    /// A concise human-readable description of the selected category or mark.
-    public var label: String
-    /// A formatted value and contributing-row summary.
-    public var valueDescription: String
+/// A typed reason charting fell back to the host's table presentation.
+public struct AutoChartFallback: Hashable, Codable, Sendable {
+    public var message: AutoChartMessage
+    public var diagnostics: [AutoChartDiagnostic]
 
-    /// Creates linked-selection state.
-    ///
-    /// - Parameters:
-    ///   - sourceRowIDs: Every contributing source row.
-    ///   - label: A human-readable selection label.
-    ///   - valueDescription: A formatted value and lineage summary.
     public init(
-        sourceRowIDs: Set<AutoChartRowID>,
-        label: String,
-        valueDescription: String
+        message: AutoChartMessage,
+        diagnostics: [AutoChartDiagnostic] = []
+    ) {
+        self.message = message
+        self.diagnostics = diagnostics
+    }
+}
+
+/// Coherent result of automatic recommendation.
+public enum AutoChartRecommendationOutcome: Hashable, Codable, Sendable {
+    case charts([AutoChartRecommendation])
+    case tableFallback(AutoChartFallback)
+}
+
+/// Result of resolving a persisted recommendation preference.
+public enum AutoChartRecommendationResolution: Sendable {
+    public enum DefaultReason: Hashable, Codable, Sendable {
+        case noPersistedPreference
+        case policyVersionChanged(previous: Int, current: Int)
+        case specificationUnavailable
+    }
+
+    case exact(AutoChartRecommendation)
+    case defaulted(AutoChartRecommendation, reason: DefaultReason)
+    case unavailable(AutoChartFallback)
+}
+
+/// Inspectable disposition of one generated chart candidate.
+public struct AutoChartCandidateDecision: Hashable, Codable, Sendable {
+    public enum Disposition: Hashable, Codable, Sendable {
+        case recommended(rank: Int, score: Double)
+        case rejected([AutoChartMessage.Code])
+        case pruned(AutoChartMessage.Code)
+    }
+
+    public var specificationID: AutoChartSpecificationID
+    public var family: AutoChartFamily
+    public var disposition: Disposition
+
+    public init(
+        specificationID: AutoChartSpecificationID,
+        family: AutoChartFamily,
+        disposition: Disposition
+    ) {
+        self.specificationID = specificationID
+        self.family = family
+        self.disposition = disposition
+    }
+}
+
+/// Inferred public semantics retained without raw column values.
+public struct AutoChartInferredColumnSemantics: Hashable, Codable, Sendable {
+    public var columnID: AutoChartColumnID
+    public var semanticType: AutoChartSemanticType
+    public var role: AutoChartAnalyticRole?
+    public var measureSemantics: AutoChartMeasureSemantics?
+
+    public init(
+        columnID: AutoChartColumnID,
+        semanticType: AutoChartSemanticType,
+        role: AutoChartAnalyticRole?,
+        measureSemantics: AutoChartMeasureSemantics?
+    ) {
+        self.columnID = columnID
+        self.semanticType = semanticType
+        self.role = role
+        self.measureSemantics = measureSemantics
+    }
+}
+
+/// Optional development trace retained by an analysis.
+public struct AutoChartDecisionTrace: Hashable, Codable, Sendable {
+    public var inferredSemantics: [AutoChartInferredColumnSemantics]
+    public var candidates: [AutoChartCandidateDecision]
+
+    public init(
+        inferredSemantics: [AutoChartInferredColumnSemantics] = [],
+        candidates: [AutoChartCandidateDecision]
+    ) {
+        self.inferredSemantics = inferredSemantics
+        self.candidates = candidates
+    }
+}
+
+public struct AutoChartSelectedDimension: Hashable, Codable, Sendable {
+    public var columnID: AutoChartColumnID
+    public var value: AutoChartValue
+
+    public init(columnID: AutoChartColumnID, value: AutoChartValue) {
+        self.columnID = columnID
+        self.value = value
+    }
+}
+
+public enum AutoChartMarkValue: Hashable, Codable, Sendable {
+    case scalar(AutoChartValue)
+    case numericRange(lower: Double, upper: Double)
+    case temporalRange(start: Date, end: Date)
+    case distribution(lower: Double, quartile1: Double, median: Double, quartile3: Double, upper: Double)
+}
+
+public struct AutoChartSelectedMeasure: Hashable, Codable, Sendable {
+    public var columnID: AutoChartColumnID?
+    public var aggregation: AutoChartAggregation
+    public var value: AutoChartMarkValue
+
+    public init(
+        columnID: AutoChartColumnID?,
+        aggregation: AutoChartAggregation,
+        value: AutoChartMarkValue
+    ) {
+        self.columnID = columnID
+        self.aggregation = aggregation
+        self.value = value
+    }
+}
+
+/// Exact typed lineage and semantic values represented by a selected mark.
+public struct AutoChartSelection<RowID: Hashable & Sendable>: Hashable, Sendable {
+    public var sourceRowIDs: Set<RowID>
+    public var dimensions: [AutoChartSelectedDimension]
+    public var measure: AutoChartSelectedMeasure?
+    public var family: AutoChartFamily
+    public var specificationID: AutoChartSpecificationID
+    public var markID: String
+
+    public init(
+        sourceRowIDs: Set<RowID>,
+        dimensions: [AutoChartSelectedDimension] = [],
+        measure: AutoChartSelectedMeasure? = nil,
+        family: AutoChartFamily,
+        specificationID: AutoChartSpecificationID,
+        markID: String
     ) {
         self.sourceRowIDs = sourceRowIDs
-        self.label = label
-        self.valueDescription = valueDescription
+        self.dimensions = dimensions
+        self.measure = measure
+        self.family = family
+        self.specificationID = specificationID
+        self.markID = markID
     }
 }
 
-/// The impact of a specification-validation issue.
-public enum AutoChartValidationSeverity: String, Codable, Sendable {
-    /// A non-fatal condition callers should present or review.
-    case warning
-    /// A condition that prevents semantically safe rendering.
-    case error
-}
+extension AutoChartSelection: Codable where RowID: Codable {}
 
-/// A diagnostic emitted while validating a caller-provided specification.
-public struct AutoChartValidationIssue: Hashable, Codable, Sendable {
-    /// Whether the issue blocks rendering.
-    public var severity: AutoChartValidationSeverity
-    /// A human-readable explanation of the invalid or cautionary condition.
-    public var message: String
+public struct AutoChartSelectionPresentation: Hashable, Codable, Sendable {
+    public var label: String
+    public var valueDescription: String
+    public var accessibilityDescription: String
 
-    /// Creates a validation diagnostic.
-    ///
-    /// - Parameters:
-    ///   - severity: Whether the issue is a warning or error.
-    ///   - message: A human-readable explanation.
-    public init(severity: AutoChartValidationSeverity, message: String) {
-        self.severity = severity
-        self.message = message
+    public init(label: String, valueDescription: String, accessibilityDescription: String) {
+        self.label = label
+        self.valueDescription = valueDescription
+        self.accessibilityDescription = accessibilityDescription
     }
 }
 
 /// The complete diagnostics produced for a chart specification and table.
 public struct AutoChartValidationResult: Hashable, Codable, Sendable {
     /// Validation diagnostics in discovery order.
-    public var issues: [AutoChartValidationIssue]
+    public var issues: [AutoChartDiagnostic]
     /// Whether the result contains no error-severity issues.
     public var isValid: Bool {
         !issues.contains { $0.severity == .error }
     }
 
     /// Creates a validation result from diagnostics.
-    public init(issues: [AutoChartValidationIssue] = []) {
+    public init(issues: [AutoChartDiagnostic] = []) {
         self.issues = issues
     }
-}
-
-/// The amount of interaction and supporting UI shown by ``AutoChartView``.
-public enum AutoChartInteraction: String, Codable, Sendable {
-    /// A compact, non-interactive presentation suitable for recommendation galleries.
-    case preview
-    /// An interactive presentation with selection, dense-axis navigation, and zoom reset.
-    case explore
 }

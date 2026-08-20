@@ -1,34 +1,33 @@
 # ``AutoChartView``
 
-Render validated recommendations and specifications with native Swift Charts.
+Compose an immutable prepared chart with optional package chrome.
 
 ## Overview
 
-The view snapshots the supplied table, validates the specification, prepares
-family-specific marks, and retains source-row IDs through grouping and binning.
-Recommendation initialization also presents its rationale and warnings.
+Rendering accepts only ``AutoChartPreparedChart`` or an analysis whose primary
+chart was already prepared. No profiling, recommendation, validation, or mark
+preparation occurs during SwiftUI view construction.
 
-Use ``AutoChartInteraction/preview`` for compact galleries and
-``AutoChartInteraction/explore`` for selection, dense-domain scrolling, and
-zoom. Bind ``AutoChartSelection`` when a chart should coordinate with a table or
-detail view.
+```swift
+AutoChartView(
+    preparedChart: prepared,
+    selection: $selection,
+    presentation: .explorer(plotHeight: 320),
+    formatters: formatters,
+    textResolver: resolver)
+```
+
+Use ``AutoChartPlot`` when the host owns titles, diagnostics, controls, and
+selection summaries. ``AutoChartPresentation`` controls exact plot-region
+height, chrome, interactions, and typography independently.
 
 ## Topics
 
-### Create a View
-
-- ``init(table:recommendation:selection:interaction:height:)``
-- ``init(table:specification:selection:interaction:height:)``
-- ``body``
-
-### Interaction
-
-- ``AutoChartInteraction``
+- ``AutoChartPlot``
+- ``AutoChartPreparedChart``
+- ``AutoChartPresentation``
+- ``AutoChartChrome``
+- ``AutoChartInteractions``
+- ``AutoChartTypography``
 - ``AutoChartSelection``
 - <doc:RenderingAndInteraction>
-
-### Safe Input
-
-- ``AutoChartEngine/validate(specification:for:)``
-- <doc:CustomSpecifications>
-

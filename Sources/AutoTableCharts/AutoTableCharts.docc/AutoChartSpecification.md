@@ -1,34 +1,31 @@
 # ``AutoChartSpecification``
 
-Describe one chart family, its channels, and its safe data preparation.
+Describe one chart family and its semantic channels.
 
 ## Overview
 
-A specification is serializable and stable enough to pass between application
-layers. It is not self-validating: channel meaning depends on a particular
-``AutoChartTable``. Call
-``AutoChartEngine/validate(specification:for:)`` before storing or rendering a
-caller-created value, and validate again when the table schema or metadata
-changes.
+A specification is renderer-independent and `Codable`. Use the family-specific
+factories—such as `bar`, `line`, `scatter`, `histogram`, or `faceted`—for ordinary
+construction. The low-level initializer remains available for advanced designs.
 
-The ``id`` derives deterministically from all specification fields. It identifies
-an exact design for deduplication and SwiftUI identity; it isn't a database key.
+Specifications depend on a particular analysis. Validate and asynchronously
+prepare caller-authored values through the retained analysis:
+
+```swift
+let specification = AutoChartSpecification.bar(
+    category: "region",
+    measure: "revenue",
+    orientation: .horizontal)
+
+let validation = analysis.validate(specification)
+guard validation.isValid else { return }
+let prepared = try await analysis.prepare(specification)
+```
+
+The structural ``AutoChartSpecification/id`` includes every visual and transform
+choice except `title`; policy identity belongs to ``AutoChartRecommendationID``.
 
 ## Topics
-
-### Design
-
-- ``family``
-- ``encoding``
-- ``aggregation``
-- ``binCount``
-- ``orientation``
-- ``stacking``
-- ``sort``
-- ``title``
-- ``id``
-
-### Supporting Types
 
 - ``AutoChartEncoding``
 - ``AutoChartFamily``
@@ -36,9 +33,5 @@ an exact design for deduplication and SwiftUI identity; it isn't a database key.
 - ``AutoChartOrientation``
 - ``AutoChartStacking``
 - ``AutoChartSort``
-
-### Guides
-
 - <doc:CustomSpecifications>
 - <doc:ChartFamilyReference>
-

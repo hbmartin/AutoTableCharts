@@ -1,95 +1,42 @@
 # Custom Specifications
 
-Override recommendation with a declarative chart while retaining the same safety checks.
+Prepare caller designs explicitly while retaining the analyzer's safety boundary.
 
 ## Overview
 
-### Build an encoding
-
-``AutoChartEncoding`` assigns table columns to channels. Required assignments
-depend on ``AutoChartFamily``. For a horizontal ranked bar, assign a categorical
-x field and quantitative y field:
+Prefer a family factory:
 
 ```swift
-let specification = AutoChartSpecification(
-    family: .bar,
-    encoding: AutoChartEncoding(x: "propertyType", y: "marketValue"),
-    aggregation: .none,
-    orientation: .horizontal,
-    sort: .descending,
-    title: "Property Types by Market Value"
-)
+let specification = AutoChartSpecification.faceted(
+    baseFamily: .line,
+    x: "month",
+    y: "revenue",
+    facet: "region",
+    title: "Monthly Revenue by Region")
 ```
 
-The names `x` and `y` describe semantic channels before orientation is applied.
-A horizontal bar renderer places the category labels vertically and the measure
-horizontally.
+The low-level initializer remains available when every channel and option must be
+set directly. Channel names describe semantic roles before orientation is
+applied.
 
-For small multiples, record which base chart each panel repeats:
-
-```swift
-let facetedTrend = AutoChartSpecification(
-    family: .faceted,
-    encoding: AutoChartEncoding(x: "date", y: "value", facet: "region"),
-    facetBaseFamily: .line
-)
-```
-
-Legacy decoded faceted specifications without `facetBaseFamily` remain valid when
-a compatible base can be inferred, but validation emits a migration warning.
-
-### Validate before rendering
+Validate against the retained analysis, then prepare asynchronously:
 
 ```swift
-let validation = AutoChartEngine.validate(
-    specification: specification,
-    for: table
-)
-
+let validation = analysis.validate(specification)
 guard validation.isValid else {
-    // Present validation.issues to the caller.
+    present(validation.issues)
     return
 }
+
+let prepared = try await analysis.prepare(specification)
+AutoChartView(preparedChart: prepared)
 ```
 
-Validation checks:
+Validation checks referenced columns, channel compatibility, completeness,
+missing values, duplicate mark grains, interval ordering, finite domains, and
+the exact rollup operation authorized by measure semantics. Composition also
+requires additive, positive, complete values.
 
-- Every referenced column exists.
-- Required channels have compatible semantic types.
-- Series and facet channels are categorical where required.
-- Heatmap axes and facet/x/series channels use distinct fields where required.
-- Incomplete results use only families that remain truthful for partial rows.
-- Composition is complete, positive, and explicitly additive.
-- Composition, heatmap, range, series, and facet channels contain no missing values.
-- Non-frequency aggregation exactly matches its safe rollup operation. Upstream
-  sums and counts marked `alreadyAggregated` both roll up with `sum`.
-- Unaggregated categorical marks have a unique result-grain value.
-- Temporal range starts don't occur after their ends.
-
-### Render a valid specification
-
-Use ``AutoChartView/init(table:specification:selection:interaction:height:)``.
-The view creates a zero-score recommendation wrapper, adds the incomplete-result
-warning when needed, and performs validation again at render time.
-
-```swift
-AutoChartView(
-    table: table,
-    specification: specification,
-    interaction: .explore
-)
-```
-
-### Keep transforms honest
-
-Set ``AutoChartAggregation/none`` when the encoded fields already identify one
-measure per mark. Use an aggregate only when the measure's hints establish that
-rollup is safe. Histogram and heatmap counts are structural frequencies and are
-validated separately; a donut specification's aggregation must match the measure's
-`safeRollupAggregation`-derived operation. A safe `.count` produces structurally
-positive row-count sectors, while `.sum` requires positive additive values.
-
-Choose ``AutoChartStacking/standard`` only for additive contributions and
-``AutoChartStacking/normalized`` only when the intended question is proportional
-composition. A syntactically valid specification can still be misleading if its
-table metadata omits truncation, grain, or upstream aggregation truth.
+Caller specifications do not become recommendations and do not alter the
+analysis outcome. Their prepared values are immutable and may be retained after
+the analyzer cache is trimmed.
