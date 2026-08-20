@@ -1070,6 +1070,10 @@ public struct AutoChartMessage: Hashable, Codable, Sendable {
         case clearSelection
         case resetZoom
         case selectionSummary
+        case selectionValue
+        case selectionRange
+        case selectionDistribution
+        case selectionRowCount
         case candidateLimit
         case markAccessibility
     }
@@ -1130,37 +1134,8 @@ public struct AutoChartDiagnostic: Hashable, Codable, Sendable {
         columnIDs: [AutoChartColumnID] = []
     ) {
         self.severity = severity
-        let resolvedCode: AutoChartMessage.Code
-        if code == .validationFailed {
-            let lowercased = message.lowercased()
-            if lowercased.contains("missing") {
-                resolvedCode = .missingValue
-            } else if lowercased.contains("aggregation")
-                || lowercased.contains("additive")
-                || lowercased.contains("composition")
-            {
-                resolvedCode = .unsafeAggregation
-            } else if lowercased.contains("duplicate") {
-                resolvedCode = .duplicateMark
-            } else if lowercased.contains("temporal")
-                || lowercased.contains("date")
-                || lowercased.contains("range")
-            {
-                resolvedCode = .invalidTemporalRange
-            } else if lowercased.contains("non-finite") {
-                resolvedCode = .nonFiniteValueOmitted
-            } else if lowercased.contains("complete result")
-                || lowercased.contains("truncated")
-            {
-                resolvedCode = .incompleteResult
-            } else {
-                resolvedCode = code
-            }
-        } else {
-            resolvedCode = code
-        }
         self.messageValue = AutoChartMessage(
-            category: .diagnostic, code: resolvedCode, defaultText: message)
+            category: .diagnostic, code: code, defaultText: message)
         self.family = family
         self.columnIDs = columnIDs
     }

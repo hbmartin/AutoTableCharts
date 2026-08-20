@@ -49,19 +49,27 @@ final class ChartState: ObservableObject {
     let analyzer: AutoChartAnalyzer
     @Published var analysis: AutoChartAnalysis<Int>?
     @Published var error: Error?
+    private var analysisTask: Task<Void, Never>?
 
     init(analyzer: AutoChartAnalyzer) {
         self.analyzer = analyzer
     }
 
-    func load(_ dataset: AutoChartDataset<Int>) async {
-        do {
-            analysis = try await analyzer.analyze(
-                dataset,
-                context: .init(goal: .comparison),
-                options: .init(includesDecisionTrace: true))
-        } catch {
-            self.error = error
+    func load(_ dataset: AutoChartDataset<Int>) {
+        analysisTask?.cancel()
+        analysisTask = Task {
+            do {
+                let nextAnalysis = try await analyzer.analyze(
+                    dataset,
+                    context: .init(goal: .comparison),
+                    options: .init(includesDecisionTrace: true))
+                try Task.checkCancellation()
+                analysis = nextAnalysis
+            } catch is CancellationError {
+                // A newer load owns the state now.
+            } catch {
+                self.error = error
+            }
         }
     }
 }

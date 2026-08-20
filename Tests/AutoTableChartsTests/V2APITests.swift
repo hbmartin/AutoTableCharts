@@ -124,12 +124,18 @@ private struct DuplicateIDTable: AutoChartTable {
             from: JSONEncoder().encode(expected))
         #expect(typed == expected)
 
-        let version = String(expected.policyVersion)
-        let legacy = "\(version.utf8.count):\(version)|\(specification.id.rawValue)"
+        let legacy =
+            "1:8|3:bar|14:value:category|13:value:measure|3:nil|3:nil|3:nil|3:nil|3:nil|4:none|3:nil|8:vertical|4:none|3:nil|6:source"
+        let legacySpecificationID = AutoChartSpecificationID(
+            rawValue:
+                "3:bar|14:value:category|13:value:measure|3:nil|3:nil|3:nil|3:nil|3:nil|4:none|3:nil|8:vertical|4:none|3:nil|6:source")
+        let legacyExpected = AutoChartRecommendationID(
+            policyVersion: 8,
+            specificationID: legacySpecificationID)
         let decodedLegacy = try JSONDecoder().decode(
             AutoChartRecommendationID.self,
             from: JSONEncoder().encode(legacy))
-        #expect(decodedLegacy == expected)
+        #expect(decodedLegacy == legacyExpected)
     }
 
     @Test func resolutionReportsExactAndPolicyDefaulting() async throws {
@@ -138,6 +144,14 @@ private struct DuplicateIDTable: AutoChartTable {
             rows: [[.text("A"), .double(1)], [.text("B"), .double(2)]])
         let analysis = try await AutoChartAnalyzer().analyze(dataset)
         let primary = try #require(analysis.primaryChart?.recommendation)
+
+        guard case .defaulted(let noPreference, reason: .noPersistedPreference) =
+            analysis.resolve(nil)
+        else {
+            Issue.record("Expected no-preference default")
+            return
+        }
+        #expect(noPreference.id == primary.id)
 
         guard case .exact(let exact) = analysis.resolve(primary.id) else {
             Issue.record("Expected exact resolution")
@@ -155,6 +169,25 @@ private struct DuplicateIDTable: AutoChartTable {
             return
         }
         #expect(defaulted.id == primary.id)
+
+        let absent = AutoChartRecommendationID(
+            policyVersion: AutoTableCharts.recommendationPolicyVersion,
+            specificationID: AutoChartSpecificationID(rawValue: "absent-specification"))
+        guard case .defaulted(let unavailable, reason: .specificationUnavailable) =
+            analysis.resolve(absent)
+        else {
+            Issue.record("Expected unavailable-specification default")
+            return
+        }
+        #expect(unavailable.id == primary.id)
+
+        let empty = try AutoChartDataset<Int>(columns: [v2Category], rows: [])
+        let fallbackAnalysis = try await AutoChartAnalyzer().analyze(empty)
+        guard case .unavailable(let fallback) = fallbackAnalysis.resolve(nil) else {
+            Issue.record("Expected unavailable fallback resolution")
+            return
+        }
+        #expect(fallback.message.code == .noChartableRows)
     }
 
     @Test func emptyDataProducesTypedTableFallback() async throws {
@@ -171,30 +204,30 @@ private struct DuplicateIDTable: AutoChartTable {
 
 @Suite struct V2InspectionAndFactoryTests {
     @Test func everyRenderableFamilyHasAFactory() {
-        let specifications: [AutoChartSpecification] = [
-            .kpi(measure: "m"),
-            .bar(category: "c", measure: "m"),
-            .rankedDot(category: "c", measure: "m"),
-            .groupedBar(category: "c", measure: "m", series: "s"),
-            .stackedBar(category: "c", measure: "m", series: "s"),
-            .normalizedBar(category: "c", measure: "m", series: "s"),
-            .line(x: "x", measure: "m"),
-            .pointLine(x: "x", measure: "m"),
-            .area(x: "x", measure: "m"),
-            .scatter(x: "x", y: "y"),
-            .bubble(x: "x", y: "y", size: "size"),
-            .histogram(value: "m"),
-            .boxPlot(measure: "m", category: "c"),
-            .heatmap(x: "x", y: "y"),
-            .donut(category: "c", measure: "m"),
-            .range(label: "c", start: "start", end: "end"),
-            .faceted(baseFamily: .bar, x: "c", y: "m", facet: "f"),
+        let specificationsByFamily: [AutoChartFamily: AutoChartSpecification] = [
+            .kpi: .kpi(measure: "m"),
+            .bar: .bar(category: "c", measure: "m"),
+            .rankedDot: .rankedDot(category: "c", measure: "m"),
+            .groupedBar: .groupedBar(category: "c", measure: "m", series: "s"),
+            .stackedBar: .stackedBar(category: "c", measure: "m", series: "s"),
+            .normalizedBar: .normalizedBar(category: "c", measure: "m", series: "s"),
+            .line: .line(x: "x", measure: "m"),
+            .pointLine: .pointLine(x: "x", measure: "m"),
+            .area: .area(x: "x", measure: "m"),
+            .scatter: .scatter(x: "x", y: "y"),
+            .bubble: .bubble(x: "x", y: "y", size: "size"),
+            .histogram: .histogram(value: "m"),
+            .boxPlot: .boxPlot(measure: "m", category: "c"),
+            .heatmap: .heatmap(x: "x", y: "y"),
+            .donut: .donut(category: "c", measure: "m"),
+            .range: .range(label: "c", start: "start", end: "end"),
+            .faceted: .faceted(baseFamily: .bar, x: "c", y: "m", facet: "f"),
         ]
-        #expect(specifications.map(\.family) == AutoChartFamily.allCases)
-        #expect(specifications[4].stacking == .standard)
-        #expect(specifications[5].stacking == .normalized)
-        #expect(specifications[11].aggregation == .count)
-        #expect(specifications[13].aggregation == .count)
+        #expect(Set(specificationsByFamily.keys) == Set(AutoChartFamily.allCases))
+        #expect(specificationsByFamily[.stackedBar]?.stacking == .standard)
+        #expect(specificationsByFamily[.normalizedBar]?.stacking == .normalized)
+        #expect(specificationsByFamily[.histogram]?.aggregation == .count)
+        #expect(specificationsByFamily[.heatmap]?.aggregation == .count)
     }
 
     @Test func fullTraceIncludesInferredSemanticsRanksAndExclusions() async throws {
@@ -233,10 +266,7 @@ private struct DuplicateIDTable: AutoChartTable {
             locale: Locale(identifier: "en_US"),
             timeZone: TimeZone(secondsFromGMT: 0)!,
             value: { _, _, context, _, _ in "context:\(context.rawValue)" })
-        for context in [
-            AutoChartFormattingContext.axisTick, .markAccessibility, .selectionSummary,
-            .kpi, .detail,
-        ] {
+        for context in AutoChartFormattingContext.allCases {
             #expect(
                 formatter.format(column: v2Measure, value: .double(1), context: context)
                     == "context:\(context.rawValue)")
@@ -283,10 +313,32 @@ private struct DuplicateIDTable: AutoChartTable {
         let presentation = selection.presentation(
             columns: [v2Category, v2Measure],
             textResolver: AutoChartTextResolver { message in
-                message.code == .selectionSummary ? "Localized selection" : nil
+                switch message.code {
+                case .selectionValue:
+                    guard case .string(let value) = message.arguments["value"],
+                        !value.isEmpty
+                    else { return nil }
+                    return "Localized value"
+                case .selectionSummary:
+                    guard message.arguments["label"] == .string("Office"),
+                        message.arguments["value"] == .string("Localized value"),
+                        message.arguments["rows"] == .integer(1)
+                    else { return nil }
+                    return "Localized selection"
+                default:
+                    return nil
+                }
             })
         #expect(presentation.label == "Office")
+        #expect(presentation.valueDescription == "Localized value")
         #expect(presentation.accessibilityDescription == "Localized selection")
+
+        let firstMeasure = AutoChartColumn(id: "m", name: "First")
+        let secondMeasure = AutoChartColumn(id: "m", name: "Second")
+        let duplicatePresentation = selection.presentation(
+            columns: [v2Category, firstMeasure, secondMeasure],
+            formatters: AutoChartFormatters { column, _, _, _, _ in column?.name })
+        #expect(duplicatePresentation.valueDescription == "First")
     }
 
     #if canImport(Charts) && canImport(SwiftUI)

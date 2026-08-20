@@ -1,6 +1,6 @@
 import Foundation
 
-public enum AutoChartFormattingContext: String, Hashable, Codable, Sendable {
+public enum AutoChartFormattingContext: String, CaseIterable, Hashable, Codable, Sendable {
     case axisTick
     case markAccessibility
     case selectionSummary
@@ -78,38 +78,84 @@ extension AutoChartSelection {
         textResolver: AutoChartTextResolver = .default
     ) -> AutoChartSelectionPresentation {
         let columnIndex = Dictionary(
-            uniqueKeysWithValues: columns.map { ($0.id, $0) })
+            columns.map { ($0.id, $0) },
+            uniquingKeysWith: { first, _ in first })
         let label = dimensions.map { dimension in
             formatters.format(
                 column: columnIndex[dimension.columnID],
                 value: dimension.value,
                 context: .selectionSummary)
         }.joined(separator: ", ")
-        let valueDescription: String
+        let valueMessage: AutoChartMessage
         if let measure {
             let column = measure.columnID.flatMap { columnIndex[$0] }
             switch measure.value {
             case .scalar(let value):
-                valueDescription = formatters.format(
+                let formatted = formatters.format(
                     column: column,
                     value: value,
                     context: .selectionSummary)
+                valueMessage = AutoChartMessage(
+                    category: .interface,
+                    code: .selectionValue,
+                    arguments: ["value": .string(formatted)],
+                    defaultText: formatted)
             case .numericRange(let lower, let upper):
-                valueDescription = "\(formatters.format(column: column, value: .double(lower), context: .selectionSummary))–\(formatters.format(column: column, value: .double(upper), context: .selectionSummary))"
+                let lower = formatters.format(
+                    column: column, value: .double(lower), context: .selectionSummary)
+                let upper = formatters.format(
+                    column: column, value: .double(upper), context: .selectionSummary)
+                valueMessage = AutoChartMessage(
+                    category: .interface,
+                    code: .selectionRange,
+                    arguments: ["lower": .string(lower), "upper": .string(upper)],
+                    defaultText: "\(lower)–\(upper)")
             case .temporalRange(let start, let end):
-                valueDescription = "\(formatters.format(column: column, value: .date(start), context: .selectionSummary))–\(formatters.format(column: column, value: .date(end), context: .selectionSummary))"
+                let start = formatters.format(
+                    column: column, value: .date(start), context: .selectionSummary)
+                let end = formatters.format(
+                    column: column, value: .date(end), context: .selectionSummary)
+                valueMessage = AutoChartMessage(
+                    category: .interface,
+                    code: .selectionRange,
+                    arguments: ["lower": .string(start), "upper": .string(end)],
+                    defaultText: "\(start)–\(end)")
             case .distribution(let lower, _, let median, _, let upper):
-                valueDescription = "Median \(formatters.format(column: column, value: .double(median), context: .selectionSummary)); range \(formatters.format(column: column, value: .double(lower), context: .selectionSummary))–\(formatters.format(column: column, value: .double(upper), context: .selectionSummary))"
+                let median = formatters.format(
+                    column: column, value: .double(median), context: .selectionSummary)
+                let lower = formatters.format(
+                    column: column, value: .double(lower), context: .selectionSummary)
+                let upper = formatters.format(
+                    column: column, value: .double(upper), context: .selectionSummary)
+                valueMessage = AutoChartMessage(
+                    category: .interface,
+                    code: .selectionDistribution,
+                    arguments: [
+                        "median": .string(median),
+                        "lower": .string(lower),
+                        "upper": .string(upper),
+                    ],
+                    defaultText: "Median \(median); range \(lower)–\(upper)")
             }
         } else {
-            valueDescription = "\(sourceRowIDs.count) source \(sourceRowIDs.count == 1 ? "row" : "rows")"
+            valueMessage = AutoChartMessage(
+                category: .interface,
+                code: .selectionRowCount,
+                arguments: ["rows": .integer(sourceRowIDs.count)],
+                defaultText:
+                    "\(sourceRowIDs.count) source \(sourceRowIDs.count == 1 ? "row" : "rows")")
         }
         let resolvedLabel = label.isEmpty ? family.displayName : label
+        let valueDescription = textResolver(valueMessage)
         let summary = textResolver(
             AutoChartMessage(
                 category: .accessibility,
                 code: .selectionSummary,
-                arguments: ["rows": .integer(sourceRowIDs.count)],
+                arguments: [
+                    "label": .string(resolvedLabel),
+                    "value": .string(valueDescription),
+                    "rows": .integer(sourceRowIDs.count),
+                ],
                 defaultText: "\(resolvedLabel), \(valueDescription)"))
         return AutoChartSelectionPresentation(
             label: resolvedLabel,

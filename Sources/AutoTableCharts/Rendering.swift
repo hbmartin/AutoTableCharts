@@ -216,30 +216,10 @@ enum AutoChartSelectionPreparation {
         let rowIDs = matches.reduce(into: Set<Int>()) {
             $0.formUnion($1.sourceRowIDs)
         }
-        let numericMatches = matches.compactMap { datum -> (value: Double, weight: Int)? in
-            guard let value = datum.yNumber else { return nil }
-            return (value, datum.sourceRowIDs.count)
-        }
-        let combinedValue: Double? = {
-            guard !numericMatches.isEmpty else { return nil }
-            if numericMatches.count == 1 { return numericMatches[0].value }
-            switch aggregation {
-            case .sum, .count:
-                return numericMatches.reduce(0) { $0 + $1.value }
-            case .mean:
-                let totalWeight = numericMatches.reduce(0) { $0 + $1.weight }
-                guard totalWeight > 0 else { return nil }
-                return numericMatches.reduce(0) {
-                    $0 + $1.value * Double($1.weight)
-                } / Double(totalWeight)
-            case .minimum:
-                return numericMatches.map(\.value).min()
-            case .maximum:
-                return numericMatches.map(\.value).max()
-            case .none, .countDistinct:
-                return nil
-            }
-        }()
+        let numericMatches = matches.compactMap(\.yNumber)
+        let combinedValue = aggregatedNumericValue(
+            for: matches,
+            aggregation: aggregation)
         let rowDescription =
             "\(rowIDs.count) source row\(rowIDs.count == 1 ? "" : "s")"
         if let combinedValue {
@@ -250,6 +230,40 @@ enum AutoChartSelectionPreparation {
             return "\(numericMatches.count) marks · \(rowDescription)"
         }
         return rowDescription
+    }
+
+    static func aggregatedNumericValue(
+        for matches: [AutoChartDatum],
+        aggregation: AutoChartAggregation
+    ) -> Double? {
+        let numericMatches = matches.compactMap { datum -> (value: Double, weight: Int)? in
+            guard let value = datum.yNumber else { return nil }
+            return (value, datum.sourceRowIDs.count)
+        }
+        guard !numericMatches.isEmpty else { return nil }
+        if numericMatches.count == 1 { return numericMatches[0].value }
+        switch aggregation {
+        case .sum, .count:
+            return numericMatches.reduce(0) { $0 + $1.value }
+        case .mean:
+            let totalWeight = numericMatches.reduce(0) { $0 + $1.weight }
+            guard totalWeight > 0 else { return nil }
+            return numericMatches.reduce(0) {
+                $0 + $1.value * Double($1.weight)
+            } / Double(totalWeight)
+        case .minimum:
+            return numericMatches.map(\.value).min()
+        case .maximum:
+            return numericMatches.map(\.value).max()
+        case .none, .countDistinct:
+            return nil
+        }
+    }
+
+    static func identicalValue<Value: Equatable>(in values: [Value]) -> Value? {
+        guard let first = values.first, values.dropFirst().allSatisfy({ $0 == first })
+        else { return nil }
+        return first
     }
 }
 
@@ -979,21 +993,18 @@ final class AutoChartPreparedTable: Sendable {
     let snapshot: AutoChartSnapshot
     let profiles: [AutoChartColumnID: AutoChartColumnProfile]
     let fingerprint: Int
-    let estimatedCost: Int?
-    let cacheConfigurationRevision: UInt64
+    let estimatedCost: Int
 
     init(
         snapshot: AutoChartSnapshot,
         profiles: [AutoChartColumnID: AutoChartColumnProfile],
         fingerprint: Int,
-        estimatedCost: Int?,
-        cacheConfigurationRevision: UInt64
+        estimatedCost: Int
     ) {
         self.snapshot = snapshot
         self.profiles = profiles
         self.fingerprint = fingerprint
         self.estimatedCost = estimatedCost
-        self.cacheConfigurationRevision = cacheConfigurationRevision
     }
 }
 
@@ -1009,6 +1020,8 @@ struct AutoChartRenderCore: Sendable {
     static func prepare(
         snapshot: AutoChartSnapshot,
         profiles: [AutoChartColumnID: AutoChartColumnProfile],
+        contentFingerprint: Int,
+        estimatedStorageCost: Int,
         recommendation: AutoChartRecommendation
     ) -> AutoChartRenderCore {
         let specification = recommendation.specification
@@ -1019,9 +1032,8 @@ struct AutoChartRenderCore: Sendable {
         let table = AutoChartPreparedTable(
             snapshot: snapshot,
             profiles: profiles,
-            fingerprint: snapshot.contentFingerprint,
-            estimatedCost: snapshot.estimatedStorageCost,
-            cacheConfigurationRevision: 0)
+            fingerprint: contentFingerprint,
+            estimatedCost: estimatedStorageCost)
         return AutoChartRenderCore(
             table: table,
             data: data,
@@ -1191,16 +1203,34 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     private var numberZoomSpan: Double { renderPresentation.numberZoomSpan }
     private var specification: AutoChartSpecification { recommendation.specification }
     private var isCompact: Bool { presentation.typography == .compact }
-    private var interactions: AutoChartInteractions { presentation.interactions }
+    private var interactions: AutoChartInteractions {
+        var interactions = presentation.interactions
+        if !presentation.chrome.contains(.zoomControls) {
+            interactions.remove(.zoom)
+        }
+        return interactions
+    }
 
     @ViewBuilder
     public var body: some View {
         switch content {
         case .fallback(let fallback):
-            ContentUnavailableView(
-                "Chart unavailable",
-                systemImage: "tablecells",
-                description: Text(textResolver(fallback.message)))
+            VStack(alignment: .leading, spacing: 10) {
+                ContentUnavailableView(
+                    "Chart unavailable",
+                    systemImage: "tablecells",
+                    description: Text(textResolver(fallback.message)))
+                if presentation.chrome.contains(.diagnostics) {
+                    ForEach(Array(fallback.diagnostics.enumerated()), id: \.offset) {
+                        _, diagnostic in
+                        Label(
+                            textResolver(diagnostic.messageValue),
+                            systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
+                }
+            }
         case .chart:
             VStack(alignment: .leading, spacing: 10) {
             if presentation.chrome.contains(.title), !specification.title.isEmpty {
@@ -2378,40 +2408,42 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             selection = nil
             return
         }
-        let first = matches[0]
         var dimensions: [AutoChartSelectedDimension] = []
         if let x = specification.encoding.x {
-            let value: AutoChartValue = first.xDate.map(AutoChartValue.date)
-                ?? first.xNumber.map(AutoChartValue.double)
-                ?? .text(first.xLabel ?? label)
-            dimensions.append(.init(columnID: x, value: value))
+            let values: [AutoChartValue] = matches.map { datum in
+                datum.xDate.map(AutoChartValue.date)
+                    ?? datum.xNumber.map(AutoChartValue.double)
+                    ?? .text(datum.xLabel ?? label)
+            }
+            if let value = AutoChartSelectionPreparation.identicalValue(in: values) {
+                dimensions.append(.init(columnID: x, value: value))
+            }
         }
         if let series = specification.encoding.series {
-            dimensions.append(.init(columnID: series, value: .text(first.series ?? "—")))
+            let values = matches.map { AutoChartValue.text($0.series ?? "—") }
+            if let value = AutoChartSelectionPreparation.identicalValue(in: values) {
+                dimensions.append(.init(columnID: series, value: value))
+            }
         }
         if let facet = specification.encoding.facet {
-            dimensions.append(.init(columnID: facet, value: .text(first.facet ?? "—")))
+            let values = matches.map { AutoChartValue.text($0.facet ?? "—") }
+            if let value = AutoChartSelectionPreparation.identicalValue(in: values) {
+                dimensions.append(.init(columnID: facet, value: value))
+            }
         }
         let markValue: AutoChartMarkValue? = {
-            if let start = first.startDate, let end = first.endDate {
-                return .temporalRange(start: start, end: end)
-            }
-            if let lower = first.lower, let upper = first.upper,
-                let quartile1 = first.quartile1, let median = first.median,
-                let quartile3 = first.quartile3
+            if let value = AutoChartSelectionPreparation.aggregatedNumericValue(
+                for: matches,
+                aggregation: specification.aggregation)
             {
-                return .distribution(
-                    lower: lower,
-                    quartile1: quartile1,
-                    median: median,
-                    quartile3: quartile3,
-                    upper: upper)
+                return .scalar(.double(value))
             }
-            if let lower = first.lower, let upper = first.upper {
-                return .numericRange(lower: lower, upper: upper)
-            }
-            if let value = first.yNumber { return .scalar(.double(value)) }
-            return nil
+            let values = matches.map(markValue(for:))
+            guard !values.contains(where: { $0 == nil }),
+                let value = AutoChartSelectionPreparation.identicalValue(
+                    in: values.compactMap { $0 })
+            else { return nil }
+            return value
         }()
         selection = AutoChartSelection(
             sourceRowIDs: preparedChart.rowIDs(for: offsetSelection.sourceRowOffsets),
@@ -2425,6 +2457,27 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             family: specification.family,
             specificationID: specification.id,
             markID: matches.map(\.id).joined(separator: "|"))
+    }
+
+    private func markValue(for datum: AutoChartDatum) -> AutoChartMarkValue? {
+        if let start = datum.startDate, let end = datum.endDate {
+            return .temporalRange(start: start, end: end)
+        }
+        if let lower = datum.lower, let upper = datum.upper,
+            let quartile1 = datum.quartile1, let median = datum.median,
+            let quartile3 = datum.quartile3
+        {
+            return .distribution(
+                lower: lower,
+                quartile1: quartile1,
+                median: median,
+                quartile3: quartile3,
+                upper: upper)
+        }
+        if let lower = datum.lower, let upper = datum.upper {
+            return .numericRange(lower: lower, upper: upper)
+        }
+        return nil
     }
 
     private func clearSelection() {

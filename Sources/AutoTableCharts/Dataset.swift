@@ -43,7 +43,7 @@ public struct AutoChartDatasetError: Error, Hashable, Sendable, CustomStringConv
     }
 }
 
-final class AutoChartMatrixStorage: @unchecked Sendable {
+final class AutoChartMatrixStorage: Sendable {
     let columns: [AutoChartColumn]
     let values: [AutoChartValue]
     let rowCount: Int

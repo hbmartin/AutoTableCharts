@@ -439,6 +439,15 @@ enum AutoChartRecommendationEngine {
                             structural.issues.filter { $0.severity == .error }
                                 .map { $0.messageValue.code }))
                 }
+                let prepared = cachedPreparedValidation(candidate.specification)
+                if !prepared.isValid {
+                    return AutoChartCandidateDecision(
+                        specificationID: candidate.specification.id,
+                        family: candidate.specification.family,
+                        disposition: .rejected(
+                            prepared.issues.filter { $0.severity == .error }
+                                .map { $0.messageValue.code }))
+                }
                 return AutoChartCandidateDecision(
                     specificationID: candidate.specification.id,
                     family: candidate.specification.family,
@@ -477,11 +486,19 @@ enum AutoChartRecommendationEngine {
         var issues: [AutoChartDiagnostic] = []
         let referenced = orderedUnique(specification.encoding.columnIDs)
         for id in referenced where profiles[id] == nil {
-            issues.append(.init(severity: .error, message: "Unknown column \(id.rawValue)."))
+            issues.append(
+                .init(
+                    severity: .error,
+                    code: .invalidInput,
+                    message: "Unknown column \(id.rawValue)."))
         }
         func require(_ id: AutoChartColumnID?, _ type: AutoChartSemanticType, _ label: String) {
             guard let id, let profile = profiles[id] else {
-                issues.append(.init(severity: .error, message: "\(label) is required."))
+                issues.append(
+                    .init(
+                        severity: .error,
+                        code: .validationFailed,
+                        message: "\(label) is required."))
                 return
             }
             let matches: Bool =
@@ -493,6 +510,7 @@ enum AutoChartRecommendationEngine {
                 issues.append(
                     .init(
                         severity: .error,
+                        code: .validationFailed,
                         message: "\(label) must be \(type.rawValue)."))
             }
         }
@@ -525,6 +543,7 @@ enum AutoChartRecommendationEngine {
             issues.append(
                 .init(
                     severity: .error,
+                    code: .missingValue,
                     message: "\(label) must not contain missing values."))
         }
         switch specification.family {
@@ -535,6 +554,7 @@ enum AutoChartRecommendationEngine {
                 issues.append(
                     .init(
                         severity: .error,
+                        code: .validationFailed,
                         message: "Key values require exactly one source row."))
             }
         case .bar, .rankedDot, .groupedBar, .stackedBar, .normalizedBar, .donut:
@@ -547,6 +567,7 @@ enum AutoChartRecommendationEngine {
                 issues.append(
                     .init(
                         severity: .error,
+                        code: .validationFailed,
                         message: "Line and area charts require an ordered or temporal x-axis."))
                 break
             }
@@ -559,6 +580,7 @@ enum AutoChartRecommendationEngine {
                 issues.append(
                     .init(
                         severity: .error,
+                        code: .validationFailed,
                         message: "Area charts require nonnegative values."))
             }
         case .scatter, .bubble:
@@ -568,6 +590,7 @@ enum AutoChartRecommendationEngine {
                 issues.append(
                     .init(
                         severity: .error,
+                        code: .validationFailed,
                         message:
                             "Scatter and bubble charts require a quantitative or temporal x-axis."))
                 break
@@ -583,6 +606,7 @@ enum AutoChartRecommendationEngine {
                     issues.append(
                         .init(
                             severity: .error,
+                            code: .validationFailed,
                             message: "Bubble sizes must be nonnegative."))
                 }
                 if specification.encoding.size == specification.encoding.x
@@ -591,6 +615,7 @@ enum AutoChartRecommendationEngine {
                     issues.append(
                         .init(
                             severity: .error,
+                            code: .validationFailed,
                             message: "Bubble size must use a distinct field."))
                 }
             }
@@ -602,6 +627,7 @@ enum AutoChartRecommendationEngine {
                 issues.append(
                     .init(
                         severity: .error,
+                        code: .validationFailed,
                         message: "Histogram bin count must be between 1 and 1000."))
             }
         case .boxPlot:
@@ -638,6 +664,7 @@ enum AutoChartRecommendationEngine {
                     issues.append(
                         .init(
                             severity: .error,
+                            code: .validationFailed,
                             message:
                                 "Faceted line charts require an ordered or temporal x-axis."
                         ))
@@ -650,6 +677,7 @@ enum AutoChartRecommendationEngine {
                     issues.append(
                         .init(
                             severity: .error,
+                            code: .validationFailed,
                             message:
                                 "Faceted scatter charts require a quantitative or temporal x-axis."
                         ))
@@ -659,6 +687,7 @@ enum AutoChartRecommendationEngine {
                 issues.append(
                     .init(
                         severity: .error,
+                        code: .validationFailed,
                         message:
                             "Faceted charts require a bar, line, or scatter base family."
                     ))
@@ -667,6 +696,7 @@ enum AutoChartRecommendationEngine {
                 issues.append(
                     .init(
                         severity: .warning,
+                        code: .validationFailed,
                         message:
                             "Facet base family was inferred for a legacy specification; encode it explicitly before persisting again."
                     ))
@@ -679,6 +709,7 @@ enum AutoChartRecommendationEngine {
             issues.append(
                 .init(
                     severity: .error,
+                    code: .validationFailed,
                     message: "Heatmap x and y categories must use distinct fields."))
         }
         if specification.encoding.series != nil,
@@ -687,6 +718,7 @@ enum AutoChartRecommendationEngine {
             issues.append(
                 .init(
                     severity: .error,
+                    code: .validationFailed,
                     message: "Series and x-axis encodings must use distinct fields."))
         }
         if specification.family == .faceted,
@@ -696,12 +728,17 @@ enum AutoChartRecommendationEngine {
             issues.append(
                 .init(
                     severity: .error,
+                    code: .validationFailed,
                     message: "Facet, x-axis, and series encodings must use distinct fields."))
         }
         if [.groupedBar, .stackedBar, .normalizedBar].contains(specification.family),
             specification.encoding.series == nil
         {
-            issues.append(.init(severity: .error, message: "Series is required."))
+            issues.append(
+                .init(
+                    severity: .error,
+                    code: .validationFailed,
+                    message: "Series is required."))
         }
         if specification.encoding.series != nil {
             let supportsSeries: Set<AutoChartFamily> = [
@@ -716,6 +753,7 @@ enum AutoChartRecommendationEngine {
                 issues.append(
                     .init(
                         severity: .error,
+                        code: .validationFailed,
                         message:
                             "\(specification.family.displayName) does not support a series encoding."
                     ))
@@ -731,6 +769,7 @@ enum AutoChartRecommendationEngine {
             issues.append(
                 .init(
                     severity: .error,
+                    code: .validationFailed,
                     message:
                         "\(specification.family.displayName) does not support \(article) \(name) encoding."
                 ))
@@ -751,6 +790,7 @@ enum AutoChartRecommendationEngine {
             issues.append(
                 .init(
                     severity: .error,
+                    code: .validationFailed,
                     message:
                         "\(specification.family.displayName) does not support a histogram bin count."
                 ))
@@ -759,6 +799,7 @@ enum AutoChartRecommendationEngine {
             issues.append(
                 .init(
                     severity: .error,
+                    code: .validationFailed,
                     message:
                         "\(specification.family.displayName) does not support a facet encoding."
                 ))
@@ -767,6 +808,7 @@ enum AutoChartRecommendationEngine {
             issues.append(
                 .init(
                     severity: .error,
+                    code: .validationFailed,
                     message:
                         "\(specification.family.displayName) does not support a facet base family."
                 ))
@@ -785,6 +827,7 @@ enum AutoChartRecommendationEngine {
             issues.append(
                 .init(
                     severity: .error,
+                    code: .invalidTemporalRange,
                     message: "Temporal field \(id.rawValue) contains unparseable values."))
         }
         for id in temporalReferences {
@@ -796,6 +839,7 @@ enum AutoChartRecommendationEngine {
             issues.append(
                 .init(
                     severity: isRequiredRangeEndpoint ? .error : .warning,
+                    code: .nonFiniteValueOmitted,
                     message: isRequiredRangeEndpoint
                         ? "Temporal field \(id.rawValue) contains non-finite dates."
                         : "Temporal field \(id.rawValue) contains non-finite dates that will be omitted."
@@ -808,6 +852,7 @@ enum AutoChartRecommendationEngine {
             issues.append(
                 .init(
                     severity: .error,
+                    code: .invalidInput,
                     message: "Quantitative field \(id.rawValue) contains non-numeric values."))
         }
         let requiresCompleteQuantitativeValues: Set<AutoChartFamily> = [
@@ -823,6 +868,7 @@ enum AutoChartRecommendationEngine {
             issues.append(
                 .init(
                     severity: isRequired ? .error : .warning,
+                    code: .nonFiniteValueOmitted,
                     message: isRequired
                         ? "Quantitative field \(id.rawValue) contains non-finite values."
                         : "Quantitative field \(id.rawValue) contains non-finite values that will be omitted."
@@ -834,6 +880,7 @@ enum AutoChartRecommendationEngine {
                     issues.append(
                         .init(
                             severity: .error,
+                            code: .chartUnavailable,
                             message:
                                 "Quantitative field \(id.rawValue) spans a range too large to render safely."
                         ))
@@ -842,6 +889,7 @@ enum AutoChartRecommendationEngine {
                     issues.append(
                         .init(
                             severity: .error,
+                            code: .invalidTemporalRange,
                             message:
                                 "Temporal field \(id.rawValue) spans a range too large to render safely."
                         ))
@@ -882,6 +930,7 @@ enum AutoChartRecommendationEngine {
             issues.append(
                 .init(
                     severity: .error,
+                    code: .unsafeAggregation,
                     message:
                         "\(specification.family.displayName) requires \(expectedAggregation.rawValue) aggregation."
                 ))
@@ -899,6 +948,7 @@ enum AutoChartRecommendationEngine {
             issues.append(
                 .init(
                     severity: .error,
+                    code: .validationFailed,
                     message:
                         "\(specification.family.displayName) requires \(expectedStacking.rawValue) stacking."
                 ))
@@ -927,7 +977,11 @@ enum AutoChartRecommendationEngine {
                     nil
                 }
             if let truncationMessage {
-                issues.append(.init(severity: .error, message: truncationMessage))
+                issues.append(
+                    .init(
+                        severity: .error,
+                        code: .incompleteResult,
+                        message: truncationMessage))
             }
         }
         if [.donut, .stackedBar, .normalizedBar].contains(specification.family) {
@@ -940,6 +994,7 @@ enum AutoChartRecommendationEngine {
                 issues.append(
                     .init(
                         severity: .error,
+                        code: .unsafeAggregation,
                         message: "Composition requires an explicitly additive measure."))
             }
             // Missing, non-numeric, and non-finite measures all shrink the
@@ -955,6 +1010,7 @@ enum AutoChartRecommendationEngine {
                 issues.append(
                     .init(
                         severity: .error,
+                        code: .unsafeAggregation,
                         message: "Composition requires positive values."))
             }
         }
@@ -968,6 +1024,7 @@ enum AutoChartRecommendationEngine {
                     issues.append(
                         .init(
                             severity: .error,
+                            code: .unsafeAggregation,
                             message:
                                 "Aggregation must use the declared safe \(safeAggregation.rawValue) operation."
                         ))
@@ -976,6 +1033,7 @@ enum AutoChartRecommendationEngine {
                 issues.append(
                     .init(
                         severity: .error,
+                        code: .unsafeAggregation,
                         message: "Aggregation requires an explicitly safe measure."))
             }
         }
@@ -1010,6 +1068,7 @@ enum AutoChartRecommendationEngine {
             issues.append(
                 .init(
                     severity: .error,
+                    code: .duplicateMark,
                     message: "Duplicate marks require an explicit safe aggregation."))
         }
         if specification.family == .range,
@@ -1025,6 +1084,7 @@ enum AutoChartRecommendationEngine {
             issues.append(
                 .init(
                     severity: .error,
+                    code: .invalidTemporalRange,
                     message: "Range starts must not occur after their ends."))
         }
         return AutoChartValidationResult(issues: issues)
@@ -1227,6 +1287,7 @@ enum AutoChartRecommendationEngine {
             return [
                 .init(
                     severity: .error,
+                    code: .nonFiniteValueOmitted,
                     message:
                         "Aggregation of quantitative field \(y.rawValue) produces non-finite values."
                 )
@@ -1240,6 +1301,7 @@ enum AutoChartRecommendationEngine {
                 return [
                     .init(
                         severity: .error,
+                        code: .nonFiniteValueOmitted,
                         message:
                             "Composition of quantitative field \(y.rawValue) produces a non-finite total."
                     )
@@ -1267,6 +1329,7 @@ enum AutoChartRecommendationEngine {
                     return [
                         .init(
                             severity: .error,
+                            code: .nonFiniteValueOmitted,
                             message:
                                 "Stacking quantitative field \(y.rawValue) produces non-finite totals."
                         )
@@ -1285,6 +1348,7 @@ enum AutoChartRecommendationEngine {
             return [
                 .init(
                     severity: .error,
+                    code: .chartUnavailable,
                     message:
                         "Aggregated quantitative field \(y.rawValue) spans a range too large to render safely."
                 )
