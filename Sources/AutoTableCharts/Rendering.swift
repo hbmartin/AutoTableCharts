@@ -13,16 +13,20 @@ struct AutoChartDatum: Identifiable, Sendable {
     var id: String
     var sourceRowIDs: Set<Int>
     var xIdentity: String? = nil
+    var xSourceValue: AutoChartValue? = nil
     var xLabel: String?
     var xNumber: Double?
     var xDate: Date?
     var yIdentity: String? = nil
+    var ySourceValue: AutoChartValue? = nil
     var yLabel: String?
     var yNumber: Double?
     var seriesIdentity: String? = nil
+    var seriesSourceValue: AutoChartValue? = nil
     var series: String?
     var size: Double?
     var facetIdentity: String? = nil
+    var facetSourceValue: AutoChartValue? = nil
     var facet: String?
     var startDate: Date?
     var endDate: Date?
@@ -292,33 +296,40 @@ enum AutoChartSelectionPreparation {
                     rangeDimensions.append(.init(columnID: x, value: range))
                 }
             } else {
-                let values: [AutoChartValue] = matches.map { datum in
-                    datum.xDate.map(AutoChartValue.date)
+                let values = matches.map { datum in
+                    datum.xSourceValue
+                        ?? datum.xDate.map(AutoChartValue.date)
                         ?? datum.xNumber.map(AutoChartValue.double)
-                        ?? .text(datum.xLabel ?? label)
                 }
-                if let value = identicalValue(in: values) {
+                if let value = identicalSourceValue(
+                    in: values,
+                    identifiedBy: matches.map(\.xIdentity))
+                {
                     dimensions.append(.init(columnID: x, value: value))
                 }
             }
         }
         if specification.family == .heatmap, let y = specification.encoding.y {
-            let values: [AutoChartValue] = matches.map {
-                $0.yLabel.map(AutoChartValue.text) ?? .null
-            }
-            if let value = identicalValue(in: values) {
+            if let value = identicalSourceValue(
+                in: matches.map(\.ySourceValue),
+                identifiedBy: matches.map(\.yIdentity))
+            {
                 dimensions.append(.init(columnID: y, value: value))
             }
         }
         if let series = specification.encoding.series {
-            let values = matches.map { $0.series.map(AutoChartValue.text) ?? .null }
-            if let value = identicalValue(in: values) {
+            if let value = identicalSourceValue(
+                in: matches.map(\.seriesSourceValue),
+                identifiedBy: matches.map(\.seriesIdentity))
+            {
                 dimensions.append(.init(columnID: series, value: value))
             }
         }
         if let facet = specification.encoding.facet {
-            let values = matches.map { $0.facet.map(AutoChartValue.text) ?? .null }
-            if let value = identicalValue(in: values) {
+            if let value = identicalSourceValue(
+                in: matches.map(\.facetSourceValue),
+                identifiedBy: matches.map(\.facetIdentity))
+            {
                 dimensions.append(.init(columnID: facet, value: value))
             }
         }
@@ -347,6 +358,22 @@ enum AutoChartSelectionPreparation {
             dimensions: dimensions,
             rangeDimensions: rangeDimensions,
             measure: measure)
+    }
+
+    private static func identicalSourceValue(
+        in values: [AutoChartValue?],
+        identifiedBy identities: [String?]
+    ) -> AutoChartValue? {
+        guard identities.count == values.count,
+            let firstIdentity = identities.first,
+            identities.dropFirst().allSatisfy({ $0 == firstIdentity })
+        else { return nil }
+        let sourceValues = values.compactMap { $0 }
+        guard sourceValues.count == values.count,
+            let value = identicalValue(in: sourceValues),
+            firstIdentity != nil || value == .null
+        else { return nil }
+        return value
     }
 
     private static func markValue(for datum: AutoChartDatum) -> AutoChartMarkValue? {
@@ -457,21 +484,25 @@ enum AutoChartDataPreparation {
                 id: "row-\(index)-\(row.id)",
                 sourceRowIDs: [row.id],
                 xIdentity: xIdentity,
+                xSourceValue: xValue,
                 xLabel: xValue?.categoryString(),
                 xNumber: xValue?.numericValue,
                 xDate: xValue.flatMap(AutoChartProfiler.dateValue),
+                ySourceValue: yValue,
                 yLabel: yValue?.categoryString(),
                 yNumber: yValue?.numericValue,
                 seriesIdentity: encoding.series.flatMap { id in
                     AutoChartProfiler.identityString(
                         row.values[id], semanticType: profiles[id]?.semanticType)
                 },
+                seriesSourceValue: encoding.series.flatMap { row.values[$0] },
                 series: encoding.series.flatMap { row.values[$0]?.categoryString() },
                 size: encoding.size.flatMap { row.values[$0]?.numericValue },
                 facetIdentity: encoding.facet.flatMap { id in
                     AutoChartProfiler.identityString(
                         row.values[id], semanticType: profiles[id]?.semanticType)
                 },
+                facetSourceValue: encoding.facet.flatMap { row.values[$0] },
                 facet: encoding.facet.flatMap { row.values[$0]?.categoryString() },
                 startDate: startDate,
                 endDate: endDate)
@@ -522,13 +553,16 @@ enum AutoChartDataPreparation {
                     $0.formUnion($1.sourceRowIDs)
                 },
                 xIdentity: first.xIdentity,
+                xSourceValue: first.xSourceValue,
                 xLabel: first.xLabel,
                 xNumber: first.xNumber,
                 xDate: first.xDate,
                 yNumber: result,
                 seriesIdentity: first.seriesIdentity,
+                seriesSourceValue: first.seriesSourceValue,
                 series: first.series,
                 facetIdentity: first.facetIdentity,
+                facetSourceValue: first.facetSourceValue,
                 facet: first.facet)
         }
         return sorted(aggregated, specification: specification, profiles: profiles)
@@ -620,6 +654,7 @@ enum AutoChartDataPreparation {
                 id: "box-\(key.identity)",
                 sourceRowIDs: Set(contributingValues.map(\.1)),
                 xIdentity: key.identity,
+                xSourceValue: x.flatMap { rows.first?.values[$0] },
                 xLabel: key.label,
                 lower: sortedValues.first,
                 quartile1: quantile(0.25),
@@ -670,8 +705,10 @@ enum AutoChartDataPreparation {
                     "heat-\(key.xIdentity.utf8.count):\(key.xIdentity)\(key.yIdentity.utf8.count):\(key.yIdentity)",
                 sourceRowIDs: Set(rows.map(\.id)),
                 xIdentity: key.xIdentity,
+                xSourceValue: rows.first?.values[x],
                 xLabel: key.xLabel,
                 yIdentity: key.yIdentity,
+                ySourceValue: rows.first?.values[y],
                 yLabel: key.yLabel,
                 yNumber: Double(rows.count))
         }.sorted {
@@ -1155,6 +1192,11 @@ struct AutoChartRenderCore: Sendable {
 }
 
 #if canImport(Charts) && canImport(SwiftUI)
+
+private enum AutoChartFacetLayout {
+    static let minimumTileWidth: CGFloat = 220
+    static let spacing: CGFloat = 16
+}
 
 private enum AutoChartFacetSelectionAxis {
     case x
@@ -1913,13 +1955,16 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         panelCount: Int
     ) -> CGFloat {
         guard panelCount > 0 else { return totalHeight }
-        let minimumTileWidth: CGFloat = 220
-        let spacing: CGFloat = 16
         let captionAllowance: CGFloat = 20
         let columns = max(
-            1, Int((availableWidth + spacing) / (minimumTileWidth + spacing)))
+            1,
+            Int(
+                (availableWidth + AutoChartFacetLayout.spacing)
+                    / (AutoChartFacetLayout.minimumTileWidth + AutoChartFacetLayout.spacing)))
         let rows = max(1, Int(ceil(Double(panelCount) / Double(columns))))
-        let chrome = CGFloat(rows - 1) * spacing + CGFloat(rows) * captionAllowance
+        let chrome =
+            CGFloat(rows - 1) * AutoChartFacetLayout.spacing
+            + CGFloat(rows) * captionAllowance
         return max(120, (totalHeight - chrome) / CGFloat(rows))
     }
 
@@ -1934,7 +1979,14 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             ?? Date.distantPast...Date.distantFuture
         let numberDomain = sharedXNumberDomain ?? 0...1
         return ScrollView {
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 220), spacing: 16)], spacing: 16) {
+            LazyVGrid(
+                columns: [
+                    GridItem(
+                        .adaptive(minimum: AutoChartFacetLayout.minimumTileWidth),
+                        spacing: AutoChartFacetLayout.spacing)
+                ],
+                spacing: AutoChartFacetLayout.spacing
+            ) {
                 ForEach(facetKeys, id: \.self) { facetKey in
                     let facetData = facets[facetKey] ?? []
                     VStack(alignment: .leading, spacing: 4) {

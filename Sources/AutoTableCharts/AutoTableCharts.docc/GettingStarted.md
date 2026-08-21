@@ -59,12 +59,13 @@ final class ChartState: ObservableObject {
         analysisTask?.cancel()
         analysisTask = Task {
             do {
-                let nextAnalysis = try await analyzer.analyze(
+                let nextAnalysis = try await self.analyzer.analyze(
                     dataset,
                     context: .init(goal: .comparison),
                     options: .init(includesDecisionTrace: true))
                 try Task.checkCancellation()
-                analysis = nextAnalysis
+                self.analysis = nextAnalysis
+                self.error = nil
             } catch is CancellationError {
                 // A newer load owns the state now.
             } catch {

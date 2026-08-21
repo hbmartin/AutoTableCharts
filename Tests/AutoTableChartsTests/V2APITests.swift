@@ -462,6 +462,38 @@ private struct FirstReadBlockingTable: AutoChartTable {
         #expect(statistics.inFlightRequests == 0)
     }
 
+    @Test func crossLayerSourceReuseIsChargedToTheProvidingLayer() async throws {
+        let dataset = try AutoChartDataset<Int>(
+            columns: [v2Category, v2Measure],
+            rows: [[.text("A"), .double(1)]])
+
+        let analysisBacked = AutoChartAnalyzer(
+            configuration: AutoChartAnalyzerConfiguration(
+                tables: .init(maximumEntries: 0),
+                analyses: .init(maximumEntries: 4),
+                preparedCharts: .init(maximumEntries: 0),
+                maximumRetainedCost: 1_024 * 1_024))
+        _ = try await analysisBacked.analyze(dataset)
+        let analysisBaseline = await analysisBacked.cacheStatistics
+        _ = try await analysisBacked.analyze(dataset)
+        let analysisReuse = await analysisBacked.cacheStatistics
+        #expect(analysisReuse.tables.misses == analysisBaseline.tables.misses)
+        #expect(analysisReuse.analyses.hits > analysisBaseline.analyses.hits)
+
+        let chartBacked = AutoChartAnalyzer(
+            configuration: AutoChartAnalyzerConfiguration(
+                tables: .init(maximumEntries: 0),
+                analyses: .init(maximumEntries: 0),
+                preparedCharts: .init(maximumEntries: 4),
+                maximumRetainedCost: 1_024 * 1_024))
+        _ = try await chartBacked.analyze(dataset)
+        let chartBaseline = await chartBacked.cacheStatistics
+        _ = try await chartBacked.analyze(dataset)
+        let chartReuse = await chartBacked.cacheStatistics
+        #expect(chartReuse.tables.misses == chartBaseline.tables.misses)
+        #expect(chartReuse.preparedCharts.hits > chartBaseline.preparedCharts.hits)
+    }
+
     @Test func concurrentIdenticalChartPreparationsUseOneCacheMiss() async throws {
         let dataset = try AutoChartDataset<Int>(
             columns: [v2Category, v2Measure],

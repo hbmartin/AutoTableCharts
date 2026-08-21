@@ -3168,6 +3168,68 @@ private let date = AutoChartColumn(
         #expect(semantics.measure?.value == .scalar(.double(2)))
     }
 
+    @Test func selectionDimensionsPreserveTypedSourceValuesInsteadOfLabels() {
+        let heatmapY = AutoChartColumnID(rawValue: "heatmap-y")
+        let series = AutoChartColumnID(rawValue: "series")
+        let facet = AutoChartColumnID(rawValue: "facet")
+        let specification = AutoChartSpecification(
+            family: .heatmap,
+            encoding: .init(
+                x: category.id,
+                y: heatmapY,
+                series: series,
+                facet: facet),
+            aggregation: .count)
+        let typed = AutoChartDatum(
+            id: "typed",
+            sourceRowIDs: [0],
+            xIdentity: "integer:1",
+            xSourceValue: .integer(1),
+            xLabel: "1",
+            yIdentity: "boolean:true",
+            ySourceValue: .boolean(true),
+            yLabel: "true",
+            seriesIdentity: "integer:2",
+            seriesSourceValue: .integer(2),
+            series: "2",
+            facetIdentity: "boolean:false",
+            facetSourceValue: .boolean(false),
+            facet: "false")
+        let semantics = AutoChartSelectionPreparation.semanticValues(
+            for: [typed],
+            specification: specification,
+            label: "1")
+        #expect(
+            semantics.dimensions
+                == [
+                    .init(columnID: category.id, value: .integer(1)),
+                    .init(columnID: heatmapY, value: .boolean(true)),
+                    .init(columnID: series, value: .integer(2)),
+                    .init(columnID: facet, value: .boolean(false)),
+                ])
+
+        let duplicateLabelsWithDifferentValues = AutoChartDatum(
+            id: "different-values",
+            sourceRowIDs: [1],
+            xIdentity: "text:1:1",
+            xSourceValue: .text("1"),
+            xLabel: "1",
+            yIdentity: "text:4:true",
+            ySourceValue: .text("true"),
+            yLabel: "true",
+            seriesIdentity: "text:1:2",
+            seriesSourceValue: .text("2"),
+            series: "2",
+            facetIdentity: "text:5:false",
+            facetSourceValue: .text("false"),
+            facet: "false")
+        let mixed = AutoChartSelectionPreparation.semanticValues(
+            for: [typed, duplicateLabelsWithDifferentValues],
+            specification: specification,
+            label: "1")
+        #expect(mixed.dimensions.isEmpty)
+    }
+
     @Test func boxPlotLabelTiesUseIdentityAsDeterministicTieBreaker() {
         let mixed = AutoChartColumn(
             id: "mixed", name: "mixed",
