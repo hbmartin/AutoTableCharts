@@ -45,13 +45,16 @@ struct AutoChartSnapshot: Sendable {
 
     init<Table: AutoChartTable>(_ table: Table) {
         do {
-            try self.init(validating: table)
+            try self.init(validating: table, checkingCancellation: false)
         } catch {
             preconditionFailure("Invalid chart table: \(error)")
         }
     }
 
-    init<Table: AutoChartTable>(validating table: Table) throws {
+    init<Table: AutoChartTable>(
+        validating table: Table,
+        checkingCancellation: Bool = true
+    ) throws {
         validationIdentity = UUID()
         var seenColumnIDs: Set<AutoChartColumnID> = []
         for column in table.chartColumns where !seenColumnIDs.insert(column.id).inserted {
@@ -67,7 +70,9 @@ struct AutoChartSnapshot: Sendable {
             let chartRows = Array(table.chartRows)
             var seenRows: Set<Table.RowID> = []
             for (index, row) in chartRows.enumerated() {
-                if index.isMultiple(of: 256) { try Task.checkCancellation() }
+                if checkingCancellation, index.isMultiple(of: 256) {
+                    try Task.checkCancellation()
+                }
                 guard seenRows.insert(row.chartRowID).inserted else {
                     throw AutoChartDatasetError(
                         code: .duplicateRowID,
@@ -77,7 +82,9 @@ struct AutoChartSnapshot: Sendable {
             var flat: [AutoChartValue] = []
             flat.reserveCapacity(chartRows.count * table.chartColumns.count)
             for (index, row) in chartRows.enumerated() {
-                if index.isMultiple(of: 256) { try Task.checkCancellation() }
+                if checkingCancellation, index.isMultiple(of: 256) {
+                    try Task.checkCancellation()
+                }
                 for column in table.chartColumns {
                     flat.append(row.chartValue(for: column.id))
                 }
@@ -352,7 +359,10 @@ enum AutoChartProfiler {
     ) -> AutoChartColumnProfile {
         // The nonthrowing entry point is retained for synchronous validation
         // helpers and tests. Analyzer work uses the cancellable variant below.
-        try! profile(column, rows: rows, checkingCancellation: false)
+        let values = rows.map { $0.values[column.id] ?? .null }
+        return makeProfile(column, values: values) { values, semanticType in
+            identitySummary(values, semanticType: semanticType)
+        }
     }
 
     private static func profile(
@@ -368,7 +378,19 @@ enum AutoChartProfiler {
             }
             values.append(row.values[column.id] ?? .null)
         }
-        if checkingCancellation { try Task.checkCancellation() }
+        try Task.checkCancellation()
+        return try makeProfile(column, values: values) { values, semanticType in
+            try identitySummaryCheckingCancellation(
+                values,
+                semanticType: semanticType)
+        }
+    }
+
+    private static func makeProfile(
+        _ column: AutoChartColumn,
+        values: [AutoChartValue],
+        summarize: ([AutoChartValue], AutoChartSemanticType?) throws -> IdentitySummary
+    ) rethrows -> AutoChartColumnProfile {
         let nonNull = values.filter {
             if case .null = $0 { return false }
             return true
@@ -402,11 +424,7 @@ enum AutoChartProfiler {
             if case .text(let text) = value { return text.count }
             return nil
         }
-        if checkingCancellation { try Task.checkCancellation() }
-        let raw = try identitySummary(
-            values,
-            semanticType: nil,
-            checkingCancellation: checkingCancellation)
+        let raw = try summarize(values, nil)
         let type = inferredSemanticType(
             column: column,
             values: nonNull,
@@ -417,10 +435,7 @@ enum AutoChartProfiler {
         let renderable =
             resolvesToRawIdentity(type)
             ? raw
-            : try identitySummary(
-                values,
-                semanticType: type,
-                checkingCancellation: checkingCancellation)
+            : try summarize(values, type)
         return AutoChartColumnProfile(
             column: column,
             semanticType: type,
@@ -451,14 +466,25 @@ enum AutoChartProfiler {
 
     private static func identitySummary(
         _ values: [AutoChartValue],
-        semanticType: AutoChartSemanticType?,
-        checkingCancellation: Bool
+        semanticType: AutoChartSemanticType?
+    ) -> IdentitySummary {
+        var summary = IdentitySummary()
+        for value in values {
+            let identity = identity(value, semanticType: semanticType)
+            guard identity != .missing else { continue }
+            summary.valueCount += 1
+            summary.distinct.insert(identity)
+        }
+        return summary
+    }
+
+    private static func identitySummaryCheckingCancellation(
+        _ values: [AutoChartValue],
+        semanticType: AutoChartSemanticType?
     ) throws -> IdentitySummary {
         var summary = IdentitySummary()
         for (index, value) in values.enumerated() {
-            if checkingCancellation, index.isMultiple(of: 256) {
-                try Task.checkCancellation()
-            }
+            if index.isMultiple(of: 256) { try Task.checkCancellation() }
             let identity = identity(value, semanticType: semanticType)
             guard identity != .missing else { continue }
             summary.valueCount += 1

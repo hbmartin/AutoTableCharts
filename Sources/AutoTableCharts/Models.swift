@@ -95,6 +95,138 @@ public enum AutoChartValue: Hashable, Codable, Sendable {
     }
 }
 
+extension AutoChartValue {
+    private enum CodingKeys: String, CodingKey {
+        case null, boolean, integer, double, decimal, text, date, binary
+    }
+
+    private enum AssociatedValueCodingKeys: String, CodingKey {
+        case value = "_0"
+    }
+
+    /// A stable token for floating-point and date payloads that JSON encoders
+    /// reject as numbers. Non-finite values are documented as retained typed
+    /// input, so persistence must round-trip them rather than throw.
+    private enum NonFiniteToken: String, Codable {
+        case positiveInfinity = "inf"
+        case negativeInfinity = "-inf"
+        case notANumber = "nan"
+
+        init(_ value: Double) {
+            if value.isNaN {
+                self = .notANumber
+            } else {
+                self = value > 0 ? .positiveInfinity : .negativeInfinity
+            }
+        }
+
+        var doubleValue: Double {
+            switch self {
+            case .positiveInfinity: .infinity
+            case .negativeInfinity: -.infinity
+            case .notANumber: .nan
+            }
+        }
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        guard container.allKeys.count == 1, let key = container.allKeys.first else {
+            throw DecodingError.dataCorrupted(
+                .init(
+                    codingPath: decoder.codingPath,
+                    debugDescription: "Expected exactly one value case."))
+        }
+        func nested() throws -> KeyedDecodingContainer<AssociatedValueCodingKeys> {
+            try container.nestedContainer(
+                keyedBy: AssociatedValueCodingKeys.self, forKey: key)
+        }
+        switch key {
+        case .null:
+            self = .null
+        case .boolean:
+            self = .boolean(try nested().decode(Bool.self, forKey: .value))
+        case .integer:
+            self = .integer(try nested().decode(Int64.self, forKey: .value))
+        case .double:
+            let values = try nested()
+            if let number = try? values.decode(Double.self, forKey: .value) {
+                self = .double(number)
+            } else {
+                let token = try values.decode(NonFiniteToken.self, forKey: .value)
+                self = .double(token.doubleValue)
+            }
+        case .decimal:
+            let values = try nested()
+            if let number = try? values.decode(Decimal.self, forKey: .value) {
+                self = .decimal(number)
+            } else {
+                _ = try values.decode(NonFiniteToken.self, forKey: .value)
+                self = .decimal(.nan)
+            }
+        case .text:
+            self = .text(try nested().decode(String.self, forKey: .value))
+        case .date:
+            let values = try nested()
+            if let date = try? values.decode(Date.self, forKey: .value) {
+                self = .date(date)
+            } else {
+                let token = try values.decode(NonFiniteToken.self, forKey: .value)
+                self = .date(Date(timeIntervalSinceReferenceDate: token.doubleValue))
+            }
+        case .binary:
+            self = .binary(try nested().decode(Data.self, forKey: .value))
+        }
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        func nested(
+            _ key: CodingKeys
+        ) -> KeyedEncodingContainer<AssociatedValueCodingKeys> {
+            container.nestedContainer(keyedBy: AssociatedValueCodingKeys.self, forKey: key)
+        }
+        switch self {
+        case .null:
+            _ = nested(.null)
+        case .boolean(let value):
+            var values = nested(.boolean)
+            try values.encode(value, forKey: .value)
+        case .integer(let value):
+            var values = nested(.integer)
+            try values.encode(value, forKey: .value)
+        case .double(let value):
+            var values = nested(.double)
+            if value.isFinite {
+                try values.encode(value, forKey: .value)
+            } else {
+                try values.encode(NonFiniteToken(value), forKey: .value)
+            }
+        case .decimal(let value):
+            var values = nested(.decimal)
+            if value.isNaN {
+                try values.encode(NonFiniteToken.notANumber, forKey: .value)
+            } else {
+                try values.encode(value, forKey: .value)
+            }
+        case .text(let value):
+            var values = nested(.text)
+            try values.encode(value, forKey: .value)
+        case .date(let value):
+            var values = nested(.date)
+            if value.timeIntervalSinceReferenceDate.isFinite {
+                try values.encode(value, forKey: .value)
+            } else {
+                try values.encode(
+                    NonFiniteToken(value.timeIntervalSinceReferenceDate), forKey: .value)
+            }
+        case .binary(let value):
+            var values = nested(.binary)
+            try values.encode(value, forKey: .value)
+        }
+    }
+}
+
 /// The semantic interpretation of a column after hints and inference are applied.
 public enum AutoChartSemanticType: String, CaseIterable, Codable, Sendable {
     /// Numeric magnitudes for measures, positions, sizes, or distributions.
@@ -1017,7 +1149,8 @@ extension AutoChartRecommendationID: Codable {
         var components: [String] = []
         while !remainder.isEmpty {
             guard let colon = remainder.firstIndex(of: ":"),
-                let length = Int(remainder[..<colon])
+                let length = Int(remainder[..<colon]),
+                length >= 0
             else { return nil }
             let valueStart = remainder.index(after: colon)
             guard let valueEnd = remainder.index(
@@ -1070,6 +1203,10 @@ public struct AutoChartMessage: Hashable, Codable, Sendable {
         case clearSelection
         case resetZoom
         case selectionSummary
+        case selectionValue
+        case selectionRange
+        case selectionDistribution
+        case selectionRowCount
         case candidateLimit
         case markAccessibility
     }
@@ -1130,37 +1267,8 @@ public struct AutoChartDiagnostic: Hashable, Codable, Sendable {
         columnIDs: [AutoChartColumnID] = []
     ) {
         self.severity = severity
-        let resolvedCode: AutoChartMessage.Code
-        if code == .validationFailed {
-            let lowercased = message.lowercased()
-            if lowercased.contains("missing") {
-                resolvedCode = .missingValue
-            } else if lowercased.contains("aggregation")
-                || lowercased.contains("additive")
-                || lowercased.contains("composition")
-            {
-                resolvedCode = .unsafeAggregation
-            } else if lowercased.contains("duplicate") {
-                resolvedCode = .duplicateMark
-            } else if lowercased.contains("temporal")
-                || lowercased.contains("date")
-                || lowercased.contains("range")
-            {
-                resolvedCode = .invalidTemporalRange
-            } else if lowercased.contains("non-finite") {
-                resolvedCode = .nonFiniteValueOmitted
-            } else if lowercased.contains("complete result")
-                || lowercased.contains("truncated")
-            {
-                resolvedCode = .incompleteResult
-            } else {
-                resolvedCode = code
-            }
-        } else {
-            resolvedCode = code
-        }
         self.messageValue = AutoChartMessage(
-            category: .diagnostic, code: resolvedCode, defaultText: message)
+            category: .diagnostic, code: code, defaultText: message)
         self.family = family
         self.columnIDs = columnIDs
     }

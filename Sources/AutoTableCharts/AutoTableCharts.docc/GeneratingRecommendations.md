@@ -23,7 +23,11 @@ Switch on the outcome:
 ```swift
 switch analysis.outcome {
 case .charts(let recommendations):
-    let primary = recommendations[0]
+    if let primary = recommendations.first {
+        presentChart(primary)
+    } else {
+        presentTable(message: "No chart recommendation is available.")
+    }
 case .tableFallback(let fallback):
     presentTable(message: fallback.message.defaultText)
 }

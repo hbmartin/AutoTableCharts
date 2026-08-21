@@ -15,6 +15,8 @@ private func preparedCore<Table: AutoChartTable>(
     return AutoChartRenderCore.prepare(
         snapshot: snapshot,
         profiles: AutoChartProfiler.profileIndex(snapshot),
+        contentFingerprint: snapshot.contentFingerprint,
+        estimatedStorageCost: snapshot.estimatedStorageCost,
         recommendation: recommendation)
 }
 #endif
@@ -2059,6 +2061,18 @@ private let date = AutoChartColumn(
         let missing = donut([[.text("A"), .double(1)], [.text("B"), .null]])
         #expect(missing.contains("Composition measures must not contain missing values."))
         #expect(!missing.contains(positive))
+
+        let positiveIssue = AutoChartRecommendationEngine.validate(
+            specification: AutoChartSpecification(
+                family: .donut,
+                encoding: .init(x: category.id, y: measure.id),
+                aggregation: .sum),
+            for: table(
+                columns: [category, measure],
+                rows: [[.text("A"), .double(1)], [.text("B"), .double(0)]]
+            )
+        ).issues.first { $0.message == positive }
+        #expect(positiveIssue?.messageValue.code == .unsafeAggregation)
     }
 
     @Test func explicitNominalBinaryValuesFailCompletenessValidation() {
@@ -2415,7 +2429,9 @@ private let date = AutoChartColumn(
                 [.text("A"), .text("Two"), .double(halfExtreme)],
                 [.text("A"), .text("Three"), .double(halfExtreme)],
             ])
-        let recommendations = AutoChartRecommendationEngine.recommendations(for: input)
+        let recommendations = AutoChartRecommendationEngine.recommendations(
+            for: input,
+            options: .init(maximumRecommendations: 10, includesDecisionTrace: true))
 
         #expect(!recommendations.chartRecommendations.isEmpty)
         for recommendation in recommendations.chartRecommendations {
@@ -2428,6 +2444,13 @@ private let date = AutoChartColumn(
         #expect(
             !recommendations.chartRecommendations.contains {
                 [.stackedBar, .normalizedBar].contains($0.specification.family)
+            })
+        #expect(
+            recommendations.decisions.contains { decision in
+                guard decision.family == .stackedBar,
+                    case .rejected(let codes) = decision.disposition
+                else { return false }
+                return codes.contains(.nonFiniteValueOmitted)
             })
     }
 
@@ -2468,6 +2491,7 @@ private let date = AutoChartColumn(
             validation.issues.contains {
                 $0.message
                     == "Aggregated quantitative field measure spans a range too large to render safely."
+                    && $0.messageValue.code == .chartUnavailable
             })
     }
 
@@ -3074,6 +3098,12 @@ private let date = AutoChartColumn(
             AutoChartSelectionPreparation.valueDescription(
                 for: matches,
                 aggregation: .countDistinct) == "2 marks · 3 source rows")
+        #expect(
+            AutoChartSelectionPreparation.aggregatedNumericValue(
+                for: matches,
+                aggregation: .mean) == 50.0 / 3.0)
+        #expect(AutoChartSelectionPreparation.identicalValue(in: ["A", "A"]) == "A")
+        #expect(AutoChartSelectionPreparation.identicalValue(in: ["A", "B"]) == nil)
     }
 
     @Test func boxPlotLabelTiesUseIdentityAsDeterministicTieBreaker() {

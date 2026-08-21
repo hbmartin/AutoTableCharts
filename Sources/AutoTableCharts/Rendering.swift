@@ -216,30 +216,10 @@ enum AutoChartSelectionPreparation {
         let rowIDs = matches.reduce(into: Set<Int>()) {
             $0.formUnion($1.sourceRowIDs)
         }
-        let numericMatches = matches.compactMap { datum -> (value: Double, weight: Int)? in
-            guard let value = datum.yNumber else { return nil }
-            return (value, datum.sourceRowIDs.count)
-        }
-        let combinedValue: Double? = {
-            guard !numericMatches.isEmpty else { return nil }
-            if numericMatches.count == 1 { return numericMatches[0].value }
-            switch aggregation {
-            case .sum, .count:
-                return numericMatches.reduce(0) { $0 + $1.value }
-            case .mean:
-                let totalWeight = numericMatches.reduce(0) { $0 + $1.weight }
-                guard totalWeight > 0 else { return nil }
-                return numericMatches.reduce(0) {
-                    $0 + $1.value * Double($1.weight)
-                } / Double(totalWeight)
-            case .minimum:
-                return numericMatches.map(\.value).min()
-            case .maximum:
-                return numericMatches.map(\.value).max()
-            case .none, .countDistinct:
-                return nil
-            }
-        }()
+        let numericMatches = matches.compactMap(\.yNumber)
+        let combinedValue = aggregatedNumericValue(
+            for: matches,
+            aggregation: aggregation)
         let rowDescription =
             "\(rowIDs.count) source row\(rowIDs.count == 1 ? "" : "s")"
         if let combinedValue {
@@ -250,6 +230,40 @@ enum AutoChartSelectionPreparation {
             return "\(numericMatches.count) marks · \(rowDescription)"
         }
         return rowDescription
+    }
+
+    static func aggregatedNumericValue(
+        for matches: [AutoChartDatum],
+        aggregation: AutoChartAggregation
+    ) -> Double? {
+        let numericMatches = matches.compactMap { datum -> (value: Double, weight: Int)? in
+            guard let value = datum.yNumber else { return nil }
+            return (value, datum.sourceRowIDs.count)
+        }
+        guard !numericMatches.isEmpty else { return nil }
+        if numericMatches.count == 1 { return numericMatches[0].value }
+        switch aggregation {
+        case .sum, .count:
+            return numericMatches.reduce(0) { $0 + $1.value }
+        case .mean:
+            let totalWeight = numericMatches.reduce(0) { $0 + $1.weight }
+            guard totalWeight > 0 else { return nil }
+            return numericMatches.reduce(0) {
+                $0 + $1.value * Double($1.weight)
+            } / Double(totalWeight)
+        case .minimum:
+            return numericMatches.map(\.value).min()
+        case .maximum:
+            return numericMatches.map(\.value).max()
+        case .none, .countDistinct:
+            return nil
+        }
+    }
+
+    static func identicalValue<Value: Equatable>(in values: [Value]) -> Value? {
+        guard let first = values.first, values.dropFirst().allSatisfy({ $0 == first })
+        else { return nil }
+        return first
     }
 }
 
@@ -979,21 +993,18 @@ final class AutoChartPreparedTable: Sendable {
     let snapshot: AutoChartSnapshot
     let profiles: [AutoChartColumnID: AutoChartColumnProfile]
     let fingerprint: Int
-    let estimatedCost: Int?
-    let cacheConfigurationRevision: UInt64
+    let estimatedCost: Int
 
     init(
         snapshot: AutoChartSnapshot,
         profiles: [AutoChartColumnID: AutoChartColumnProfile],
         fingerprint: Int,
-        estimatedCost: Int?,
-        cacheConfigurationRevision: UInt64
+        estimatedCost: Int
     ) {
         self.snapshot = snapshot
         self.profiles = profiles
         self.fingerprint = fingerprint
         self.estimatedCost = estimatedCost
-        self.cacheConfigurationRevision = cacheConfigurationRevision
     }
 }
 
@@ -1009,6 +1020,8 @@ struct AutoChartRenderCore: Sendable {
     static func prepare(
         snapshot: AutoChartSnapshot,
         profiles: [AutoChartColumnID: AutoChartColumnProfile],
+        contentFingerprint: Int,
+        estimatedStorageCost: Int,
         recommendation: AutoChartRecommendation
     ) -> AutoChartRenderCore {
         let specification = recommendation.specification
@@ -1019,9 +1032,8 @@ struct AutoChartRenderCore: Sendable {
         let table = AutoChartPreparedTable(
             snapshot: snapshot,
             profiles: profiles,
-            fingerprint: snapshot.contentFingerprint,
-            estimatedCost: snapshot.estimatedStorageCost,
-            cacheConfigurationRevision: 0)
+            fingerprint: contentFingerprint,
+            estimatedCost: estimatedStorageCost)
         return AutoChartRenderCore(
             table: table,
             data: data,
@@ -1193,14 +1205,40 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     private var isCompact: Bool { presentation.typography == .compact }
     private var interactions: AutoChartInteractions { presentation.interactions }
 
+    /// Whether the plotted y values are row counts rather than values of the
+    /// measure column. Counts must not be formatted with the measure column's
+    /// unit hints.
+    private var yValueIsRowCount: Bool {
+        specification.aggregation == .count || specification.aggregation == .countDistinct
+    }
+
+    /// The column whose unit hints apply to the numeric value axis, or `nil`
+    /// when the axis shows counts or normalized proportions.
+    private var yAxisColumnID: AutoChartColumnID? {
+        if yValueIsRowCount || specification.stacking == .normalized { return nil }
+        return specification.encoding.y
+    }
+
     @ViewBuilder
     public var body: some View {
         switch content {
         case .fallback(let fallback):
-            ContentUnavailableView(
-                "Chart unavailable",
-                systemImage: "tablecells",
-                description: Text(textResolver(fallback.message)))
+            VStack(alignment: .leading, spacing: 10) {
+                ContentUnavailableView(
+                    "Chart unavailable",
+                    systemImage: "tablecells",
+                    description: Text(textResolver(fallback.message)))
+                if presentation.chrome.contains(.diagnostics) {
+                    ForEach(Array(fallback.diagnostics.enumerated()), id: \.offset) {
+                        _, diagnostic in
+                        Label(
+                            textResolver(diagnostic.messageValue),
+                            systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
+                }
+            }
         case .chart:
             VStack(alignment: .leading, spacing: 10) {
             if presentation.chrome.contains(.title), !specification.title.isEmpty {
@@ -1334,7 +1372,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             }
             .chartXAxisLabel(yTitle)
             .chartYAxisLabel(xTitle)
-            .chartXAxis { numericAxis(columnID: specification.encoding.y) }
+            .chartXAxis { numericAxis(columnID: yAxisColumnID) }
             selectableCategoryY(verticalZoom(chart, categoryCount: uniqueXCount))
         } else {
             let chart = Chart(data) { datum in
@@ -1345,7 +1383,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             }
             .chartXAxisLabel(xTitle)
             .chartYAxisLabel(yTitle)
-            .chartYAxis { numericAxis(columnID: specification.encoding.y) }
+            .chartYAxis { numericAxis(columnID: yAxisColumnID) }
             selectableCategoryX(horizontalZoom(chart, categoryCount: uniqueXCount))
         }
     }
@@ -1367,7 +1405,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         }
         .chartXAxisLabel(yTitle)
         .chartYAxisLabel(xTitle)
-        .chartXAxis { numericAxis(columnID: specification.encoding.y) }
+        .chartXAxis { numericAxis(columnID: yAxisColumnID) }
         return selectableCategoryY(verticalZoom(chart, categoryCount: uniqueXCount))
     }
 
@@ -1384,8 +1422,8 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             .chartXAxisLabel(xTitle)
             .chartYAxisLabel(yTitle)
             .chartXAxis { temporalAxis(columnID: specification.encoding.x) }
-            .chartYAxis { numericAxis(columnID: specification.encoding.y) }
-            .environment(\.timeZone, .gmt)
+            .chartYAxis { numericAxis(columnID: yAxisColumnID) }
+            .environment(\.timeZone, formatters.timeZone)
             selectableDateX(timeZoom(chart))
         } else if xSemanticType == .quantitative {
             let chart = Chart(data) { datum in
@@ -1398,7 +1436,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             .chartXAxisLabel(xTitle)
             .chartYAxisLabel(yTitle)
             .chartXAxis { numericAxis(columnID: specification.encoding.x) }
-            .chartYAxis { numericAxis(columnID: specification.encoding.y) }
+            .chartYAxis { numericAxis(columnID: yAxisColumnID) }
             selectableNumberX(numberZoom(chart))
         } else {
             let chart = Chart(data) { datum in
@@ -1410,7 +1448,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             }
             .chartXAxisLabel(xTitle)
             .chartYAxisLabel(yTitle)
-            .chartYAxis { numericAxis(columnID: specification.encoding.y) }
+            .chartYAxis { numericAxis(columnID: yAxisColumnID) }
             selectableCategoryX(horizontalZoom(chart, categoryCount: uniqueXCount))
         }
     }
@@ -1427,8 +1465,8 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             .chartXAxisLabel(xTitle)
             .chartYAxisLabel(yTitle)
             .chartXAxis { temporalAxis(columnID: specification.encoding.x) }
-            .chartYAxis { numericAxis(columnID: specification.encoding.y) }
-            .environment(\.timeZone, .gmt)
+            .chartYAxis { numericAxis(columnID: yAxisColumnID) }
+            .environment(\.timeZone, formatters.timeZone)
             selectableDateX(timeZoom(chart))
         } else {
             let chart = Chart(data) { datum in
@@ -1440,7 +1478,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             .chartXAxisLabel(xTitle)
             .chartYAxisLabel(yTitle)
             .chartXAxis { numericAxis(columnID: specification.encoding.x) }
-            .chartYAxis { numericAxis(columnID: specification.encoding.y) }
+            .chartYAxis { numericAxis(columnID: yAxisColumnID) }
             selectableNumberX(numberZoom(chart))
         }
     }
@@ -1493,7 +1531,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             }
         }
         .chartYAxisLabel(yTitle)
-        .chartYAxis { numericAxis(columnID: specification.encoding.y) }
+        .chartYAxis { numericAxis(columnID: yAxisColumnID) }
         return selectableCategoryIdentityX(horizontalZoom(chart, categoryCount: uniqueXCount))
     }
 
@@ -1575,7 +1613,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         .chartXAxisLabel("Date")
         .chartYAxisLabel(xTitle)
         .chartXAxis { temporalAxis(columnID: specification.encoding.start) }
-        .environment(\.timeZone, .gmt)
+        .environment(\.timeZone, formatters.timeZone)
         return selectableCategoryY(timeZoom(chart))
     }
 
@@ -1739,6 +1777,46 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             if left != right { return left < right }
             return ($0 ?? "") < ($1 ?? "")
         }
+        return Group {
+            if let plotHeight = presentation.plotHeight {
+                GeometryReader { geometry in
+                    facetGrid(
+                        facets: facets,
+                        facetKeys: facetKeys,
+                        tileHeight: facetTileHeight(
+                            totalHeight: plotHeight,
+                            availableWidth: geometry.size.width,
+                            panelCount: facetKeys.count))
+                }
+            } else {
+                facetGrid(facets: facets, facetKeys: facetKeys, tileHeight: 180)
+            }
+        }
+    }
+
+    /// Divides the requested total plot height among the grid rows the panels
+    /// occupy at the given width, with a floor that keeps panels legible.
+    private func facetTileHeight(
+        totalHeight: CGFloat,
+        availableWidth: CGFloat,
+        panelCount: Int
+    ) -> CGFloat {
+        guard panelCount > 0 else { return totalHeight }
+        let minimumTileWidth: CGFloat = 220
+        let spacing: CGFloat = 16
+        let captionAllowance: CGFloat = 20
+        let columns = max(
+            1, Int((availableWidth + spacing) / (minimumTileWidth + spacing)))
+        let rows = max(1, Int(ceil(Double(panelCount) / Double(columns))))
+        let chrome = CGFloat(rows - 1) * spacing + CGFloat(rows) * captionAllowance
+        return max(120, (totalHeight - chrome) / CGFloat(rows))
+    }
+
+    private func facetGrid(
+        facets: [String?: [AutoChartDatum]],
+        facetKeys: [String?],
+        tileHeight: CGFloat
+    ) -> some View {
         let yDomain = sharedYDomain ?? 0...1
         let dateDomain =
             sharedXDateDomain
@@ -1761,10 +1839,11 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
                             }
                             .chartXScale(domain: dateDomain)
                             .chartYScale(domain: yDomain)
-                            .environment(\.timeZone, .gmt)
+                            .environment(\.timeZone, formatters.timeZone)
                             selectableFacet(chart, axis: .x, as: Date.self) { value in
                                 select(date: value, in: facetData)
                             }
+                            .frame(height: tileHeight)
                         } else if facetBaseFamily == .line {
                             let chart = Chart(facetData) { datum in
                                 lineMarks(
@@ -1778,6 +1857,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
                             selectableFacet(chart, axis: .x, as: String.self) { value in
                                 select(category: value, in: facetData)
                             }
+                            .frame(height: tileHeight)
                         } else if facetBaseFamily == .scatter,
                             xSemanticType == .temporal
                         {
@@ -1788,10 +1868,11 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
                             }
                             .chartXScale(domain: dateDomain)
                             .chartYScale(domain: yDomain)
-                            .environment(\.timeZone, .gmt)
+                            .environment(\.timeZone, formatters.timeZone)
                             selectableFacet(chart, axis: .x, as: Date.self) { value in
                                 select(date: value, in: facetData)
                             }
+                            .frame(height: tileHeight)
                         } else if facetBaseFamily == .scatter {
                             let chart = Chart(facetData) { datum in
                                 scatterMark(
@@ -1803,6 +1884,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
                             selectableFacet(chart, axis: .x, as: Double.self) { value in
                                 select(number: value, in: facetData)
                             }
+                            .frame(height: tileHeight)
                         } else {
                             if specification.orientation == .horizontal {
                                 let chart = Chart(facetData) { datum in
@@ -1816,6 +1898,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
                                 selectableFacet(chart, axis: .y, as: String.self) { value in
                                     select(category: value, in: facetData)
                                 }
+                                .frame(height: tileHeight)
                             } else {
                                 let chart = Chart(facetData) { datum in
                                     verticalBarMark(
@@ -1828,6 +1911,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
                                 selectableFacet(chart, axis: .x, as: String.self) { value in
                                     select(category: value, in: facetData)
                                 }
+                                .frame(height: tileHeight)
                             }
                         }
                     }
@@ -1862,7 +1946,8 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
 
     private func markAccessibilityLabel(for datum: AutoChartDatum) -> String {
         let xColumn = specification.encoding.x.flatMap(snapshot.column)
-        let yColumn = specification.encoding.y.flatMap(snapshot.column)
+        let yColumn = yValueIsRowCount
+            ? nil : specification.encoding.y.flatMap(snapshot.column)
         let name: String
         if specification.family == .histogram {
             name = datum.xLabel ?? "Value"
@@ -2321,11 +2406,10 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             selection = nil
             return
         }
-        let base = nearestDate.formatted(
-            Date.FormatStyle(
-                date: .abbreviated,
-                time: .shortened,
-                timeZone: TimeZone.gmt))
+        let base = formatters.format(
+            column: specification.encoding.x.flatMap(snapshot.column),
+            value: .date(nearestDate),
+            context: .selectionSummary)
         applySelection(
             matches,
             label: selectionLabel(base: base, matches: matches))
@@ -2378,53 +2462,86 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             selection = nil
             return
         }
-        let first = matches[0]
         var dimensions: [AutoChartSelectedDimension] = []
-        if let x = specification.encoding.x {
-            let value: AutoChartValue = first.xDate.map(AutoChartValue.date)
-                ?? first.xNumber.map(AutoChartValue.double)
-                ?? .text(first.xLabel ?? label)
-            dimensions.append(.init(columnID: x, value: value))
+        // A histogram bin has no single x value; its synthetic midpoint is a
+        // number present in no source row, so no x dimension is recorded.
+        if let x = specification.encoding.x, specification.family != .histogram {
+            let values: [AutoChartValue] = matches.map { datum in
+                datum.xDate.map(AutoChartValue.date)
+                    ?? datum.xNumber.map(AutoChartValue.double)
+                    ?? .text(datum.xLabel ?? label)
+            }
+            if let value = AutoChartSelectionPreparation.identicalValue(in: values) {
+                dimensions.append(.init(columnID: x, value: value))
+            }
+        }
+        if specification.family == .heatmap, let y = specification.encoding.y {
+            let values: [AutoChartValue] = matches.map {
+                $0.yLabel.map(AutoChartValue.text) ?? .null
+            }
+            if let value = AutoChartSelectionPreparation.identicalValue(in: values) {
+                dimensions.append(.init(columnID: y, value: value))
+            }
         }
         if let series = specification.encoding.series {
-            dimensions.append(.init(columnID: series, value: .text(first.series ?? "—")))
+            let values = matches.map { $0.series.map(AutoChartValue.text) ?? .null }
+            if let value = AutoChartSelectionPreparation.identicalValue(in: values) {
+                dimensions.append(.init(columnID: series, value: value))
+            }
         }
         if let facet = specification.encoding.facet {
-            dimensions.append(.init(columnID: facet, value: .text(first.facet ?? "—")))
+            let values = matches.map { $0.facet.map(AutoChartValue.text) ?? .null }
+            if let value = AutoChartSelectionPreparation.identicalValue(in: values) {
+                dimensions.append(.init(columnID: facet, value: value))
+            }
         }
         let markValue: AutoChartMarkValue? = {
-            if let start = first.startDate, let end = first.endDate {
-                return .temporalRange(start: start, end: end)
-            }
-            if let lower = first.lower, let upper = first.upper,
-                let quartile1 = first.quartile1, let median = first.median,
-                let quartile3 = first.quartile3
+            if let value = AutoChartSelectionPreparation.aggregatedNumericValue(
+                for: matches,
+                aggregation: specification.aggregation)
             {
-                return .distribution(
-                    lower: lower,
-                    quartile1: quartile1,
-                    median: median,
-                    quartile3: quartile3,
-                    upper: upper)
+                return .scalar(.double(value))
             }
-            if let lower = first.lower, let upper = first.upper {
-                return .numericRange(lower: lower, upper: upper)
-            }
-            if let value = first.yNumber { return .scalar(.double(value)) }
-            return nil
+            let values = matches.map(markValue(for:))
+            guard !values.contains(where: { $0 == nil }),
+                let value = AutoChartSelectionPreparation.identicalValue(
+                    in: values.compactMap { $0 })
+            else { return nil }
+            return value
         }()
         selection = AutoChartSelection(
             sourceRowIDs: preparedChart.rowIDs(for: offsetSelection.sourceRowOffsets),
             dimensions: dimensions,
             measure: markValue.map {
                 AutoChartSelectedMeasure(
-                    columnID: specification.encoding.y,
+                    columnID: yValueIsRowCount ? nil : specification.encoding.y,
                     aggregation: specification.aggregation,
                     value: $0)
             },
             family: specification.family,
             specificationID: specification.id,
             markID: matches.map(\.id).joined(separator: "|"))
+    }
+
+    private func markValue(for datum: AutoChartDatum) -> AutoChartMarkValue? {
+        if let start = datum.startDate, let end = datum.endDate {
+            return .temporalRange(start: start, end: end)
+        }
+        if let lower = datum.lower, let upper = datum.upper,
+            let quartile1 = datum.quartile1, let median = datum.median,
+            let quartile3 = datum.quartile3
+        {
+            return .distribution(
+                lower: lower,
+                quartile1: quartile1,
+                median: median,
+                quartile3: quartile3,
+                upper: upper)
+        }
+        if let lower = datum.lower, let upper = datum.upper {
+            return .numericRange(lower: lower, upper: upper)
+        }
+        return nil
     }
 
     private func clearSelection() {

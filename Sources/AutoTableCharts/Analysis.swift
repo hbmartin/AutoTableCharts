@@ -2,10 +2,20 @@ import Foundation
 
 /// Count and approximate retained-byte limit for one analyzer layer.
 public struct AutoChartCacheLimit: Hashable, Codable, Sendable {
-    public var maximumEntries: Int
+    public var maximumEntries: Int {
+        didSet { maximumEntries = max(0, maximumEntries) }
+    }
+
+    private enum CodingKeys: String, CodingKey { case maximumEntries }
 
     public init(maximumEntries: Int) {
         self.maximumEntries = max(0, maximumEntries)
+    }
+
+    /// Decodes a limit and applies the same safe minimum as the initializer.
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(maximumEntries: try container.decode(Int.self, forKey: .maximumEntries))
     }
 }
 
@@ -21,7 +31,13 @@ public struct AutoChartAnalyzerConfiguration: Hashable, Codable, Sendable {
     public var tables: AutoChartCacheLimit
     public var analyses: AutoChartCacheLimit
     public var preparedCharts: AutoChartCacheLimit
-    public var maximumRetainedCost: Int
+    public var maximumRetainedCost: Int {
+        didSet { maximumRetainedCost = max(0, maximumRetainedCost) }
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case tables, analyses, preparedCharts, maximumRetainedCost
+    }
 
     public init(
         tables: AutoChartCacheLimit = .init(maximumEntries: 8),
@@ -33,6 +49,18 @@ public struct AutoChartAnalyzerConfiguration: Hashable, Codable, Sendable {
         self.analyses = analyses
         self.preparedCharts = preparedCharts
         self.maximumRetainedCost = max(0, maximumRetainedCost)
+    }
+
+    /// Decodes a configuration and applies the same safe minimums as the initializer.
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            tables: try container.decode(AutoChartCacheLimit.self, forKey: .tables),
+            analyses: try container.decode(AutoChartCacheLimit.self, forKey: .analyses),
+            preparedCharts: try container.decode(
+                AutoChartCacheLimit.self, forKey: .preparedCharts),
+            maximumRetainedCost: try container.decode(
+                Int.self, forKey: .maximumRetainedCost))
     }
 }
 
@@ -105,19 +133,25 @@ final class AutoChartPreparedSource<RowID: Hashable & Sendable>: Sendable {
     let snapshot: AutoChartSnapshot
     let profiles: [AutoChartColumnID: AutoChartColumnProfile]
     let rowIDs: [RowID]
+    let contentFingerprint: Int
+    let estimatedStorageCost: Int
     let cost: Int
 
     init(
         key: AutoChartAnalyzer.TableKey,
         snapshot: AutoChartSnapshot,
         profiles: [AutoChartColumnID: AutoChartColumnProfile],
-        rowIDs: [RowID]
+        rowIDs: [RowID],
+        contentFingerprint: Int,
+        estimatedStorageCost: Int
     ) {
         self.key = key
         self.snapshot = snapshot
         self.profiles = profiles
         self.rowIDs = rowIDs
-        self.cost = snapshot.estimatedStorageCost + profiles.count * 192
+        self.contentFingerprint = contentFingerprint
+        self.estimatedStorageCost = estimatedStorageCost
+        self.cost = estimatedStorageCost + profiles.count * 192
     }
 }
 
@@ -127,7 +161,12 @@ public struct AutoChartPreparedChart<RowID: Hashable & Sendable>: Sendable {
     public let validation: AutoChartValidationResult
     public let marks: [AutoChartPreparedMark<RowID>]
     public var diagnostics: [AutoChartDiagnostic] {
-        recommendation.diagnostics + validation.issues.filter { $0.severity == .warning }
+        var result = recommendation.diagnostics
+        for issue in validation.issues
+        where issue.severity == .warning && !result.contains(issue) {
+            result.append(issue)
+        }
+        return result
     }
 
     let sourceRowIDs: [RowID]
@@ -354,6 +393,52 @@ public actor AutoChartAnalyzer {
         var unkeyedRowIDs: AutoChartAnyRowIDs?
     }
 
+    private struct RequestPreparation<RowID: Hashable & Sendable>: Sendable {
+        var rowIDs: [RowID]
+        var dataKey: AutoChartDataKey?
+        var snapshot: AutoChartSnapshot?
+        var contentFingerprint: Int?
+    }
+
+    private struct InFlightIdentity: Hashable, Sendable {
+        var key: RequestKey
+        var id: UUID
+    }
+
+    private struct InFlightCandidate: Sendable {
+        var identity: InFlightIdentity
+        var snapshot: AutoChartSnapshot?
+        var rowIDs: AutoChartAnyRowIDs?
+    }
+
+    private struct InFlightRegistration: Sendable {
+        var identity: InFlightIdentity
+        var waiterToken: UUID
+        var task: Task<AutoChartAnyCacheBox, Error>
+    }
+
+    private enum SourceCandidateOrigin: Hashable, Sendable {
+        case table
+        case analysis
+        case chart
+    }
+
+    private struct SourceCandidateIdentity: Hashable, Sendable {
+        var key: TableKey
+        var source: ObjectIdentifier
+        var origin: SourceCandidateOrigin
+    }
+
+    private struct SourceCandidate<RowID: Hashable & Sendable>: Sendable {
+        var identity: SourceCandidateIdentity
+        var source: AutoChartPreparedSource<RowID>
+    }
+
+    private struct SourceResolution<RowID: Hashable & Sendable>: Sendable {
+        var source: AutoChartPreparedSource<RowID>?
+        var tableKey: TableKey
+    }
+
     private let configuration: AutoChartAnalyzerConfiguration
     private var tableEntries: [TableKey: AutoChartAnyCacheBox] = [:]
     private var tableRecency: [TableKey] = []
@@ -380,261 +465,212 @@ public actor AutoChartAnalyzer {
         return value
     }
 
-    public func analyze<Table: AutoChartTable>(
+    public nonisolated func analyze<Table: AutoChartTable>(
         _ table: Table,
         context: AutoChartContext = .init(),
         options: AutoChartOptions = .init()
     ) async throws -> AutoChartAnalysis<Table.RowID> {
-        statistics.inFlightRequests += 1
-        let requestGeneration = generation
-        defer {
-            if requestGeneration == generation {
-                statistics.inFlightRequests = max(0, statistics.inFlightRequests - 1)
-            }
-        }
-        try Task.checkCancellation()
-        let rowIDs = table.chartRows.map(\.chartRowID)
-        let unkeyedSnapshot: AutoChartSnapshot?
-        let unkeyedFingerprint: Int?
-        let contentIdentity: String
-        if table.chartDataKey == nil {
-            let snapshot = try AutoChartSnapshot(validating: table)
-            try Task.checkCancellation()
-            let fingerprint = try snapshot.contentFingerprintCheckingCancellation()
-            unkeyedSnapshot = snapshot
-            unkeyedFingerprint = fingerprint
-            contentIdentity = "fingerprint:\(fingerprint)"
-        } else {
-            unkeyedSnapshot = nil
-            unkeyedFingerprint = nil
-            contentIdentity = table.chartDataKey.map {
-                "key:\($0.identity):\($0.revision)"
-            } ?? "unreachable"
-        }
-        let prefix = TableKey(
-            rowIDType: String(reflecting: Table.RowID.self),
-            tableType: String(reflecting: Table.self),
-            contentIdentity: contentIdentity)
-        let baseRequestKey = RequestKey(
-            table: prefix,
-            context: context,
-            options: options,
-            policyVersion: AutoTableCharts.recommendationPolicyVersion)
-        var requestKey = baseRequestKey
-        if let snapshot = unkeyedSnapshot {
-            var matchingKey: RequestKey?
-            for (candidateKey, flight) in inFlightAnalyses where
-                candidateKey.context == context
-                    && candidateKey.options == options
-                    && candidateKey.policyVersion == AutoTableCharts.recommendationPolicyVersion
-                    && isCollisionFamily(candidateKey.table, of: prefix)
-            {
-                if try flight.unkeyedSnapshot?
-                    .hasSameContentCheckingCancellation(as: snapshot) == true,
-                    flight.unkeyedRowIDs?.matches(rowIDs) == true
-                {
-                    matchingKey = candidateKey
-                    break
-                }
-            }
-            if let matchingKey {
-                requestKey = matchingKey
-            } else if inFlightAnalyses[baseRequestKey] != nil {
-                // A content hash is only a lookup accelerator. Keep unequal
-                // snapshots in distinct request-key collision buckets.
-                requestKey.table.contentIdentity += ":collision:\(UUID().uuidString)"
-            }
-        }
-        let finalRequestKey = requestKey
-        let waiterToken = UUID()
-        let flightID: UUID
-        let task: Task<AutoChartAnyCacheBox, Error>
-        if var existing = inFlightAnalyses[finalRequestKey] {
-            existing.waiterTokens.insert(waiterToken)
-            inFlightAnalyses[finalRequestKey] = existing
-            flightID = existing.id
-            task = existing.task
-        } else {
-            flightID = UUID()
-            task = Task {
-                [table, context, options, rowIDs, unkeyedSnapshot, unkeyedFingerprint] in
+        while true {
+            do {
+                return try await analyzeOnce(table, context: context, options: options)
+            } catch is CancellationError where !Task.isCancelled {
+                // removeAll() invalidated this request's generation while it was
+                // in flight. The caller's own task was never cancelled, so a
+                // CancellationError here would be spurious; restart the request
+                // under the new generation instead.
                 await Task.yield()
-                let analysis = try await self.analyzeUncoalesced(
-                    table,
-                    context: context,
-                    options: options,
-                    rowIDs: rowIDs,
-                    precomputedSnapshot: unkeyedSnapshot,
-                    precomputedFingerprint: unkeyedFingerprint)
-                return AutoChartAnyCacheBox(analysis, cost: 0)
             }
-            inFlightAnalyses[finalRequestKey] = InFlightAnalysis(
-                id: flightID,
-                task: task,
-                waiterTokens: [waiterToken],
-                unkeyedSnapshot: unkeyedSnapshot,
-                unkeyedRowIDs: unkeyedSnapshot.map { _ in AutoChartAnyRowIDs(rowIDs) })
         }
+    }
+
+    private nonisolated func analyzeOnce<Table: AutoChartTable>(
+        _ table: Table,
+        context: AutoChartContext,
+        options: AutoChartOptions
+    ) async throws -> AutoChartAnalysis<Table.RowID> {
+        let requestGeneration = await beginRequest()
         do {
-            let box = try await withTaskCancellationHandler {
-                try await task.value
-            } onCancel: {
-                Task {
-                    await self.releaseWaiter(
-                        finalRequestKey,
-                        flightID: flightID,
-                        waiterToken: waiterToken,
-                        cancelWhenEmpty: true)
-                }
-            }
-            releaseWaiter(
-                finalRequestKey,
-                flightID: flightID,
-                waiterToken: waiterToken,
-                cancelWhenEmpty: false)
+            let preparation = try Self.prepareRequest(table)
             try Task.checkCancellation()
-            guard let analysis = box.value as? AutoChartAnalysis<Table.RowID> else {
-                preconditionFailure("Coalesced analysis row-ID type mismatch.")
+            guard await isCurrentGeneration(requestGeneration) else {
+                throw CancellationError()
             }
-            return analysis
+            let contentIdentity = preparation.dataKey.map {
+                "key:\($0.identity.utf8.count):\($0.identity)|\($0.revision.utf8.count):\($0.revision)"
+            } ?? preparation.contentFingerprint.map {
+                "fingerprint:\($0)"
+            } ?? "unreachable"
+            let baseRequestKey = RequestKey(
+                table: TableKey(
+                    rowIDType: String(reflecting: Table.RowID.self),
+                    tableType: String(reflecting: Table.self),
+                    contentIdentity: contentIdentity),
+                context: context,
+                options: options,
+                policyVersion: AutoTableCharts.recommendationPolicyVersion)
+            let registration = try await registerRequest(
+                table,
+                context: context,
+                options: options,
+                preparation: preparation,
+                baseRequestKey: baseRequestKey,
+                requestGeneration: requestGeneration)
+            do {
+                let box = try await withTaskCancellationHandler {
+                    try await registration.task.value
+                } onCancel: {
+                    Task {
+                        await self.releaseWaiter(
+                            registration.identity.key,
+                            flightID: registration.identity.id,
+                            waiterToken: registration.waiterToken,
+                            cancelWhenEmpty: true)
+                    }
+                }
+                await releaseWaiter(
+                    registration.identity.key,
+                    flightID: registration.identity.id,
+                    waiterToken: registration.waiterToken,
+                    cancelWhenEmpty: false)
+                try Task.checkCancellation()
+                guard let analysis = box.value as? AutoChartAnalysis<Table.RowID> else {
+                    preconditionFailure("Coalesced analysis row-ID type mismatch.")
+                }
+                await finishRequest(generation: requestGeneration)
+                return analysis
+            } catch {
+                await releaseWaiter(
+                    registration.identity.key,
+                    flightID: registration.identity.id,
+                    waiterToken: registration.waiterToken,
+                    cancelWhenEmpty: false)
+                throw error
+            }
         } catch {
-            releaseWaiter(
-                finalRequestKey,
-                flightID: flightID,
-                waiterToken: waiterToken,
-                cancelWhenEmpty: false)
+            await finishRequest(generation: requestGeneration)
             throw error
         }
     }
 
-    private func analyzeUncoalesced<Table: AutoChartTable>(
+    private nonisolated static func prepareRequest<Table: AutoChartTable>(
+        _ table: Table
+    ) throws -> RequestPreparation<Table.RowID> {
+        try Task.checkCancellation()
+        let rowIDs = table.chartRows.map(\.chartRowID)
+        guard table.chartDataKey == nil else {
+            return RequestPreparation(rowIDs: rowIDs, dataKey: table.chartDataKey)
+        }
+        let snapshot = try AutoChartSnapshot(validating: table)
+        let fingerprint = try snapshot.contentFingerprintCheckingCancellation()
+        try Task.checkCancellation()
+        return RequestPreparation(
+            rowIDs: rowIDs,
+            dataKey: nil,
+            snapshot: snapshot,
+            contentFingerprint: fingerprint)
+    }
+
+    private nonisolated func registerRequest<Table: AutoChartTable>(
         _ table: Table,
         context: AutoChartContext,
         options: AutoChartOptions,
-        rowIDs: [Table.RowID],
-        precomputedSnapshot: AutoChartSnapshot?,
-        precomputedFingerprint: Int?
-    ) async throws -> AutoChartAnalysis<Table.RowID> {
-        let requestGeneration = generation
-        let keyPrefix = TableKey(
-            rowIDType: String(reflecting: Table.RowID.self),
-            tableType: String(reflecting: Table.self),
-            contentIdentity: table.chartDataKey.map {
-                "key:\($0.identity):\($0.revision)"
-            } ?? precomputedFingerprint.map {
-                "fingerprint:\($0)"
-            } ?? "pending")
+        preparation: RequestPreparation<Table.RowID>,
+        baseRequestKey: RequestKey,
+        requestGeneration: UInt64
+    ) async throws -> InFlightRegistration {
+        while true {
+            try Task.checkCancellation()
+            guard await isCurrentGeneration(requestGeneration) else {
+                throw CancellationError()
+            }
+            let candidates = await inFlightCandidates(for: baseRequestKey)
+            let matchingIdentity: InFlightIdentity?
+            if let snapshot = preparation.snapshot {
+                matchingIdentity = try candidates.first { candidate in
+                    try candidate.snapshot?
+                        .hasSameContentCheckingCancellation(as: snapshot) == true
+                        && candidate.rowIDs?.matches(preparation.rowIDs) == true
+                }?.identity
+            } else {
+                matchingIdentity = candidates.first?.identity
+            }
+            if let registration = await registerInFlight(
+                table,
+                context: context,
+                options: options,
+                preparation: preparation,
+                baseRequestKey: baseRequestKey,
+                observed: Set(candidates.map(\.identity)),
+                matching: matchingIdentity,
+                requestGeneration: requestGeneration)
+            {
+                return registration
+            }
+        }
+    }
 
+    private nonisolated func analyzeUncoalesced<Table: AutoChartTable>(
+        _ table: Table,
+        context: AutoChartContext,
+        options: AutoChartOptions,
+        preparation: RequestPreparation<Table.RowID>,
+        requestTableKey: TableKey,
+        requestGeneration: UInt64
+    ) async throws -> AutoChartAnalysis<Table.RowID> {
+        try Task.checkCancellation()
         var source: AutoChartPreparedSource<Table.RowID>?
-        if table.chartDataKey != nil,
-            let cached = tableEntries[keyPrefix]?.value as? AutoChartPreparedSource<Table.RowID>
-        {
-            statistics.tables.hits += 1
-            touch(keyPrefix, in: &tableRecency)
-            source = cached
-        } else if table.chartDataKey != nil {
-            statistics.tables.misses += 1
+        if preparation.dataKey != nil {
+            source = await cachedKeyedSource(for: requestTableKey)
         }
 
         if source == nil {
             let snapshot: AutoChartSnapshot
-            if let precomputedSnapshot {
-                snapshot = precomputedSnapshot
+            let fingerprint: Int
+            if let preparedSnapshot = preparation.snapshot,
+                let preparedFingerprint = preparation.contentFingerprint
+            {
+                snapshot = preparedSnapshot
+                fingerprint = preparedFingerprint
             } else {
                 snapshot = try AutoChartSnapshot(validating: table)
+                fingerprint = try snapshot.contentFingerprintCheckingCancellation()
             }
             try Task.checkCancellation()
+
             let tableKey: TableKey
-            if table.chartDataKey == nil {
-                let fingerprint: Int
-                if let precomputedFingerprint {
-                    fingerprint = precomputedFingerprint
-                } else {
-                    fingerprint = try snapshot.contentFingerprintCheckingCancellation()
-                }
-                let baseTableKey = TableKey(
-                    rowIDType: keyPrefix.rowIDType,
-                    tableType: keyPrefix.tableType,
+            if preparation.dataKey == nil {
+                let collisionBase = TableKey(
+                    rowIDType: requestTableKey.rowIDType,
+                    tableType: requestTableKey.tableType,
                     contentIdentity: "fingerprint:\(fingerprint)")
-                var matchingKey: TableKey?
-                for candidateKey in Array(tableRecency.reversed())
-                    where isCollisionFamily(candidateKey, of: baseTableKey)
-                {
-                    guard let cached = tableEntries[candidateKey]?.value
-                        as? AutoChartPreparedSource<Table.RowID>
-                    else { continue }
-                    if try cached.snapshot.hasSameContentCheckingCancellation(as: snapshot),
-                        cached.rowIDs == rowIDs
-                    {
-                        matchingKey = candidateKey
-                        statistics.tables.hits += 1
-                        touch(candidateKey, in: &tableRecency)
-                        source = cached
-                        break
-                    }
-                }
-                if source == nil {
-                    statistics.tables.misses += 1
-                    for (candidateKey, box) in analysisEntries
-                        where isCollisionFamily(candidateKey.table, of: baseTableKey)
-                    {
-                        guard let cached = box.value
-                            as? AutoChartCachedAnalysis<Table.RowID>
-                        else { continue }
-                        if try cached.source.snapshot
-                            .hasSameContentCheckingCancellation(as: snapshot),
-                            cached.source.rowIDs == rowIDs
-                        {
-                            matchingKey = candidateKey.table
-                            source = cached.source
-                            break
-                        }
-                    }
-                }
-                if source == nil {
-                    for (candidateKey, box) in chartEntries
-                        where isCollisionFamily(candidateKey.table, of: baseTableKey)
-                    {
-                        guard let cachedSource = box.sharedObject
-                            as? AutoChartPreparedSource<Table.RowID>
-                        else { continue }
-                        if try cachedSource.snapshot
-                            .hasSameContentCheckingCancellation(as: snapshot),
-                            cachedSource.rowIDs == rowIDs
-                        {
-                            matchingKey = candidateKey.table
-                            source = cachedSource
-                            break
-                        }
-                    }
-                }
-                tableKey = matchingKey
-                    ?? (isTableKeyRetained(inCollisionFamilyOf: baseTableKey)
-                        ? TableKey(
-                            rowIDType: baseTableKey.rowIDType,
-                            tableType: baseTableKey.tableType,
-                            contentIdentity: baseTableKey.contentIdentity
-                                + ":collision:\(UUID().uuidString)")
-                        : baseTableKey)
-                if requestGeneration == generation,
-                    tableEntries[tableKey] == nil,
-                    let source
-                {
-                    insertTable(source)
-                }
+                let resolution = try await resolveUnkeyedSource(
+                    snapshot: snapshot,
+                    rowIDs: preparation.rowIDs,
+                    collisionBase: collisionBase,
+                    preferredKey: requestTableKey,
+                    requestGeneration: requestGeneration)
+                source = resolution.source
+                tableKey = resolution.tableKey
             } else {
-                tableKey = keyPrefix
+                tableKey = requestTableKey
             }
+
             if source == nil {
                 let profiles = try AutoChartProfiler.profileIndexCheckingCancellation(snapshot)
-                source = AutoChartPreparedSource(
+                try Task.checkCancellation()
+                let estimatedStorageCost = snapshot.estimatedStorageCost
+                try Task.checkCancellation()
+                let preparedSource = AutoChartPreparedSource(
                     key: tableKey,
                     snapshot: snapshot,
                     profiles: profiles,
-                    rowIDs: rowIDs)
-                if requestGeneration == generation, let source {
-                    insertTable(source)
-                }
+                    rowIDs: preparation.rowIDs,
+                    contentFingerprint: fingerprint,
+                    estimatedStorageCost: estimatedStorageCost)
+                source = preparedSource
+                await insertTableIfCurrent(
+                    preparedSource,
+                    requestGeneration: requestGeneration)
             }
         }
 
@@ -646,20 +682,18 @@ public actor AutoChartAnalyzer {
             context: context,
             options: options,
             policyVersion: AutoTableCharts.recommendationPolicyVersion)
-        if let cached = analysisEntries[analysisKey]?.value
-            as? AutoChartCachedAnalysis<Table.RowID>
+        if let cached: AutoChartCachedAnalysis<Table.RowID> = await cachedAnalysis(
+            for: analysisKey)
         {
-            statistics.analyses.hits += 1
-            touch(analysisKey, in: &analysisRecency)
             return makeAnalysis(cached)
         }
-        statistics.analyses.misses += 1
-        try Task.checkCancellation()
 
+        try Task.checkCancellation()
         let set = AutoChartRecommendationEngine.recommendations(
             snapshot: source.snapshot,
             context: context,
             options: options)
+        try Task.checkCancellation()
         let recommendations = set.chartRecommendations
         let outcome: AutoChartRecommendationOutcome
         if recommendations.isEmpty {
@@ -676,12 +710,12 @@ public actor AutoChartAnalyzer {
             outcome = .charts(recommendations)
         }
         let primary: AutoChartPreparedChart<Table.RowID>?
-        try Task.checkCancellation()
         if let first = recommendations.first {
             primary = try await prepare(first, source: source)
         } else {
             primary = nil
         }
+        try Task.checkCancellation()
         let diagnostics = recommendations.flatMap(\.diagnostics)
         let trace = options.includesDecisionTrace
             ? AutoChartDecisionTrace(
@@ -704,8 +738,243 @@ public actor AutoChartAnalyzer {
             trace: trace,
             primary: primary,
             recommendations: recommendations)
-        if requestGeneration == generation { insertAnalysis(cached, for: analysisKey) }
+        await insertAnalysisIfCurrent(
+            cached,
+            for: analysisKey,
+            requestGeneration: requestGeneration)
         return makeAnalysis(cached)
+    }
+
+    private nonisolated func resolveUnkeyedSource<RowID: Hashable & Sendable>(
+        snapshot: AutoChartSnapshot,
+        rowIDs: [RowID],
+        collisionBase: TableKey,
+        preferredKey: TableKey,
+        requestGeneration: UInt64
+    ) async throws -> SourceResolution<RowID> {
+        while true {
+            try Task.checkCancellation()
+            let candidates: [SourceCandidate<RowID>] = await sourceCandidates(
+                inCollisionFamilyOf: collisionBase)
+            let matching = try candidates.first { candidate in
+                try candidate.source.snapshot.hasSameContentCheckingCancellation(as: snapshot)
+                    && candidate.source.rowIDs == rowIDs
+            }
+            if let resolution = await finishUnkeyedSourceLookup(
+                observed: Set(candidates.map(\.identity)),
+                matching: matching,
+                collisionBase: collisionBase,
+                preferredKey: preferredKey,
+                requestGeneration: requestGeneration)
+            {
+                return resolution
+            }
+        }
+    }
+
+    private func beginRequest() -> UInt64 {
+        statistics.inFlightRequests += 1
+        return generation
+    }
+
+    private func finishRequest(generation requestGeneration: UInt64) {
+        guard requestGeneration == generation else { return }
+        statistics.inFlightRequests = max(0, statistics.inFlightRequests - 1)
+    }
+
+    private func isCurrentGeneration(_ requestGeneration: UInt64) -> Bool {
+        requestGeneration == generation
+    }
+
+    private func inFlightCandidates(for base: RequestKey) -> [InFlightCandidate] {
+        inFlightAnalyses.compactMap { key, flight in
+            guard key.context == base.context,
+                key.options == base.options,
+                key.policyVersion == base.policyVersion,
+                isCollisionFamily(key.table, of: base.table)
+            else { return nil }
+            return InFlightCandidate(
+                identity: InFlightIdentity(key: key, id: flight.id),
+                snapshot: flight.unkeyedSnapshot,
+                rowIDs: flight.unkeyedRowIDs)
+        }
+    }
+
+    private func registerInFlight<Table: AutoChartTable>(
+        _ table: Table,
+        context: AutoChartContext,
+        options: AutoChartOptions,
+        preparation: RequestPreparation<Table.RowID>,
+        baseRequestKey: RequestKey,
+        observed: Set<InFlightIdentity>,
+        matching: InFlightIdentity?,
+        requestGeneration: UInt64
+    ) -> InFlightRegistration? {
+        guard requestGeneration == generation,
+            Set(inFlightCandidates(for: baseRequestKey).map(\.identity)) == observed
+        else { return nil }
+        let waiterToken = UUID()
+        if let matching,
+            var existing = inFlightAnalyses[matching.key],
+            existing.id == matching.id
+        {
+            existing.waiterTokens.insert(waiterToken)
+            inFlightAnalyses[matching.key] = existing
+            return InFlightRegistration(
+                identity: matching,
+                waiterToken: waiterToken,
+                task: existing.task)
+        }
+
+        var requestKey = baseRequestKey
+        if inFlightAnalyses[requestKey] != nil {
+            requestKey.table.contentIdentity += ":collision:\(UUID().uuidString)"
+        }
+        let identity = InFlightIdentity(key: requestKey, id: UUID())
+        let task = Task {
+            [table, context, options, preparation, requestKey, requestGeneration] in
+            await Task.yield()
+            let analysis = try await self.analyzeUncoalesced(
+                table,
+                context: context,
+                options: options,
+                preparation: preparation,
+                requestTableKey: requestKey.table,
+                requestGeneration: requestGeneration)
+            return AutoChartAnyCacheBox(analysis, cost: 0)
+        }
+        inFlightAnalyses[requestKey] = InFlightAnalysis(
+            id: identity.id,
+            task: task,
+            waiterTokens: [waiterToken],
+            unkeyedSnapshot: preparation.snapshot,
+            unkeyedRowIDs: preparation.snapshot.map { _ in
+                AutoChartAnyRowIDs(preparation.rowIDs)
+            })
+        return InFlightRegistration(
+            identity: identity,
+            waiterToken: waiterToken,
+            task: task)
+    }
+
+    private func cachedKeyedSource<RowID: Hashable & Sendable>(
+        for key: TableKey
+    ) -> AutoChartPreparedSource<RowID>? {
+        if let cached = tableEntries[key]?.value as? AutoChartPreparedSource<RowID> {
+            statistics.tables.hits += 1
+            touch(key, in: &tableRecency)
+            return cached
+        }
+        statistics.tables.misses += 1
+        return nil
+    }
+
+    private func sourceCandidates<RowID: Hashable & Sendable>(
+        inCollisionFamilyOf base: TableKey
+    ) -> [SourceCandidate<RowID>] {
+        var candidates: [SourceCandidate<RowID>] = []
+        for key in tableRecency.reversed() where isCollisionFamily(key, of: base) {
+            guard let source = tableEntries[key]?.value as? AutoChartPreparedSource<RowID>
+            else { continue }
+            candidates.append(
+                SourceCandidate(
+                    identity: SourceCandidateIdentity(
+                        key: key,
+                        source: ObjectIdentifier(source),
+                        origin: .table),
+                    source: source))
+        }
+        for (key, box) in analysisEntries where isCollisionFamily(key.table, of: base) {
+            guard let analysis = box.value as? AutoChartCachedAnalysis<RowID> else { continue }
+            candidates.append(
+                SourceCandidate(
+                    identity: SourceCandidateIdentity(
+                        key: key.table,
+                        source: ObjectIdentifier(analysis.source),
+                        origin: .analysis),
+                    source: analysis.source))
+        }
+        for (key, box) in chartEntries where isCollisionFamily(key.table, of: base) {
+            guard let source = box.sharedObject as? AutoChartPreparedSource<RowID> else {
+                continue
+            }
+            candidates.append(
+                SourceCandidate(
+                    identity: SourceCandidateIdentity(
+                        key: key.table,
+                        source: ObjectIdentifier(source),
+                        origin: .chart),
+                    source: source))
+        }
+        return candidates
+    }
+
+    private func finishUnkeyedSourceLookup<RowID: Hashable & Sendable>(
+        observed: Set<SourceCandidateIdentity>,
+        matching: SourceCandidate<RowID>?,
+        collisionBase: TableKey,
+        preferredKey: TableKey,
+        requestGeneration: UInt64
+    ) -> SourceResolution<RowID>? {
+        let current: [SourceCandidate<RowID>] = sourceCandidates(
+            inCollisionFamilyOf: collisionBase)
+        guard Set(current.map(\.identity)) == observed else { return nil }
+
+        if let matching {
+            if matching.identity.origin == .table {
+                statistics.tables.hits += 1
+                touch(matching.identity.key, in: &tableRecency)
+            } else {
+                statistics.tables.misses += 1
+            }
+            if requestGeneration == generation,
+                tableEntries[matching.source.key] == nil
+            {
+                insertTable(matching.source)
+            }
+            return SourceResolution(
+                source: matching.source,
+                tableKey: matching.source.key)
+        }
+
+        statistics.tables.misses += 1
+        let tableKey = isTableKeyRetained(inCollisionFamilyOf: preferredKey)
+            ? TableKey(
+                rowIDType: preferredKey.rowIDType,
+                tableType: preferredKey.tableType,
+                contentIdentity: preferredKey.contentIdentity
+                    + ":collision:\(UUID().uuidString)")
+            : preferredKey
+        return SourceResolution(source: nil, tableKey: tableKey)
+    }
+
+    private func insertTableIfCurrent<RowID: Hashable & Sendable>(
+        _ source: AutoChartPreparedSource<RowID>,
+        requestGeneration: UInt64
+    ) {
+        guard requestGeneration == generation else { return }
+        insertTable(source)
+    }
+
+    private func cachedAnalysis<RowID: Hashable & Sendable>(
+        for key: AnalysisKey
+    ) -> AutoChartCachedAnalysis<RowID>? {
+        if let cached = analysisEntries[key]?.value as? AutoChartCachedAnalysis<RowID> {
+            statistics.analyses.hits += 1
+            touch(key, in: &analysisRecency)
+            return cached
+        }
+        statistics.analyses.misses += 1
+        return nil
+    }
+
+    private func insertAnalysisIfCurrent<RowID: Hashable & Sendable>(
+        _ analysis: AutoChartCachedAnalysis<RowID>,
+        for key: AnalysisKey,
+        requestGeneration: UInt64
+    ) {
+        guard requestGeneration == generation else { return }
+        insertAnalysis(analysis, for: key)
     }
 
     private func releaseWaiter(
@@ -737,21 +1006,22 @@ public actor AutoChartAnalyzer {
             || chartEntries.keys.contains { isCollisionFamily($0.table, of: base) }
     }
 
-    func prepare<RowID: Hashable & Sendable>(
+    nonisolated func prepare<RowID: Hashable & Sendable>(
         _ recommendation: AutoChartRecommendation,
         source: AutoChartPreparedSource<RowID>
     ) async throws -> AutoChartPreparedChart<RowID> {
         try Task.checkCancellation()
         let key = ChartKey(table: source.key, specification: recommendation.specification)
-        if let cached = chartEntries[key]?.value as? AutoChartPreparedChart<RowID> {
-            statistics.preparedCharts.hits += 1
-            touch(key, in: &chartRecency)
-            return cached
+        let lookup: (cached: AutoChartPreparedChart<RowID>?, generation: UInt64) =
+            await lookupChart(for: key)
+        if let cached = lookup.cached {
+            return adapted(cached, to: recommendation, source: source)
         }
-        statistics.preparedCharts.misses += 1
         let core = AutoChartRenderCore.prepare(
             snapshot: source.snapshot,
             profiles: source.profiles,
+            contentFingerprint: source.contentFingerprint,
+            estimatedStorageCost: source.estimatedStorageCost,
             recommendation: recommendation)
         guard core.validation.isValid else {
             throw AutoChartPreparationError.invalidSpecification(core.validation)
@@ -761,12 +1031,58 @@ public actor AutoChartAnalyzer {
             source: source,
             recommendation: recommendation,
             core: core)
-        insertChart(
+        return await storePreparedChart(
             prepared,
             key: key,
             cost: estimatedChartCost(core),
-            source: source)
+            source: source,
+            generation: lookup.generation)
+    }
+
+    private func lookupChart<RowID: Hashable & Sendable>(
+        for key: ChartKey
+    ) -> (cached: AutoChartPreparedChart<RowID>?, generation: UInt64) {
+        if let cached = chartEntries[key]?.value as? AutoChartPreparedChart<RowID> {
+            statistics.preparedCharts.hits += 1
+            touch(key, in: &chartRecency)
+            return (cached, generation)
+        }
+        statistics.preparedCharts.misses += 1
+        return (nil, generation)
+    }
+
+    private func storePreparedChart<RowID: Hashable & Sendable>(
+        _ prepared: AutoChartPreparedChart<RowID>,
+        key: ChartKey,
+        cost: Int,
+        source: AutoChartPreparedSource<RowID>,
+        generation preparedGeneration: UInt64
+    ) -> AutoChartPreparedChart<RowID> {
+        if let cached = chartEntries[key]?.value as? AutoChartPreparedChart<RowID> {
+            touch(key, in: &chartRecency)
+            return adapted(cached, to: prepared.recommendation, source: source)
+        }
+        if preparedGeneration == generation {
+            insertChart(prepared, key: key, cost: cost, source: source)
+        }
         return prepared
+    }
+
+    /// Rebuilds a cached chart around the requesting recommendation when the
+    /// cached one differs. The chart cache is keyed by table and specification
+    /// only, so a caller-provided specification and an engine recommendation
+    /// share prepared data but must keep their own score, rationale, and
+    /// diagnostics.
+    private nonisolated func adapted<RowID: Hashable & Sendable>(
+        _ cached: AutoChartPreparedChart<RowID>,
+        to recommendation: AutoChartRecommendation,
+        source: AutoChartPreparedSource<RowID>
+    ) -> AutoChartPreparedChart<RowID> {
+        guard cached.recommendation != recommendation else { return cached }
+        return AutoChartPreparedChart(
+            source: source,
+            recommendation: recommendation,
+            core: cached.core)
     }
 
     public func trim(to target: AutoChartCacheTrimTarget) {
@@ -799,7 +1115,7 @@ public actor AutoChartAnalyzer {
         statistics = .init()
     }
 
-    private func makeAnalysis<RowID: Hashable & Sendable>(
+    private nonisolated func makeAnalysis<RowID: Hashable & Sendable>(
         _ cached: AutoChartCachedAnalysis<RowID>
     ) -> AutoChartAnalysis<RowID> {
         AutoChartAnalysis(
@@ -832,8 +1148,16 @@ public actor AutoChartAnalyzer {
         _ analysis: AutoChartCachedAnalysis<RowID>,
         for key: AnalysisKey
     ) {
-        guard configuration.analyses.maximumEntries > 0 else { return }
-        let cost = 256 + analysis.recommendations.count * 512 + analysis.profiles.count * 32
+        let cost = 256 + analysis.recommendations.count * 512
+            + analysis.profiles.count * 32
+            + (analysis.primary.map { estimatedChartCost($0.core) } ?? 0)
+        // Admitting an entry that cannot coexist with its shared source would
+        // make the cost trim evict every other resident entry before finally
+        // evicting this one, draining the cache on every oversized analysis.
+        guard configuration.analyses.maximumEntries > 0,
+            configuration.maximumRetainedCost > 0,
+            adding(cost, to: analysis.source.cost) <= configuration.maximumRetainedCost
+        else { return }
         analysisEntries[key] = AutoChartAnyCacheBox(
             analysis,
             cost: cost,
@@ -851,7 +1175,7 @@ public actor AutoChartAnalyzer {
     ) {
         guard configuration.preparedCharts.maximumEntries > 0,
             configuration.maximumRetainedCost > 0,
-            cost <= configuration.maximumRetainedCost
+            adding(cost, to: source.cost) <= configuration.maximumRetainedCost
         else { return }
         chartEntries[key] = AutoChartAnyCacheBox(
             chart,
@@ -862,7 +1186,7 @@ public actor AutoChartAnalyzer {
         trimLocked()
     }
 
-    private func estimatedChartCost(_ core: AutoChartRenderCore) -> Int {
+    private nonisolated func estimatedChartCost(_ core: AutoChartRenderCore) -> Int {
         512 + core.data.count * 320
     }
 
