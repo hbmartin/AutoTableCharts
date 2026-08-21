@@ -982,6 +982,19 @@ enum AutoChartRecommendationEngine {
                         severity: .error,
                         code: .incompleteResult,
                         message: truncationMessage))
+            } else {
+                // Descriptive families may honestly describe a subset, but the
+                // caution must survive caller-provided specifications too, not
+                // only engine-generated recommendations. Keep this diagnostic
+                // identical to the engine's candidate warning so the two
+                // sources deduplicate.
+                issues.append(
+                    .init(
+                        severity: .warning,
+                        code: .incompleteResult,
+                        message:
+                            "Based on the first returned rows; totals and composition are suppressed.",
+                        family: specification.family))
             }
         }
         if [.donut, .stackedBar, .normalizedBar].contains(specification.family) {
@@ -1142,7 +1155,7 @@ enum AutoChartRecommendationEngine {
                 stacking: stacking,
                 sort: sort,
                 title: title?.isEmpty == false ? title! : generatedTitle),
-            score: score,
+            score: score + preferredTransformBonus(aggregation, y),
             rationale: rationale,
             warnings: warnings)
     }
@@ -1154,19 +1167,49 @@ enum AutoChartRecommendationEngine {
     private static func compositionIsSafe(_ hints: AutoChartColumnHints) -> Bool {
         guard let semantics = hints.measureSemantics else { return false }
         return semantics.rollup == .additive
+            && sourceSupportsAdditiveRollup(semantics.source)
     }
 
     private static func safeRollupAggregation(
         _ hints: AutoChartColumnHints
     ) -> AutoChartAggregation? {
-        switch hints.measureSemantics?.rollup {
+        guard let semantics = hints.measureSemantics else { return nil }
+        switch semantics.rollup {
         case .additive:
+            guard sourceSupportsAdditiveRollup(semantics.source) else { return nil }
             return .sum
         case .safe(let operation):
             return operation
-        case .nonAdditive, .unknown, nil:
+        case .nonAdditive, .unknown:
             return nil
         }
+    }
+
+    /// Already-aggregated measures are additive only for upstream sums and
+    /// ordinary counts; a mean, distinct count, or other summary does not
+    /// become summable because the host labeled the column additive.
+    private static func sourceSupportsAdditiveRollup(
+        _ source: AutoChartMeasureSource
+    ) -> Bool {
+        switch source {
+        case .rowLevel, .derived:
+            return true
+        case .aggregated(let operation):
+            return operation == .sum || operation == .count
+        }
+    }
+
+    /// A small ranking bonus when a candidate uses the transform the host
+    /// declared as preferred. Preference influences ranking only; safety has
+    /// already constrained which aggregations reach this point.
+    private static func preferredTransformBonus(
+        _ aggregation: AutoChartAggregation,
+        _ measure: AutoChartColumnProfile?
+    ) -> Double {
+        guard aggregation != .none,
+            measure?.column.hints.measureSemantics?.preferredTransform == aggregation
+        else { return 0 }
+        return 4
     }
 
     /// Whether preparation can create a numeric domain that is not bounded by the

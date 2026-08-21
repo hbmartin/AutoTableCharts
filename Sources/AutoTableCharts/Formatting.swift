@@ -44,10 +44,32 @@ public struct AutoChartFormatters: Sendable {
         value: AutoChartValue
     ) -> String {
         if case .date(let date) = value {
+            guard date.timeIntervalSinceReferenceDate.isFinite else {
+                return date.formatted(
+                    Date.FormatStyle(
+                        date: .abbreviated,
+                        time: .omitted,
+                        locale: locale,
+                        timeZone: timeZone))
+            }
+            // Sub-day values must keep their time component or every tick,
+            // mark, and selection within one day formats identically.
+            var calendar = Calendar(identifier: .gregorian)
+            calendar.timeZone = timeZone
+            calendar.locale = locale
+            let components = calendar.dateComponents([.hour, .minute, .second], from: date)
+            let time: Date.FormatStyle.TimeStyle =
+                if (components.second ?? 0) != 0 {
+                    .standard
+                } else if (components.hour ?? 0) != 0 || (components.minute ?? 0) != 0 {
+                    .shortened
+                } else {
+                    .omitted
+                }
             return date.formatted(
                 Date.FormatStyle(
                     date: .abbreviated,
-                    time: .omitted,
+                    time: time,
                     locale: locale,
                     timeZone: timeZone))
         }

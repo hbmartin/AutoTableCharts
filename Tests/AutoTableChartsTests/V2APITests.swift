@@ -490,7 +490,52 @@ private struct DuplicateIDTable: AutoChartTable {
         #expect(analysis.primaryChart != nil)
         #expect(statistics.tables.entries == 0)
         #expect(statistics.analyses.entries == 0)
-        #expect(statistics.analyses.evictions >= 1)
+        // The shared snapshot's cost exceeds the retained-cost budget, so the
+        // analysis is rejected at admission instead of being admitted and
+        // immediately evicted after draining the cache.
+        #expect(statistics.analyses.evictions == 0)
+    }
+
+    @Test func anEntryTooLargeToOutliveItsSharedSnapshotDoesNotDrainTheCache() async throws {
+        let analyzer = AutoChartAnalyzer(
+            configuration: AutoChartAnalyzerConfiguration(
+                tables: .init(maximumEntries: 4),
+                analyses: .init(maximumEntries: 4),
+                preparedCharts: .init(maximumEntries: 4),
+                maximumRetainedCost: 64 * 1_024))
+        let resident = try AutoChartDataset<Int>(
+            columns: [v2Category, v2Measure],
+            rows: [[.text("A"), .double(1)]],
+            key: .init(identity: "resident", revision: "1"))
+        _ = try await analyzer.analyze(resident)
+        let baseline = await analyzer.cacheStatistics
+        #expect(baseline.tables.entries == 1)
+        #expect(baseline.analyses.entries == 1)
+
+        let oversized = try AutoChartDataset<Int>(
+            columns: [v2Category, v2Measure],
+            rows: (0..<1_000).map { [.text("Category \($0)"), .double(Double($0))] },
+            key: .init(identity: "oversized", revision: "1"))
+        let analysis = try await analyzer.analyze(oversized)
+        let statistics = await analyzer.cacheStatistics
+
+        #expect(analysis.primaryChart != nil)
+        #expect(statistics.tables.entries == 1)
+        #expect(statistics.analyses.entries == 1)
+        #expect(statistics.tables.evictions == 0)
+        #expect(statistics.analyses.evictions == 0)
+        #expect(statistics.preparedCharts.evictions == 0)
+    }
+
+    @Test func removeAllDoesNotFailConcurrentAnalyzeCallers() async throws {
+        let dataset = try AutoChartDataset<Int>(
+            columns: [v2Category, v2Measure],
+            rows: (0..<2_000).map { [.text("Category \($0 % 25)"), .double(Double($0))] })
+        let analyzer = AutoChartAnalyzer()
+        let task = Task { try await analyzer.analyze(dataset) }
+        await analyzer.removeAll()
+        let analysis = try await task.value
+        #expect(analysis.primaryChart != nil)
     }
 
     @Test func evictionDoesNotBreakLiveAnalyses() async throws {
@@ -524,5 +569,185 @@ private struct DuplicateIDTable: AutoChartTable {
         let task = Task { try await analyzer.analyze(dataset) }
         task.cancel()
         await #expect(throws: CancellationError.self) { try await task.value }
+    }
+}
+
+
+@Suite struct ReviewFixRegressionTests {
+    @Test func corruptLegacyRecommendationIDsFailDecodingInsteadOfTrapping() throws {
+        for corrupt in ["\"-1:a\"", "\"999:a\"", "\"junk\""] {
+            #expect(throws: DecodingError.self) {
+                _ = try JSONDecoder().decode(
+                    AutoChartRecommendationID.self, from: Data(corrupt.utf8))
+            }
+        }
+        let legacy = try JSONDecoder().decode(
+            AutoChartRecommendationID.self, from: Data("\"1:7|3:bar\"".utf8))
+        #expect(legacy.policyVersion == 7)
+        #expect(legacy.specificationID.rawValue == "3:bar")
+    }
+
+    @Test func negativeCacheLimitsAreClampedEverywhere() async throws {
+        let limit = try JSONDecoder().decode(
+            AutoChartCacheLimit.self, from: Data(#"{"maximumEntries":-1}"#.utf8))
+        #expect(limit.maximumEntries == 0)
+
+        var mutated = AutoChartCacheLimit(maximumEntries: 3)
+        mutated.maximumEntries = -5
+        #expect(mutated.maximumEntries == 0)
+
+        let configJSON = #"""
+            {"tables":{"maximumEntries":-1},"analyses":{"maximumEntries":16},
+             "preparedCharts":{"maximumEntries":16},"maximumRetainedCost":-9}
+            """#
+        let configuration = try JSONDecoder().decode(
+            AutoChartAnalyzerConfiguration.self, from: Data(configJSON.utf8))
+        #expect(configuration.tables.maximumEntries == 0)
+        #expect(configuration.maximumRetainedCost == 0)
+
+        let analyzer = AutoChartAnalyzer(configuration: configuration)
+        await analyzer.trim(to: .configuredLimits)
+        let dataset = try AutoChartDataset<Int>(
+            columns: [v2Category, v2Measure],
+            rows: [[.text("A"), .double(1)]])
+        _ = try await analyzer.analyze(dataset)
+    }
+
+    @Test func nonFiniteValuesRoundTripThroughDatasetCoding() throws {
+        let dataset = try AutoChartDataset<Int>(
+            columns: [v2Category, v2Measure],
+            rows: [
+                [.text("A"), .double(.infinity)],
+                [.text("B"), .double(-.infinity)],
+                [.text("C"), .decimal(.nan)],
+                [.date(Date(timeIntervalSinceReferenceDate: .infinity)), .double(1)],
+            ])
+        let encoded = try JSONEncoder().encode(dataset)
+        let decoded = try JSONDecoder().decode(AutoChartDataset<Int>.self, from: encoded)
+        let values = decoded.chartRows.map { $0.chartValue(for: v2Measure.id) }
+        #expect(values[0] == .double(.infinity))
+        #expect(values[1] == .double(-.infinity))
+        guard case .decimal(let notANumber) = values[2] else {
+            Issue.record("Expected a decimal value.")
+            return
+        }
+        #expect(notANumber.isNaN)
+        guard case .date(let date) = decoded.chartRows[3].chartValue(for: v2Category.id)
+        else {
+            Issue.record("Expected a date value.")
+            return
+        }
+        #expect(date.timeIntervalSinceReferenceDate == .infinity)
+    }
+
+    @Test func distinctDataKeysNeverCollideThroughConcatenation() async throws {
+        let analyzer = AutoChartAnalyzer()
+        let first = try AutoChartDataset<Int>(
+            columns: [v2Category, v2Measure],
+            rows: [[.text("A"), .double(1)]],
+            key: .init(identity: "sales:2024", revision: "1"))
+        let second = try AutoChartDataset<Int>(
+            columns: [v2Category, v2Measure],
+            rows: [[.text("A"), .double(1)], [.text("B"), .double(2)]],
+            key: .init(identity: "sales", revision: "2024:1"))
+        let firstAnalysis = try await analyzer.analyze(first)
+        let secondAnalysis = try await analyzer.analyze(second)
+        #expect(try #require(firstAnalysis.primaryChart).marks.count == 1)
+        #expect(try #require(secondAnalysis.primaryChart).marks.count == 2)
+    }
+
+    @Test func callerSpecificationPreparationKeepsRecommendationMetadataDistinct()
+        async throws
+    {
+        let dataset = try AutoChartDataset<Int>(
+            columns: [v2Category, v2Measure],
+            rows: [[.text("A"), .double(1)], [.text("B"), .double(2)]],
+            key: .init(identity: "metadata", revision: "1"))
+        let analyzer = AutoChartAnalyzer()
+        let analysis = try await analyzer.analyze(dataset)
+        guard case .charts(let recommendations) = analysis.outcome,
+            let primary = recommendations.first
+        else {
+            Issue.record("Expected chart recommendations.")
+            return
+        }
+        let caller = try await analysis.prepare(primary.specification)
+        #expect(caller.recommendation.score == 0)
+        let prepared = try await analysis.prepare(primary.id)
+        #expect(prepared.recommendation == primary)
+        #expect(await analyzer.cacheStatistics.preparedCharts.entries == 1)
+    }
+
+    @Test func truncatedCallerSpecificationsCarryTheIncompleteResultCaution()
+        async throws
+    {
+        let x = AutoChartColumn(
+            id: "x", name: "X",
+            hints: .init(semanticType: .quantitative, role: .measure))
+        let y = AutoChartColumn(
+            id: "y", name: "Y",
+            hints: .init(semanticType: .quantitative, role: .measure))
+        let dataset = try AutoChartDataset<Int>(
+            columns: [x, y],
+            rows: (0..<20).map { [.double(Double($0)), .double(Double($0 * 2))] },
+            metadata: .init(isTruncated: true))
+        let analysis = try await AutoChartAnalyzer().analyze(dataset)
+        let prepared = try await analysis.prepare(.scatter(x: "x", y: "y"))
+        #expect(prepared.diagnostics.contains {
+            $0.severity == .warning && $0.messageValue.code == .incompleteResult
+        })
+        if let primary = analysis.primaryChart {
+            let cautions = primary.diagnostics.filter {
+                $0.messageValue.code == .incompleteResult
+            }
+            #expect(cautions.count == 1)
+        }
+    }
+
+    @Test func upstreamMeanMeasuresAreNotSummedDespiteAdditiveRollup() async throws {
+        func recommendations(
+            source: AutoChartMeasureSource
+        ) async throws -> [AutoChartRecommendation] {
+            let measure = AutoChartColumn(
+                id: "measure", name: "Value",
+                hints: .init(
+                    semanticType: .quantitative,
+                    role: .measure,
+                    measureSemantics: .init(source: source, rollup: .additive)))
+            let dataset = try AutoChartDataset<Int>(
+                columns: [v2Category, measure],
+                rows: [
+                    [.text("A"), .double(1)],
+                    [.text("A"), .double(2)],
+                    [.text("B"), .double(3)],
+                ])
+            let analysis = try await AutoChartAnalyzer(configuration: .uncached)
+                .analyze(dataset)
+            guard case .charts(let recommendations) = analysis.outcome else { return [] }
+            return recommendations
+        }
+        let summed = try await recommendations(source: .aggregated(.sum))
+        #expect(summed.contains { $0.specification.aggregation == .sum })
+        let meaned = try await recommendations(source: .aggregated(.mean))
+        #expect(!meaned.contains { $0.specification.aggregation == .sum })
+    }
+
+    @Test func subDayTemporalValuesFormatDistinctly() {
+        let formatters = AutoChartFormatters(
+            locale: Locale(identifier: "en_US"), timeZone: .gmt)
+        let midnight = Date(timeIntervalSince1970: 1_699_920_000)
+        let first = formatters.format(
+            column: nil, value: .date(midnight), context: .axisTick)
+        let second = formatters.format(
+            column: nil,
+            value: .date(midnight.addingTimeInterval(6 * 3_600)),
+            context: .axisTick)
+        let third = formatters.format(
+            column: nil,
+            value: .date(midnight.addingTimeInterval(12 * 3_600)),
+            context: .axisTick)
+        #expect(second != first)
+        #expect(third != second)
+        #expect(!first.contains(":"))
     }
 }

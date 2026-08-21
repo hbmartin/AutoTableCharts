@@ -31,8 +31,10 @@ the snapshot.
 Identical in-flight analyses are coalesced. Cancellation is checked between
 pipeline stages and bounded row chunks; shared work is cancelled only when its
 last waiter leaves. `trim(to: .minimum)` evicts completed reusable entries while
-preserving work in flight. ``AutoChartAnalyzer/removeAll()`` also cancels work in
-flight and resets retained state.
+preserving work in flight. ``AutoChartAnalyzer/removeAll()`` cancels shared work
+in flight and resets retained state; `analyze` callers whose own tasks were not
+cancelled restart transparently against the reset analyzer instead of receiving
+a spurious `CancellationError`.
 
 Inspect ``AutoChartAnalyzer/cacheStatistics`` for per-layer entries, cost, hits,
 misses, evictions, and the number of in-flight requests.

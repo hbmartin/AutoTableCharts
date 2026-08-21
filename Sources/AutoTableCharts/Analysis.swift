@@ -2,10 +2,20 @@ import Foundation
 
 /// Count and approximate retained-byte limit for one analyzer layer.
 public struct AutoChartCacheLimit: Hashable, Codable, Sendable {
-    public var maximumEntries: Int
+    public var maximumEntries: Int {
+        didSet { maximumEntries = max(0, maximumEntries) }
+    }
+
+    private enum CodingKeys: String, CodingKey { case maximumEntries }
 
     public init(maximumEntries: Int) {
         self.maximumEntries = max(0, maximumEntries)
+    }
+
+    /// Decodes a limit and applies the same safe minimum as the initializer.
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(maximumEntries: try container.decode(Int.self, forKey: .maximumEntries))
     }
 }
 
@@ -21,7 +31,13 @@ public struct AutoChartAnalyzerConfiguration: Hashable, Codable, Sendable {
     public var tables: AutoChartCacheLimit
     public var analyses: AutoChartCacheLimit
     public var preparedCharts: AutoChartCacheLimit
-    public var maximumRetainedCost: Int
+    public var maximumRetainedCost: Int {
+        didSet { maximumRetainedCost = max(0, maximumRetainedCost) }
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case tables, analyses, preparedCharts, maximumRetainedCost
+    }
 
     public init(
         tables: AutoChartCacheLimit = .init(maximumEntries: 8),
@@ -33,6 +49,18 @@ public struct AutoChartAnalyzerConfiguration: Hashable, Codable, Sendable {
         self.analyses = analyses
         self.preparedCharts = preparedCharts
         self.maximumRetainedCost = max(0, maximumRetainedCost)
+    }
+
+    /// Decodes a configuration and applies the same safe minimums as the initializer.
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            tables: try container.decode(AutoChartCacheLimit.self, forKey: .tables),
+            analyses: try container.decode(AutoChartCacheLimit.self, forKey: .analyses),
+            preparedCharts: try container.decode(
+                AutoChartCacheLimit.self, forKey: .preparedCharts),
+            maximumRetainedCost: try container.decode(
+                Int.self, forKey: .maximumRetainedCost))
     }
 }
 
@@ -133,7 +161,12 @@ public struct AutoChartPreparedChart<RowID: Hashable & Sendable>: Sendable {
     public let validation: AutoChartValidationResult
     public let marks: [AutoChartPreparedMark<RowID>]
     public var diagnostics: [AutoChartDiagnostic] {
-        recommendation.diagnostics + validation.issues.filter { $0.severity == .warning }
+        var result = recommendation.diagnostics
+        for issue in validation.issues
+        where issue.severity == .warning && !result.contains(issue) {
+            result.append(issue)
+        }
+        return result
     }
 
     let sourceRowIDs: [RowID]
@@ -437,6 +470,24 @@ public actor AutoChartAnalyzer {
         context: AutoChartContext = .init(),
         options: AutoChartOptions = .init()
     ) async throws -> AutoChartAnalysis<Table.RowID> {
+        while true {
+            do {
+                return try await analyzeOnce(table, context: context, options: options)
+            } catch is CancellationError where !Task.isCancelled {
+                // removeAll() invalidated this request's generation while it was
+                // in flight. The caller's own task was never cancelled, so a
+                // CancellationError here would be spurious; restart the request
+                // under the new generation instead.
+                await Task.yield()
+            }
+        }
+    }
+
+    private nonisolated func analyzeOnce<Table: AutoChartTable>(
+        _ table: Table,
+        context: AutoChartContext,
+        options: AutoChartOptions
+    ) async throws -> AutoChartAnalysis<Table.RowID> {
         let requestGeneration = await beginRequest()
         do {
             let preparation = try Self.prepareRequest(table)
@@ -445,7 +496,7 @@ public actor AutoChartAnalyzer {
                 throw CancellationError()
             }
             let contentIdentity = preparation.dataKey.map {
-                "key:\($0.identity):\($0.revision)"
+                "key:\($0.identity.utf8.count):\($0.identity)|\($0.revision.utf8.count):\($0.revision)"
             } ?? preparation.contentFingerprint.map {
                 "fingerprint:\($0)"
             } ?? "unreachable"
@@ -964,7 +1015,7 @@ public actor AutoChartAnalyzer {
         let lookup: (cached: AutoChartPreparedChart<RowID>?, generation: UInt64) =
             await lookupChart(for: key)
         if let cached = lookup.cached {
-            return cached
+            return adapted(cached, to: recommendation, source: source)
         }
         let core = AutoChartRenderCore.prepare(
             snapshot: source.snapshot,
@@ -1009,12 +1060,29 @@ public actor AutoChartAnalyzer {
     ) -> AutoChartPreparedChart<RowID> {
         if let cached = chartEntries[key]?.value as? AutoChartPreparedChart<RowID> {
             touch(key, in: &chartRecency)
-            return cached
+            return adapted(cached, to: prepared.recommendation, source: source)
         }
         if preparedGeneration == generation {
             insertChart(prepared, key: key, cost: cost, source: source)
         }
         return prepared
+    }
+
+    /// Rebuilds a cached chart around the requesting recommendation when the
+    /// cached one differs. The chart cache is keyed by table and specification
+    /// only, so a caller-provided specification and an engine recommendation
+    /// share prepared data but must keep their own score, rationale, and
+    /// diagnostics.
+    private nonisolated func adapted<RowID: Hashable & Sendable>(
+        _ cached: AutoChartPreparedChart<RowID>,
+        to recommendation: AutoChartRecommendation,
+        source: AutoChartPreparedSource<RowID>
+    ) -> AutoChartPreparedChart<RowID> {
+        guard cached.recommendation != recommendation else { return cached }
+        return AutoChartPreparedChart(
+            source: source,
+            recommendation: recommendation,
+            core: cached.core)
     }
 
     public func trim(to target: AutoChartCacheTrimTarget) {
@@ -1080,8 +1148,16 @@ public actor AutoChartAnalyzer {
         _ analysis: AutoChartCachedAnalysis<RowID>,
         for key: AnalysisKey
     ) {
-        guard configuration.analyses.maximumEntries > 0 else { return }
-        let cost = 256 + analysis.recommendations.count * 512 + analysis.profiles.count * 32
+        let cost = 256 + analysis.recommendations.count * 512
+            + analysis.profiles.count * 32
+            + (analysis.primary.map { estimatedChartCost($0.core) } ?? 0)
+        // Admitting an entry that cannot coexist with its shared source would
+        // make the cost trim evict every other resident entry before finally
+        // evicting this one, draining the cache on every oversized analysis.
+        guard configuration.analyses.maximumEntries > 0,
+            configuration.maximumRetainedCost > 0,
+            adding(cost, to: analysis.source.cost) <= configuration.maximumRetainedCost
+        else { return }
         analysisEntries[key] = AutoChartAnyCacheBox(
             analysis,
             cost: cost,
@@ -1099,7 +1175,7 @@ public actor AutoChartAnalyzer {
     ) {
         guard configuration.preparedCharts.maximumEntries > 0,
             configuration.maximumRetainedCost > 0,
-            cost <= configuration.maximumRetainedCost
+            adding(cost, to: source.cost) <= configuration.maximumRetainedCost
         else { return }
         chartEntries[key] = AutoChartAnyCacheBox(
             chart,

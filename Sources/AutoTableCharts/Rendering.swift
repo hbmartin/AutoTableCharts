@@ -1203,12 +1203,20 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     private var numberZoomSpan: Double { renderPresentation.numberZoomSpan }
     private var specification: AutoChartSpecification { recommendation.specification }
     private var isCompact: Bool { presentation.typography == .compact }
-    private var interactions: AutoChartInteractions {
-        var interactions = presentation.interactions
-        if !presentation.chrome.contains(.zoomControls) {
-            interactions.remove(.zoom)
-        }
-        return interactions
+    private var interactions: AutoChartInteractions { presentation.interactions }
+
+    /// Whether the plotted y values are row counts rather than values of the
+    /// measure column. Counts must not be formatted with the measure column's
+    /// unit hints.
+    private var yValueIsRowCount: Bool {
+        specification.aggregation == .count || specification.aggregation == .countDistinct
+    }
+
+    /// The column whose unit hints apply to the numeric value axis, or `nil`
+    /// when the axis shows counts or normalized proportions.
+    private var yAxisColumnID: AutoChartColumnID? {
+        if yValueIsRowCount || specification.stacking == .normalized { return nil }
+        return specification.encoding.y
     }
 
     @ViewBuilder
@@ -1364,7 +1372,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             }
             .chartXAxisLabel(yTitle)
             .chartYAxisLabel(xTitle)
-            .chartXAxis { numericAxis(columnID: specification.encoding.y) }
+            .chartXAxis { numericAxis(columnID: yAxisColumnID) }
             selectableCategoryY(verticalZoom(chart, categoryCount: uniqueXCount))
         } else {
             let chart = Chart(data) { datum in
@@ -1375,7 +1383,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             }
             .chartXAxisLabel(xTitle)
             .chartYAxisLabel(yTitle)
-            .chartYAxis { numericAxis(columnID: specification.encoding.y) }
+            .chartYAxis { numericAxis(columnID: yAxisColumnID) }
             selectableCategoryX(horizontalZoom(chart, categoryCount: uniqueXCount))
         }
     }
@@ -1397,7 +1405,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         }
         .chartXAxisLabel(yTitle)
         .chartYAxisLabel(xTitle)
-        .chartXAxis { numericAxis(columnID: specification.encoding.y) }
+        .chartXAxis { numericAxis(columnID: yAxisColumnID) }
         return selectableCategoryY(verticalZoom(chart, categoryCount: uniqueXCount))
     }
 
@@ -1414,8 +1422,8 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             .chartXAxisLabel(xTitle)
             .chartYAxisLabel(yTitle)
             .chartXAxis { temporalAxis(columnID: specification.encoding.x) }
-            .chartYAxis { numericAxis(columnID: specification.encoding.y) }
-            .environment(\.timeZone, .gmt)
+            .chartYAxis { numericAxis(columnID: yAxisColumnID) }
+            .environment(\.timeZone, formatters.timeZone)
             selectableDateX(timeZoom(chart))
         } else if xSemanticType == .quantitative {
             let chart = Chart(data) { datum in
@@ -1428,7 +1436,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             .chartXAxisLabel(xTitle)
             .chartYAxisLabel(yTitle)
             .chartXAxis { numericAxis(columnID: specification.encoding.x) }
-            .chartYAxis { numericAxis(columnID: specification.encoding.y) }
+            .chartYAxis { numericAxis(columnID: yAxisColumnID) }
             selectableNumberX(numberZoom(chart))
         } else {
             let chart = Chart(data) { datum in
@@ -1440,7 +1448,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             }
             .chartXAxisLabel(xTitle)
             .chartYAxisLabel(yTitle)
-            .chartYAxis { numericAxis(columnID: specification.encoding.y) }
+            .chartYAxis { numericAxis(columnID: yAxisColumnID) }
             selectableCategoryX(horizontalZoom(chart, categoryCount: uniqueXCount))
         }
     }
@@ -1457,8 +1465,8 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             .chartXAxisLabel(xTitle)
             .chartYAxisLabel(yTitle)
             .chartXAxis { temporalAxis(columnID: specification.encoding.x) }
-            .chartYAxis { numericAxis(columnID: specification.encoding.y) }
-            .environment(\.timeZone, .gmt)
+            .chartYAxis { numericAxis(columnID: yAxisColumnID) }
+            .environment(\.timeZone, formatters.timeZone)
             selectableDateX(timeZoom(chart))
         } else {
             let chart = Chart(data) { datum in
@@ -1470,7 +1478,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             .chartXAxisLabel(xTitle)
             .chartYAxisLabel(yTitle)
             .chartXAxis { numericAxis(columnID: specification.encoding.x) }
-            .chartYAxis { numericAxis(columnID: specification.encoding.y) }
+            .chartYAxis { numericAxis(columnID: yAxisColumnID) }
             selectableNumberX(numberZoom(chart))
         }
     }
@@ -1523,7 +1531,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             }
         }
         .chartYAxisLabel(yTitle)
-        .chartYAxis { numericAxis(columnID: specification.encoding.y) }
+        .chartYAxis { numericAxis(columnID: yAxisColumnID) }
         return selectableCategoryIdentityX(horizontalZoom(chart, categoryCount: uniqueXCount))
     }
 
@@ -1605,7 +1613,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         .chartXAxisLabel("Date")
         .chartYAxisLabel(xTitle)
         .chartXAxis { temporalAxis(columnID: specification.encoding.start) }
-        .environment(\.timeZone, .gmt)
+        .environment(\.timeZone, formatters.timeZone)
         return selectableCategoryY(timeZoom(chart))
     }
 
@@ -1769,6 +1777,46 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             if left != right { return left < right }
             return ($0 ?? "") < ($1 ?? "")
         }
+        return Group {
+            if let plotHeight = presentation.plotHeight {
+                GeometryReader { geometry in
+                    facetGrid(
+                        facets: facets,
+                        facetKeys: facetKeys,
+                        tileHeight: facetTileHeight(
+                            totalHeight: plotHeight,
+                            availableWidth: geometry.size.width,
+                            panelCount: facetKeys.count))
+                }
+            } else {
+                facetGrid(facets: facets, facetKeys: facetKeys, tileHeight: 180)
+            }
+        }
+    }
+
+    /// Divides the requested total plot height among the grid rows the panels
+    /// occupy at the given width, with a floor that keeps panels legible.
+    private func facetTileHeight(
+        totalHeight: CGFloat,
+        availableWidth: CGFloat,
+        panelCount: Int
+    ) -> CGFloat {
+        guard panelCount > 0 else { return totalHeight }
+        let minimumTileWidth: CGFloat = 220
+        let spacing: CGFloat = 16
+        let captionAllowance: CGFloat = 20
+        let columns = max(
+            1, Int((availableWidth + spacing) / (minimumTileWidth + spacing)))
+        let rows = max(1, Int(ceil(Double(panelCount) / Double(columns))))
+        let chrome = CGFloat(rows - 1) * spacing + CGFloat(rows) * captionAllowance
+        return max(120, (totalHeight - chrome) / CGFloat(rows))
+    }
+
+    private func facetGrid(
+        facets: [String?: [AutoChartDatum]],
+        facetKeys: [String?],
+        tileHeight: CGFloat
+    ) -> some View {
         let yDomain = sharedYDomain ?? 0...1
         let dateDomain =
             sharedXDateDomain
@@ -1791,10 +1839,11 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
                             }
                             .chartXScale(domain: dateDomain)
                             .chartYScale(domain: yDomain)
-                            .environment(\.timeZone, .gmt)
+                            .environment(\.timeZone, formatters.timeZone)
                             selectableFacet(chart, axis: .x, as: Date.self) { value in
                                 select(date: value, in: facetData)
                             }
+                            .frame(height: tileHeight)
                         } else if facetBaseFamily == .line {
                             let chart = Chart(facetData) { datum in
                                 lineMarks(
@@ -1808,6 +1857,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
                             selectableFacet(chart, axis: .x, as: String.self) { value in
                                 select(category: value, in: facetData)
                             }
+                            .frame(height: tileHeight)
                         } else if facetBaseFamily == .scatter,
                             xSemanticType == .temporal
                         {
@@ -1818,10 +1868,11 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
                             }
                             .chartXScale(domain: dateDomain)
                             .chartYScale(domain: yDomain)
-                            .environment(\.timeZone, .gmt)
+                            .environment(\.timeZone, formatters.timeZone)
                             selectableFacet(chart, axis: .x, as: Date.self) { value in
                                 select(date: value, in: facetData)
                             }
+                            .frame(height: tileHeight)
                         } else if facetBaseFamily == .scatter {
                             let chart = Chart(facetData) { datum in
                                 scatterMark(
@@ -1833,6 +1884,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
                             selectableFacet(chart, axis: .x, as: Double.self) { value in
                                 select(number: value, in: facetData)
                             }
+                            .frame(height: tileHeight)
                         } else {
                             if specification.orientation == .horizontal {
                                 let chart = Chart(facetData) { datum in
@@ -1846,6 +1898,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
                                 selectableFacet(chart, axis: .y, as: String.self) { value in
                                     select(category: value, in: facetData)
                                 }
+                                .frame(height: tileHeight)
                             } else {
                                 let chart = Chart(facetData) { datum in
                                     verticalBarMark(
@@ -1858,6 +1911,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
                                 selectableFacet(chart, axis: .x, as: String.self) { value in
                                     select(category: value, in: facetData)
                                 }
+                                .frame(height: tileHeight)
                             }
                         }
                     }
@@ -1892,7 +1946,8 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
 
     private func markAccessibilityLabel(for datum: AutoChartDatum) -> String {
         let xColumn = specification.encoding.x.flatMap(snapshot.column)
-        let yColumn = specification.encoding.y.flatMap(snapshot.column)
+        let yColumn = yValueIsRowCount
+            ? nil : specification.encoding.y.flatMap(snapshot.column)
         let name: String
         if specification.family == .histogram {
             name = datum.xLabel ?? "Value"
@@ -2351,11 +2406,10 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             selection = nil
             return
         }
-        let base = nearestDate.formatted(
-            Date.FormatStyle(
-                date: .abbreviated,
-                time: .shortened,
-                timeZone: TimeZone.gmt))
+        let base = formatters.format(
+            column: specification.encoding.x.flatMap(snapshot.column),
+            value: .date(nearestDate),
+            context: .selectionSummary)
         applySelection(
             matches,
             label: selectionLabel(base: base, matches: matches))
@@ -2409,7 +2463,9 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             return
         }
         var dimensions: [AutoChartSelectedDimension] = []
-        if let x = specification.encoding.x {
+        // A histogram bin has no single x value; its synthetic midpoint is a
+        // number present in no source row, so no x dimension is recorded.
+        if let x = specification.encoding.x, specification.family != .histogram {
             let values: [AutoChartValue] = matches.map { datum in
                 datum.xDate.map(AutoChartValue.date)
                     ?? datum.xNumber.map(AutoChartValue.double)
@@ -2419,14 +2475,22 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
                 dimensions.append(.init(columnID: x, value: value))
             }
         }
+        if specification.family == .heatmap, let y = specification.encoding.y {
+            let values: [AutoChartValue] = matches.map {
+                $0.yLabel.map(AutoChartValue.text) ?? .null
+            }
+            if let value = AutoChartSelectionPreparation.identicalValue(in: values) {
+                dimensions.append(.init(columnID: y, value: value))
+            }
+        }
         if let series = specification.encoding.series {
-            let values = matches.map { AutoChartValue.text($0.series ?? "—") }
+            let values = matches.map { $0.series.map(AutoChartValue.text) ?? .null }
             if let value = AutoChartSelectionPreparation.identicalValue(in: values) {
                 dimensions.append(.init(columnID: series, value: value))
             }
         }
         if let facet = specification.encoding.facet {
-            let values = matches.map { AutoChartValue.text($0.facet ?? "—") }
+            let values = matches.map { $0.facet.map(AutoChartValue.text) ?? .null }
             if let value = AutoChartSelectionPreparation.identicalValue(in: values) {
                 dimensions.append(.init(columnID: facet, value: value))
             }
@@ -2450,7 +2514,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             dimensions: dimensions,
             measure: markValue.map {
                 AutoChartSelectedMeasure(
-                    columnID: specification.encoding.y,
+                    columnID: yValueIsRowCount ? nil : specification.encoding.y,
                     aggregation: specification.aggregation,
                     value: $0)
             },
