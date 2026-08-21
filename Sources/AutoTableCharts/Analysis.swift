@@ -360,6 +360,9 @@ private struct AutoChartCachedAnalysis<RowID: Hashable & Sendable>: Sendable {
 
 /// Instance-owned analysis, preparation, and cache lifecycle service.
 public actor AutoChartAnalyzer {
+    private struct GenerationInvalidatedError: Error {}
+    private static let maximumGenerationRetries = 3
+
     struct TableKey: Hashable, Sendable {
         var rowIDType: String
         var tableType: String
@@ -393,11 +396,14 @@ public actor AutoChartAnalyzer {
         var unkeyedRowIDs: AutoChartAnyRowIDs?
     }
 
+    private enum RequestContent: Sendable {
+        case keyed(AutoChartDataKey)
+        case fingerprinted(snapshot: AutoChartSnapshot, contentFingerprint: Int)
+    }
+
     private struct RequestPreparation<RowID: Hashable & Sendable>: Sendable {
         var rowIDs: [RowID]
-        var dataKey: AutoChartDataKey?
-        var snapshot: AutoChartSnapshot?
-        var contentFingerprint: Int?
+        var content: RequestContent
     }
 
     private struct InFlightIdentity: Hashable, Sendable {
@@ -417,10 +423,20 @@ public actor AutoChartAnalyzer {
         var task: Task<AutoChartAnyCacheBox, Error>
     }
 
+    private struct InFlightChart: Sendable {
+        var id: UUID
+        var task: Task<AutoChartAnyCacheBox, Error>
+    }
+
+    private enum ChartPreparationRegistration: Sendable {
+        case cached(AutoChartAnyCacheBox)
+        case inFlight(Task<AutoChartAnyCacheBox, Error>)
+    }
+
     private enum SourceCandidateOrigin: Hashable, Sendable {
         case table
-        case analysis
-        case chart
+        case analysis(AnalysisKey)
+        case chart(ChartKey)
     }
 
     private struct SourceCandidateIdentity: Hashable, Sendable {
@@ -447,6 +463,7 @@ public actor AutoChartAnalyzer {
     private var chartEntries: [ChartKey: AutoChartAnyCacheBox] = [:]
     private var chartRecency: [ChartKey] = []
     private var inFlightAnalyses: [RequestKey: InFlightAnalysis] = [:]
+    private var inFlightCharts: [ChartKey: InFlightChart] = [:]
     private var statistics = AutoChartCacheStatistics()
     private var generation: UInt64 = 0
 
@@ -470,14 +487,16 @@ public actor AutoChartAnalyzer {
         context: AutoChartContext = .init(),
         options: AutoChartOptions = .init()
     ) async throws -> AutoChartAnalysis<Table.RowID> {
+        var generationRetries = 0
         while true {
             do {
                 return try await analyzeOnce(table, context: context, options: options)
-            } catch is CancellationError where !Task.isCancelled {
-                // removeAll() invalidated this request's generation while it was
-                // in flight. The caller's own task was never cancelled, so a
-                // CancellationError here would be spurious; restart the request
-                // under the new generation instead.
+            } catch is GenerationInvalidatedError {
+                try Task.checkCancellation()
+                guard generationRetries < Self.maximumGenerationRetries else {
+                    throw CancellationError()
+                }
+                generationRetries += 1
                 await Task.yield()
             }
         }
@@ -493,13 +512,17 @@ public actor AutoChartAnalyzer {
             let preparation = try Self.prepareRequest(table)
             try Task.checkCancellation()
             guard await isCurrentGeneration(requestGeneration) else {
-                throw CancellationError()
+                throw GenerationInvalidatedError()
             }
-            let contentIdentity = preparation.dataKey.map {
-                "key:\($0.identity.utf8.count):\($0.identity)|\($0.revision.utf8.count):\($0.revision)"
-            } ?? preparation.contentFingerprint.map {
-                "fingerprint:\($0)"
-            } ?? "unreachable"
+            let contentIdentity: String
+            switch preparation.content {
+            case .keyed(let dataKey):
+                contentIdentity =
+                    "key:\(dataKey.identity.utf8.count):\(dataKey.identity)|"
+                    + "\(dataKey.revision.utf8.count):\(dataKey.revision)"
+            case .fingerprinted(_, let contentFingerprint):
+                contentIdentity = "fingerprint:\(contentFingerprint)"
+            }
             let baseRequestKey = RequestKey(
                 table: TableKey(
                     rowIDType: String(reflecting: Table.RowID.self),
@@ -536,18 +559,27 @@ public actor AutoChartAnalyzer {
                 guard let analysis = box.value as? AutoChartAnalysis<Table.RowID> else {
                     preconditionFailure("Coalesced analysis row-ID type mismatch.")
                 }
-                await finishRequest(generation: requestGeneration)
+                guard await finishRequestIfCurrent(generation: requestGeneration) else {
+                    throw GenerationInvalidatedError()
+                }
                 return analysis
             } catch {
                 await releaseWaiter(
                     registration.identity.key,
                     flightID: registration.identity.id,
                     waiterToken: registration.waiterToken,
-                    cancelWhenEmpty: false)
+                    cancelWhenEmpty: error is CancellationError)
                 throw error
             }
         } catch {
             await finishRequest(generation: requestGeneration)
+            let requestIsCurrent = await isCurrentGeneration(requestGeneration)
+            if error is CancellationError,
+                !Task.isCancelled,
+                !requestIsCurrent
+            {
+                throw GenerationInvalidatedError()
+            }
             throw error
         }
     }
@@ -557,17 +589,17 @@ public actor AutoChartAnalyzer {
     ) throws -> RequestPreparation<Table.RowID> {
         try Task.checkCancellation()
         let rowIDs = table.chartRows.map(\.chartRowID)
-        guard table.chartDataKey == nil else {
-            return RequestPreparation(rowIDs: rowIDs, dataKey: table.chartDataKey)
+        if let dataKey = table.chartDataKey {
+            return RequestPreparation(rowIDs: rowIDs, content: .keyed(dataKey))
         }
         let snapshot = try AutoChartSnapshot(validating: table)
         let fingerprint = try snapshot.contentFingerprintCheckingCancellation()
         try Task.checkCancellation()
         return RequestPreparation(
             rowIDs: rowIDs,
-            dataKey: nil,
-            snapshot: snapshot,
-            contentFingerprint: fingerprint)
+            content: .fingerprinted(
+                snapshot: snapshot,
+                contentFingerprint: fingerprint))
     }
 
     private nonisolated func registerRequest<Table: AutoChartTable>(
@@ -585,13 +617,14 @@ public actor AutoChartAnalyzer {
             }
             let candidates = await inFlightCandidates(for: baseRequestKey)
             let matchingIdentity: InFlightIdentity?
-            if let snapshot = preparation.snapshot {
+            switch preparation.content {
+            case .fingerprinted(let snapshot, _):
                 matchingIdentity = try candidates.first { candidate in
                     try candidate.snapshot?
                         .hasSameContentCheckingCancellation(as: snapshot) == true
                         && candidate.rowIDs?.matches(preparation.rowIDs) == true
                 }?.identity
-            } else {
+            case .keyed:
                 matchingIdentity = candidates.first?.identity
             }
             if let registration = await registerInFlight(
@@ -619,26 +652,29 @@ public actor AutoChartAnalyzer {
     ) async throws -> AutoChartAnalysis<Table.RowID> {
         try Task.checkCancellation()
         var source: AutoChartPreparedSource<Table.RowID>?
-        if preparation.dataKey != nil {
+        switch preparation.content {
+        case .keyed:
             source = await cachedKeyedSource(for: requestTableKey)
+        case .fingerprinted:
+            source = nil
         }
 
         if source == nil {
             let snapshot: AutoChartSnapshot
             let fingerprint: Int
-            if let preparedSnapshot = preparation.snapshot,
-                let preparedFingerprint = preparation.contentFingerprint
-            {
-                snapshot = preparedSnapshot
-                fingerprint = preparedFingerprint
-            } else {
+            switch preparation.content {
+            case .keyed:
                 snapshot = try AutoChartSnapshot(validating: table)
                 fingerprint = try snapshot.contentFingerprintCheckingCancellation()
+            case .fingerprinted(let preparedSnapshot, let preparedFingerprint):
+                snapshot = preparedSnapshot
+                fingerprint = preparedFingerprint
             }
             try Task.checkCancellation()
 
             let tableKey: TableKey
-            if preparation.dataKey == nil {
+            switch preparation.content {
+            case .fingerprinted:
                 let collisionBase = TableKey(
                     rowIDType: requestTableKey.rowIDType,
                     tableType: requestTableKey.tableType,
@@ -651,7 +687,7 @@ public actor AutoChartAnalyzer {
                     requestGeneration: requestGeneration)
                 source = resolution.source
                 tableKey = resolution.tableKey
-            } else {
+            case .keyed:
                 tableKey = requestTableKey
             }
 
@@ -782,6 +818,12 @@ public actor AutoChartAnalyzer {
         statistics.inFlightRequests = max(0, statistics.inFlightRequests - 1)
     }
 
+    private func finishRequestIfCurrent(generation requestGeneration: UInt64) -> Bool {
+        guard requestGeneration == generation else { return false }
+        statistics.inFlightRequests = max(0, statistics.inFlightRequests - 1)
+        return true
+    }
+
     private func isCurrentGeneration(_ requestGeneration: UInt64) -> Bool {
         requestGeneration == generation
     }
@@ -847,10 +889,15 @@ public actor AutoChartAnalyzer {
             id: identity.id,
             task: task,
             waiterTokens: [waiterToken],
-            unkeyedSnapshot: preparation.snapshot,
-            unkeyedRowIDs: preparation.snapshot.map { _ in
-                AutoChartAnyRowIDs(preparation.rowIDs)
-            })
+            unkeyedSnapshot: {
+                guard case .fingerprinted(let snapshot, _) = preparation.content
+                else { return nil }
+                return snapshot
+            }(),
+            unkeyedRowIDs: {
+                guard case .fingerprinted = preparation.content else { return nil }
+                return AutoChartAnyRowIDs(preparation.rowIDs)
+            }())
         return InFlightRegistration(
             identity: identity,
             waiterToken: waiterToken,
@@ -891,7 +938,7 @@ public actor AutoChartAnalyzer {
                     identity: SourceCandidateIdentity(
                         key: key.table,
                         source: ObjectIdentifier(analysis.source),
-                        origin: .analysis),
+                        origin: .analysis(key)),
                     source: analysis.source))
         }
         for (key, box) in chartEntries where isCollisionFamily(key.table, of: base) {
@@ -903,7 +950,7 @@ public actor AutoChartAnalyzer {
                     identity: SourceCandidateIdentity(
                         key: key.table,
                         source: ObjectIdentifier(source),
-                        origin: .chart),
+                        origin: .chart(key)),
                     source: source))
         }
         return candidates
@@ -921,11 +968,16 @@ public actor AutoChartAnalyzer {
         guard Set(current.map(\.identity)) == observed else { return nil }
 
         if let matching {
-            if matching.identity.origin == .table {
+            switch matching.identity.origin {
+            case .table:
                 statistics.tables.hits += 1
                 touch(matching.identity.key, in: &tableRecency)
-            } else {
-                statistics.tables.misses += 1
+            case .analysis(let key):
+                statistics.analyses.hits += 1
+                touch(key, in: &analysisRecency)
+            case .chart(let key):
+                statistics.preparedCharts.hits += 1
+                touch(key, in: &chartRecency)
             }
             if requestGeneration == generation,
                 tableEntries[matching.source.key] == nil
@@ -1012,11 +1064,44 @@ public actor AutoChartAnalyzer {
     ) async throws -> AutoChartPreparedChart<RowID> {
         try Task.checkCancellation()
         let key = ChartKey(table: source.key, specification: recommendation.specification)
-        let lookup: (cached: AutoChartPreparedChart<RowID>?, generation: UInt64) =
-            await lookupChart(for: key)
-        if let cached = lookup.cached {
-            return adapted(cached, to: recommendation, source: source)
+        let registration = await registerChartPreparation(
+            recommendation,
+            source: source,
+            key: key)
+        let box: AutoChartAnyCacheBox
+        switch registration {
+        case .cached(let cached):
+            box = cached
+        case .inFlight(let task):
+            box = try await task.value
         }
+        try Task.checkCancellation()
+        guard let prepared = box.value as? AutoChartPreparedChart<RowID> else {
+            preconditionFailure("Coalesced chart preparation row-ID type mismatch.")
+        }
+        return adapted(prepared, to: recommendation, source: source)
+    }
+
+    private func registerChartPreparation<RowID: Hashable & Sendable>(
+        _ recommendation: AutoChartRecommendation,
+        source: AutoChartPreparedSource<RowID>,
+        key: ChartKey
+    ) -> ChartPreparationRegistration {
+        if let cached = chartEntries[key]?.value as? AutoChartPreparedChart<RowID> {
+            statistics.preparedCharts.hits += 1
+            touch(key, in: &chartRecency)
+            return .cached(AutoChartAnyCacheBox(cached, cost: 0))
+        }
+        if let existing = inFlightCharts[key] {
+            return .inFlight(existing.task)
+        }
+        statistics.preparedCharts.misses += 1
+        let flightID = UUID()
+        let preparedGeneration = generation
+        let task = Task.detached {
+            [recommendation, source, key, flightID, preparedGeneration] in
+            do {
+                try Task.checkCancellation()
         let core = AutoChartRenderCore.prepare(
             snapshot: source.snapshot,
             profiles: source.profiles,
@@ -1031,24 +1116,26 @@ public actor AutoChartAnalyzer {
             source: source,
             recommendation: recommendation,
             core: core)
-        return await storePreparedChart(
+                let stored = await self.storePreparedChart(
             prepared,
             key: key,
-            cost: estimatedChartCost(core),
+                    cost: self.estimatedChartCost(core),
             source: source,
-            generation: lookup.generation)
+                    generation: preparedGeneration)
+                await self.finishChartPreparation(key: key, flightID: flightID)
+                return AutoChartAnyCacheBox(stored, cost: 0)
+            } catch {
+                await self.finishChartPreparation(key: key, flightID: flightID)
+                throw error
+    }
+        }
+        inFlightCharts[key] = InFlightChart(id: flightID, task: task)
+        return .inFlight(task)
     }
 
-    private func lookupChart<RowID: Hashable & Sendable>(
-        for key: ChartKey
-    ) -> (cached: AutoChartPreparedChart<RowID>?, generation: UInt64) {
-        if let cached = chartEntries[key]?.value as? AutoChartPreparedChart<RowID> {
-            statistics.preparedCharts.hits += 1
-            touch(key, in: &chartRecency)
-            return (cached, generation)
-        }
-        statistics.preparedCharts.misses += 1
-        return (nil, generation)
+    private func finishChartPreparation(key: ChartKey, flightID: UUID) {
+        guard inFlightCharts[key]?.id == flightID else { return }
+        inFlightCharts.removeValue(forKey: key)
     }
 
     private func storePreparedChart<RowID: Hashable & Sendable>(
@@ -1105,7 +1192,9 @@ public actor AutoChartAnalyzer {
     public func removeAll() {
         generation &+= 1
         for flight in inFlightAnalyses.values { flight.task.cancel() }
+        for flight in inFlightCharts.values { flight.task.cancel() }
         inFlightAnalyses.removeAll(keepingCapacity: false)
+        inFlightCharts.removeAll(keepingCapacity: false)
         tableEntries.removeAll(keepingCapacity: false)
         tableRecency.removeAll(keepingCapacity: false)
         analysisEntries.removeAll(keepingCapacity: false)

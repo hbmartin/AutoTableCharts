@@ -2452,6 +2452,17 @@ private let date = AutoChartColumn(
                 else { return false }
                 return codes.contains(.nonFiniteValueOmitted)
             })
+
+        let limitedTrace = AutoChartRecommendationEngine.recommendations(
+            for: input,
+            options: .init(maximumRecommendations: 1, includesDecisionTrace: true))
+        #expect(
+            limitedTrace.decisions.contains { decision in
+                guard decision.family == .stackedBar,
+                    case .pruned(.candidateLimit) = decision.disposition
+                else { return false }
+                return true
+            })
     }
 
     @Test func aggregatedFiniteValuesCannotOverflowTheirAxisSpan() {
@@ -3054,14 +3065,14 @@ private let date = AutoChartColumn(
                 aggregation: .none) == "2 marks · 2 source rows")
     }
 
-    @Test func selectionHelpersPreserveBinRangesAndRejectAnglesPastTotal() {
+    @Test func selectionHelpersPreserveBinRangesAndRejectAnglesPastTotal() throws {
         let bins = [
             AutoChartDatum(
                 id: "first", sourceRowIDs: [0], xLabel: "0–10",
-                xNumber: 5, yNumber: 1),
+                xNumber: 5, yNumber: 1, lower: 0, upper: 10),
             AutoChartDatum(
                 id: "second", sourceRowIDs: [1], xLabel: "10–20",
-                xNumber: 15, yNumber: 2),
+                xNumber: 15, yNumber: 2, lower: 10, upper: 20),
         ]
         #expect(
             AutoChartSelectionPreparation.numberSelectionLabel(
@@ -3070,6 +3081,42 @@ private let date = AutoChartColumn(
                 family: .histogram) == "0–10")
         #expect(AutoChartSelectionPreparation.angleMatch(to: 2, in: bins)?.id == "second")
         #expect(AutoChartSelectionPreparation.angleMatch(to: 4, in: bins) == nil)
+
+        let specification = AutoChartSpecification.histogram(value: measure.id)
+        let semantics = AutoChartSelectionPreparation.semanticValues(
+            for: [bins[0]],
+            specification: specification,
+            label: "0–10")
+        #expect(
+            semantics.rangeDimensions
+                == [
+                    AutoChartSelectedRangeDimension(
+                        columnID: measure.id,
+                        value: .numeric(lower: 0, upper: 10))
+                ])
+        #expect(
+            semantics.measure
+                == AutoChartSelectedMeasure(
+                    columnID: nil,
+                    aggregation: .count,
+                    value: .scalar(.double(1))))
+
+        let selection = AutoChartSelection(
+            sourceRowIDs: Set(["r0"]),
+            dimensions: semantics.dimensions,
+            rangeDimensions: semantics.rangeDimensions,
+            measure: semantics.measure,
+            family: .histogram,
+            specificationID: specification.id,
+            markID: bins[0].id)
+        let presentation = selection.presentation(columns: [measure])
+        #expect(presentation.label.contains("0"))
+        #expect(presentation.label.contains("10"))
+        #expect(presentation.valueDescription.contains("1"))
+        #expect(
+            try JSONDecoder().decode(
+                AutoChartSelection<String>.self,
+                from: JSONEncoder().encode(selection)) == selection)
 
         let sectors = [
             AutoChartDatum(id: "missing-lineage", sourceRowIDs: [], yNumber: 1),
@@ -3104,6 +3151,83 @@ private let date = AutoChartColumn(
                 aggregation: .mean) == 50.0 / 3.0)
         #expect(AutoChartSelectionPreparation.identicalValue(in: ["A", "A"]) == "A")
         #expect(AutoChartSelectionPreparation.identicalValue(in: ["A", "B"]) == nil)
+
+        let specification = AutoChartSpecification(
+            family: .bar,
+            encoding: .init(x: category.id, y: measure.id),
+            aggregation: .countDistinct)
+        let semantics = AutoChartSelectionPreparation.semanticValues(
+            for: [
+                AutoChartDatum(
+                    id: "distinct", sourceRowIDs: [0, 1], xLabel: "A", yNumber: 2)
+            ],
+            specification: specification,
+            label: "A")
+        #expect(semantics.measure?.columnID == measure.id)
+        #expect(semantics.measure?.aggregation == .countDistinct)
+        #expect(semantics.measure?.value == .scalar(.double(2)))
+    }
+
+    @Test func selectionDimensionsPreserveTypedSourceValuesInsteadOfLabels() {
+        let heatmapY = AutoChartColumnID(rawValue: "heatmap-y")
+        let series = AutoChartColumnID(rawValue: "series")
+        let facet = AutoChartColumnID(rawValue: "facet")
+        let specification = AutoChartSpecification(
+            family: .heatmap,
+            encoding: .init(
+                x: category.id,
+                y: heatmapY,
+                series: series,
+                facet: facet),
+            aggregation: .count)
+        let typed = AutoChartDatum(
+            id: "typed",
+            sourceRowIDs: [0],
+            xIdentity: "integer:1",
+            xSourceValue: .integer(1),
+            xLabel: "1",
+            yIdentity: "boolean:true",
+            ySourceValue: .boolean(true),
+            yLabel: "true",
+            seriesIdentity: "integer:2",
+            seriesSourceValue: .integer(2),
+            series: "2",
+            facetIdentity: "boolean:false",
+            facetSourceValue: .boolean(false),
+            facet: "false")
+        let semantics = AutoChartSelectionPreparation.semanticValues(
+            for: [typed],
+            specification: specification,
+            label: "1")
+        #expect(
+            semantics.dimensions
+                == [
+                    .init(columnID: category.id, value: .integer(1)),
+                    .init(columnID: heatmapY, value: .boolean(true)),
+                    .init(columnID: series, value: .integer(2)),
+                    .init(columnID: facet, value: .boolean(false)),
+                ])
+
+        let duplicateLabelsWithDifferentValues = AutoChartDatum(
+            id: "different-values",
+            sourceRowIDs: [1],
+            xIdentity: "text:1:1",
+            xSourceValue: .text("1"),
+            xLabel: "1",
+            yIdentity: "text:4:true",
+            ySourceValue: .text("true"),
+            yLabel: "true",
+            seriesIdentity: "text:1:2",
+            seriesSourceValue: .text("2"),
+            series: "2",
+            facetIdentity: "text:5:false",
+            facetSourceValue: .text("false"),
+            facet: "false")
+        let mixed = AutoChartSelectionPreparation.semanticValues(
+            for: [typed, duplicateLabelsWithDifferentValues],
+            specification: specification,
+            label: "1")
+        #expect(mixed.dimensions.isEmpty)
     }
 
     @Test func boxPlotLabelTiesUseIdentityAsDeterministicTieBreaker() {

@@ -439,8 +439,12 @@ enum AutoChartRecommendationEngine {
                             structural.issues.filter { $0.severity == .error }
                                 .map { $0.messageValue.code }))
                 }
-                let prepared = cachedPreparedValidation(candidate.specification)
-                if !prepared.isValid {
+                // `diversify` prepares only candidates it actually considers.
+                // Do not turn trace construction into a full data-preparation
+                // pass over candidates already excluded by the result limit.
+                if let prepared = preparedValidationResults[candidate.specification],
+                    !prepared.isValid
+                {
                     return AutoChartCandidateDecision(
                         specificationID: candidate.specification.id,
                         family: candidate.specification.family,

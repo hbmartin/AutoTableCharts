@@ -1,3 +1,4 @@
+import Dispatch
 import Foundation
 import Testing
 
@@ -29,6 +30,53 @@ private struct DuplicateIDTable: AutoChartTable {
     let chartColumns = [v2Measure]
     let chartRows: [DuplicateIDRow]
     let chartMetadata = AutoChartTableMetadata()
+}
+
+private final class FirstRowReadGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private let entered = DispatchSemaphore(value: 0)
+    private let release = DispatchSemaphore(value: 0)
+    private var reads = 0
+
+    func read<Row>(_ rows: [Row]) -> [Row] {
+        lock.lock()
+        reads += 1
+        let shouldBlock = reads == 1
+        lock.unlock()
+        if shouldBlock {
+            entered.signal()
+            release.wait()
+        }
+        return rows
+    }
+
+    func waitUntilFirstRead() async {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global().async {
+                self.entered.wait()
+                continuation.resume()
+            }
+        }
+    }
+
+    func resumeFirstRead() {
+        release.signal()
+    }
+
+    var readCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return reads
+    }
+}
+
+private struct FirstReadBlockingTable: AutoChartTable {
+    let rows: [DuplicateIDRow]
+    let gate: FirstRowReadGate
+    let chartColumns = [v2Measure]
+    let chartMetadata = AutoChartTableMetadata()
+
+    var chartRows: [DuplicateIDRow] { gate.read(rows) }
 }
 
 @Suite struct V2DatasetTests {
@@ -136,9 +184,19 @@ private struct DuplicateIDTable: AutoChartTable {
             AutoChartRecommendationID.self,
             from: JSONEncoder().encode(legacy))
         #expect(decodedLegacy == legacyExpected)
+
+        let unicodeLegacy = "1:9|5:café"
+        let unicodeExpected = AutoChartRecommendationID(
+            policyVersion: 9,
+            specificationID: AutoChartSpecificationID(rawValue: "5:café"))
+        #expect(
+            try JSONDecoder().decode(
+                AutoChartRecommendationID.self,
+                from: JSONEncoder().encode(unicodeLegacy)) == unicodeExpected)
     }
 
     @Test func resolutionReportsExactAndPolicyDefaulting() async throws {
+        #expect(AutoTableCharts.recommendationPolicyVersion == 10)
         let dataset = try AutoChartDataset<Int>(
             columns: [v2Category, v2Measure],
             rows: [[.text("A"), .double(1)], [.text("B"), .double(2)]])
@@ -160,15 +218,19 @@ private struct DuplicateIDTable: AutoChartTable {
         #expect(exact.id == primary.id)
 
         let stale = AutoChartRecommendationID(
-            policyVersion: primary.id.policyVersion - 1,
+            policyVersion: 9,
             specificationID: primary.specification.id)
-        guard case .defaulted(let defaulted, reason: .policyVersionChanged) =
+        guard case .defaulted(
+            let defaulted,
+            reason: .policyVersionChanged(let previous, let current)) =
             analysis.resolve(stale)
         else {
             Issue.record("Expected policy-version default")
             return
         }
         #expect(defaulted.id == primary.id)
+        #expect(previous == 9)
+        #expect(current == 10)
 
         let absent = AutoChartRecommendationID(
             policyVersion: AutoTableCharts.recommendationPolicyVersion,
@@ -293,6 +355,8 @@ private struct DuplicateIDTable: AutoChartTable {
                 column: nil,
                 value: .date(Date(timeIntervalSince1970: 0)),
                 context: .axisTick).isEmpty)
+        #expect(formatter.formatNormalizedFraction(0.25, context: .axisTick).contains("25"))
+        #expect(!formatter.formatNormalizedFraction(0.25, context: .axisTick).contains("0.25"))
     }
 
     @Test func resolverFallsBackAndCanOverrideSelectionAccessibility() {
@@ -396,6 +460,65 @@ private struct DuplicateIDTable: AutoChartTable {
         #expect(statistics.tables.misses == 1)
         #expect(statistics.analyses.misses == 1)
         #expect(statistics.inFlightRequests == 0)
+    }
+
+    @Test func crossLayerSourceReuseIsChargedToTheProvidingLayer() async throws {
+        let dataset = try AutoChartDataset<Int>(
+            columns: [v2Category, v2Measure],
+            rows: [[.text("A"), .double(1)]])
+
+        let analysisBacked = AutoChartAnalyzer(
+            configuration: AutoChartAnalyzerConfiguration(
+                tables: .init(maximumEntries: 0),
+                analyses: .init(maximumEntries: 4),
+                preparedCharts: .init(maximumEntries: 0),
+                maximumRetainedCost: 1_024 * 1_024))
+        _ = try await analysisBacked.analyze(dataset)
+        let analysisBaseline = await analysisBacked.cacheStatistics
+        _ = try await analysisBacked.analyze(dataset)
+        let analysisReuse = await analysisBacked.cacheStatistics
+        #expect(analysisReuse.tables.misses == analysisBaseline.tables.misses)
+        #expect(analysisReuse.analyses.hits > analysisBaseline.analyses.hits)
+
+        let chartBacked = AutoChartAnalyzer(
+            configuration: AutoChartAnalyzerConfiguration(
+                tables: .init(maximumEntries: 0),
+                analyses: .init(maximumEntries: 0),
+                preparedCharts: .init(maximumEntries: 4),
+                maximumRetainedCost: 1_024 * 1_024))
+        _ = try await chartBacked.analyze(dataset)
+        let chartBaseline = await chartBacked.cacheStatistics
+        _ = try await chartBacked.analyze(dataset)
+        let chartReuse = await chartBacked.cacheStatistics
+        #expect(chartReuse.tables.misses == chartBaseline.tables.misses)
+        #expect(chartReuse.preparedCharts.hits > chartBaseline.preparedCharts.hits)
+    }
+
+    @Test func concurrentIdenticalChartPreparationsUseOneCacheMiss() async throws {
+        let dataset = try AutoChartDataset<Int>(
+            columns: [v2Category, v2Measure],
+            rows: (0..<5_000).map {
+                [.text("Category \($0 % 50)"), .double(Double($0))]
+            })
+        let analyzer = AutoChartAnalyzer()
+        let analysis = try await analyzer.analyze(dataset)
+        let baselineMisses = await analyzer.cacheStatistics.preparedCharts.misses
+        let specification = AutoChartSpecification.bar(
+            category: v2Category.id,
+            measure: v2Measure.id,
+            aggregation: .sum,
+            title: "Concurrent single flight")
+
+        try await withThrowingTaskGroup(of: AutoChartPreparedChart<Int>.self) { group in
+            for _ in 0..<24 {
+                group.addTask { try await analysis.prepare(specification) }
+            }
+            while try await group.next() != nil {}
+        }
+
+        let statistics = await analyzer.cacheStatistics
+        #expect(statistics.preparedCharts.misses == baselineMisses + 1)
+        #expect(statistics.preparedCharts.entries >= 1)
     }
 
     @Test func unkeyedRequestsWithDifferentLineageDoNotCoalesce() async throws {
@@ -528,14 +651,24 @@ private struct DuplicateIDTable: AutoChartTable {
     }
 
     @Test func removeAllDoesNotFailConcurrentAnalyzeCallers() async throws {
-        let dataset = try AutoChartDataset<Int>(
-            columns: [v2Category, v2Measure],
-            rows: (0..<2_000).map { [.text("Category \($0 % 25)"), .double(Double($0))] })
+        let gate = FirstRowReadGate()
+        let table = FirstReadBlockingTable(
+            rows: (0..<2_000).map {
+                DuplicateIDRow(chartRowID: $0, value: Double($0))
+            },
+            gate: gate)
         let analyzer = AutoChartAnalyzer()
-        let task = Task { try await analyzer.analyze(dataset) }
+        let task = Task { try await analyzer.analyze(table) }
+
+        await gate.waitUntilFirstRead()
+        #expect(await analyzer.cacheStatistics.inFlightRequests == 1)
         await analyzer.removeAll()
+        gate.resumeFirstRead()
         let analysis = try await task.value
+
         #expect(analysis.primaryChart != nil)
+        #expect(gate.readCount >= 2)
+        #expect(await analyzer.cacheStatistics.inFlightRequests == 0)
     }
 
     @Test func evictionDoesNotBreakLiveAnalyses() async throws {
@@ -574,6 +707,40 @@ private struct DuplicateIDTable: AutoChartTable {
 
 
 @Suite struct ReviewFixRegressionTests {
+    @Test func malformedAutoChartValueRepresentationsAreRejected() {
+        for malformed in [
+            #"{"null":123}"#,
+            #"{"decimal":{"_0":"inf"}}"#,
+            #"{"decimal":{"_0":"-inf"}}"#,
+        ] {
+            #expect(throws: DecodingError.self) {
+                _ = try JSONDecoder().decode(
+                    AutoChartValue.self,
+                    from: Data(malformed.utf8))
+            }
+        }
+    }
+
+    @Test func nonFiniteAutoChartValuesHaveStableEqualityHashingAndCoding() throws {
+        let values: [AutoChartValue] = [
+            .double(.nan),
+            .decimal(.nan),
+            .date(Date(timeIntervalSinceReferenceDate: .nan)),
+        ]
+        for value in values {
+            #expect(value == value)
+            #expect(Set([value, value]).count == 1)
+            let decoded = try JSONDecoder().decode(
+                AutoChartValue.self,
+                from: JSONEncoder().encode(value))
+            #expect(decoded == value)
+            #expect(decoded.hashValue == value.hashValue)
+        }
+
+        #expect(AutoChartValue.double(0) == .double(-0.0))
+        #expect(AutoChartValue.double(0).hashValue == AutoChartValue.double(-0.0).hashValue)
+    }
+
     @Test func corruptLegacyRecommendationIDsFailDecodingInsteadOfTrapping() throws {
         for corrupt in ["\"-1:a\"", "\"999:a\"", "\"junk\""] {
             #expect(throws: DecodingError.self) {

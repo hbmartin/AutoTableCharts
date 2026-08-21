@@ -96,6 +96,68 @@ public enum AutoChartValue: Hashable, Codable, Sendable {
 }
 
 extension AutoChartValue {
+    public static func == (lhs: Self, rhs: Self) -> Bool {
+        return switch (lhs, rhs) {
+        case (.null, .null): true
+        case (.boolean(let lhs), .boolean(let rhs)): lhs == rhs
+        case (.integer(let lhs), .integer(let rhs)): lhs == rhs
+        case (.double(let lhs), .double(let rhs)):
+            lhs == rhs || (lhs.isNaN && rhs.isNaN)
+        case (.decimal(let lhs), .decimal(let rhs)):
+            lhs == rhs || (lhs.isNaN && rhs.isNaN)
+        case (.text(let lhs), .text(let rhs)): lhs == rhs
+        case (.date(let lhs), .date(let rhs)):
+            lhs == rhs
+                || (lhs.timeIntervalSinceReferenceDate.isNaN
+                    && rhs.timeIntervalSinceReferenceDate.isNaN)
+        case (.binary(let lhs), .binary(let rhs)): lhs == rhs
+        default: false
+        }
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        switch self {
+        case .null:
+            hasher.combine(0)
+        case .boolean(let value):
+            hasher.combine(1)
+            hasher.combine(value)
+        case .integer(let value):
+            hasher.combine(2)
+            hasher.combine(value)
+        case .double(let value):
+            hasher.combine(3)
+            Self.hash(value, into: &hasher)
+        case .decimal(let value):
+            hasher.combine(4)
+            if value.isNaN {
+                hasher.combine("nan")
+            } else {
+                hasher.combine(value)
+            }
+        case .text(let value):
+            hasher.combine(5)
+            hasher.combine(value)
+        case .date(let value):
+            hasher.combine(6)
+            Self.hash(value.timeIntervalSinceReferenceDate, into: &hasher)
+        case .binary(let value):
+            hasher.combine(7)
+            hasher.combine(value)
+        }
+    }
+
+    private static func hash(_ value: Double, into hasher: inout Hasher) {
+        if value.isNaN {
+            hasher.combine("nan")
+        } else {
+            // `0.0 == -0.0`, so equal signed-zero values need one hash identity.
+            hasher.combine(value == 0 ? 0.0 : value)
+        }
+    }
+}
+
+extension AutoChartValue {
     private enum CodingKeys: String, CodingKey {
         case null, boolean, integer, double, decimal, text, date, binary
     }
@@ -143,6 +205,7 @@ extension AutoChartValue {
         }
         switch key {
         case .null:
+            _ = try nested()
             self = .null
         case .boolean:
             self = .boolean(try nested().decode(Bool.self, forKey: .value))
@@ -161,7 +224,13 @@ extension AutoChartValue {
             if let number = try? values.decode(Decimal.self, forKey: .value) {
                 self = .decimal(number)
             } else {
-                _ = try values.decode(NonFiniteToken.self, forKey: .value)
+                let token = try values.decode(NonFiniteToken.self, forKey: .value)
+                guard token == .notANumber else {
+                    throw DecodingError.dataCorruptedError(
+                        forKey: .value,
+                        in: values,
+                        debugDescription: "Decimal values support only the nan token.")
+                }
                 self = .decimal(.nan)
             }
         case .text:
@@ -1145,20 +1214,25 @@ extension AutoChartRecommendationID: Codable {
     }
 
     private static func decodeLegacy(_ rawValue: String) -> Self? {
-        var remainder = rawValue[...]
+        let bytes = Array(rawValue.utf8)
+        var offset = 0
         var components: [String] = []
-        while !remainder.isEmpty {
-            guard let colon = remainder.firstIndex(of: ":"),
-                let length = Int(remainder[..<colon]),
-                length >= 0
+        while offset < bytes.count {
+            guard let colon = bytes[offset...].firstIndex(of: 0x3A),
+                let length = Int(String(decoding: bytes[offset..<colon], as: UTF8.self)),
+                length >= 0,
+                length <= bytes.count - colon - 1
             else { return nil }
-            let valueStart = remainder.index(after: colon)
-            guard let valueEnd = remainder.index(
-                valueStart, offsetBy: length, limitedBy: remainder.endIndex)
+            let valueStart = colon + 1
+            let valueEnd = valueStart + length
+            guard let value = String(bytes: bytes[valueStart..<valueEnd], encoding: .utf8)
             else { return nil }
-            components.append(String(remainder[valueStart..<valueEnd]))
-            remainder = remainder[valueEnd...]
-            if remainder.first == "|" { remainder.removeFirst() }
+            components.append(value)
+            offset = valueEnd
+            if offset < bytes.count {
+                guard bytes[offset] == 0x7C else { return nil }
+                offset += 1
+            }
         }
         guard let versionText = components.first,
             let version = Int(versionText), components.count > 1
@@ -1466,6 +1540,24 @@ public struct AutoChartSelectedDimension: Hashable, Codable, Sendable {
     }
 }
 
+/// A typed interval used by a selected dimension whose mark represents a range
+/// rather than one source value, such as a histogram bin.
+public enum AutoChartSelectedRangeValue: Hashable, Codable, Sendable {
+    case numeric(lower: Double, upper: Double)
+    case temporal(start: Date, end: Date)
+}
+
+/// The source column and exact interval represented by a selected range dimension.
+public struct AutoChartSelectedRangeDimension: Hashable, Codable, Sendable {
+    public var columnID: AutoChartColumnID
+    public var value: AutoChartSelectedRangeValue
+
+    public init(columnID: AutoChartColumnID, value: AutoChartSelectedRangeValue) {
+        self.columnID = columnID
+        self.value = value
+    }
+}
+
 public enum AutoChartMarkValue: Hashable, Codable, Sendable {
     case scalar(AutoChartValue)
     case numericRange(lower: Double, upper: Double)
@@ -1493,6 +1585,7 @@ public struct AutoChartSelectedMeasure: Hashable, Codable, Sendable {
 public struct AutoChartSelection<RowID: Hashable & Sendable>: Hashable, Sendable {
     public var sourceRowIDs: Set<RowID>
     public var dimensions: [AutoChartSelectedDimension]
+    public var rangeDimensions: [AutoChartSelectedRangeDimension]
     public var measure: AutoChartSelectedMeasure?
     public var family: AutoChartFamily
     public var specificationID: AutoChartSpecificationID
@@ -1501,6 +1594,7 @@ public struct AutoChartSelection<RowID: Hashable & Sendable>: Hashable, Sendable
     public init(
         sourceRowIDs: Set<RowID>,
         dimensions: [AutoChartSelectedDimension] = [],
+        rangeDimensions: [AutoChartSelectedRangeDimension] = [],
         measure: AutoChartSelectedMeasure? = nil,
         family: AutoChartFamily,
         specificationID: AutoChartSpecificationID,
@@ -1508,6 +1602,7 @@ public struct AutoChartSelection<RowID: Hashable & Sendable>: Hashable, Sendable
     ) {
         self.sourceRowIDs = sourceRowIDs
         self.dimensions = dimensions
+        self.rangeDimensions = rangeDimensions
         self.measure = measure
         self.family = family
         self.specificationID = specificationID
@@ -1515,7 +1610,40 @@ public struct AutoChartSelection<RowID: Hashable & Sendable>: Hashable, Sendable
     }
 }
 
-extension AutoChartSelection: Codable where RowID: Codable {}
+extension AutoChartSelection: Codable where RowID: Codable {
+    private enum CodingKeys: String, CodingKey {
+        case sourceRowIDs, dimensions, rangeDimensions, measure, family, specificationID, markID
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            sourceRowIDs: try container.decode(Set<RowID>.self, forKey: .sourceRowIDs),
+            dimensions: try container.decode(
+                [AutoChartSelectedDimension].self, forKey: .dimensions),
+            rangeDimensions: try container.decodeIfPresent(
+                [AutoChartSelectedRangeDimension].self, forKey: .rangeDimensions) ?? [],
+            measure: try container.decodeIfPresent(
+                AutoChartSelectedMeasure.self, forKey: .measure),
+            family: try container.decode(AutoChartFamily.self, forKey: .family),
+            specificationID: try container.decode(
+                AutoChartSpecificationID.self, forKey: .specificationID),
+            markID: try container.decode(String.self, forKey: .markID))
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(sourceRowIDs, forKey: .sourceRowIDs)
+        try container.encode(dimensions, forKey: .dimensions)
+        if !rangeDimensions.isEmpty {
+            try container.encode(rangeDimensions, forKey: .rangeDimensions)
+        }
+        try container.encodeIfPresent(measure, forKey: .measure)
+        try container.encode(family, forKey: .family)
+        try container.encode(specificationID, forKey: .specificationID)
+        try container.encode(markID, forKey: .markID)
+    }
+}
 
 public struct AutoChartSelectionPresentation: Hashable, Codable, Sendable {
     public var label: String

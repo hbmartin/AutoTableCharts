@@ -39,6 +39,17 @@ public struct AutoChartFormatters: Sendable {
         return defaultFormat(column: column, value: value)
     }
 
+    func formatNormalizedFraction(
+        _ value: Double,
+        context: AutoChartFormattingContext
+    ) -> String {
+        if let formatted = override?(nil, .double(value), context, locale, timeZone) {
+            return formatted
+        }
+        return value.formatted(
+            .percent.locale(locale).precision(.fractionLength(0...2)))
+    }
+
     private func defaultFormat(
         column: AutoChartColumn?,
         value: AutoChartValue
@@ -102,12 +113,30 @@ extension AutoChartSelection {
         let columnIndex = Dictionary(
             columns.map { ($0.id, $0) },
             uniquingKeysWith: { first, _ in first })
-        let label = dimensions.map { dimension in
+        let scalarLabels = dimensions.map { dimension in
             formatters.format(
                 column: columnIndex[dimension.columnID],
                 value: dimension.value,
                 context: .selectionSummary)
-        }.joined(separator: ", ")
+        }
+        let rangeLabels = rangeDimensions.map { dimension in
+            let column = columnIndex[dimension.columnID]
+            switch dimension.value {
+            case .numeric(let lower, let upper):
+                let lower = formatters.format(
+                    column: column, value: .double(lower), context: .selectionSummary)
+                let upper = formatters.format(
+                    column: column, value: .double(upper), context: .selectionSummary)
+                return "\(lower)–\(upper)"
+            case .temporal(let start, let end):
+                let start = formatters.format(
+                    column: column, value: .date(start), context: .selectionSummary)
+                let end = formatters.format(
+                    column: column, value: .date(end), context: .selectionSummary)
+                return "\(start)–\(end)"
+            }
+        }
+        let label = (scalarLabels + rangeLabels).joined(separator: ", ")
         let valueMessage: AutoChartMessage
         if let measure {
             let column = measure.columnID.flatMap { columnIndex[$0] }
