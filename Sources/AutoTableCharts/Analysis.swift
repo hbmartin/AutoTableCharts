@@ -417,6 +417,16 @@ public actor AutoChartAnalyzer {
         var task: Task<AutoChartAnyCacheBox, Error>
     }
 
+    private struct InFlightChart: Sendable {
+        var id: UUID
+        var task: Task<AutoChartAnyCacheBox, Error>
+    }
+
+    private enum ChartPreparationRegistration: Sendable {
+        case cached(AutoChartAnyCacheBox)
+        case inFlight(Task<AutoChartAnyCacheBox, Error>)
+    }
+
     private enum SourceCandidateOrigin: Hashable, Sendable {
         case table
         case analysis
@@ -447,6 +457,7 @@ public actor AutoChartAnalyzer {
     private var chartEntries: [ChartKey: AutoChartAnyCacheBox] = [:]
     private var chartRecency: [ChartKey] = []
     private var inFlightAnalyses: [RequestKey: InFlightAnalysis] = [:]
+    private var inFlightCharts: [ChartKey: InFlightChart] = [:]
     private var statistics = AutoChartCacheStatistics()
     private var generation: UInt64 = 0
 
@@ -536,7 +547,9 @@ public actor AutoChartAnalyzer {
                 guard let analysis = box.value as? AutoChartAnalysis<Table.RowID> else {
                     preconditionFailure("Coalesced analysis row-ID type mismatch.")
                 }
-                await finishRequest(generation: requestGeneration)
+                guard await finishRequestIfCurrent(generation: requestGeneration) else {
+                    throw CancellationError()
+                }
                 return analysis
             } catch {
                 await releaseWaiter(
@@ -782,6 +795,12 @@ public actor AutoChartAnalyzer {
         statistics.inFlightRequests = max(0, statistics.inFlightRequests - 1)
     }
 
+    private func finishRequestIfCurrent(generation requestGeneration: UInt64) -> Bool {
+        guard requestGeneration == generation else { return false }
+        statistics.inFlightRequests = max(0, statistics.inFlightRequests - 1)
+        return true
+    }
+
     private func isCurrentGeneration(_ requestGeneration: UInt64) -> Bool {
         requestGeneration == generation
     }
@@ -1012,11 +1031,44 @@ public actor AutoChartAnalyzer {
     ) async throws -> AutoChartPreparedChart<RowID> {
         try Task.checkCancellation()
         let key = ChartKey(table: source.key, specification: recommendation.specification)
-        let lookup: (cached: AutoChartPreparedChart<RowID>?, generation: UInt64) =
-            await lookupChart(for: key)
-        if let cached = lookup.cached {
-            return adapted(cached, to: recommendation, source: source)
+        let registration = await registerChartPreparation(
+            recommendation,
+            source: source,
+            key: key)
+        let box: AutoChartAnyCacheBox
+        switch registration {
+        case .cached(let cached):
+            box = cached
+        case .inFlight(let task):
+            box = try await task.value
         }
+        try Task.checkCancellation()
+        guard let prepared = box.value as? AutoChartPreparedChart<RowID> else {
+            preconditionFailure("Coalesced chart preparation row-ID type mismatch.")
+        }
+        return adapted(prepared, to: recommendation, source: source)
+    }
+
+    private func registerChartPreparation<RowID: Hashable & Sendable>(
+        _ recommendation: AutoChartRecommendation,
+        source: AutoChartPreparedSource<RowID>,
+        key: ChartKey
+    ) -> ChartPreparationRegistration {
+        if let cached = chartEntries[key]?.value as? AutoChartPreparedChart<RowID> {
+            statistics.preparedCharts.hits += 1
+            touch(key, in: &chartRecency)
+            return .cached(AutoChartAnyCacheBox(cached, cost: 0))
+        }
+        if let existing = inFlightCharts[key] {
+            return .inFlight(existing.task)
+        }
+        statistics.preparedCharts.misses += 1
+        let flightID = UUID()
+        let preparedGeneration = generation
+        let task = Task.detached {
+            [recommendation, source, key, flightID, preparedGeneration] in
+            do {
+                try Task.checkCancellation()
         let core = AutoChartRenderCore.prepare(
             snapshot: source.snapshot,
             profiles: source.profiles,
@@ -1031,24 +1083,26 @@ public actor AutoChartAnalyzer {
             source: source,
             recommendation: recommendation,
             core: core)
-        return await storePreparedChart(
+                let stored = await self.storePreparedChart(
             prepared,
             key: key,
-            cost: estimatedChartCost(core),
+                    cost: self.estimatedChartCost(core),
             source: source,
-            generation: lookup.generation)
+                    generation: preparedGeneration)
+                await self.finishChartPreparation(key: key, flightID: flightID)
+                return AutoChartAnyCacheBox(stored, cost: 0)
+            } catch {
+                await self.finishChartPreparation(key: key, flightID: flightID)
+                throw error
+    }
+        }
+        inFlightCharts[key] = InFlightChart(id: flightID, task: task)
+        return .inFlight(task)
     }
 
-    private func lookupChart<RowID: Hashable & Sendable>(
-        for key: ChartKey
-    ) -> (cached: AutoChartPreparedChart<RowID>?, generation: UInt64) {
-        if let cached = chartEntries[key]?.value as? AutoChartPreparedChart<RowID> {
-            statistics.preparedCharts.hits += 1
-            touch(key, in: &chartRecency)
-            return (cached, generation)
-        }
-        statistics.preparedCharts.misses += 1
-        return (nil, generation)
+    private func finishChartPreparation(key: ChartKey, flightID: UUID) {
+        guard inFlightCharts[key]?.id == flightID else { return }
+        inFlightCharts.removeValue(forKey: key)
     }
 
     private func storePreparedChart<RowID: Hashable & Sendable>(
@@ -1105,7 +1159,9 @@ public actor AutoChartAnalyzer {
     public func removeAll() {
         generation &+= 1
         for flight in inFlightAnalyses.values { flight.task.cancel() }
+        for flight in inFlightCharts.values { flight.task.cancel() }
         inFlightAnalyses.removeAll(keepingCapacity: false)
+        inFlightCharts.removeAll(keepingCapacity: false)
         tableEntries.removeAll(keepingCapacity: false)
         tableRecency.removeAll(keepingCapacity: false)
         analysisEntries.removeAll(keepingCapacity: false)
