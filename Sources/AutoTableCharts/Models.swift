@@ -71,10 +71,15 @@ public enum AutoChartValue: Hashable, Codable, Sendable {
         }
     }
 
+    /// Shown wherever a value exists but cannot be rendered as itself: nulls
+    /// and non-finite dates. A blank label would read as "nothing is here",
+    /// which is exactly the wrong thing to say about a retained value.
+    public static let unrepresentableValuePlaceholder = "—"
+
     /// A concise, locale-aware representation suitable for labels and selections.
     public var displayString: String {
         switch self {
-        case .null: "—"
+        case .null: Self.unrepresentableValuePlaceholder
         case .boolean(let value): value ? "Yes" : "No"
         case .integer(let value): value.formatted(.number.grouping(.automatic))
         case .double(let value):
@@ -85,11 +90,13 @@ public enum AutoChartValue: Hashable, Codable, Sendable {
                 .number.grouping(.automatic).precision(.fractionLength(0...3)))
         case .text(let value): value
         case .date(let value):
-            value.formatted(
-                Date.FormatStyle(
-                    date: .abbreviated,
-                    time: .omitted,
-                    timeZone: TimeZone.gmt))
+            value.timeIntervalSinceReferenceDate.isFinite
+                ? value.formatted(
+                    Date.FormatStyle(
+                        date: .abbreviated,
+                        time: .omitted,
+                        timeZone: TimeZone.gmt))
+                : Self.unrepresentableValuePlaceholder
         case .binary: "<binary>"
         }
     }

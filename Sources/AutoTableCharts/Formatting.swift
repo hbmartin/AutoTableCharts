@@ -55,13 +55,12 @@ public struct AutoChartFormatters: Sendable {
         value: AutoChartValue
     ) -> String {
         if case .date(let date) = value {
+            // Non-finite dates survive validation as a warning, so they reach
+            // ticks, mark labels, and selection summaries. `Date.FormatStyle`
+            // renders NaN as an empty string and infinities as year 5828963;
+            // neither tells the reader the value is unusable.
             guard date.timeIntervalSinceReferenceDate.isFinite else {
-                return date.formatted(
-                    Date.FormatStyle(
-                        date: .abbreviated,
-                        time: .omitted,
-                        locale: locale,
-                        timeZone: timeZone))
+                return AutoChartValue.unrepresentableValuePlaceholder
             }
             // Sub-day values must keep their time component or every tick,
             // mark, and selection within one day formats identically.

@@ -17,6 +17,11 @@ private let v2Measure = AutoChartColumn(
         unit: .currency(code: "USD"),
         measureSemantics: .init(source: .rowLevel, rollup: .additive)))
 
+private let v2Date = AutoChartColumn(
+    id: "date",
+    name: "Observed",
+    hints: .init(semanticType: .temporal, role: .dimension))
+
 private struct DuplicateIDRow: AutoChartRow {
     let chartRowID: Int
     let value: Double
@@ -319,6 +324,49 @@ private struct FirstReadBlockingTable: AutoChartTable {
         #expect(profile.nonNullCount == 2)
         #expect(profile.numericMinimum == 3)
         #expect(profile.numericMaximum == 8)
+    }
+
+    /// A temporal profile carries a count and bounds, never the dates: nothing
+    /// row-proportional is retained, so the analyzer's flat per-profile cost
+    /// charge tells the truth however long the column is.
+    @Test func temporalProfilesRetainCountsRatherThanDates() async throws {
+        let start = try Date("2026-01-01T00:00:00Z", strategy: .iso8601)
+        let dataset = try AutoChartDataset<Int>(
+            columns: [v2Date, v2Measure],
+            rows: (0..<500).map {
+                [.date(start.addingTimeInterval(Double($0) * 86_400)), .double(Double($0))]
+            })
+        let analyzer = AutoChartAnalyzer()
+        let analysis = try await analyzer.analyze(dataset)
+        let profile = try #require(
+            analysis.columnProfiles.first { $0.column.id == v2Date.id })
+        #expect(profile.isTemporal)
+        #expect(profile.temporalValueCount == 500)
+        #expect(profile.nonFiniteDateCount == 0)
+        #expect(profile.temporalMinimum == start)
+        #expect(profile.hasFiniteTemporalSpan)
+    }
+
+    /// `AutoChartColumnProfile` is public, so a host can build one — for a test
+    /// double, or from a profile it computed elsewhere.
+    @Test func columnProfilesAreConstructibleByHosts() {
+        let profile = AutoChartColumnProfile(
+            column: v2Measure,
+            semanticType: .quantitative,
+            nonNullCount: 2,
+            numericTypeCount: 2,
+            numericValueCount: 2,
+            renderableValueCount: 2,
+            renderableDistinctCount: 2,
+            distinctCount: 2,
+            numericMinimum: 3,
+            numericMaximum: 8,
+            allNumericValuesPositive: true)
+        #expect(profile.isQuantitative)
+        #expect(profile.isUniqueAtRowGrain)
+        #expect(profile.hasFiniteNumericSpan)
+        #expect(!profile.hasNonFiniteNumericValues)
+        #expect(profile.temporalValueCount == 0)
     }
 }
 
@@ -707,6 +755,109 @@ private struct FirstReadBlockingTable: AutoChartTable {
 
 
 @Suite struct ReviewFixRegressionTests {
+    /// `AutoChartSpecification.id` excludes the title, so two identically
+    /// shaped charts must share one preparation instead of each paying a full
+    /// pass over the snapshot.
+    @Test func chartCacheIgnoresTitleWhenSharingPreparedMarks() async throws {
+        let dataset = try AutoChartDataset<Int>(
+            columns: [v2Category, v2Measure],
+            rows: (0..<200).map { [.text("Category \($0 % 10)"), .double(Double($0))] })
+        let analyzer = AutoChartAnalyzer()
+        let analysis = try await analyzer.analyze(dataset)
+        let baseline = await analyzer.cacheStatistics.preparedCharts
+
+        func specification(title: String) -> AutoChartSpecification {
+            .bar(
+                category: v2Category.id,
+                measure: v2Measure.id,
+                aggregation: .sum,
+                title: title)
+        }
+        #expect(specification(title: "One").id == specification(title: "Two").id)
+
+        let first = try await analysis.prepare(specification(title: "One"))
+        let second = try await analysis.prepare(specification(title: "Two"))
+        let statistics = await analyzer.cacheStatistics.preparedCharts
+        #expect(statistics.misses == baseline.misses + 1)
+        #expect(statistics.hits > baseline.hits)
+        // Sharing the preparation must not leak the first caller's title.
+        #expect(first.recommendation.specification.title == "One")
+        #expect(second.recommendation.specification.title == "Two")
+        #expect(first.marks == second.marks)
+    }
+
+    /// A memory trim must release memory: work already in flight when the host
+    /// trimmed must not repopulate the cache it was asked to empty, and it must
+    /// still hand its caller a result.
+    @Test func trimStopsInFlightWorkFromRepopulatingTheCache() async throws {
+        let dataset = try AutoChartDataset<Int>(
+            columns: [v2Category, v2Measure],
+            rows: (0..<50_000).map { [.text("Category \($0 % 50)"), .double(Double($0))] })
+        let analyzer = AutoChartAnalyzer()
+        async let pending = analyzer.analyze(dataset)
+        // Trim only once the request has begun; a trim that lands first would
+        // be observed by the request and caching would be legitimate.
+        while await analyzer.cacheStatistics.inFlightRequests == 0 {
+            await Task.yield()
+        }
+        await analyzer.trim(to: .minimum)
+        let analysis = try await pending
+
+        let statistics = await analyzer.cacheStatistics
+        #expect(statistics.tables.entries == 0)
+        #expect(statistics.analyses.entries == 0)
+        #expect(statistics.preparedCharts.entries == 0)
+        // The caller still gets its analysis; only caching was suppressed.
+        #expect(analysis.primaryChart != nil)
+    }
+
+    /// `validation(for:)` shares the prepared-chart cache with `prepare(_:)`
+    /// instead of preparing the same marks a second time.
+    @Test func asyncValidationSharesPreparationWithPrepare() async throws {
+        let dataset = try AutoChartDataset<Int>(
+            columns: [v2Category, v2Measure],
+            rows: (0..<200).map { [.text("Category \($0 % 10)"), .double(Double($0))] })
+        let analyzer = AutoChartAnalyzer()
+        let analysis = try await analyzer.analyze(dataset)
+        let baseline = await analyzer.cacheStatistics.preparedCharts
+        let specification = AutoChartSpecification.bar(
+            category: v2Category.id,
+            measure: v2Measure.id,
+            aggregation: .sum)
+
+        let validation = try await analysis.validation(for: specification)
+        #expect(validation.isValid)
+        #expect(validation == analysis.validate(specification))
+        _ = try await analysis.prepare(specification)
+
+        let statistics = await analyzer.cacheStatistics.preparedCharts
+        #expect(statistics.misses == baseline.misses + 1)
+        #expect(statistics.hits > baseline.hits)
+    }
+
+    /// An invalid specification reports its issues rather than surfacing as a
+    /// thrown preparation error the caller has to unwrap.
+    @Test func asyncValidationReportsInvalidSpecificationsWithoutThrowing() async throws {
+        let dataset = try AutoChartDataset<Int>(
+            columns: [v2Category, v2Measure],
+            rows: [[.text("A"), .double(1)], [.text("B"), .double(2)]])
+        let analyzer = AutoChartAnalyzer()
+        let analysis = try await analyzer.analyze(dataset)
+        // A donut needs its measure on `y`; without one it cannot compose.
+        let invalid = AutoChartSpecification(
+            family: .donut,
+            encoding: .init(x: v2Category.id),
+            aggregation: .sum)
+
+        let entriesBefore = await analyzer.cacheStatistics.preparedCharts.entries
+        let validation = try await analysis.validation(for: invalid)
+        #expect(!validation.isValid)
+        #expect(validation.issues.contains { $0.severity == .error })
+        // Documented on `validation(for:)`: only a valid specification is left
+        // in the cache, so a rejected candidate cannot evict a wanted entry.
+        #expect(await analyzer.cacheStatistics.preparedCharts.entries == entriesBefore)
+    }
+
     @Test func malformedAutoChartValueRepresentationsAreRejected() {
         for malformed in [
             #"{"null":123}"#,

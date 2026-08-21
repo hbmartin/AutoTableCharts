@@ -267,62 +267,83 @@ private let date = AutoChartColumn(
                 timeZone: TimeZone.gmt))
         #expect(AutoChartValue.date(value).displayString == expectedDate)
 
-        let expectedAccessibleDate = value.formatted(
-            Date.FormatStyle(
-                date: .abbreviated,
-                time: .shortened,
-                timeZone: TimeZone.gmt))
-        let datum = AutoChartDatum(
-            id: "date",
-            sourceRowIDs: [0],
-            xDate: value,
-            yNumber: 2)
+        let accessibleDate = AutoChartFormatters(timeZone: .gmt).format(
+            column: nil,
+            value: .date(value),
+            context: .markAccessibility)
         let label = AutoChartAccessibility.markLabel(
-            for: datum,
-            family: .line,
-            xSemanticType: .temporal,
-            xCategoryName: "Unused")
-        #expect(label == "\(expectedAccessibleDate), 2")
+            name: accessibleDate,
+            valueDescription: "2")
+        #expect(label == "\(accessibleDate), 2")
         #expect(!label.contains("T00:00:00Z"))
     }
 
     @Test func accessibilityLabelsIncludeSeriesContext() {
-        let datum = AutoChartDatum(
-            id: "series",
-            sourceRowIDs: [0],
-            xLabel: "Office",
-            yNumber: 2,
-            series: "North")
         #expect(
             AutoChartAccessibility.markLabel(
-                for: datum,
-                family: .bar,
-                xSemanticType: .nominal,
-                xCategoryName: "Office",
-                seriesName: "North",
-                facetDescription: "Region: West") == "Office, North, Region: West, 2")
+                name: "Office",
+                series: "North",
+                facet: "Region: West",
+                valueDescription: "2") == "Office, North, Region: West, 2")
+        // Absent components drop out rather than leaving empty separators.
+        #expect(
+            AutoChartAccessibility.markLabel(
+                name: "Office",
+                series: nil,
+                facet: "",
+                valueDescription: "2") == "Office, 2")
     }
 
-    @Test func quantitativeAccessibilityDoesNotResolveAnUnusedCategoryLabel() {
-        var categoryLookupCount = 0
-        func categoryName() -> String {
-            categoryLookupCount += 1
-            return "Unused"
+    /// A resolver receives the label's pieces, not one pre-joined English
+    /// sentence, so a host can translate and reorder them.
+    @Test func markAccessibilityMessagesCarryTheirComponentsAsArguments() {
+        // The resolver closure is `@Sendable`; these bodies are synchronous
+        // and single-threaded, so a reference box is enough to observe it.
+        final class Recorder: @unchecked Sendable {
+            var message: AutoChartMessage?
         }
-        let datum = AutoChartDatum(
-            id: "number",
-            sourceRowIDs: [0],
-            xNumber: 10,
-            yNumber: 2)
+        let recorder = Recorder()
+        let resolver = AutoChartTextResolver { message in
+            recorder.message = message
+            return "resolved"
+        }
+        #expect(
+            AutoChartAccessibility.markLabel(
+                name: "Office",
+                series: "North",
+                facet: "Region: West",
+                valueDescription: "$12,000",
+                textResolver: resolver) == "resolved")
+        #expect(recorder.message?.code == .markAccessibility)
+        #expect(recorder.message?.category == .accessibility)
+        #expect(
+            recorder.message?.arguments == [
+                "name": .string("Office"),
+                "series": .string("North"),
+                "facet": .string("Region: West"),
+                "value": .string("$12,000"),
+            ])
+        #expect(recorder.message?.defaultText == "Office, North, Region: West, $12,000")
 
-        let label = AutoChartAccessibility.markLabel(
-            for: datum,
-            family: .scatter,
-            xSemanticType: .quantitative,
-            xCategoryName: categoryName())
+        #expect(
+            AutoChartAccessibility.heatmapLabel(
+                category: "Office",
+                secondaryCategory: "Boston",
+                valueDescription: "3",
+                textResolver: resolver) == "resolved")
+        #expect(
+            recorder.message?.arguments == [
+                "category": .string("Office"),
+                "secondaryCategory": .string("Boston"),
+                "value": .string("3"),
+            ])
+    }
 
-        #expect(label == "10, 2")
-        #expect(categoryLookupCount == 0)
+    @Test func quantitativeAccessibilityUsesTheNumericPosition() {
+        #expect(
+            AutoChartAccessibility.markLabel(
+                name: "10",
+                valueDescription: "2") == "10, 2")
     }
 
     @Test func heatmapAccessibilityIncludesBothCategoriesAndCount() {
@@ -333,9 +354,10 @@ private let date = AutoChartColumn(
 
         #expect(
             AutoChartAccessibility.heatmapLabel(
-                for: datum,
-                xCategoryName: "Office",
-                yCategoryName: "Boston") == "Office, Boston, 3")
+                category: "Office",
+                secondaryCategory: "Boston",
+                valueDescription: "3") == "Office, Boston, 3")
+        #expect(datum.sourceRowIDs == [0, 1, 2])
     }
 
     @Test func rangeAccessibilityDescribesDates() throws {
@@ -352,13 +374,12 @@ private let date = AutoChartColumn(
             startDate: start,
             endDate: end)
         let interval = "From \(start.formatted(style)) to \(end.formatted(style))"
-        #expect(datum.intervalAccessibilityDescription == interval)
+        #expect(datum.startDate == start)
+        #expect(datum.endDate == end)
         #expect(
-            datum.accessibilityLabel(
+            AutoChartAccessibility.markLabel(
                 name: "Lease",
-                series: nil,
-                valueDescription: datum.intervalAccessibilityDescription)
-                == "Lease, \(interval)")
+                valueDescription: interval) == "Lease, \(interval)")
     }
 }
 
@@ -522,7 +543,7 @@ private let date = AutoChartColumn(
         let profile = AutoChartProfiler.profiles(snapshot)[0]
 
         #expect(profile.semanticType == .temporal)
-        #expect(profile.temporalValues.count == 1)
+        #expect(profile.temporalValueCount == 1)
         #expect(profile.nonFiniteDateCount == 1)
     }
 
@@ -983,7 +1004,10 @@ private let date = AutoChartColumn(
         #expect(!result.chartRecommendations.contains { $0.specification.family == .bar })
     }
 
-    @Test func safeCountRollupsDoNotEnableComposition() {
+    /// Counting rows partitions a whole even when the measure's own values do
+    /// not, so a safe count is the one honest composition available to a
+    /// measure containing negatives.
+    @Test func rowLevelSafeCountsProduceCountAggregatedDonuts() {
         let count = AutoChartColumn(
             id: "count", name: "count",
             hints: AutoChartColumnHints(
@@ -1002,10 +1026,77 @@ private let date = AutoChartColumn(
             for: input,
             context: AutoChartContext(goal: .composition)
         ).chartRecommendations
-        #expect(!recommendations.contains { $0.specification.family == .donut })
         #expect(
             recommendations.first { $0.specification.family == .bar }?
                 .specification.aggregation == .count)
+        let donut = recommendations.first { $0.specification.family == .donut }
+        #expect(donut?.specification.aggregation == .count)
+        let data = donut.map {
+            AutoChartDataPreparation.data(
+                snapshot: AutoChartSnapshot(input),
+                specification: $0.specification)
+        }
+        #expect(
+            Dictionary(
+                uniqueKeysWithValues: data?.compactMap { datum in
+                    guard let label = datum.xLabel, let value = datum.yNumber else { return nil }
+                    return (label, value)
+                } ?? []) == ["A": 2, "B": 1])
+    }
+
+    /// A distinct count does not partition — per-category distinct counts
+    /// overlap — so it must not reach a composition family.
+    @Test func safeDistinctCountRollupsDoNotEnableComposition() {
+        let distinct = AutoChartColumn(
+            id: "distinct", name: "distinct",
+            hints: AutoChartColumnHints(
+                semanticType: .quantitative,
+                measureSemantics: .init(
+                    source: .rowLevel, rollup: .safe(.countDistinct))))
+        let input = table(
+            columns: [category, distinct],
+            rows: [
+                [.text("A"), .double(10)],
+                [.text("A"), .double(20)],
+                [.text("B"), .double(30)],
+            ])
+        let recommendations = AutoChartRecommendationEngine.recommendations(
+            for: input,
+            context: AutoChartContext(goal: .composition)
+        ).chartRecommendations
+        #expect(!recommendations.contains { $0.specification.family == .donut })
+        #expect(!recommendations.contains { $0.specification.family == .stackedBar })
+    }
+
+    /// A named safe operation cannot make an upstream summary summable: only
+    /// summation combines values additively, so the source must vouch for it.
+    @Test func safeSumRollupsCannotSumUpstreamMeans() {
+        let mean = AutoChartColumn(
+            id: "mean", name: "average_price",
+            hints: AutoChartColumnHints(
+                semanticType: .quantitative,
+                measureSemantics: .init(
+                    source: .aggregated(.mean), rollup: .safe(.sum))))
+        let input = table(
+            columns: [category, mean],
+            rows: [
+                [.text("A"), .double(10)],
+                [.text("A"), .double(20)],
+                [.text("B"), .double(30)],
+            ])
+        let validation = AutoChartRecommendationEngine.validate(
+            specification: AutoChartSpecification.bar(
+                category: category.id, measure: mean.id, aggregation: .sum),
+            snapshot: AutoChartSnapshot(input))
+        #expect(!validation.isValid)
+        #expect(
+            validation.issues.contains {
+                $0.severity == .error && $0.messageValue.code == .unsafeAggregation
+            })
+        #expect(
+            !AutoChartRecommendationEngine.recommendations(for: input)
+                .chartRecommendations
+                .contains { $0.specification.aggregation == .sum })
     }
 
     @Test func intervalEndHintsDoNotBecomeRangeStarts() {
@@ -2140,7 +2231,7 @@ private let date = AutoChartColumn(
             AutoChartProfiler.identity(.date(nonFinite), semanticType: .temporal) == .missing)
         #expect(AutoChartProfiler.identity(.date(nonFinite), semanticType: nil) == .missing)
         #expect(profiles[date.id]?.nonNullCount == 2)
-        #expect(profiles[date.id]?.temporalValues.count == 1)
+        #expect(profiles[date.id]?.temporalValueCount == 1)
         #expect(profiles[date.id]?.renderableValueCount == 1)
         #expect(profiles[nominalDate.id]?.renderableValueCount == 1)
 
@@ -3059,10 +3150,28 @@ private let date = AutoChartColumn(
             to: selectedDate.addingTimeInterval(60),
             in: matches)
         #expect(Set(nearest.map(\.id)) == ["first", "second"])
-        #expect(
-            AutoChartSelectionPreparation.valueDescription(
-                for: nearest,
-                aggregation: .none) == "2 marks · 2 source rows")
+        #expect(AutoChartSelectionPreparation.sourceRowOffsets(for: nearest) == [0, 1])
+
+        // Two marks share the position, so `.none` cannot report one measure
+        // value and the rendered summary falls back to the source-row count.
+        let specification = AutoChartSpecification(
+            family: .line,
+            encoding: .init(x: date.id, y: measure.id, series: category.id))
+        let semantics = AutoChartSelectionPreparation.semanticValues(
+            for: nearest,
+            specification: specification,
+            label: "Jan 1, 2026")
+        #expect(semantics.measure == nil)
+        let presentation = AutoChartSelection(
+            sourceRowIDs: Set(["r0", "r1"]),
+            dimensions: semantics.dimensions,
+            rangeDimensions: semantics.rangeDimensions,
+            measure: semantics.measure,
+            family: .line,
+            specificationID: specification.id,
+            markID: nearest.map(\.id).joined(separator: "|"))
+            .presentation(columns: [date, measure, category])
+        #expect(presentation.valueDescription == "2 source rows")
     }
 
     @Test func selectionHelpersPreserveBinRangesAndRejectAnglesPastTotal() throws {
@@ -3124,12 +3233,8 @@ private let date = AutoChartColumn(
         ]
         #expect(AutoChartSelectionPreparation.angleMatch(to: 0.5, in: sectors) == nil)
         #expect(AutoChartSelectionPreparation.angleMatch(to: 2, in: sectors)?.id == "selectable")
-        #expect(
-            AutoChartSelectionPreparation.selection(
-                for: [], label: "Missing", aggregation: .none) == nil)
-        #expect(
-            AutoChartSelectionPreparation.selection(
-                for: [sectors[0]], label: "Missing", aggregation: .none) == nil)
+        #expect(AutoChartSelectionPreparation.sourceRowOffsets(for: []) == nil)
+        #expect(AutoChartSelectionPreparation.sourceRowOffsets(for: [sectors[0]]) == nil)
     }
 
     @Test func selectionSummariesRespectNonadditiveAggregations() {
@@ -3138,17 +3243,47 @@ private let date = AutoChartColumn(
             AutoChartDatum(id: "second", sourceRowIDs: [1, 2], yNumber: 20),
         ]
         #expect(
-            AutoChartSelectionPreparation.valueDescription(
-                for: matches,
-                aggregation: .mean) == "16.667 · 3 source rows")
-        #expect(
-            AutoChartSelectionPreparation.valueDescription(
-                for: matches,
-                aggregation: .countDistinct) == "2 marks · 3 source rows")
-        #expect(
             AutoChartSelectionPreparation.aggregatedNumericValue(
                 for: matches,
                 aggregation: .mean) == 50.0 / 3.0)
+        // A mean weights by source rows and reaches the summary as one value;
+        // a distinct count over several marks has no combinable value, so the
+        // summary reports rows instead of inventing a number.
+        #expect(
+            AutoChartSelectionPreparation.semanticValues(
+                for: matches,
+                specification: AutoChartSpecification(
+                    family: .bar,
+                    encoding: .init(x: category.id, y: measure.id),
+                    aggregation: .mean),
+                label: "A"
+            ).measure
+                == AutoChartSelectedMeasure(
+                    columnID: measure.id,
+                    aggregation: .mean,
+                    value: .scalar(.double(50.0 / 3.0))))
+        let distinctSemantics = AutoChartSelectionPreparation.semanticValues(
+            for: matches,
+            specification: AutoChartSpecification(
+                family: .bar,
+                encoding: .init(x: category.id, y: measure.id),
+                aggregation: .countDistinct),
+            label: "A")
+        #expect(distinctSemantics.measure == nil)
+        #expect(
+            AutoChartSelection(
+                sourceRowIDs: Set(["r0", "r1", "r2"]),
+                dimensions: distinctSemantics.dimensions,
+                rangeDimensions: distinctSemantics.rangeDimensions,
+                measure: distinctSemantics.measure,
+                family: .bar,
+                specificationID: AutoChartSpecification(
+                    family: .bar,
+                    encoding: .init(x: category.id, y: measure.id),
+                    aggregation: .countDistinct).id,
+                markID: "first|second"
+            ).presentation(columns: [category, measure]).valueDescription
+                == "3 source rows")
         #expect(AutoChartSelectionPreparation.identicalValue(in: ["A", "A"]) == "A")
         #expect(AutoChartSelectionPreparation.identicalValue(in: ["A", "B"]) == nil)
 

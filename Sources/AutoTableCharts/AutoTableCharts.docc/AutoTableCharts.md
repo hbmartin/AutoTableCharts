@@ -46,6 +46,8 @@ analyzer is trimmed or cleared.
 
 ### Analysis and Preparation
 
+- <doc:PreparedAnalysisAndCaching>
+- <doc:OutcomesAndResolution>
 - ``AutoChartAnalyzer``
 - ``AutoChartAnalysis``
 - ``AutoChartRecommendationOutcome``
