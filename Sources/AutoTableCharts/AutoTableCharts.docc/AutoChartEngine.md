@@ -1,37 +1,46 @@
-# ``AutoChartEngine``
+# Prepared Analysis and Scoped Caching
 
-Generate and validate deterministic chart specifications.
+Own analysis and prepared-chart reuse at an explicit application scope.
 
 ## Overview
 
-The engine is a synchronous, offline namespace. It snapshots an
-``AutoChartTable``, profiles columns, enumerates compatible families, applies
-hard safety validation, ranks valid candidates with the current policy, and
-diversifies the bounded result. Equal inputs produce equal ordering.
+``AutoChartAnalyzer`` is an actor. A call to `analyze(_:context:options:)`
+validates and snapshots the input, profiles it, recommends candidates, validates
+the primary specification, and prepares the primary chart exactly once.
+Alternatives are prepared only through `AutoChartAnalysis.prepare(_:)`.
 
-Use recommendation output directly when possible. Use validation for a
-caller-authored ``AutoChartSpecification``; a valid result means the implemented
-hard checks passed, not that the specification is statistically optimal or
-domain-correct beyond the supplied metadata.
+The standard configuration retains up to eight table/profile nodes, sixteen
+analyses, sixteen prepared charts, and 64 MiB of shared storage. Use
+``AutoChartAnalyzerConfiguration/uncached`` for an isolated one-shot analyzer or
+configure limits for the owning application.
+
+```swift
+let analyzer = AutoChartAnalyzer(
+    configuration: AutoChartAnalyzerConfiguration(
+        tables: .init(maximumEntries: 8),
+        analyses: .init(maximumEntries: 64),
+        preparedCharts: .init(maximumEntries: 16),
+        maximumRetainedCost: 32 * 1_024 * 1_024))
+```
+
+``AutoChartDataKey`` enables reuse without a content scan. Keep `identity`
+stable for one logical table and change `revision` for any value, row ID, schema,
+hint, or metadata change. Without a key, the analyzer fingerprints and compares
+the snapshot.
+
+Identical in-flight analyses are coalesced. Cancellation is checked between
+pipeline stages and bounded row chunks; shared work is cancelled only when its
+last waiter leaves. `trim(to: .minimum)` evicts completed reusable entries while
+preserving work in flight. ``AutoChartAnalyzer/removeAll()`` also cancels work in
+flight and resets retained state.
+
+Inspect ``AutoChartAnalyzer/cacheStatistics`` for per-layer entries, cost, hits,
+misses, evictions, and the number of in-flight requests.
 
 ## Topics
 
-### Generate Recommendations
-
-- ``recommendations(for:context:options:)``
-- ``AutoChartContext``
-- ``AutoChartOptions``
-- ``AutoChartRecommendationSet``
-
-### Validate Specifications
-
-- ``validate(specification:for:)``
-- ``AutoChartSpecification``
-- ``AutoChartValidationResult``
-
-### Understand the Policy
-
+- ``AutoChartAnalyzerConfiguration``
+- ``AutoChartCacheTrimTarget``
+- ``AutoChartCacheStatistics``
+- ``AutoChartDataKey``
 - <doc:RecommendationPipeline>
-- <doc:SafetySemanticsAndCompleteness>
-- <doc:ResearchFoundations>
-

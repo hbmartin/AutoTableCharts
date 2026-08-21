@@ -1,133 +1,112 @@
 # Getting Started
 
-Adapt a typed table, request recommendations, and render the best safe chart.
+Build a typed dataset, retain an async analysis, and render its eager primary chart.
 
 ## Overview
 
-### Add the package
+### Build immutable input
 
-AutoTableCharts requires Swift 6.2. Native Swift Charts rendering supports iOS
-17, macOS 14, tvOS 17, and watchOS 10 or later. The Foundation-only typed models,
-recommendation, and validation APIs also build on Linux. Until
-the package has a versioned release, add the repository's `main` branch in Xcode
-or Swift Package Manager:
+``AutoChartDataset`` is the shortest path from query-style rows to the package.
+This initializer uses source offsets as `Int` row IDs:
 
 ```swift
-dependencies: [
-    .package(
-        url: "https://github.com/hbmartin/AutoTableCharts.git",
-        branch: "main"
-    )
-]
-```
-
-Add `AutoTableCharts` to the target that presents charts, then import the module
-alongside SwiftUI.
-
-### Describe rows
-
-Your existing row type can conform without copying or changing its storage.
-Expose a stable ID and translate values into ``AutoChartValue``.
-
-```swift
-import AutoTableCharts
-import Foundation
-
-struct HoldingRow: AutoChartRow {
-    let id: String
-    let propertyType: String
-    let marketValue: Double
-
-    var chartRowID: AutoChartRowID { AutoChartRowID(rawValue: id) }
-
-    func chartValue(for columnID: AutoChartColumnID) -> AutoChartValue {
-        switch columnID {
-        case "propertyType": .text(propertyType)
-        case "marketValue": .double(marketValue)
-        default: .null
-        }
-    }
-}
-```
-
-### Describe the table
-
-Column hints carry meaning that can't always be recovered from values alone.
-The market value below is explicitly quantitative, denominated in USD, and
-already summed at the result grain, so summing it across unique categories is
-safe.
-
-```swift
-struct HoldingsTable: AutoChartTable {
-    let chartRows: [HoldingRow]
-
-    let chartColumns: [AutoChartColumn] = [
+let dataset = try AutoChartDataset<Int>(
+    columns: [
         AutoChartColumn(
-            id: "propertyType",
-            name: "Property Type",
-            hints: AutoChartColumnHints(
-                semanticType: .nominal,
-                role: .dimension
-            )
-        ),
+            id: "propertyType", name: "Property Type",
+            hints: .init(semanticType: .nominal, role: .dimension)),
         AutoChartColumn(
-            id: "marketValue",
-            name: "Current Market Value",
-            hints: AutoChartColumnHints(
+            id: "marketValue", name: "Market Value",
+            hints: .init(
                 semanticType: .quantitative,
                 role: .measure,
                 unit: .currency(code: "USD"),
-                aggregation: .sum,
-                aggregationSafety: .alreadyAggregated
-            )
-        ),
-    ]
-
-    let chartMetadata = AutoChartTableMetadata(
-        grain: "property type",
-        provenance: "portfolio summary"
-    )
-}
+                measureSemantics: .init(
+                    source: .aggregated(.sum),
+                    rollup: .additive,
+                    preferredTransform: .sum))),
+    ],
+    rows: [
+        [.text("Office"), .double(18_000_000)],
+        [.text("Industrial"), .double(14_500_000)],
+    ],
+    metadata: .init(grain: "property type"),
+    key: .init(identity: "portfolio-summary", revision: "2026-08-20"))
 ```
 
-### Recommend and render
+Use the explicit-row-ID initializer for UUIDs, database keys, or other domain
+identities. Dataset initialization throws ``AutoChartDatasetError`` rather than
+silently fixing malformed matrices or duplicate IDs.
 
-Generate recommendations once for the table and analytical goal. The result is
-deterministic for equal inputs.
+### Analyze once
+
+Keep one analyzer at the application or feature scope that should share reuse.
+Store the result in async state:
 
 ```swift
-import SwiftUI
+@MainActor
+final class ChartState: ObservableObject {
+    let analyzer: AutoChartAnalyzer
+    @Published var analysis: AutoChartAnalysis<Int>?
+    @Published var error: Error?
 
-struct HoldingsChart: View {
-    let table: HoldingsTable
-    @State private var selection: AutoChartSelection?
-
-    private var recommendation: AutoChartRecommendation? {
-        AutoChartEngine.recommendations(
-            for: table,
-            context: AutoChartContext(
-                goal: .comparison,
-                title: "Current Market Value by Property Type"
-            )
-        ).chartRecommendations.first
+    init(analyzer: AutoChartAnalyzer) {
+        self.analyzer = analyzer
     }
 
-    var body: some View {
-        if let recommendation {
-            AutoChartView(
-                table: table,
-                recommendation: recommendation,
-                selection: $selection,
-                interaction: .explore
-            )
-        } else {
-            Text("No safe chart is available.")
+    func load(_ dataset: AutoChartDataset<Int>) async {
+        do {
+            analysis = try await analyzer.analyze(
+                dataset,
+                context: .init(goal: .comparison),
+                options: .init(includesDecisionTrace: true))
+        } catch {
+            self.error = error
         }
     }
 }
 ```
 
-The selection contains every source-row ID represented by the selected mark,
-including grouped values and histogram bins. See <doc:RenderingAndInteraction>
-for linked-selection behavior and <doc:SafetySemanticsAndCompleteness> for the
-metadata that controls conservative fallbacks.
+Analysis includes summarized public column profiles, typed diagnostics, an
+optional full decision trace, a typed outcome, and the eagerly prepared primary.
+
+### Render the primary or a fallback
+
+```swift
+if let analysis = state.analysis {
+    AutoChartView(
+        analysis: analysis,
+        selection: $selection,
+        presentation: .preview(plotHeight: 156))
+} else {
+    ExistingTableView()
+}
+```
+
+`AutoChartView(analysis:)` presents the primary or the package fallback. Many
+applications instead switch on `analysis.outcome` and keep their existing table
+UI for `.tableFallback`.
+
+### Prepare an alternative
+
+```swift
+.task(id: selectedRecommendationID) {
+    guard let id = selectedRecommendationID else { return }
+    selection = nil
+    preparedChart = try? await analysis.prepare(id)
+}
+```
+
+The task should be cancellable and keyed by recommendation ID. Render the
+returned immutable chart synchronously with `AutoChartView(preparedChart:)`.
+
+See <doc:SafetySemanticsAndCompleteness> for measure contracts and
+<doc:RenderingAndInteraction> for formatting and semantic selection.
+
+### Migrate from v1
+
+Version 2 removes the synchronous engine, global render cache, string row ID,
+table-based rendering initializers, table pseudo-family, aggregation-safety
+enum, and combined interaction preset. Adopt ``AutoChartAnalyzer``, a typed
+`RowID`, ``AutoChartMeasureSemantics``, prepared-only rendering, typed outcomes,
+and ``AutoChartPresentation``. There are no compatibility wrappers.

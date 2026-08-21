@@ -9,34 +9,95 @@ private func dateBits(_ date: Date) -> UInt64 {
     return (interval == 0 ? 0.0 : interval).bitPattern
 }
 
-struct AutoChartSnapshot: Sendable {
-    struct Row: Sendable {
-        let id: AutoChartRowID
-        let values: [AutoChartColumnID: AutoChartValue]
+struct AutoChartErasedRowID: @unchecked Sendable, Hashable, CustomStringConvertible {
+    private let value: AnyHashable
+
+    init<RowID: Hashable & Sendable>(_ value: RowID) {
+        self.value = AnyHashable(value)
     }
 
-    let columns: [AutoChartColumn]
+    var description: String { String(describing: value.base) }
+}
+
+struct AutoChartSnapshot: Sendable {
+    struct RowValues: Sendable {
+        let storage: AutoChartMatrixStorage
+        let rowIndex: Int
+
+        subscript(columnID: AutoChartColumnID) -> AutoChartValue? {
+            storage.value(row: rowIndex, columnID: columnID)
+        }
+    }
+
+    struct Row: Sendable {
+        /// Internal source offset. Public typed IDs are retained by `AutoChartAnalysis`.
+        let id: Int
+        let values: RowValues
+    }
+
+    let storage: AutoChartMatrixStorage
+    let rowIdentities: [AutoChartErasedRowID]
     let rows: [Row]
-    let metadata: AutoChartTableMetadata
     let validationIdentity: UUID
 
+    var columns: [AutoChartColumn] { storage.columns }
+    var metadata: AutoChartTableMetadata { storage.metadata }
+
     init<Table: AutoChartTable>(_ table: Table) {
+        do {
+            try self.init(validating: table)
+        } catch {
+            preconditionFailure("Invalid chart table: \(error)")
+        }
+    }
+
+    init<Table: AutoChartTable>(validating table: Table) throws {
         validationIdentity = UUID()
         var seenColumnIDs: Set<AutoChartColumnID> = []
-        let columns = table.chartColumns.filter { column in
-            seenColumnIDs.insert(column.id).inserted
+        for column in table.chartColumns where !seenColumnIDs.insert(column.id).inserted {
+            throw AutoChartDatasetError(
+                code: .duplicateColumnID,
+                identifier: column.id.rawValue)
         }
-        self.columns = columns
-        metadata = table.chartMetadata
-        rows = table.chartRows.map { row in
-            let values = Dictionary(
-                uniqueKeysWithValues: columns.map { column in
-                    let value = row.chartValue(for: column.id)
-                    return (column.id, value)
-                })
-            return Row(
-                id: row.chartRowID,
-                values: values)
+
+        if let dataset = table as? any AutoChartDatasetStorageProviding {
+            storage = dataset._autoChartMatrixStorage
+            rowIdentities = dataset._autoChartErasedRowIDs
+        } else {
+            let chartRows = Array(table.chartRows)
+            var seenRows: Set<Table.RowID> = []
+            for (index, row) in chartRows.enumerated() {
+                if index.isMultiple(of: 256) { try Task.checkCancellation() }
+                guard seenRows.insert(row.chartRowID).inserted else {
+                    throw AutoChartDatasetError(
+                        code: .duplicateRowID,
+                        identifier: String(describing: row.chartRowID))
+                }
+            }
+            var flat: [AutoChartValue] = []
+            flat.reserveCapacity(chartRows.count * table.chartColumns.count)
+            for (index, row) in chartRows.enumerated() {
+                if index.isMultiple(of: 256) { try Task.checkCancellation() }
+                for column in table.chartColumns {
+                    flat.append(row.chartValue(for: column.id))
+                }
+            }
+            storage = AutoChartMatrixStorage(
+                columns: table.chartColumns,
+                values: flat,
+                rowCount: chartRows.count,
+                metadata: table.chartMetadata)
+            rowIdentities = chartRows.map { AutoChartErasedRowID($0.chartRowID) }
+        }
+        guard rowIdentities.count == storage.rowCount else {
+            throw AutoChartDatasetError(
+                code: .rowIDCountMismatch,
+                expectedCount: storage.rowCount,
+                actualCount: rowIdentities.count)
+        }
+        let matrixStorage = storage
+        rows = (0..<matrixStorage.rowCount).map {
+            Row(id: $0, values: RowValues(storage: matrixStorage, rowIndex: $0))
         }
     }
 
@@ -46,7 +107,24 @@ struct AutoChartSnapshot: Sendable {
         hasher.combine(metadata)
         hasher.combine(rows.count)
         for row in rows {
-            hasher.combine(row.id)
+            hasher.combine(rowIdentities[row.id])
+            for column in columns {
+                Self.combineContent(
+                    row.values[column.id] ?? .null,
+                    into: &hasher)
+            }
+        }
+        return hasher.finalize()
+    }
+
+    func contentFingerprintCheckingCancellation() throws -> Int {
+        var hasher = Hasher()
+        hasher.combine(columns)
+        hasher.combine(metadata)
+        hasher.combine(rows.count)
+        for (index, row) in rows.enumerated() {
+            if index.isMultiple(of: 256) { try Task.checkCancellation() }
+            hasher.combine(rowIdentities[row.id])
             for column in columns {
                 Self.combineContent(
                     row.values[column.id] ?? .null,
@@ -68,11 +146,9 @@ struct AutoChartSnapshot: Sendable {
         }
         for row in rows {
             Self.addStorageCost(128, to: &storageCost)
-            Self.addStorageCost(row.id.rawValue.utf8.count, to: &storageCost)
-            // Rows always carry exactly one value per column and the total is
-            // order independent, so iterate storage directly rather than
-            // looking every cell up by column.
-            for value in row.values.values {
+            Self.addStorageCost(rowIdentities[row.id].description.utf8.count, to: &storageCost)
+            for column in columns {
+                let value = row.values[column.id] ?? .null
                 Self.addStorageCost(96, to: &storageCost)
                 Self.addStorageCost(Self.payloadCost(value), to: &storageCost)
             }
@@ -88,6 +164,7 @@ struct AutoChartSnapshot: Sendable {
     func hasSameContent(as other: AutoChartSnapshot) -> Bool {
         guard columns == other.columns,
             metadata == other.metadata,
+            rowIdentities == other.rowIdentities,
             rows.count == other.rows.count
         else { return false }
         return zip(rows, other.rows).allSatisfy { left, right in
@@ -98,6 +175,26 @@ struct AutoChartSnapshot: Sendable {
                     right.values[column.id] ?? .null)
             }
         }
+    }
+
+    func hasSameContentCheckingCancellation(as other: AutoChartSnapshot) throws -> Bool {
+        guard columns == other.columns,
+            metadata == other.metadata,
+            rowIdentities == other.rowIdentities,
+            rows.count == other.rows.count
+        else { return false }
+        for (index, pair) in zip(rows, other.rows).enumerated() {
+            if index.isMultiple(of: 256) { try Task.checkCancellation() }
+            let (left, right) = pair
+            guard left.id == right.id else { return false }
+            for column in columns where !Self.valuesMatch(
+                left.values[column.id] ?? .null,
+                right.values[column.id] ?? .null)
+            {
+                return false
+            }
+        }
+        return true
     }
 
     private static func valuesMatch(_ left: AutoChartValue, _ right: AutoChartValue) -> Bool {
@@ -165,39 +262,39 @@ struct AutoChartSnapshot: Sendable {
     }
 }
 
-struct AutoChartColumnProfile: Sendable {
-    var column: AutoChartColumn
-    var semanticType: AutoChartSemanticType
-    var nonNullCount: Int
-    var numericTypeCount: Int
-    var numericValueCount: Int
-    var renderableValueCount: Int
+public struct AutoChartColumnProfile: Sendable {
+    public var column: AutoChartColumn
+    public var semanticType: AutoChartSemanticType
+    public var nonNullCount: Int
+    public var numericTypeCount: Int
+    public var numericValueCount: Int
+    public var renderableValueCount: Int
     /// Unique values after applying the column's inferred semantic identity.
-    var renderableDistinctCount: Int
+    public var renderableDistinctCount: Int
     /// Unique raw typed values used while inferring the column's semantic type.
-    var distinctCount: Int
-    var numericMinimum: Double?
-    var numericMaximum: Double?
+    public var distinctCount: Int
+    public var numericMinimum: Double?
+    public var numericMaximum: Double?
     /// Whether every value is a positive number, counting a missing or non-finite
     /// value as disqualifying. Recommendation uses this to avoid proposing a
     /// composition that could only ever render part of a whole.
-    var allNumericValuesPositive: Bool
-    var averageTextLength: Double
+    public var allNumericValuesPositive: Bool
+    public var averageTextLength: Double
     var temporalValues: [Date]
-    var temporalMinimum: Date?
-    var temporalMaximum: Date?
+    public var temporalMinimum: Date?
+    public var temporalMaximum: Date?
     /// Typed dates whose interval cannot be positioned on a finite chart axis.
-    var nonFiniteDateCount: Int
+    public var nonFiniteDateCount: Int
 
-    var isQuantitative: Bool { semanticType == .quantitative }
-    var isTemporal: Bool { semanticType == .temporal }
-    var hasNonFiniteNumericValues: Bool { numericValueCount != numericTypeCount }
-    var hasNonFiniteDateValues: Bool { nonFiniteDateCount > 0 }
-    var hasFiniteNumericSpan: Bool {
+    public var isQuantitative: Bool { semanticType == .quantitative }
+    public var isTemporal: Bool { semanticType == .temporal }
+    public var hasNonFiniteNumericValues: Bool { numericValueCount != numericTypeCount }
+    public var hasNonFiniteDateValues: Bool { nonFiniteDateCount > 0 }
+    public var hasFiniteNumericSpan: Bool {
         guard let numericMinimum, let numericMaximum else { return true }
         return (numericMaximum - numericMinimum).isFinite
     }
-    var hasFiniteTemporalSpan: Bool {
+    public var hasFiniteTemporalSpan: Bool {
         guard let temporalMinimum, let temporalMaximum else {
             return true
         }
@@ -206,8 +303,8 @@ struct AutoChartColumnProfile: Sendable {
     /// Whether every renderable value is distinct, so marks keyed by this column
     /// alone can't collide. Recommendation and validation share this rule so they
     /// can't disagree about whether an aggregation is required.
-    var isUniqueAtRowGrain: Bool { renderableDistinctCount == renderableValueCount }
-    var isCategorical: Bool {
+    public var isUniqueAtRowGrain: Bool { renderableDistinctCount == renderableValueCount }
+    public var isCategorical: Bool {
         semanticType == .nominal || semanticType == .ordinal
             || semanticType == .boolean
     }
@@ -236,11 +333,42 @@ enum AutoChartProfiler {
         profileIndex(profiles(snapshot))
     }
 
+    static func profileIndexCheckingCancellation(
+        _ snapshot: AutoChartSnapshot
+    ) throws -> [AutoChartColumnID: AutoChartColumnProfile] {
+        var profiles: [AutoChartColumnProfile] = []
+        profiles.reserveCapacity(snapshot.columns.count)
+        for column in snapshot.columns {
+            try Task.checkCancellation()
+            profiles.append(
+                try profile(column, rows: snapshot.rows, checkingCancellation: true))
+        }
+        return profileIndex(profiles)
+    }
+
     static func profile(
         _ column: AutoChartColumn,
         rows: [AutoChartSnapshot.Row]
     ) -> AutoChartColumnProfile {
-        let values = rows.map { $0.values[column.id] ?? .null }
+        // The nonthrowing entry point is retained for synchronous validation
+        // helpers and tests. Analyzer work uses the cancellable variant below.
+        try! profile(column, rows: rows, checkingCancellation: false)
+    }
+
+    private static func profile(
+        _ column: AutoChartColumn,
+        rows: [AutoChartSnapshot.Row],
+        checkingCancellation: Bool
+    ) throws -> AutoChartColumnProfile {
+        var values: [AutoChartValue] = []
+        values.reserveCapacity(rows.count)
+        for (index, row) in rows.enumerated() {
+            if checkingCancellation, index.isMultiple(of: 256) {
+                try Task.checkCancellation()
+            }
+            values.append(row.values[column.id] ?? .null)
+        }
+        if checkingCancellation { try Task.checkCancellation() }
         let nonNull = values.filter {
             if case .null = $0 { return false }
             return true
@@ -274,7 +402,11 @@ enum AutoChartProfiler {
             if case .text(let text) = value { return text.count }
             return nil
         }
-        let raw = identitySummary(values, semanticType: nil)
+        if checkingCancellation { try Task.checkCancellation() }
+        let raw = try identitySummary(
+            values,
+            semanticType: nil,
+            checkingCancellation: checkingCancellation)
         let type = inferredSemanticType(
             column: column,
             values: nonNull,
@@ -283,7 +415,12 @@ enum AutoChartProfiler {
             temporalTypeCount: dates.count + nonFiniteDateCount,
             distinctCount: raw.distinct.count)
         let renderable =
-            resolvesToRawIdentity(type) ? raw : identitySummary(values, semanticType: type)
+            resolvesToRawIdentity(type)
+            ? raw
+            : try identitySummary(
+                values,
+                semanticType: type,
+                checkingCancellation: checkingCancellation)
         return AutoChartColumnProfile(
             column: column,
             semanticType: type,
@@ -314,10 +451,14 @@ enum AutoChartProfiler {
 
     private static func identitySummary(
         _ values: [AutoChartValue],
-        semanticType: AutoChartSemanticType?
-    ) -> IdentitySummary {
+        semanticType: AutoChartSemanticType?,
+        checkingCancellation: Bool
+    ) throws -> IdentitySummary {
         var summary = IdentitySummary()
-        for value in values {
+        for (index, value) in values.enumerated() {
+            if checkingCancellation, index.isMultiple(of: 256) {
+                try Task.checkCancellation()
+            }
             let identity = identity(value, semanticType: semanticType)
             guard identity != .missing else { continue }
             summary.valueCount += 1

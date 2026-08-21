@@ -7,37 +7,20 @@ import Testing
 import Charts
 import SwiftUI
 
-@MainActor
-// Reads the private stored `data` property of `AutoChartView` by reflection.
-// Update this helper if that storage changes. A nil result means reflection failed,
-// while an empty array means the view successfully prepared no marks.
-private func preparedData(in view: AutoChartView) -> [AutoChartDatum]? {
-    Mirror(reflecting: view).children.first { $0.label == "data" }?.value
-        as? [AutoChartDatum]
-}
-
-@MainActor
-private func reflectedStoredValue<Value>(
-    named name: String,
-    in view: AutoChartView
-) -> Value? {
-    Mirror(reflecting: view).children.first { $0.label == name }?.value as? Value
-}
-
-@MainActor
-private func reflectedOptionalStoredValue<Value>(
-    named name: String,
-    in view: AutoChartView
-) -> Value? {
-    guard
-        let stored = Mirror(reflecting: view).children.first(where: { $0.label == name })?.value
-    else { return nil }
-    return Mirror(reflecting: stored).children.first?.value as? Value
+private func preparedCore<Table: AutoChartTable>(
+    for table: Table,
+    recommendation: AutoChartRecommendation
+) -> AutoChartRenderCore {
+    let snapshot = AutoChartSnapshot(table)
+    return AutoChartRenderCore.prepare(
+        snapshot: snapshot,
+        profiles: AutoChartProfiler.profileIndex(snapshot),
+        recommendation: recommendation)
 }
 #endif
 
 private struct TestRow: AutoChartRow {
-    var chartRowID: AutoChartRowID
+    var chartRowID: String
     var values: [AutoChartColumnID: AutoChartValue]
 
     func chartValue(for columnID: AutoChartColumnID) -> AutoChartValue {
@@ -75,7 +58,7 @@ private final class ChartValueReadCounter: @unchecked Sendable {
 }
 
 private struct CountingRow: AutoChartRow {
-    var chartRowID: AutoChartRowID
+    var chartRowID: String
     var values: [AutoChartColumnID: AutoChartValue]
     var counter = ChartValueReadCounter()
 
@@ -91,6 +74,12 @@ private struct VersionedCountingTable: AutoChartTable {
     var chartMetadata = AutoChartTableMetadata()
     var chartDataIdentity: String?
     var chartDataVersion: String?
+
+    var chartDataKey: AutoChartDataKey? {
+        chartDataIdentity.map {
+            AutoChartDataKey(identity: $0, revision: chartDataVersion ?? "")
+        }
+    }
 }
 
 private func table(
@@ -105,7 +94,7 @@ private func table(
         chartColumns: columns,
         chartRows: rows.enumerated().map { index, values in
             TestRow(
-                chartRowID: AutoChartRowID(rawValue: "r\(index)"),
+                chartRowID: "r\(index)",
                 values: Dictionary(
                     uniqueKeysWithValues: zip(columns, values).map { ($0.id, $1) }))
         },
@@ -121,8 +110,7 @@ private let measure = AutoChartColumn(
         semanticType: .quantitative,
         role: .measure,
         unit: .currency(code: "USD"),
-        aggregation: .sum,
-        aggregationSafety: .alreadyAggregated))
+        measureSemantics: .init(source: .aggregated(.sum), rollup: .additive)))
 private let date = AutoChartColumn(
     id: "date", name: "valuation_date",
     hints: AutoChartColumnHints(semanticType: .temporal, role: .dimension))
@@ -284,7 +272,7 @@ private let date = AutoChartColumn(
                 timeZone: TimeZone.gmt))
         let datum = AutoChartDatum(
             id: "date",
-            sourceRowIDs: ["r0"],
+            sourceRowIDs: [0],
             xDate: value,
             yNumber: 2)
         let label = AutoChartAccessibility.markLabel(
@@ -299,7 +287,7 @@ private let date = AutoChartColumn(
     @Test func accessibilityLabelsIncludeSeriesContext() {
         let datum = AutoChartDatum(
             id: "series",
-            sourceRowIDs: ["r0"],
+            sourceRowIDs: [0],
             xLabel: "Office",
             yNumber: 2,
             series: "North")
@@ -321,7 +309,7 @@ private let date = AutoChartColumn(
         }
         let datum = AutoChartDatum(
             id: "number",
-            sourceRowIDs: ["r0"],
+            sourceRowIDs: [0],
             xNumber: 10,
             yNumber: 2)
 
@@ -338,7 +326,7 @@ private let date = AutoChartColumn(
     @Test func heatmapAccessibilityIncludesBothCategoriesAndCount() {
         let datum = AutoChartDatum(
             id: "heatmap",
-            sourceRowIDs: ["r0", "r1", "r2"],
+            sourceRowIDs: [0, 1, 2],
             yNumber: 3)
 
         #expect(
@@ -357,7 +345,7 @@ private let date = AutoChartColumn(
             timeZone: TimeZone.gmt)
         let datum = AutoChartDatum(
             id: "range",
-            sourceRowIDs: ["r0"],
+            sourceRowIDs: [0],
             xLabel: "Lease",
             startDate: start,
             endDate: end)
@@ -382,698 +370,122 @@ private let date = AutoChartColumn(
 // and the counts it asserts. Keep it that way: making one of these bodies
 // `async`, or awaiting anything mid-body, reopens that window and the exact
 // counts below start to flake.
-@Suite(.serialized) struct RenderCacheTests {
+@Suite struct AnalyzerCacheTests {
     @Test func configurationClampsNegativeLimits() {
-        let configuration = AutoChartRenderCacheConfiguration(
-            maximumTableEntries: -1,
-            maximumTableCost: -1,
-            maximumRenderEntries: -1,
-            maximumRenderCost: -1)
+        let configuration = AutoChartAnalyzerConfiguration(
+            tables: .init(maximumEntries: -1),
+            analyses: .init(maximumEntries: -1),
+            preparedCharts: .init(maximumEntries: -1),
+            maximumRetainedCost: -1)
 
-        #expect(configuration.maximumTableEntries == 0)
-        #expect(configuration.maximumTableCost == 0)
-        #expect(configuration.maximumRenderEntries == 0)
-        #expect(configuration.maximumRenderCost == 0)
+        #expect(configuration.tables.maximumEntries == 0)
+        #expect(configuration.analyses.maximumEntries == 0)
+        #expect(configuration.preparedCharts.maximumEntries == 0)
+        #expect(configuration.maximumRetainedCost == 0)
     }
 
-    #if canImport(Charts) && canImport(SwiftUI)
-    @Test @MainActor func oversizedTableCacheKeysCountAgainstTheByteBudget() {
-        let originalConfiguration = AutoChartRenderCache.configuration
-        defer {
-            AutoChartRenderCache.configure(originalConfiguration)
-            AutoChartRenderCache.removeAll()
-        }
-        AutoChartRenderCache.configure(
-            AutoChartRenderCacheConfiguration(
-                maximumTableEntries: 8,
-                maximumTableCost: 4_096,
-                maximumRenderEntries: 0,
-                maximumRenderCost: 0))
-        AutoChartRenderCache.removeAll()
-
+    @Test func keyedAnalysisScansCellsOnceAndReusesEveryLayer() async throws {
         let counter = ChartValueReadCounter()
-        let oversizedKey = String(repeating: "identity", count: 1_024)
-        let input = VersionedCountingTable(
-            chartColumns: [category, measure],
-            chartRows: [
-                CountingRow(
-                    chartRowID: "r0",
-                    values: [category.id: .text("A"), measure.id: .double(1)],
-                    counter: counter)
-            ],
-            chartDataIdentity: oversizedKey,
-            chartDataVersion: oversizedKey)
-        let recommendation = AutoChartRecommendation(
-            specification: AutoChartSpecification(
-                family: .bar,
-                encoding: .init(x: category.id, y: measure.id)),
-            score: 0,
-            rationale: ["Oversized table-key test"])
-
-        _ = AutoChartView(table: input, recommendation: recommendation)
-
-        #expect(AutoChartRenderCache.retainedTableCount == 0)
-        #expect(AutoChartRenderCache.retainedRenderCount == 0)
-    }
-
-    @Test @MainActor func specificationEncodingIDsCountAgainstTheRenderBudget() {
-        let originalConfiguration = AutoChartRenderCache.configuration
-        defer {
-            AutoChartRenderCache.configure(originalConfiguration)
-            AutoChartRenderCache.removeAll()
-        }
-        AutoChartRenderCache.configure(
-            AutoChartRenderCacheConfiguration(
-                maximumTableEntries: 8,
-                maximumTableCost: 1_024 * 1_024,
-                maximumRenderEntries: 8,
-                maximumRenderCost: 4_096))
-        AutoChartRenderCache.removeAll()
-
-        let oversizedID = AutoChartColumnID(
-            rawValue: String(repeating: "encoding", count: 1_024))
-        let oversizedCategory = AutoChartColumn(
-            id: oversizedID,
-            name: "oversized_category",
-            hints: AutoChartColumnHints(semanticType: .nominal, role: .dimension))
-        let input = table(
-            columns: [oversizedCategory, measure],
-            rows: [[.text("A"), .double(1)]])
-        let recommendation = AutoChartRecommendation(
-            specification: AutoChartSpecification(
-                family: .bar,
-                encoding: .init(x: oversizedID, y: measure.id)),
-            score: 0,
-            rationale: ["Oversized render-key test"])
-
-        _ = AutoChartView(table: input, recommendation: recommendation)
-
-        #expect(AutoChartRenderCache.retainedTableCount == 1)
-        #expect(AutoChartRenderCache.retainedRenderCount == 0)
-    }
-
-    @Test @MainActor func presentationTitlesCountAgainstTheRenderBudget() {
-        let originalConfiguration = AutoChartRenderCache.configuration
-        defer {
-            AutoChartRenderCache.configure(originalConfiguration)
-            AutoChartRenderCache.removeAll()
-        }
-        AutoChartRenderCache.configure(
-            AutoChartRenderCacheConfiguration(
-                maximumTableEntries: 8,
-                maximumTableCost: 1_024 * 1_024,
-                maximumRenderEntries: 8,
-                maximumRenderCost: 4_096))
-        AutoChartRenderCache.removeAll()
-
-        let oversizedDisplayName = String(repeating: "Presentation title", count: 512)
-        let titledCategory = AutoChartColumn(
-            id: "category", name: "category", displayName: oversizedDisplayName,
-            hints: AutoChartColumnHints(semanticType: .nominal, role: .dimension))
-        let input = table(
-            columns: [titledCategory, measure],
-            rows: [[.text("A"), .double(1)]])
-        let recommendation = AutoChartRecommendation(
-            specification: AutoChartSpecification(
-                family: .bar,
-                encoding: .init(x: titledCategory.id, y: measure.id)),
-            score: 0,
-            rationale: ["Oversized presentation-title test"])
-
-        _ = AutoChartView(table: input, recommendation: recommendation)
-
-        #expect(AutoChartRenderCache.retainedTableCount == 1)
-        #expect(AutoChartRenderCache.retainedRenderCount == 0)
-    }
-
-    @Test @MainActor func versionedTablesReusePreparedRenderingData() throws {
-        let counter = ChartValueReadCounter()
-        let input = VersionedCountingTable(
-            chartColumns: [category, measure],
-            chartRows: [
-                CountingRow(
-                    chartRowID: "r0",
-                    values: [category.id: .text("A"), measure.id: .double(1)],
-                    counter: counter)
-            ],
-            chartDataIdentity: UUID().uuidString,
-            chartDataVersion: UUID().uuidString)
-        let recommendation = try #require(
-            AutoChartEngine.recommendations(for: input).chartRecommendations.first)
-
-        counter.reset()
-        _ = AutoChartView(table: input, recommendation: recommendation)
-        #expect(counter.count > 0)
-
-        counter.reset()
-        _ = AutoChartView(table: input, recommendation: recommendation)
-        #expect(counter.count == 0)
-    }
-
-    @Test @MainActor func renderCachingWorksWhenTableCachingIsDisabled() {
-        let originalConfiguration = AutoChartRenderCache.configuration
-        defer {
-            AutoChartRenderCache.configure(originalConfiguration)
-            AutoChartRenderCache.removeAll()
-        }
-        AutoChartRenderCache.configure(
-            AutoChartRenderCacheConfiguration(
-                maximumTableEntries: 0,
-                maximumTableCost: 0,
-                maximumRenderEntries: 8,
-                maximumRenderCost: 1_024 * 1_024))
-        AutoChartRenderCache.removeAll()
-
-        let counter = ChartValueReadCounter()
-        let input = VersionedCountingTable(
-            chartColumns: [category, measure],
-            chartRows: [
-                CountingRow(
-                    chartRowID: "r0",
-                    values: [category.id: .text("A"), measure.id: .double(1)],
-                    counter: counter)
-            ],
-            chartDataIdentity: UUID().uuidString,
-            chartDataVersion: UUID().uuidString)
-        let recommendation = AutoChartRecommendation(
-            specification: AutoChartSpecification(
-                family: .bar,
-                encoding: .init(x: category.id, y: measure.id)),
-            score: 0,
-            rationale: ["Independent render-cache test"])
-
-        _ = AutoChartView(table: input, recommendation: recommendation)
-        #expect(AutoChartRenderCache.retainedTableCount == 0)
-        #expect(AutoChartRenderCache.retainedRenderCount == 1)
-
-        counter.reset()
-        _ = AutoChartView(table: input, recommendation: recommendation)
-        #expect(counter.count == 0)
-        #expect(AutoChartRenderCache.retainedTableCount == 0)
-        #expect(AutoChartRenderCache.retainedRenderCount == 1)
-    }
-
-    @Test @MainActor func distinctSpecificationsReuseARenderOwnedVersionedSnapshot() {
-        let originalConfiguration = AutoChartRenderCache.configuration
-        defer {
-            AutoChartRenderCache.configure(originalConfiguration)
-            AutoChartRenderCache.removeAll()
-        }
-        AutoChartRenderCache.configure(
-            AutoChartRenderCacheConfiguration(
-                maximumTableEntries: 0,
-                maximumTableCost: 0,
-                maximumRenderEntries: 8,
-                maximumRenderCost: 1_024 * 1_024))
-        AutoChartRenderCache.removeAll()
-
-        let counter = ChartValueReadCounter()
-        let input = VersionedCountingTable(
-            chartColumns: [category, measure],
-            chartRows: (0..<100).map { index in
-                CountingRow(
-                    chartRowID: AutoChartRowID(rawValue: "r\(index)"),
-                    values: [
-                        category.id: .text("Category \(index)"),
-                        measure.id: .double(Double(index)),
-                    ],
-                    counter: counter)
-            },
-            chartDataIdentity: UUID().uuidString,
-            chartDataVersion: UUID().uuidString)
-        let bar = AutoChartRecommendation(
-            specification: AutoChartSpecification(
-                family: .bar,
-                encoding: .init(x: category.id, y: measure.id)),
-            score: 0,
-            rationale: ["Render-owned sharing test"])
-        let dots = AutoChartRecommendation(
-            specification: AutoChartSpecification(
-                family: .rankedDot,
-                encoding: .init(x: category.id, y: measure.id)),
-            score: 0,
-            rationale: ["Render-owned sharing test"])
-
-        _ = AutoChartView(table: input, recommendation: bar)
-        #expect(counter.count > 0)
-
-        counter.reset()
-        _ = AutoChartView(table: input, recommendation: dots)
-        #expect(counter.count == 0)
-        #expect(AutoChartRenderCache.retainedTableCount == 0)
-        #expect(AutoChartRenderCache.retainedRenderCount == 2)
-    }
-
-    @Test @MainActor func aSharedRenderOwnedSnapshotIsChargedToTheBudgetOnce() {
-        let originalConfiguration = AutoChartRenderCache.configuration
-        defer {
-            AutoChartRenderCache.configure(originalConfiguration)
-            AutoChartRenderCache.removeAll()
-        }
-        let renderOnly = AutoChartRenderCacheConfiguration(
-            maximumTableEntries: 0,
-            maximumTableCost: 0,
-            maximumRenderEntries: 8,
-            maximumRenderCost: 8 * 1_024 * 1_024)
-        func versionedTable() -> VersionedCountingTable {
-            VersionedCountingTable(
-                chartColumns: [category, measure],
-                chartRows: (0..<200).map { index in
-                    CountingRow(
-                        chartRowID: AutoChartRowID(rawValue: "r\(index)"),
-                        values: [
-                            category.id: .text("Category \(index)"),
-                            measure.id: .double(Double(index)),
-                        ])
-                },
-                chartDataIdentity: UUID().uuidString,
-                chartDataVersion: UUID().uuidString)
-        }
-        // Identical rows and specifications everywhere, so every measurement
-        // charges the same per-entry and per-snapshot amounts.
-        func cost(
-            ofRendering families: [AutoChartFamily],
-            sharingOneIdentity: Bool
-        ) -> Int {
-            AutoChartRenderCache.removeAll()
-            let shared = versionedTable()
-            for family in families {
-                _ = AutoChartView(
-                    table: sharingOneIdentity ? shared : versionedTable(),
-                    recommendation: AutoChartRecommendation(
-                        specification: AutoChartSpecification(
-                            family: family,
-                            encoding: .init(x: category.id, y: measure.id)),
-                        score: 0,
-                        rationale: ["Shared snapshot budget test"]))
-            }
-            #expect(AutoChartRenderCache.retainedRenderCount == families.count)
-            return AutoChartRenderCache.retainedRenderCost
-        }
-
-        AutoChartRenderCache.configure(renderOnly)
-        // Two specifications over one table identity share a single
-        // render-owned snapshot; over two identities they cannot share at all.
-        let sharedCost = cost(ofRendering: [.bar, .rankedDot], sharingOneIdentity: true)
-        let unsharedCost = cost(ofRendering: [.bar, .rankedDot], sharingOneIdentity: false)
-        // Each single-entry measurement charges one entry and one snapshot, so
-        // their sum exceeds the shared pair by exactly one snapshot.
-        let barCost = cost(ofRendering: [.bar], sharingOneIdentity: true)
-        let dotCost = cost(ofRendering: [.rankedDot], sharingOneIdentity: true)
-        let snapshotCost = barCost + dotCost - sharedCost
-
-        #expect(snapshotCost > 0)
-        #expect(sharedCost == unsharedCost - snapshotCost)
-    }
-
-    @Test @MainActor func anEntryTooLargeToOutliveItsSharedSnapshotIsRejected() {
-        let originalConfiguration = AutoChartRenderCache.configuration
-        defer {
-            AutoChartRenderCache.configure(originalConfiguration)
-            AutoChartRenderCache.removeAll()
-        }
-        let input = VersionedCountingTable(
-            chartColumns: [category, measure],
-            chartRows: (0..<200).map { index in
-                CountingRow(
-                    chartRowID: AutoChartRowID(rawValue: "r\(index)"),
-                    values: [
-                        category.id: .text("Category \(index)"),
-                        measure.id: .double(Double(index)),
-                    ])
-            },
-            chartDataIdentity: UUID().uuidString,
-            chartDataVersion: UUID().uuidString)
-        func render(title: String) {
-            _ = AutoChartView(
-                table: input,
-                recommendation: AutoChartRecommendation(
-                    specification: AutoChartSpecification(
-                        family: .bar,
-                        encoding: .init(x: category.id, y: measure.id),
-                        title: title),
-                    score: 0,
-                    rationale: ["Shared snapshot admission test"]))
-        }
-        func configure(maximumRenderCost: Int) {
-            AutoChartRenderCache.configure(
-                AutoChartRenderCacheConfiguration(
-                    maximumTableEntries: 0,
-                    maximumTableCost: 0,
-                    maximumRenderEntries: 8,
-                    maximumRenderCost: maximumRenderCost))
-            AutoChartRenderCache.removeAll()
-        }
-
-        // One entry plus the render-owned snapshot it introduces, measured
-        // against a budget too large to constrain either.
-        configure(maximumRenderCost: 8 * 1_024 * 1_024)
-        render(title: "")
-        let seatedCost = AutoChartRenderCache.retainedRenderCost
-
-        // A budget with room for exactly that pair. The longer title makes the
-        // second entry cost more, so it could not stay resident once it is the
-        // last entry holding the snapshot. Admitting it on the strength of a
-        // snapshot already charged would evict the first entry and then itself.
-        configure(maximumRenderCost: seatedCost)
-        render(title: "")
-        #expect(AutoChartRenderCache.retainedRenderCount == 1)
-        render(title: String(repeating: "t", count: 64))
-        #expect(AutoChartRenderCache.retainedRenderCount == 1)
-        #expect(AutoChartRenderCache.retainedRenderCost == seatedCost)
-    }
-
-    @Test @MainActor func evictingEveryRenderEntryRefundsTheSharedSnapshot() {
-        let originalConfiguration = AutoChartRenderCache.configuration
-        defer {
-            AutoChartRenderCache.configure(originalConfiguration)
-            AutoChartRenderCache.removeAll()
-        }
-        AutoChartRenderCache.configure(
-            AutoChartRenderCacheConfiguration(
-                maximumTableEntries: 0,
-                maximumTableCost: 0,
-                maximumRenderEntries: 8,
-                maximumRenderCost: 8 * 1_024 * 1_024))
-        AutoChartRenderCache.removeAll()
-
-        let input = VersionedCountingTable(
-            chartColumns: [category, measure],
-            chartRows: (0..<50).map { index in
-                CountingRow(
-                    chartRowID: AutoChartRowID(rawValue: "r\(index)"),
-                    values: [
-                        category.id: .text("Category \(index)"),
-                        measure.id: .double(Double(index)),
-                    ])
-            },
-            chartDataIdentity: UUID().uuidString,
-            chartDataVersion: UUID().uuidString)
-        for family in [AutoChartFamily.bar, .rankedDot] {
-            _ = AutoChartView(
-                table: input,
-                recommendation: AutoChartRecommendation(
-                    specification: AutoChartSpecification(
-                        family: family,
-                        encoding: .init(x: category.id, y: measure.id)),
-                    score: 0,
-                    rationale: ["Shared snapshot refund test"]))
-        }
-        #expect(AutoChartRenderCache.retainedRenderCount == 2)
-        #expect(AutoChartRenderCache.retainedRenderCost > 0)
-
-        // Evict through the entry-removal path rather than a blunt purge, so a
-        // snapshot that was never refunded would still be charged afterwards.
-        AutoChartRenderCache.configure(
-            AutoChartRenderCacheConfiguration(
-                maximumTableEntries: 0,
-                maximumTableCost: 0,
-                maximumRenderEntries: 0,
-                maximumRenderCost: 8 * 1_024 * 1_024))
-
-        #expect(AutoChartRenderCache.retainedRenderCount == 0)
-        #expect(AutoChartRenderCache.retainedRenderCost == 0)
-    }
-
-    @Test @MainActor func disablingTableCachingPreservesIndependentlyOwnedRenders() {
-        let originalConfiguration = AutoChartRenderCache.configuration
-        defer {
-            AutoChartRenderCache.configure(originalConfiguration)
-            AutoChartRenderCache.removeAll()
-        }
-        let renderOnly = AutoChartRenderCacheConfiguration(
-            maximumTableEntries: 0,
-            maximumTableCost: 0,
-            maximumRenderEntries: 8,
-            maximumRenderCost: 1_024 * 1_024)
-        AutoChartRenderCache.configure(renderOnly)
-        AutoChartRenderCache.removeAll()
-
-        let counter = ChartValueReadCounter()
-        let identity = UUID().uuidString
-        let version = UUID().uuidString
-        let input = VersionedCountingTable(
-            chartColumns: [category, measure],
-            chartRows: [
-                CountingRow(
-                    chartRowID: "r0",
-                    values: [category.id: .text("A"), measure.id: .double(1)],
-                    counter: counter)
-            ],
-            chartDataIdentity: identity,
-            chartDataVersion: version)
-        let bar = AutoChartRecommendation(
-            specification: AutoChartSpecification(
-                family: .bar,
-                encoding: .init(x: category.id, y: measure.id)),
-            score: 0,
-            rationale: ["Independent render preservation test"])
-        let dots = AutoChartRecommendation(
-            specification: AutoChartSpecification(
-                family: .rankedDot,
-                encoding: .init(x: category.id, y: measure.id)),
-            score: 0,
-            rationale: ["Independent render preservation test"])
-
-        _ = AutoChartView(table: input, recommendation: bar)
-        AutoChartRenderCache.configure(
-            AutoChartRenderCacheConfiguration(
-                maximumTableEntries: 8,
-                maximumTableCost: 1_024 * 1_024,
-                maximumRenderEntries: 8,
-                maximumRenderCost: 1_024 * 1_024))
-        _ = AutoChartView(table: input, recommendation: dots)
-        #expect(AutoChartRenderCache.retainedTableCount == 1)
-        #expect(AutoChartRenderCache.retainedRenderCount == 2)
-
-        AutoChartRenderCache.configure(renderOnly)
-        #expect(AutoChartRenderCache.retainedTableCount == 0)
-        #expect(AutoChartRenderCache.retainedRenderCount == 1)
-
-        counter.reset()
-        _ = AutoChartView(table: input, recommendation: bar)
-        #expect(counter.count == 0)
-    }
-
-    @Test @MainActor func aVersionWithoutATableIdentityCannotCrossContaminateTables() throws {
-        let counter = ChartValueReadCounter()
-        func input(value: Double) -> VersionedCountingTable {
-            VersionedCountingTable(
-                chartColumns: [category, measure],
-                chartRows: [
-                    CountingRow(
-                        chartRowID: "r0",
-                        values: [category.id: .text("A"), measure.id: .double(value)],
-                        counter: counter)
+        let rows = (0..<6).map { index in
+            CountingRow(
+                chartRowID: "r\(index)",
+                values: [
+                    category.id: .text(index.isMultiple(of: 2) ? "Office" : "Retail"),
+                    measure.id: .double(Double(index + 1)),
                 ],
-                chartDataIdentity: nil,
-                chartDataVersion: "shared-version")
-        }
-        let recommendation = AutoChartRecommendation(
-            specification: AutoChartSpecification(
-                family: .bar,
-                encoding: .init(x: category.id, y: measure.id)),
-            score: 0,
-            rationale: ["Test"])
-
-        let first = AutoChartView(
-            table: input(value: 1), recommendation: recommendation)
-        let second = AutoChartView(
-            table: input(value: 2), recommendation: recommendation)
-        let firstValue = try #require(preparedData(in: first)?.first?.yNumber)
-        let secondValue = try #require(preparedData(in: second)?.first?.yNumber)
-
-        #expect(firstValue == 1)
-        #expect(secondValue == 2)
-        #expect(firstValue != secondValue)
-    }
-
-    @Test @MainActor func signedZeroContentCanReplaceAndReuseCachedRenderingData() throws {
-        let originalConfiguration = AutoChartRenderCache.configuration
-        defer {
-            AutoChartRenderCache.configure(originalConfiguration)
-            AutoChartRenderCache.removeAll()
-        }
-        AutoChartRenderCache.configure(.standard)
-        AutoChartRenderCache.removeAll()
-
-        let counter = ChartValueReadCounter()
-        func input(value: Double) -> VersionedCountingTable {
-            VersionedCountingTable(
-                chartColumns: [category, measure],
-                chartRows: [
-                    CountingRow(
-                        chartRowID: "r0",
-                        values: [category.id: .text("A"), measure.id: .double(value)],
-                        counter: counter)
-                ],
-                chartDataIdentity: nil,
-                chartDataVersion: nil)
-        }
-        let recommendation = AutoChartRecommendation(
-            specification: AutoChartSpecification(
-                family: .bar,
-                encoding: .init(x: category.id, y: measure.id)),
-            score: 0,
-            rationale: ["Signed-zero cache test"])
-
-        // The cache is process-wide and other suites render into it, so measure
-        // growth from this test's own insertions rather than its absolute size.
-        let baseline = AutoChartRenderCache.retainedTableCount
-        _ = AutoChartView(table: input(value: 0.0), recommendation: recommendation)
-        let afterPositiveZero = AutoChartRenderCache.retainedTableCount
-        #expect(afterPositiveZero >= baseline + 1)
-        let negative = AutoChartView(
-            table: input(value: -0.0), recommendation: recommendation)
-        let negativeValue = try #require(preparedData(in: negative)?.first?.yNumber)
-        #expect(negativeValue.bitPattern == (-0.0).bitPattern)
-        let afterNegativeZero = AutoChartRenderCache.retainedTableCount
-        // Signed-zero content is distinct, so it takes an entry of its own.
-        #expect(afterNegativeZero >= afterPositiveZero + 1)
-
-        counter.reset()
-        _ = AutoChartView(table: input(value: -0.0), recommendation: recommendation)
-        #expect(counter.count == 2)
-        // Repeating identical content reuses the entry instead of adding one.
-        #expect(AutoChartRenderCache.retainedTableCount == afterNegativeZero)
-    }
-
-    @Test @MainActor func recommendationsShareOneVersionedTableSnapshot() {
-        let counter = ChartValueReadCounter()
-        let measures = (0..<9).map { index in
-            AutoChartColumn(
-                id: AutoChartColumnID(rawValue: "measure-\(index)"),
-                name: "measure_\(index)",
-                hints: AutoChartColumnHints(semanticType: .quantitative))
-        }
-        let columns = [category] + measures
-        let rows = (0..<5_000).map { rowIndex in
-            var values: [AutoChartColumnID: AutoChartValue] = [
-                category.id: .text("Category \(rowIndex)")
-            ]
-            for (measureIndex, measure) in measures.enumerated() {
-                values[measure.id] = .double(Double(rowIndex + measureIndex))
-            }
-            return CountingRow(
-                chartRowID: AutoChartRowID(rawValue: "r\(rowIndex)"),
-                values: values,
                 counter: counter)
         }
         let input = VersionedCountingTable(
-            chartColumns: columns,
-            chartRows: rows,
-            chartDataIdentity: UUID().uuidString,
-            chartDataVersion: UUID().uuidString)
-        let recommendations = measures.prefix(6).map { measure in
-            AutoChartRecommendation(
-                specification: AutoChartSpecification(
-                    family: .bar,
-                    encoding: .init(x: category.id, y: measure.id)),
-                score: 0,
-                rationale: ["Cache sharing test"])
-        }
-
-        counter.reset()
-        for recommendation in recommendations {
-            _ = AutoChartView(table: input, recommendation: recommendation)
-        }
-        #expect(counter.count == rows.count * columns.count)
-
-        counter.reset()
-        for recommendation in recommendations {
-            _ = AutoChartView(table: input, recommendation: recommendation)
-        }
-        #expect(counter.count == 0)
-    }
-
-    @Test @MainActor func oversizedBinaryPayloadsAreNotRetainedByTheRenderCache() {
-        let counter = ChartValueReadCounter()
-        // The payload must exceed whatever table-cache budget is active so the
-        // prepared table is rejected from the process-wide cache.
-        let oversizedPayloadSize =
-            AutoChartRenderCache.configuration.maximumTableCost + 1_024 * 1_024
-        let blob = AutoChartColumn(id: "blob", name: "blob")
-        let input = VersionedCountingTable(
-            chartColumns: [category, measure, blob],
-            chartRows: [
-                CountingRow(
-                    chartRowID: "r0",
-                    values: [
-                        category.id: .text("A"),
-                        measure.id: .double(1),
-                        blob.id: .binary(Data(count: oversizedPayloadSize)),
-                    ],
-                    counter: counter)
-            ],
-            chartDataIdentity: UUID().uuidString,
-            chartDataVersion: UUID().uuidString)
-        let recommendation = AutoChartRecommendation(
-            specification: AutoChartSpecification(
-                family: .bar,
-                encoding: .init(x: category.id, y: measure.id)),
-            score: 0,
-            rationale: ["Large payload test"])
-
-        _ = AutoChartView(table: input, recommendation: recommendation)
-        counter.reset()
-        _ = AutoChartView(table: input, recommendation: recommendation)
-
-        #expect(counter.count > 0)
-    }
-
-    @Test @MainActor func cacheCanBeConfiguredAndMemoryPressurePurgesIt() {
-        let originalConfiguration = AutoChartRenderCache.configuration
-        defer {
-            AutoChartRenderCache.configure(originalConfiguration)
-            AutoChartRenderCache.removeAll()
-        }
-
-        AutoChartRenderCache.configure(.standard)
-        AutoChartRenderCache.removeAll()
-
-        let counter = ChartValueReadCounter()
-        let input = VersionedCountingTable(
             chartColumns: [category, measure],
-            chartRows: [
-                CountingRow(
-                    chartRowID: "r0",
-                    values: [category.id: .text("A"), measure.id: .double(1)],
-                    counter: counter)
-            ],
-            chartDataIdentity: UUID().uuidString,
-            chartDataVersion: UUID().uuidString)
-        let recommendation = AutoChartRecommendation(
-            specification: AutoChartSpecification(
-                family: .bar,
-                encoding: .init(x: category.id, y: measure.id)),
-            score: 0,
-            rationale: ["Cache configuration test"])
+            chartRows: rows,
+            chartDataIdentity: "result",
+            chartDataVersion: "revision-1")
+        let analyzer = AutoChartAnalyzer()
 
-        _ = AutoChartView(table: input, recommendation: recommendation)
-        counter.reset()
-        _ = AutoChartView(table: input, recommendation: recommendation)
-        #expect(counter.count == 0)
+        let first = try await analyzer.analyze(input)
+        let readsAfterFirst = counter.count
+        let second = try await analyzer.analyze(input)
 
-        AutoChartRenderCache.handleMemoryPressure()
-        counter.reset()
-        _ = AutoChartView(table: input, recommendation: recommendation)
-        #expect(counter.count > 0)
-
-        let disabledConfiguration = AutoChartRenderCacheConfiguration(
-            maximumTableEntries: 0,
-            maximumTableCost: 0,
-            maximumRenderEntries: 0,
-            maximumRenderCost: 0)
-        AutoChartRenderCache.configure(disabledConfiguration)
-        #expect(AutoChartRenderCache.configuration == disabledConfiguration)
-
-        counter.reset()
-        _ = AutoChartView(table: input, recommendation: recommendation)
-        counter.reset()
-        _ = AutoChartView(table: input, recommendation: recommendation)
-        #expect(counter.count > 0)
+        #expect(readsAfterFirst == rows.count * 2)
+        #expect(counter.count == readsAfterFirst)
+        #expect(first.primaryChart?.recommendation.id == second.primaryChart?.recommendation.id)
+        let statistics = await analyzer.cacheStatistics
+        #expect(statistics.tables.hits == 1)
+        #expect(statistics.analyses.hits == 1)
+        #expect(statistics.preparedCharts.entries == 1)
     }
-    #endif
+
+    @Test func alternativesPrepareExplicitlyAndCacheWithinOneAnalyzer() async throws {
+        let input = table(
+            columns: [category, measure],
+            rows: [
+                [.text("Office"), .double(20)],
+                [.text("Retail"), .double(10)],
+                [.text("Industrial"), .double(15)],
+            ])
+        let analyzer = AutoChartAnalyzer()
+        let analysis = try await analyzer.analyze(input)
+        guard case .charts(let recommendations) = analysis.outcome else {
+            Issue.record("Expected chart recommendations")
+            return
+        }
+        let alternative = try #require(recommendations.dropFirst().first)
+
+        let afterAnalysis = await analyzer.cacheStatistics
+        #expect(afterAnalysis.preparedCharts.entries == 1)
+        let first = try await analysis.prepare(alternative.id)
+        let second = try await analysis.prepare(alternative.id)
+
+        #expect(first.recommendation.id == alternative.id)
+        #expect(second.recommendation.id == alternative.id)
+        let afterAlternative = await analyzer.cacheStatistics
+        #expect(afterAlternative.preparedCharts.entries == 2)
+        #expect(afterAlternative.preparedCharts.hits >= 1)
+    }
+
+    @Test func trimDoesNotInvalidateCallerHeldAnalysis() async throws {
+        let input = table(
+            columns: [category, measure],
+            rows: [[.text("Office"), .double(20)], [.text("Retail"), .double(10)]])
+        let analyzer = AutoChartAnalyzer()
+        let analysis = try await analyzer.analyze(input)
+        let primaryID = try #require(analysis.primaryChart?.recommendation.id)
+
+        await analyzer.trim(to: .minimum)
+        let trimmed = await analyzer.cacheStatistics
+        #expect(trimmed.tables.entries == 0)
+        #expect(trimmed.analyses.entries == 0)
+        #expect(trimmed.preparedCharts.entries == 0)
+
+        let preparedAgain = try await analysis.prepare(primaryID)
+        #expect(preparedAgain.recommendation.id == primaryID)
+    }
+
+    @Test func analyzerInstancesHaveIndependentCaches() async throws {
+        let input = table(
+            columns: [category, measure],
+            rows: [[.text("Office"), .double(20)], [.text("Retail"), .double(10)]])
+        let first = AutoChartAnalyzer()
+        let second = AutoChartAnalyzer()
+
+        _ = try await first.analyze(input)
+        let firstStats = await first.cacheStatistics
+        let secondStats = await second.cacheStatistics
+
+        #expect(firstStats.analyses.entries == 1)
+        #expect(secondStats.analyses.entries == 0)
+    }
+
+    @Test func removeAllResetsRetainedStateAndStatistics() async throws {
+        let input = table(
+            columns: [category, measure],
+            rows: [[.text("Office"), .double(20)]])
+        let analyzer = AutoChartAnalyzer()
+        _ = try await analyzer.analyze(input)
+        await analyzer.removeAll()
+
+        #expect(await analyzer.cacheStatistics == AutoChartCacheStatistics())
+    }
 }
 
 @Suite struct ProfilingTests {
@@ -1144,7 +556,7 @@ private let date = AutoChartColumn(
         #expect(AutoChartProfiler.parseISODate("0001-02-03") != nil)
     }
 
-    @Test func duplicateColumnIDsAreDeduplicatedAtSnapshotBoundary() {
+    @Test func duplicateColumnIDsAreRejectedAtSnapshotBoundary() {
         let first = AutoChartColumn(
             id: "duplicate", name: "first",
             hints: AutoChartColumnHints(semanticType: .quantitative))
@@ -1154,17 +566,9 @@ private let date = AutoChartColumn(
         let input = TestTable(
             chartColumns: [first, second],
             chartRows: [TestRow(chartRowID: "r0", values: ["duplicate": .double(1)])])
-        let snapshot = AutoChartSnapshot(input)
-        #expect(snapshot.columns.map(\.name) == ["first"])
-        #expect(AutoChartProfiler.profiles(snapshot).count == 1)
-        #expect(
-            AutoChartEngine.validate(
-                specification: AutoChartSpecification(
-                    family: .histogram,
-                    encoding: AutoChartEncoding(x: "duplicate"),
-                    aggregation: .count),
-                for: input
-            ).isValid)
+        #expect(throws: AutoChartDatasetError.self) {
+            try AutoChartSnapshot(validating: input)
+        }
     }
 
     @Test func identifiersAndBinaryAreNotMeasures() {
@@ -1265,16 +669,16 @@ private let date = AutoChartColumn(
             rationale: ["Equal"])
 
         #expect(first.id == higher.id)
-        let highest = try #require(AutoChartEngine.bestCandidatesByID([first, higher]).first)
-        #expect(AutoChartEngine.bestCandidatesByID([first, higher]).count == 1)
+        let highest = try #require(AutoChartRecommendationEngine.bestCandidatesByID([first, higher]).first)
+        #expect(AutoChartRecommendationEngine.bestCandidatesByID([first, higher]).count == 1)
         #expect(highest.specification.title == "Higher title")
 
-        let stableTie = try #require(AutoChartEngine.bestCandidatesByID([first, equal]).first)
+        let stableTie = try #require(AutoChartRecommendationEngine.bestCandidatesByID([first, equal]).first)
         #expect(stableTie.specification.title == "First title")
     }
 
     @Test func scalarUsesKPI() {
-        let result = AutoChartEngine.recommendations(
+        let result = AutoChartRecommendationEngine.recommendations(
             for: table(
                 columns: [measure], rows: [[.double(42)]]))
         #expect(result.chartRecommendations.first?.specification.family == .kpi)
@@ -1290,18 +694,18 @@ private let date = AutoChartColumn(
         let input = table(
             columns: [empty, populated],
             rows: [[.null, .double(42)]])
-        let result = AutoChartEngine.recommendations(for: input)
+        let result = AutoChartRecommendationEngine.recommendations(for: input)
         #expect(result.chartRecommendations.first?.specification.family == .kpi)
         #expect(result.chartRecommendations.first?.specification.encoding.y == populated.id)
 
         let emptyKPI = AutoChartSpecification(
             family: .kpi,
             encoding: .init(y: empty.id))
-        #expect(!AutoChartEngine.validate(specification: emptyKPI, for: input).isValid)
+        #expect(!AutoChartRecommendationEngine.validate(specification: emptyKPI, for: input).isValid)
     }
 
     @Test func categoryMeasureUsesBarAndDonutAlternatives() {
-        let result = AutoChartEngine.recommendations(
+        let result = AutoChartRecommendationEngine.recommendations(
             for: table(
                 columns: [category, measure],
                 rows: [
@@ -1322,20 +726,19 @@ private let date = AutoChartColumn(
             id: "income", name: "noi", displayName: "NOI",
             hints: AutoChartColumnHints(
                 semanticType: .quantitative,
-                aggregation: .sum,
-                aggregationSafety: .alreadyAggregated))
+                measureSemantics: .init(source: .aggregated(.sum), rollup: .additive)))
         let input = table(
             columns: [segment, income],
             rows: [[.text("A"), .double(1)], [.text("B"), .double(2)]])
         let bar = try #require(
-            AutoChartEngine.recommendations(for: input).chartRecommendations.first {
+            AutoChartRecommendationEngine.recommendations(for: input).chartRecommendations.first {
                 $0.specification.family == .bar
             })
         #expect(bar.specification.title == "NOI by Segment")
     }
 
     @Test func temporalMeasureUsesLine() {
-        let result = AutoChartEngine.recommendations(
+        let result = AutoChartRecommendationEngine.recommendations(
             for: table(
                 columns: [date, measure],
                 rows: [
@@ -1355,7 +758,7 @@ private let date = AutoChartColumn(
                 [.date(Date(timeIntervalSinceReferenceDate: .nan)), .double(2)],
             ])
 
-        let result = AutoChartEngine.recommendations(for: input)
+        let result = AutoChartRecommendationEngine.recommendations(for: input)
 
         #expect(
             result.chartRecommendations.contains {
@@ -1368,7 +771,7 @@ private let date = AutoChartColumn(
         let second = AutoChartColumn(
             id: "second", name: "occupancy_rate",
             hints: AutoChartColumnHints(semanticType: .quantitative, role: .measure))
-        let result = AutoChartEngine.recommendations(
+        let result = AutoChartRecommendationEngine.recommendations(
             for: table(
                 columns: [measure, second],
                 rows: [[.double(10), .double(0.8)], [.double(12), .double(0.9)]]),
@@ -1377,7 +780,7 @@ private let date = AutoChartColumn(
     }
 
     @Test func singleMeasureOffersHistogramAndBoxPlot() {
-        let result = AutoChartEngine.recommendations(
+        let result = AutoChartRecommendationEngine.recommendations(
             for: table(
                 columns: [measure],
                 rows: [[.double(1)], [.double(2)], [.double(4)], [.double(8)]]),
@@ -1391,7 +794,7 @@ private let date = AutoChartColumn(
         let second = AutoChartColumn(
             id: "market", name: "market",
             hints: AutoChartColumnHints(semanticType: .nominal, role: .dimension))
-        let result = AutoChartEngine.recommendations(
+        let result = AutoChartRecommendationEngine.recommendations(
             for: table(
                 columns: [category, second],
                 rows: [
@@ -1406,7 +809,7 @@ private let date = AutoChartColumn(
         let end = AutoChartColumn(
             id: "end", name: "expiration_date",
             hints: AutoChartColumnHints(semanticType: .temporal, role: .intervalEnd))
-        let result = AutoChartEngine.recommendations(
+        let result = AutoChartRecommendationEngine.recommendations(
             for: table(
                 columns: [category, date, end],
                 rows: [[.text("Lease A"), .text("2026-01-01"), .text("2026-12-31")]]),
@@ -1415,7 +818,7 @@ private let date = AutoChartColumn(
     }
 
     @Test func datedEventsWithMeasuresOfferRangeInsteadOfInvalidBubble() {
-        let result = AutoChartEngine.recommendations(
+        let result = AutoChartRecommendationEngine.recommendations(
             for: table(
                 columns: [date, category, measure],
                 rows: [
@@ -1434,7 +837,7 @@ private let date = AutoChartColumn(
         let second = AutoChartColumn(
             id: "market", name: "market",
             hints: AutoChartColumnHints(semanticType: .nominal, role: .dimension))
-        let result = AutoChartEngine.recommendations(
+        let result = AutoChartRecommendationEngine.recommendations(
             for: table(
                 columns: [category, second, measure],
                 rows: [
@@ -1453,7 +856,7 @@ private let date = AutoChartColumn(
         let input = table(
             columns: [category, measure],
             rows: [[.text("A"), .double(1)], [.text("B"), .double(2)]])
-        let recommendations = AutoChartEngine.recommendations(for: input)
+        let recommendations = AutoChartRecommendationEngine.recommendations(for: input)
         #expect(
             recommendations.chartRecommendations.map(\.specification.family) == [
                 .bar, .rankedDot, .boxPlot, .histogram, .donut,
@@ -1464,7 +867,7 @@ private let date = AutoChartColumn(
         let unsafeMeasure = AutoChartColumn(
             id: "raw", name: "raw_value",
             hints: AutoChartColumnHints(semanticType: .quantitative, role: .measure))
-        let result = AutoChartEngine.recommendations(
+        let result = AutoChartRecommendationEngine.recommendations(
             for: table(
                 columns: [category, unsafeMeasure],
                 rows: [
@@ -1480,9 +883,10 @@ private let date = AutoChartColumn(
             hints: AutoChartColumnHints(
                 semanticType: .quantitative,
                 role: .measure,
-                aggregation: .mean,
-                aggregationSafety: .alreadyAggregated))
-        let result = AutoChartEngine.recommendations(
+                measureSemantics: .init(
+                    source: .aggregated(.mean), rollup: .nonAdditive,
+                    preferredTransform: .mean)))
+        let result = AutoChartRecommendationEngine.recommendations(
             for: table(
                 columns: [category, mean],
                 rows: [
@@ -1498,9 +902,10 @@ private let date = AutoChartColumn(
             hints: AutoChartColumnHints(
                 semanticType: .quantitative,
                 role: .measure,
-                aggregation: .mean,
-                aggregationSafety: .safe))
-        let result = AutoChartEngine.recommendations(
+                measureSemantics: .init(
+                    source: .rowLevel, rollup: .safe(.mean),
+                    preferredTransform: .mean)))
+        let result = AutoChartRecommendationEngine.recommendations(
             for: table(
                 columns: [category, average],
                 rows: [
@@ -1522,15 +927,16 @@ private let date = AutoChartColumn(
             id: "count", name: "count",
             hints: AutoChartColumnHints(
                 semanticType: .quantitative,
-                aggregation: .count,
-                aggregationSafety: .alreadyAggregated))
+                measureSemantics: .init(
+                    source: .aggregated(.count), rollup: .additive,
+                    preferredTransform: .count)))
         let input = table(
             columns: [category, count],
             rows: [
                 [.text("A"), .double(2)],
                 [.text("A"), .double(3)],
             ])
-        let recommendation = AutoChartEngine.recommendations(for: input)
+        let recommendation = AutoChartRecommendationEngine.recommendations(for: input)
             .chartRecommendations.first { $0.specification.family == .bar }
         #expect(recommendation?.specification.aggregation == .sum)
         let data = recommendation.map {
@@ -1544,13 +950,13 @@ private let date = AutoChartColumn(
             family: .bar,
             encoding: .init(x: category.id, y: count.id),
             aggregation: .count)
-        #expect(!AutoChartEngine.validate(specification: wrongCount, for: input).isValid)
+        #expect(!AutoChartRecommendationEngine.validate(specification: wrongCount, for: input).isValid)
 
         let donut = AutoChartSpecification(
             family: .donut,
             encoding: .init(x: category.id, y: count.id),
             aggregation: .sum)
-        #expect(AutoChartEngine.validate(specification: donut, for: input).isValid)
+        #expect(AutoChartRecommendationEngine.validate(specification: donut, for: input).isValid)
     }
 
     @Test func distinctCountsAreNotCompositionSafeOrImplicitlyRollable() {
@@ -1558,8 +964,9 @@ private let date = AutoChartColumn(
             id: "distinct", name: "distinct",
             hints: AutoChartColumnHints(
                 semanticType: .quantitative,
-                aggregation: .countDistinct,
-                aggregationSafety: .alreadyAggregated))
+                measureSemantics: .init(
+                    source: .aggregated(.countDistinct), rollup: .nonAdditive,
+                    preferredTransform: .countDistinct)))
         let input = table(
             columns: [category, distinctCount],
             rows: [
@@ -1567,20 +974,21 @@ private let date = AutoChartColumn(
                 [.text("A"), .double(3)],
                 [.text("B"), .double(4)],
             ])
-        let result = AutoChartEngine.recommendations(
+        let result = AutoChartRecommendationEngine.recommendations(
             for: input,
             context: AutoChartContext(goal: .composition))
         #expect(!result.chartRecommendations.contains { $0.specification.family == .donut })
         #expect(!result.chartRecommendations.contains { $0.specification.family == .bar })
     }
 
-    @Test func rowLevelSafeCountsProduceCountAggregatedDonuts() {
+    @Test func safeCountRollupsDoNotEnableComposition() {
         let count = AutoChartColumn(
             id: "count", name: "count",
             hints: AutoChartColumnHints(
                 semanticType: .quantitative,
-                aggregation: .count,
-                aggregationSafety: .safe))
+                measureSemantics: .init(
+                    source: .rowLevel, rollup: .safe(.count),
+                    preferredTransform: .count)))
         let input = table(
             columns: [category, count],
             rows: [
@@ -1588,23 +996,14 @@ private let date = AutoChartColumn(
                 [.text("A"), .double(20)],
                 [.text("B"), .double(30)],
             ])
-        let donut = AutoChartEngine.recommendations(
+        let recommendations = AutoChartRecommendationEngine.recommendations(
             for: input,
             context: AutoChartContext(goal: .composition)
-        ).chartRecommendations.first { $0.specification.family == .donut }
-        #expect(donut?.specification.aggregation == .count)
-        #expect(donut?.specification.title == "Count of Count by Property Type")
-        let data = donut.map {
-            AutoChartDataPreparation.data(
-                snapshot: AutoChartSnapshot(input),
-                specification: $0.specification)
-        }
+        ).chartRecommendations
+        #expect(!recommendations.contains { $0.specification.family == .donut })
         #expect(
-            Dictionary(
-                uniqueKeysWithValues: data?.compactMap { datum in
-                    guard let label = datum.xLabel, let value = datum.yNumber else { return nil }
-                    return (label, value)
-                } ?? []) == ["A": 2, "B": 1])
+            recommendations.first { $0.specification.family == .bar }?
+                .specification.aggregation == .count)
     }
 
     @Test func intervalEndHintsDoNotBecomeRangeStarts() {
@@ -1619,7 +1018,7 @@ private let date = AutoChartColumn(
         let input = table(
             columns: [end, start, category],
             rows: [[.text("2026-12-31"), .text("2026-01-01"), .text("A")]])
-        let range = AutoChartEngine.recommendations(
+        let range = AutoChartRecommendationEngine.recommendations(
             for: input,
             context: AutoChartContext(goal: .range)
         ).chartRecommendations.first { $0.specification.family == .range }
@@ -1638,7 +1037,7 @@ private let date = AutoChartColumn(
                 [.text("2026-01-02"), .text("B"), .double(2)],
                 [.text("2026-01-03"), .text("C"), .double(3)],
             ])
-        let result = AutoChartEngine.recommendations(
+        let result = AutoChartRecommendationEngine.recommendations(
             for: input,
             context: AutoChartContext(goal: .relationship),
             options: AutoChartOptions(
@@ -1664,7 +1063,7 @@ private let date = AutoChartColumn(
                 [.text("2026-01-02"), .double(2)],
                 [.text("2026-01-03"), .double(3)],
             ])
-        let scatter = AutoChartEngine.recommendations(
+        let scatter = AutoChartRecommendationEngine.recommendations(
             for: input,
             context: AutoChartContext(goal: .relationship),
             options: AutoChartOptions(maximumRecommendations: 12)
@@ -1688,7 +1087,7 @@ private let date = AutoChartColumn(
                 [.double(1), .double(2), .double(3)],
                 [.double(4), .double(5), .double(6)],
             ])
-        let result = AutoChartEngine.recommendations(
+        let result = AutoChartRecommendationEngine.recommendations(
             for: input,
             options: AutoChartOptions(
                 maximumRecommendations: 12,
@@ -1717,7 +1116,7 @@ private let date = AutoChartColumn(
             ],
             truncated: true)
         let recommendation = try #require(
-            AutoChartEngine.recommendations(
+            AutoChartRecommendationEngine.recommendations(
                 for: input,
                 options: AutoChartOptions(maximumRecommendations: 12)
             ).chartRecommendations.first { $0.specification.family == .faceted })
@@ -1740,7 +1139,7 @@ private let date = AutoChartColumn(
                 [.text("A very long category"), .text("West"), .double(2)],
             ])
         let recommendation = try #require(
-            AutoChartEngine.recommendations(
+            AutoChartRecommendationEngine.recommendations(
                 for: input,
                 options: AutoChartOptions(maximumRecommendations: 12)
             ).chartRecommendations.first {
@@ -1768,12 +1167,12 @@ private let date = AutoChartColumn(
             id: "second", name: "current_balance",
             hints: AutoChartColumnHints(
                 semanticType: .quantitative, role: .measure,
-                aggregationSafety: .rowLevel))
+                measureSemantics: .init(source: .rowLevel, rollup: .unknown)))
         let size = AutoChartColumn(
             id: "size", name: "rentable_sqft",
             hints: AutoChartColumnHints(
                 semanticType: .quantitative, role: .measure,
-                aggregationSafety: .rowLevel))
+                measureSemantics: .init(source: .rowLevel, rollup: .unknown)))
         let input = table(
             columns: [category, series, facet, date, end, measure, secondMeasure, size],
             rows: [
@@ -1797,7 +1196,6 @@ private let date = AutoChartColumn(
         let grouped = AutoChartEncoding(
             x: category.id, y: measure.id, series: series.id)
         let specifications: [AutoChartSpecification] = [
-            .init(family: .table),
             .init(family: .kpi, encoding: .init(y: measure.id)),
             .init(family: .bar, encoding: xy),
             .init(family: .rankedDot, encoding: xy),
@@ -1838,7 +1236,7 @@ private let date = AutoChartColumn(
                 ? table(columns: [measure], rows: [[.double(20)]])
                 : input
             #expect(
-                AutoChartEngine.validate(
+                AutoChartRecommendationEngine.validate(
                     specification: specification, for: validationInput
                 ).isValid,
                 "\(specification.family) should validate")
@@ -1856,7 +1254,7 @@ private let date = AutoChartColumn(
         let spec = AutoChartSpecification(
             family: .scatter,
             encoding: AutoChartEncoding(x: category.id, y: category.id))
-        let validation = AutoChartEngine.validate(specification: spec, for: input)
+        let validation = AutoChartRecommendationEngine.validate(specification: spec, for: input)
         #expect(!validation.isValid)
         #expect(!validation.issues.isEmpty)
     }
@@ -1886,17 +1284,17 @@ private let date = AutoChartColumn(
         let barWithFacet = AutoChartSpecification(
             family: .bar,
             encoding: AutoChartEncoding(x: category.id, y: measure.id, facet: facet.id))
-        #expect(!AutoChartEngine.validate(specification: bubble, for: input).isValid)
-        #expect(!AutoChartEngine.validate(specification: range, for: input).isValid)
-        #expect(!AutoChartEngine.validate(specification: faceted, for: input).isValid)
+        #expect(!AutoChartRecommendationEngine.validate(specification: bubble, for: input).isValid)
+        #expect(!AutoChartRecommendationEngine.validate(specification: range, for: input).isValid)
+        #expect(!AutoChartRecommendationEngine.validate(specification: faceted, for: input).isValid)
         #expect(
-            AutoChartEngine.validate(
+            AutoChartRecommendationEngine.validate(
                 specification: barWithFacet, for: input
             ).issues.contains {
                 $0.message == "Bar does not support a facet encoding."
             })
         #expect(
-            AutoChartEngine.validate(
+            AutoChartRecommendationEngine.validate(
                 specification: line, for: input
             ).issues.contains {
                 $0.message == "Duplicate marks require an explicit safe aggregation."
@@ -1916,7 +1314,7 @@ private let date = AutoChartColumn(
         let prepared = AutoChartDataPreparation.data(
             snapshot: AutoChartSnapshot(input),
             specification: specification)
-        let validation = AutoChartEngine.validate(specification: specification, for: input)
+        let validation = AutoChartRecommendationEngine.validate(specification: specification, for: input)
 
         #expect(prepared.count == 2)
         #expect(Set(prepared.compactMap(\.xIdentity)).count == 1)
@@ -1943,7 +1341,7 @@ private let date = AutoChartColumn(
         let prepared = AutoChartDataPreparation.data(
             snapshot: AutoChartSnapshot(input),
             specification: specification)
-        let validation = AutoChartEngine.validate(specification: specification, for: input)
+        let validation = AutoChartRecommendationEngine.validate(specification: specification, for: input)
 
         #expect(prepared.count == 2)
         #expect(Set(prepared.compactMap(\.xIdentity)).count == 1)
@@ -1970,7 +1368,7 @@ private let date = AutoChartColumn(
         let prepared = AutoChartDataPreparation.data(
             snapshot: snapshot,
             specification: specification)
-        let validation = AutoChartEngine.validate(specification: specification, for: input)
+        let validation = AutoChartRecommendationEngine.validate(specification: specification, for: input)
         let profile = AutoChartProfiler.profiles(snapshot)[0]
 
         // Ordinal years accept mixed integer and floating-point storage, so two
@@ -2010,7 +1408,7 @@ private let date = AutoChartColumn(
         #expect(Set(prepared.compactMap(\.xIdentity)).count == 2)
         #expect(profile.renderableDistinctCount == 2)
         #expect(profile.isUniqueAtRowGrain)
-        #expect(AutoChartEngine.validate(specification: specification, for: input).isValid)
+        #expect(AutoChartRecommendationEngine.validate(specification: specification, for: input).isValid)
     }
 
     @Test func equivalentLargeOrdinalStorageValuesShareAnExactIdentity() throws {
@@ -2042,7 +1440,7 @@ private let date = AutoChartColumn(
         #expect(profile.renderableDistinctCount == 2)
         #expect(!profile.isUniqueAtRowGrain)
         #expect(
-            AutoChartEngine.validate(
+            AutoChartRecommendationEngine.validate(
                 specification: specification,
                 snapshot: snapshot,
                 profiles: AutoChartProfiler.profileIndex(snapshot)
@@ -2060,7 +1458,7 @@ private let date = AutoChartColumn(
             family: .donut,
             encoding: AutoChartEncoding(x: category.id, y: measure.id),
             aggregation: .sum)
-        let issues = AutoChartEngine.validate(
+        let issues = AutoChartRecommendationEngine.validate(
             specification: specification, for: input
         ).issues
         #expect(issues.map(\.message) == ["Composition charts require a complete result."])
@@ -2111,7 +1509,7 @@ private let date = AutoChartColumn(
             snapshot: AutoChartSnapshot(input), specification: spec)
         #expect(data.count == 1)
         #expect(data[0].yNumber == 3)
-        #expect(data[0].sourceRowIDs == ["r0", "r1"])
+        #expect(data[0].sourceRowIDs == [0, 1])
     }
 
     @Test func boxPlotsExcludeNullMeasuresFromLineage() {
@@ -2128,7 +1526,7 @@ private let date = AutoChartColumn(
         let data = AutoChartDataPreparation.data(
             snapshot: AutoChartSnapshot(input),
             specification: specification)
-        #expect(data.first?.sourceRowIDs == ["r0", "r2"])
+        #expect(data.first?.sourceRowIDs == [0, 2])
         #expect(data.first?.median == 2)
     }
 
@@ -2180,7 +1578,7 @@ private let date = AutoChartColumn(
             family: .line,
             encoding: AutoChartEncoding(x: date.id, y: measure.id),
             aggregation: .sum)
-        #expect(AutoChartEngine.validate(specification: specification, for: input).isValid)
+        #expect(AutoChartRecommendationEngine.validate(specification: specification, for: input).isValid)
         let data = AutoChartDataPreparation.data(
             snapshot: AutoChartSnapshot(input), specification: specification)
         #expect(data.count == 3)
@@ -2202,7 +1600,7 @@ private let date = AutoChartColumn(
             family: .line,
             encoding: .init(x: ordinal.id, y: measure.id),
             sort: .source)
-        #expect(AutoChartEngine.validate(specification: specification, for: input).isValid)
+        #expect(AutoChartRecommendationEngine.validate(specification: specification, for: input).isValid)
         let data = AutoChartDataPreparation.data(
             snapshot: AutoChartSnapshot(input),
             specification: specification)
@@ -2231,22 +1629,22 @@ private let date = AutoChartColumn(
                 x: measure.id, y: measure.id, size: measure.id),
             aggregation: .sum)
         #expect(
-            !AutoChartEngine.validate(
+            !AutoChartRecommendationEngine.validate(
                 specification: donutCount, for: categoryInput
             ).isValid)
         #expect(
-            !AutoChartEngine.validate(
+            !AutoChartRecommendationEngine.validate(
                 specification: normalizedBar, for: categoryInput
             ).isValid)
         #expect(
-            !AutoChartEngine.validate(
+            !AutoChartRecommendationEngine.validate(
                 specification: rangeAggregation,
                 for: table(
                     columns: [category, date],
                     rows: [[.text("A"), .text("2026-01-01")]])
             ).isValid)
         #expect(
-            !AutoChartEngine.validate(
+            !AutoChartRecommendationEngine.validate(
                 specification: bubbleAggregation,
                 for: table(columns: [measure], rows: [[.double(1)]])
             ).isValid)
@@ -2257,7 +1655,7 @@ private let date = AutoChartColumn(
             columns: [measure], rows: (0..<5).map { [.double(Double($0))] })
         let kpi = AutoChartSpecification(
             family: .kpi, encoding: AutoChartEncoding(y: measure.id))
-        #expect(!AutoChartEngine.validate(specification: kpi, for: kpiInput).isValid)
+        #expect(!AutoChartRecommendationEngine.validate(specification: kpi, for: kpiInput).isValid)
 
         let negativeAreaInput = table(
             columns: [date, measure],
@@ -2268,7 +1666,7 @@ private let date = AutoChartColumn(
         let area = AutoChartSpecification(
             family: .area, encoding: AutoChartEncoding(x: date.id, y: measure.id))
         #expect(
-            !AutoChartEngine.validate(
+            !AutoChartRecommendationEngine.validate(
                 specification: area, for: negativeAreaInput
             ).isValid)
     }
@@ -2288,7 +1686,7 @@ private let date = AutoChartColumn(
             encoding: .init(x: category.id, y: measure.id, series: series.id),
             aggregation: .sum)
         #expect(
-            AutoChartEngine.validate(
+            AutoChartRecommendationEngine.validate(
                 specification: specification,
                 for: input
             ).issues.contains {
@@ -2311,7 +1709,7 @@ private let date = AutoChartColumn(
             family: .faceted,
             encoding: .init(x: category.id, y: measure.id, facet: facet.id))
         #expect(
-            !AutoChartEngine.validate(specification: categorical, for: categoricalInput).isValid)
+            !AutoChartRecommendationEngine.validate(specification: categorical, for: categoricalInput).isValid)
 
         let temporalInput = table(
             columns: [date, facet, measure],
@@ -2323,7 +1721,7 @@ private let date = AutoChartColumn(
         let temporal = AutoChartSpecification(
             family: .faceted,
             encoding: .init(x: date.id, y: measure.id, facet: facet.id))
-        #expect(AutoChartEngine.validate(specification: temporal, for: temporalInput).isValid)
+        #expect(AutoChartRecommendationEngine.validate(specification: temporal, for: temporalInput).isValid)
     }
 
     @Test func nullGroupsDoNotMergeWithRealLabels() {
@@ -2333,7 +1731,7 @@ private let date = AutoChartColumn(
         let specification = AutoChartSpecification(
             family: .boxPlot,
             encoding: AutoChartEncoding(x: category.id, y: measure.id))
-        #expect(!AutoChartEngine.validate(specification: specification, for: input).isValid)
+        #expect(!AutoChartRecommendationEngine.validate(specification: specification, for: input).isValid)
         let data = AutoChartDataPreparation.data(
             snapshot: AutoChartSnapshot(input), specification: specification)
         #expect(Set(data.compactMap(\.xLabel)) == ["Missing value", "All"])
@@ -2353,7 +1751,7 @@ private let date = AutoChartColumn(
             encoding: AutoChartEncoding(
                 x: category.id, y: measure.id, facet: facet.id))
         #expect(
-            !AutoChartEngine.validate(
+            !AutoChartRecommendationEngine.validate(
                 specification: faceted, for: facetedInput
             ).isValid)
         let facetData = AutoChartDataPreparation.data(
@@ -2383,8 +1781,8 @@ private let date = AutoChartColumn(
             family: .faceted,
             encoding: AutoChartEncoding(
                 x: category.id, y: measure.id, series: series.id, facet: facet.id))
-        #expect(!AutoChartEngine.validate(specification: duplicate, for: input).isValid)
-        #expect(AutoChartEngine.validate(specification: separated, for: input).isValid)
+        #expect(!AutoChartRecommendationEngine.validate(specification: duplicate, for: input).isValid)
+        #expect(AutoChartRecommendationEngine.validate(specification: separated, for: input).isValid)
     }
 
     @Test func redundantFamilyChannelsAreRejectedWithoutBanningDiscreteEvents() {
@@ -2410,9 +1808,9 @@ private let date = AutoChartColumn(
             encoding: .init(
                 x: category.id, y: measure.id, series: facet.id, facet: facet.id),
             facetBaseFamily: .bar)
-        #expect(!AutoChartEngine.validate(specification: heatmap, for: input).isValid)
-        #expect(!AutoChartEngine.validate(specification: facetEqualsX, for: input).isValid)
-        #expect(!AutoChartEngine.validate(specification: facetEqualsSeries, for: input).isValid)
+        #expect(!AutoChartRecommendationEngine.validate(specification: heatmap, for: input).isValid)
+        #expect(!AutoChartRecommendationEngine.validate(specification: facetEqualsX, for: input).isValid)
+        #expect(!AutoChartRecommendationEngine.validate(specification: facetEqualsSeries, for: input).isValid)
 
         let eventDate = AutoChartColumn(
             id: "event-date", name: "event_date",
@@ -2427,7 +1825,7 @@ private let date = AutoChartColumn(
                 start: eventDate.id,
                 end: eventDate.id),
             orientation: .horizontal)
-        #expect(AutoChartEngine.validate(specification: discreteEvent, for: events).isValid)
+        #expect(AutoChartRecommendationEngine.validate(specification: discreteEvent, for: events).isValid)
     }
 
     @Test func legacyFacetsInferTheirBaseWhileExplicitBasesControlValidation() {
@@ -2446,7 +1844,7 @@ private let date = AutoChartColumn(
         let legacy = AutoChartSpecification(
             family: .faceted,
             encoding: .init(x: ordinal.id, y: measure.id, facet: facet.id))
-        let legacyValidation = AutoChartEngine.validate(specification: legacy, for: input)
+        let legacyValidation = AutoChartRecommendationEngine.validate(specification: legacy, for: input)
         #expect(legacyValidation.isValid)
         #expect(legacyValidation.issues.contains { $0.severity == .warning })
 
@@ -2458,8 +1856,8 @@ private let date = AutoChartColumn(
             family: .faceted,
             encoding: legacy.encoding,
             facetBaseFamily: .scatter)
-        #expect(AutoChartEngine.validate(specification: line, for: input).isValid)
-        #expect(!AutoChartEngine.validate(specification: scatter, for: input).isValid)
+        #expect(AutoChartRecommendationEngine.validate(specification: line, for: input).isValid)
+        #expect(!AutoChartRecommendationEngine.validate(specification: scatter, for: input).isValid)
     }
 
     @Test func explicitTemporalColumnsRejectUnparseableRows() {
@@ -2475,7 +1873,7 @@ private let date = AutoChartColumn(
         let specification = AutoChartSpecification(
             family: .line,
             encoding: AutoChartEncoding(x: temporal.id, y: measure.id))
-        #expect(!AutoChartEngine.validate(specification: specification, for: input).isValid)
+        #expect(!AutoChartRecommendationEngine.validate(specification: specification, for: input).isValid)
     }
 
     @Test func explicitQuantitativeColumnsRejectNonNumericRows() {
@@ -2491,7 +1889,7 @@ private let date = AutoChartColumn(
         let specification = AutoChartSpecification(
             family: .bar,
             encoding: .init(x: category.id, y: quantitative.id))
-        let validation = AutoChartEngine.validate(
+        let validation = AutoChartRecommendationEngine.validate(
             specification: specification,
             for: input)
 
@@ -2516,10 +1914,10 @@ private let date = AutoChartColumn(
                 [.text("C"), .double(3)],
             ])
         let recommendation = try #require(
-            AutoChartEngine.recommendations(for: input).chartRecommendations.first {
+            AutoChartRecommendationEngine.recommendations(for: input).chartRecommendations.first {
                 $0.specification.family == .bar
             })
-        let validation = AutoChartEngine.validate(
+        let validation = AutoChartRecommendationEngine.validate(
             specification: recommendation.specification,
             for: input)
         let prepared = AutoChartDataPreparation.data(
@@ -2557,7 +1955,7 @@ private let date = AutoChartColumn(
                 [.double(.nan), .double(4), .double(5)],
                 [.double(6), .double(.infinity), .double(7)],
             ])
-        let positionValidation = AutoChartEngine.validate(
+        let positionValidation = AutoChartRecommendationEngine.validate(
             specification: specification,
             for: positionsInput)
         let prepared = AutoChartDataPreparation.data(
@@ -2578,7 +1976,7 @@ private let date = AutoChartColumn(
                 [.double(1), .double(2), .double(3)],
                 [.double(4), .double(5), .double(.nan)],
             ])
-        let sizeValidation = AutoChartEngine.validate(
+        let sizeValidation = AutoChartRecommendationEngine.validate(
             specification: specification,
             for: sizesInput)
         #expect(!sizeValidation.isValid)
@@ -2620,7 +2018,7 @@ private let date = AutoChartColumn(
         ]
 
         for specification in specifications {
-            let validation = AutoChartEngine.validate(specification: specification, for: input)
+            let validation = AutoChartRecommendationEngine.validate(specification: specification, for: input)
             #expect(!validation.isValid)
             #expect(
                 validation.issues.contains {
@@ -2639,7 +2037,7 @@ private let date = AutoChartColumn(
 
     @Test func compositionPositivityIsReportedOnlyForCompleteMeasures() {
         func donut(_ rows: [[AutoChartValue]]) -> [String] {
-            AutoChartEngine.validate(
+            AutoChartRecommendationEngine.validate(
                 specification: AutoChartSpecification(
                     family: .donut,
                     encoding: .init(x: category.id, y: measure.id),
@@ -2677,7 +2075,7 @@ private let date = AutoChartColumn(
             family: .heatmap,
             encoding: .init(x: binaryCategory.id, y: category.id),
             aggregation: .count)
-        let validation = AutoChartEngine.validate(specification: heatmap, for: input)
+        let validation = AutoChartRecommendationEngine.validate(specification: heatmap, for: input)
 
         #expect(!validation.isValid)
         #expect(
@@ -2704,9 +2102,9 @@ private let date = AutoChartColumn(
             snapshot: AutoChartSnapshot(input),
             specification: specification)
 
-        #expect(AutoChartEngine.validate(specification: specification, for: input).isValid)
+        #expect(AutoChartRecommendationEngine.validate(specification: specification, for: input).isValid)
         #expect(prepared.count == 1)
-        #expect(prepared.first?.sourceRowIDs == ["r2"])
+        #expect(prepared.first?.sourceRowIDs == [2])
         #expect(prepared.first?.xIdentity != nil)
     }
 
@@ -2735,7 +2133,7 @@ private let date = AutoChartColumn(
         let specification = AutoChartSpecification(
             family: .line,
             encoding: .init(x: date.id, y: measure.id))
-        let validation = AutoChartEngine.validate(
+        let validation = AutoChartRecommendationEngine.validate(
             specification: specification,
             snapshot: snapshot,
             profiles: profiles
@@ -2768,7 +2166,7 @@ private let date = AutoChartColumn(
             family: .range,
             encoding: .init(x: category.id, start: date.id, end: end.id),
             orientation: .horizontal)
-        let validation = AutoChartEngine.validate(specification: specification, for: input)
+        let validation = AutoChartRecommendationEngine.validate(specification: specification, for: input)
         let prepared = AutoChartDataPreparation.data(
             snapshot: AutoChartSnapshot(input),
             specification: specification)
@@ -2799,7 +2197,7 @@ private let date = AutoChartColumn(
             family: .bar,
             encoding: .init(x: category.id, y: measure.id),
             aggregation: .sum)
-        let validation = AutoChartEngine.validate(specification: specification, for: input)
+        let validation = AutoChartRecommendationEngine.validate(specification: specification, for: input)
 
         #expect(!validation.isValid)
         #expect(
@@ -2833,7 +2231,7 @@ private let date = AutoChartColumn(
         ]
 
         for specification in specifications {
-            let validation = AutoChartEngine.validate(
+            let validation = AutoChartRecommendationEngine.validate(
                 specification: specification,
                 for: input)
             #expect(!validation.isValid)
@@ -2857,7 +2255,7 @@ private let date = AutoChartColumn(
         let specification = AutoChartSpecification(
             family: .donut,
             encoding: .init(x: category.id, y: measure.id))
-        let validation = AutoChartEngine.validate(
+        let validation = AutoChartRecommendationEngine.validate(
             specification: specification,
             for: input)
 
@@ -2882,7 +2280,7 @@ private let date = AutoChartColumn(
             family: .donut,
             encoding: .init(x: category.id, y: measure.id),
             aggregation: .sum)
-        let validation = AutoChartEngine.validate(
+        let validation = AutoChartRecommendationEngine.validate(
             specification: specification,
             for: input)
 
@@ -2913,7 +2311,7 @@ private let date = AutoChartColumn(
             family: .stackedBar,
             encoding: .init(x: category.id, y: measure.id, series: series.id),
             stacking: .standard)
-        let validation = AutoChartEngine.validate(
+        let validation = AutoChartRecommendationEngine.validate(
             specification: specification,
             for: input)
 
@@ -2960,7 +2358,7 @@ private let date = AutoChartColumn(
                     [.text("A"), .text("Segment \(segment)"), .double(segments[segment])]
                 })
             for specification in specifications {
-                let validation = AutoChartEngine.validate(
+                let validation = AutoChartRecommendationEngine.validate(
                     specification: specification,
                     for: input)
 
@@ -2990,7 +2388,7 @@ private let date = AutoChartColumn(
                 family: .donut,
                 encoding: .init(x: category.id, y: measure.id),
                 aggregation: .sum)
-            let validation = AutoChartEngine.validate(
+            let validation = AutoChartRecommendationEngine.validate(
                 specification: specification,
                 for: input)
 
@@ -3017,12 +2415,12 @@ private let date = AutoChartColumn(
                 [.text("A"), .text("Two"), .double(halfExtreme)],
                 [.text("A"), .text("Three"), .double(halfExtreme)],
             ])
-        let recommendations = AutoChartEngine.recommendations(for: input)
+        let recommendations = AutoChartRecommendationEngine.recommendations(for: input)
 
         #expect(!recommendations.chartRecommendations.isEmpty)
         for recommendation in recommendations.chartRecommendations {
             #expect(
-                AutoChartEngine.validate(
+                AutoChartRecommendationEngine.validate(
                     specification: recommendation.specification,
                     for: input
                 ).isValid)
@@ -3057,7 +2455,7 @@ private let date = AutoChartColumn(
             snapshot: snapshot,
             specification: specification,
             profiles: profiles)
-        let validation = AutoChartEngine.validate(
+        let validation = AutoChartRecommendationEngine.validate(
             specification: specification,
             snapshot: snapshot,
             profiles: profiles,
@@ -3074,13 +2472,7 @@ private let date = AutoChartColumn(
     }
 
     #if canImport(Charts) && canImport(SwiftUI)
-    // Every test in this block builds `AutoChartView`, which mutates the
-    // process-wide render preparation cache that `RenderCacheTests` asserts
-    // exact counts on. Synchronous `@MainActor` bodies are what keep the two
-    // suites from interleaving — see the note above `RenderCacheTests`.
-    @Test @MainActor func nonFiniteDatesCannotBoundASharedFacetAxis() throws {
-        AutoChartRenderCache.removeAll()
-        defer { AutoChartRenderCache.removeAll() }
+    @Test func nonFiniteDatesCannotBoundASharedFacetAxis() throws {
         let facet = AutoChartColumn(
             id: "facet", name: "region",
             hints: AutoChartColumnHints(semanticType: .nominal))
@@ -3099,18 +2491,14 @@ private let date = AutoChartColumn(
             specification: specification)
 
         #expect(prepared.count == 1)
-        // Building the view computes the shared date domain after the non-finite
-        // row has been omitted.
-        let view = AutoChartView(
-            table: input,
+        let core = preparedCore(
+            for: input,
             recommendation: AutoChartRecommendation(
                 specification: specification,
                 score: 0,
                 rationale: ["Non-finite date test"]))
-        #expect(preparedData(in: view)?.count == 1)
-        let domain: ClosedRange<Date>? = reflectedOptionalStoredValue(
-            named: "sharedXDateDomain",
-            in: view)
+        #expect(core.data.count == 1)
+        let domain = core.presentation.sharedXDateDomain
         #expect(domain?.lowerBound.timeIntervalSinceReferenceDate.isFinite == true)
         #expect(domain?.upperBound.timeIntervalSinceReferenceDate.isFinite == true)
     }
@@ -3171,22 +2559,18 @@ private let date = AutoChartColumn(
         return (input, specification)
     }
 
-    @Test @MainActor func extremeQuantitativeFacetSpanIsRejectedAndHasNoDomain() {
-        AutoChartRenderCache.removeAll()
-        defer { AutoChartRenderCache.removeAll() }
+    @Test func extremeQuantitativeFacetSpanIsRejectedAndHasNoDomain() {
         let fixture = extremeNumericFacetFixture()
-        let view = AutoChartView(
-            table: fixture.input,
+        let core = preparedCore(
+            for: fixture.input,
             recommendation: AutoChartRecommendation(
                 specification: fixture.specification,
                 score: 0,
                 rationale: ["Finite-domain test"]))
-        let domain: ClosedRange<Double>? = reflectedOptionalStoredValue(
-            named: "sharedXNumberDomain",
-            in: view)
+        let domain = core.presentation.sharedXNumberDomain
         #expect(domain == nil)
         #expect(
-            AutoChartEngine.validate(
+            AutoChartRecommendationEngine.validate(
                 specification: fixture.specification,
                 for: fixture.input
             ).issues.contains {
@@ -3195,67 +2579,53 @@ private let date = AutoChartColumn(
             })
     }
 
-    @Test @MainActor func oneSidedExtremeQuantitativeFacetDomainRemainsFinite() {
-        AutoChartRenderCache.removeAll()
-        defer { AutoChartRenderCache.removeAll() }
+    @Test func oneSidedExtremeQuantitativeFacetDomainRemainsFinite() {
         let fixture = extremeNumericFacetFixture(oneSided: true)
-        let view = AutoChartView(
-            table: fixture.input,
+        let core = preparedCore(
+            for: fixture.input,
             recommendation: AutoChartRecommendation(
                 specification: fixture.specification,
                 score: 0,
                 rationale: ["Finite unpadded-domain test"]))
-        let domain: ClosedRange<Double>? = reflectedOptionalStoredValue(
-            named: "sharedXNumberDomain",
-            in: view)
+        let domain = core.presentation.sharedXNumberDomain
         #expect(domain != nil)
         #expect(domain.map { ($0.upperBound - $0.lowerBound).isFinite } == true)
         #expect(
-            AutoChartEngine.validate(
+            AutoChartRecommendationEngine.validate(
                 specification: fixture.specification,
                 for: fixture.input
             ).isValid)
     }
 
-    @Test @MainActor func extremeQuantitativeSpanDisablesZoom() {
-        AutoChartRenderCache.removeAll()
-        defer { AutoChartRenderCache.removeAll() }
+    @Test func extremeQuantitativeSpanDisablesZoom() {
         let fixture = extremeNumericFacetFixture()
         let scatter = AutoChartSpecification(
             family: .scatter,
             encoding: .init(x: fixture.quantitativeX.id, y: measure.id))
-        let view = AutoChartView(
-            table: fixture.input,
+        let core = preparedCore(
+            for: fixture.input,
             recommendation: AutoChartRecommendation(
                 specification: scatter,
                 score: 0,
                 rationale: ["Finite-zoom test"]))
-        let zoomCount: Int? = reflectedStoredValue(
-            named: "numberZoomValueCount",
-            in: view)
-        let zoomSpan: Double? = reflectedStoredValue(
-            named: "numberZoomSpan",
-            in: view)
+        let zoomCount = core.presentation.numberZoomValueCount
+        let zoomSpan = core.presentation.numberZoomSpan
         #expect(zoomCount == 0)
-        #expect(zoomSpan?.isFinite == true)
+        #expect(zoomSpan.isFinite)
     }
 
-    @Test @MainActor func extremeTemporalFacetSpanIsRejectedAndHasNoDomain() {
-        AutoChartRenderCache.removeAll()
-        defer { AutoChartRenderCache.removeAll() }
+    @Test func extremeTemporalFacetSpanIsRejectedAndHasNoDomain() {
         let fixture = extremeTemporalFacetFixture()
-        let view = AutoChartView(
-            table: fixture.input,
+        let core = preparedCore(
+            for: fixture.input,
             recommendation: AutoChartRecommendation(
                 specification: fixture.specification,
                 score: 0,
                 rationale: ["Finite date-domain test"]))
-        let domain: ClosedRange<Date>? = reflectedOptionalStoredValue(
-            named: "sharedXDateDomain",
-            in: view)
+        let domain = core.presentation.sharedXDateDomain
         #expect(domain == nil)
         #expect(
-            AutoChartEngine.validate(
+            AutoChartRecommendationEngine.validate(
                 specification: fixture.specification,
                 for: fixture.input
             ).issues.contains {
@@ -3263,27 +2633,21 @@ private let date = AutoChartColumn(
             })
     }
 
-    @Test @MainActor func extremeTemporalSpanDisablesZoom() {
-        AutoChartRenderCache.removeAll()
-        defer { AutoChartRenderCache.removeAll() }
+    @Test func extremeTemporalSpanDisablesZoom() {
         let fixture = extremeTemporalFacetFixture()
         let line = AutoChartSpecification(
             family: .line,
             encoding: .init(x: date.id, y: measure.id))
-        let view = AutoChartView(
-            table: fixture.input,
+        let core = preparedCore(
+            for: fixture.input,
             recommendation: AutoChartRecommendation(
                 specification: line,
                 score: 0,
                 rationale: ["Finite date-zoom test"]))
-        let timeZoomCount: Int? = reflectedStoredValue(
-            named: "timeZoomValueCount",
-            in: view)
-        let timeZoomSpan: TimeInterval? = reflectedStoredValue(
-            named: "timeZoomSpan",
-            in: view)
+        let timeZoomCount = core.presentation.timeZoomValueCount
+        let timeZoomSpan = core.presentation.timeZoomSpan
         #expect(timeZoomCount == 0)
-        #expect(timeZoomSpan?.isFinite == true)
+        #expect(timeZoomSpan.isFinite)
     }
     #endif
 
@@ -3309,7 +2673,7 @@ private let date = AutoChartColumn(
 
         // Value ties keep the canonical identity tie-breaker ascending for both sort
         // directions, so these expectations are intentionally equal.
-        let expectedTieOrder = ["row-0-r0", "row-2-r2", "row-1-r1"]
+        let expectedTieOrder = ["row-0-0", "row-2-2", "row-1-1"]
         #expect(prepared(.ascending).map(\.id) == expectedTieOrder)
         #expect(prepared(.descending).map(\.id) == expectedTieOrder)
     }
@@ -3351,7 +2715,7 @@ private let date = AutoChartColumn(
                 start: date.id,
                 end: date.id),
             binCount: 5)
-        let messages = AutoChartEngine.validate(
+        let messages = AutoChartRecommendationEngine.validate(
             specification: specification,
             for: input
         ).issues.map(\.message)
@@ -3391,7 +2755,7 @@ private let date = AutoChartColumn(
             family: .bubble,
             encoding: .init(x: x.id, y: y.id, size: size.id))
 
-        let messages = AutoChartEngine.validate(
+        let messages = AutoChartRecommendationEngine.validate(
             specification: specification,
             for: input
         ).issues.map(\.message).filter { $0.contains("contains non-numeric values") }
@@ -3418,7 +2782,7 @@ private let date = AutoChartColumn(
                 start: temporal.id,
                 end: temporal.id))
 
-        let messages = AutoChartEngine.validate(
+        let messages = AutoChartRecommendationEngine.validate(
             specification: specification,
             for: input
         ).issues.map(\.message).filter { $0.contains("contains unparseable values") }
@@ -3444,19 +2808,19 @@ private let date = AutoChartColumn(
         let specification = AutoChartSpecification(
             family: .bar,
             encoding: .init(x: category.id, y: measure.id))
-        let memo = AutoChartEngine.AutoChartValidationMemo()
+        let memo = AutoChartRecommendationEngine.AutoChartValidationMemo()
         func profiles(
             _ snapshot: AutoChartSnapshot
         ) -> [AutoChartColumnID: AutoChartColumnProfile] {
             AutoChartProfiler.profileIndex(snapshot)
         }
 
-        let first = AutoChartEngine.validate(
+        let first = AutoChartRecommendationEngine.validate(
             specification: specification,
             snapshot: firstSnapshot,
             profiles: profiles(firstSnapshot),
             memo: memo)
-        let second = AutoChartEngine.validate(
+        let second = AutoChartRecommendationEngine.validate(
             specification: specification,
             snapshot: secondSnapshot,
             profiles: profiles(secondSnapshot),
@@ -3488,7 +2852,7 @@ private let date = AutoChartColumn(
             specification: specification)
 
         #expect(Set(prepared.compactMap(\.xIdentity)).count == 1)
-        #expect(!AutoChartEngine.validate(specification: specification, for: input).isValid)
+        #expect(!AutoChartRecommendationEngine.validate(specification: specification, for: input).isValid)
     }
 
     @Test func completeResultFamiliesRejectMissingEncodedValues() {
@@ -3511,7 +2875,7 @@ private let date = AutoChartColumn(
             family: .normalizedBar,
             encoding: .init(x: category.id, y: measure.id, series: series.id),
             stacking: .normalized)
-        let compositionIssues = AutoChartEngine.validate(
+        let compositionIssues = AutoChartRecommendationEngine.validate(
             specification: normalized, for: compositionInput
         ).issues.map(\.message)
         #expect(compositionIssues.contains("Series fields must not contain missing values."))
@@ -3530,7 +2894,7 @@ private let date = AutoChartColumn(
             encoding: .init(x: category.id, y: series.id),
             aggregation: .count)
         #expect(
-            AutoChartEngine.validate(
+            AutoChartRecommendationEngine.validate(
                 specification: heatmap, for: heatmapInput
             ).issues.contains {
                 $0.message == "Heatmap x categories must not contain missing values."
@@ -3543,7 +2907,7 @@ private let date = AutoChartColumn(
             family: .range,
             encoding: .init(x: category.id, start: date.id, end: end.id))
         #expect(
-            AutoChartEngine.validate(
+            AutoChartRecommendationEngine.validate(
                 specification: range, for: rangeInput
             ).issues.contains {
                 $0.message == "Range ends must not contain missing values."
@@ -3555,8 +2919,9 @@ private let date = AutoChartColumn(
             id: "average", name: "average",
             hints: AutoChartColumnHints(
                 semanticType: .quantitative,
-                aggregation: .mean,
-                aggregationSafety: .safe))
+                measureSemantics: .init(
+                    source: .rowLevel, rollup: .safe(.mean),
+                    preferredTransform: .mean)))
         let input = table(
             columns: [category, average],
             rows: [[.text("A"), .double(1)], [.text("A"), .double(3)]])
@@ -3568,8 +2933,8 @@ private let date = AutoChartColumn(
             family: .bar,
             encoding: .init(x: category.id, y: average.id),
             aggregation: .mean)
-        #expect(!AutoChartEngine.validate(specification: sum, for: input).isValid)
-        #expect(AutoChartEngine.validate(specification: mean, for: input).isValid)
+        #expect(!AutoChartRecommendationEngine.validate(specification: sum, for: input).isValid)
+        #expect(AutoChartRecommendationEngine.validate(specification: mean, for: input).isValid)
     }
 
     @Test func typedHeatmapIdentitiesAndIDsDoNotCollide() {
@@ -3645,13 +3010,13 @@ private let date = AutoChartColumn(
         let selectedDate = try Date("2026-01-01T00:00:00Z", strategy: .iso8601)
         let matches = [
             AutoChartDatum(
-                id: "first", sourceRowIDs: ["r0"], xDate: selectedDate,
+                id: "first", sourceRowIDs: [0], xDate: selectedDate,
                 yNumber: 10, series: "First"),
             AutoChartDatum(
-                id: "second", sourceRowIDs: ["r1"], xDate: selectedDate,
+                id: "second", sourceRowIDs: [1], xDate: selectedDate,
                 yNumber: 20, series: "Second"),
             AutoChartDatum(
-                id: "later", sourceRowIDs: ["r2"],
+                id: "later", sourceRowIDs: [2],
                 xDate: selectedDate.addingTimeInterval(86_400),
                 yNumber: 30, series: "First"),
         ]
@@ -3668,10 +3033,10 @@ private let date = AutoChartColumn(
     @Test func selectionHelpersPreserveBinRangesAndRejectAnglesPastTotal() {
         let bins = [
             AutoChartDatum(
-                id: "first", sourceRowIDs: ["r0"], xLabel: "0–10",
+                id: "first", sourceRowIDs: [0], xLabel: "0–10",
                 xNumber: 5, yNumber: 1),
             AutoChartDatum(
-                id: "second", sourceRowIDs: ["r1"], xLabel: "10–20",
+                id: "second", sourceRowIDs: [1], xLabel: "10–20",
                 xNumber: 15, yNumber: 2),
         ]
         #expect(
@@ -3684,7 +3049,7 @@ private let date = AutoChartColumn(
 
         let sectors = [
             AutoChartDatum(id: "missing-lineage", sourceRowIDs: [], yNumber: 1),
-            AutoChartDatum(id: "selectable", sourceRowIDs: ["r2"], yNumber: 2),
+            AutoChartDatum(id: "selectable", sourceRowIDs: [2], yNumber: 2),
         ]
         #expect(AutoChartSelectionPreparation.angleMatch(to: 0.5, in: sectors) == nil)
         #expect(AutoChartSelectionPreparation.angleMatch(to: 2, in: sectors)?.id == "selectable")
@@ -3698,8 +3063,8 @@ private let date = AutoChartColumn(
 
     @Test func selectionSummariesRespectNonadditiveAggregations() {
         let matches = [
-            AutoChartDatum(id: "first", sourceRowIDs: ["r0"], yNumber: 10),
-            AutoChartDatum(id: "second", sourceRowIDs: ["r1", "r2"], yNumber: 20),
+            AutoChartDatum(id: "first", sourceRowIDs: [0], yNumber: 10),
+            AutoChartDatum(id: "second", sourceRowIDs: [1, 2], yNumber: 20),
         ]
         #expect(
             AutoChartSelectionPreparation.valueDescription(

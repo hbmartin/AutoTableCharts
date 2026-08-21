@@ -11,7 +11,7 @@ import SwiftUI
 
 struct AutoChartDatum: Identifiable, Sendable {
     var id: String
-    var sourceRowIDs: Set<AutoChartRowID>
+    var sourceRowIDs: Set<Int>
     var xIdentity: String? = nil
     var xLabel: String?
     var xNumber: Double?
@@ -123,18 +123,24 @@ enum AutoChartAccessibility {
 }
 
 enum AutoChartSelectionPreparation {
+    struct OffsetSelection: Sendable {
+        var sourceRowOffsets: Set<Int>
+        var label: String
+        var valueDescription: String
+    }
+
     static func selection(
         for matches: [AutoChartDatum],
         label: String,
         aggregation: AutoChartAggregation
-    ) -> AutoChartSelection? {
+    ) -> OffsetSelection? {
         guard !matches.isEmpty else { return nil }
-        let rowIDs = matches.reduce(into: Set<AutoChartRowID>()) {
+        let rowIDs = matches.reduce(into: Set<Int>()) {
             $0.formUnion($1.sourceRowIDs)
         }
         guard !rowIDs.isEmpty else { return nil }
-        return AutoChartSelection(
-            sourceRowIDs: rowIDs,
+        return OffsetSelection(
+            sourceRowOffsets: rowIDs,
             label: label,
             valueDescription: valueDescription(
                 for: matches,
@@ -207,7 +213,7 @@ enum AutoChartSelectionPreparation {
         for matches: [AutoChartDatum],
         aggregation: AutoChartAggregation
     ) -> String {
-        let rowIDs = matches.reduce(into: Set<AutoChartRowID>()) {
+        let rowIDs = matches.reduce(into: Set<Int>()) {
             $0.formUnion($1.sourceRowIDs)
         }
         let numericMatches = matches.compactMap { datum -> (value: Double, weight: Int)? in
@@ -318,21 +324,19 @@ enum AutoChartDataPreparation {
             let endDate = end.flatMap(AutoChartProfiler.dateValue)
             if specification.family == .range {
                 guard startDate != nil, endDate != nil else { return nil }
-            } else if specification.family != .table,
-                specification.family != .kpi,
+            } else if specification.family != .kpi,
                 encoding.x != nil
             {
                 guard xIdentity != nil else { return nil }
             }
-            if specification.family != .table,
-                specification.family != .kpi,
+            if specification.family != .kpi,
                 encoding.y != nil,
                 yValue?.numericValue == nil
             {
                 return nil
             }
             return AutoChartDatum(
-                id: "row-\(index)-\(row.id.rawValue)",
+                id: "row-\(index)-\(row.id)",
                 sourceRowIDs: [row.id],
                 xIdentity: xIdentity,
                 xLabel: xValue?.categoryString(),
@@ -417,7 +421,7 @@ enum AutoChartDataPreparation {
         specification: AutoChartSpecification
     ) -> [AutoChartDatum] {
         guard let x = specification.encoding.x else { return [] }
-        let values = snapshot.rows.compactMap { row -> (Double, AutoChartRowID)? in
+        let values = snapshot.rows.compactMap { row -> (Double, Int)? in
             guard let value = row.values[x]?.numericValue, value.isFinite else { return nil }
             return (value, row.id)
         }
@@ -431,7 +435,7 @@ enum AutoChartDataPreparation {
         let scaledWidth =
             scaledMaximum > scaledMinimum
             ? (scaledMaximum - scaledMinimum) / Double(count) : 1
-        var bins: [[(Double, AutoChartRowID)]] = Array(repeating: [], count: count)
+        var bins: [[(Double, Int)]] = Array(repeating: [], count: count)
         for value in values {
             let scaledValue = value.0 / scale
             let position = (scaledValue - scaledMinimum) / scaledWidth
@@ -479,7 +483,7 @@ enum AutoChartDataPreparation {
                 label: value?.categoryString() ?? "Missing value")
         }
         return grouped.compactMap { key, rows in
-            let contributingValues = rows.compactMap { row -> (Double, AutoChartRowID)? in
+            let contributingValues = rows.compactMap { row -> (Double, Int)? in
                 guard let value = row.values[y]?.numericValue else { return nil }
                 return (value, row.id)
             }
@@ -679,7 +683,7 @@ func disambiguatedCategoryValue(
     return labels[identity] ?? label ?? identity
 }
 
-private struct AutoChartRenderPresentation {
+struct AutoChartRenderPresentation: Sendable {
     var sizeBounds: (minimum: Double, maximum: Double)?
     var sharedYDomain: ClosedRange<Double>?
     var sharedXDateDomain: ClosedRange<Date>?
@@ -828,7 +832,7 @@ private struct AutoChartRenderPresentation {
         let facetDisplayLabels =
             specification.encoding.facet != nil
             ? categoryLabels(identity: \.facetIdentity, label: \.facet) : [:]
-        let facetBaseFamily = AutoChartEngine.resolvedFacetBaseFamily(
+        let facetBaseFamily = AutoChartRecommendationEngine.resolvedFacetBaseFamily(
             specification: specification,
             profiles: profiles)
 
@@ -971,7 +975,7 @@ private extension AutoChartFamily {
     }
 }
 
-private final class AutoChartPreparedTable: Sendable {
+final class AutoChartPreparedTable: Sendable {
     let snapshot: AutoChartSnapshot
     let profiles: [AutoChartColumnID: AutoChartColumnProfile]
     let fingerprint: Int
@@ -993,7 +997,7 @@ private final class AutoChartPreparedTable: Sendable {
     }
 }
 
-private struct AutoChartRenderCore {
+struct AutoChartRenderCore: Sendable {
     let table: AutoChartPreparedTable
     let data: [AutoChartDatum]
     let validation: AutoChartValidationResult
@@ -1001,816 +1005,36 @@ private struct AutoChartRenderCore {
 
     var snapshot: AutoChartSnapshot { table.snapshot }
     var fingerprint: Int { table.fingerprint }
-}
 
-/// Process-wide retention limits for prepared rendering data.
-///
-/// The table and render costs are approximate retained-byte budgets rather than
-/// exact allocation limits. Set either entry count or cost to zero to disable
-/// that cache layer. Initializer inputs below zero are clamped to zero.
-public struct AutoChartRenderCacheConfiguration: Equatable, Sendable {
-    /// The standard cache limits used until a host supplies another configuration.
-    public static let standard = AutoChartRenderCacheConfiguration()
-
-    /// The maximum number of snapshots and profile sets retained. Defaults to eight.
-    public let maximumTableEntries: Int
-    /// The approximate retained-byte budget for snapshots and profiles. Defaults to 32 MiB.
-    public let maximumTableCost: Int
-    /// The maximum number of prepared recommendation results retained. Defaults to sixteen.
-    public let maximumRenderEntries: Int
-    /// The approximate retained-byte budget for prepared recommendation results.
-    /// Defaults to 32 MiB. A table snapshot shared through the table cache is
-    /// excluded; a snapshot retained only through render entries counts against
-    /// this budget once, however many render entries share it.
-    public let maximumRenderCost: Int
-
-    /// Creates process-wide rendering cache limits.
-    ///
-    /// - Parameters:
-    ///   - maximumTableEntries: Maximum retained snapshots and profile sets.
-    ///   - maximumTableCost: Approximate retained-byte budget for snapshots and profiles.
-    ///   - maximumRenderEntries: Maximum retained prepared recommendation results.
-    ///   - maximumRenderCost: Approximate retained-byte budget for prepared results.
-    ///     Table-cache snapshots are excluded, while a snapshot retained only through
-    ///     render entries is counted once no matter how many share it.
-    public init(
-        maximumTableEntries: Int = 8,
-        maximumTableCost: Int = 32 * 1_024 * 1_024,
-        maximumRenderEntries: Int = 16,
-        maximumRenderCost: Int = 32 * 1_024 * 1_024
-    ) {
-        self.maximumTableEntries = max(0, maximumTableEntries)
-        self.maximumTableCost = max(0, maximumTableCost)
-        self.maximumRenderEntries = max(0, maximumRenderEntries)
-        self.maximumRenderCost = max(0, maximumRenderCost)
-    }
-}
-
-private extension AutoChartRenderCacheConfiguration {
-    var isTableCachingEnabled: Bool {
-        maximumTableEntries > 0 && maximumTableCost > 0
-    }
-
-    var isRenderCachingEnabled: Bool {
-        maximumRenderEntries > 0 && maximumRenderCost > 0
-    }
-}
-
-/// Controls the process-wide cache used by ``AutoChartView``.
-public enum AutoChartRenderCache {
-    /// The currently active process-wide limits.
-    public static var configuration: AutoChartRenderCacheConfiguration {
-        AutoChartRenderPreparationCache.shared.configuration
-    }
-
-    /// Applies new process-wide limits and immediately evicts entries that exceed them.
-    ///
-    /// Configuration and rendering may safely occur from different threads. Configure
-    /// the cache during application or extension startup when possible so its behavior
-    /// remains predictable for every chart in the process.
-    public static func configure(_ configuration: AutoChartRenderCacheConfiguration) {
-        AutoChartRenderPreparationCache.shared.configure(configuration)
-    }
-
-    /// Releases every retained table and prepared rendering result.
-    public static func removeAll() {
-        AutoChartRenderPreparationCache.shared.removeAll()
-    }
-
-    static func handleMemoryPressure() {
-        AutoChartRenderPreparationCache.shared.removeAll()
-    }
-
-    static var retainedTableCount: Int {
-        AutoChartRenderPreparationCache.shared.tableEntryCount
-    }
-
-    static var retainedRenderCount: Int {
-        AutoChartRenderPreparationCache.shared.renderEntryCount
-    }
-
-    /// The bytes currently charged against the render budget, counting a shared
-    /// render-owned snapshot once.
-    static var retainedRenderCost: Int {
-        AutoChartRenderPreparationCache.shared.totalRenderCost
-    }
-}
-
-private struct AutoChartRenderTableCacheKey: Hashable {
-    var tableType: String
-    var tableIdentity: String?
-    var contentIdentity: String
-}
-
-private struct AutoChartRenderCacheKey: Hashable {
-    var table: AutoChartRenderTableCacheKey
-    var specification: AutoChartSpecification
-}
-
-private final class AutoChartRenderPreparationCache: @unchecked Sendable {
-    static let shared = AutoChartRenderPreparationCache()
-
-    private let lock = NSLock()
-    private var activeConfiguration = AutoChartRenderCacheConfiguration.standard
-    private var configurationRevision: UInt64 = 0
-    private var tableEntries: [AutoChartRenderTableCacheKey: AutoChartPreparedTable] = [:]
-    private var tableRecency: [AutoChartRenderTableCacheKey] = []
-    private var tableTotalCost = 0
-    private var entries: [AutoChartRenderCacheKey: AutoChartRenderCore] = [:]
-    private var costs: [AutoChartRenderCacheKey: Int] = [:]
-    private var recency: [AutoChartRenderCacheKey] = []
-    private var totalCost = 0
-    /// Byte cost of each render-owned prepared table, charged to the budget once
-    /// however many render entries share it.
-    private var renderTableCosts: [ObjectIdentifier: Int] = [:]
-    /// Render entries retaining each render-owned prepared table. A table is
-    /// charged while this is non-empty and released when the last entry goes.
-    private var renderTableRetainers: [ObjectIdentifier: Set<AutoChartRenderCacheKey>] = [:]
-    /// Reverse index from a render entry to the render-owned table it retains.
-    private var renderEntryTables: [AutoChartRenderCacheKey: ObjectIdentifier] = [:]
-    // Retains the UIKit registration for the process lifetime of the shared cache.
-    private var memoryWarningObserver: NSObjectProtocol?
-
-    private struct ConfigurationSnapshot {
-        let value: AutoChartRenderCacheConfiguration
-        let revision: UInt64
-    }
-
-    private init() {
-        #if canImport(UIKit) && !os(watchOS)
-        memoryWarningObserver = NotificationCenter.default.addObserver(
-            forName: UIApplication.didReceiveMemoryWarningNotification,
-            object: nil,
-            queue: nil
-        ) { _ in
-            AutoChartRenderCache.handleMemoryPressure()
-        }
-        #endif
-    }
-
-    func core<Table: AutoChartTable>(
-        table: Table,
-        recommendation: AutoChartRecommendation
-    ) -> AutoChartRenderCore {
-        let tableType = String(reflecting: Table.self)
-        if let tableIdentity = table.chartDataIdentity,
-            let version = table.chartDataVersion
-        {
-            let tableKey = AutoChartRenderTableCacheKey(
-                tableType: tableType,
-                tableIdentity: tableIdentity,
-                contentIdentity: "version:\(version)")
-            let renderKey = AutoChartRenderCacheKey(
-                table: tableKey,
-                specification: recommendation.specification)
-            // Identity and version are the caller's content-stability contract, so
-            // the render layer can hit independently of the table layer.
-            if let cached = value(for: renderKey) { return cached }
-            if let prepared = tableValue(for: tableKey) {
-                return core(
-                    table: prepared,
-                    tableKey: tableKey,
-                    recommendation: recommendation)
-            }
-            if let prepared = renderOwnedTableValue(for: tableKey) {
-                return core(
-                    table: prepared,
-                    tableKey: tableKey,
-                    recommendation: recommendation)
-            }
-            var hasher = Hasher()
-            hasher.combine(tableType)
-            hasher.combine(tableIdentity)
-            hasher.combine(version)
-            return core(
-                snapshot: AutoChartSnapshot(table),
-                tableKey: tableKey,
-                recommendation: recommendation,
-                fingerprint: hasher.finalize())
-        }
-
-        let snapshot = AutoChartSnapshot(table)
-        let fingerprint = snapshot.contentFingerprint
-        let tableKey = AutoChartRenderTableCacheKey(
-            tableType: tableType,
-            tableIdentity: nil,
-            contentIdentity: "fingerprint:\(fingerprint)")
-        if let prepared = tableValue(for: tableKey, matching: snapshot) {
-            return core(
-                table: prepared,
-                tableKey: tableKey,
-                recommendation: recommendation)
-        }
-        if let prepared = renderOwnedTableValue(for: tableKey, matching: snapshot) {
-            return core(
-                table: prepared,
-                tableKey: tableKey,
-                recommendation: recommendation)
-        }
-        return core(
-            snapshot: snapshot,
-            tableKey: tableKey,
-            recommendation: recommendation,
-            fingerprint: fingerprint)
-    }
-
-    private func core(
-        snapshot: AutoChartSnapshot,
-        tableKey: AutoChartRenderTableCacheKey,
-        recommendation: AutoChartRecommendation,
-        fingerprint: Int
-    ) -> AutoChartRenderCore {
-        let cacheConfiguration = configurationSnapshot()
-        let profiles = AutoChartProfiler.profileIndex(snapshot)
-        let tableCostLimit = max(
-            cacheConfiguration.value.isTableCachingEnabled
-                ? cacheConfiguration.value.maximumTableCost : 0,
-            cacheConfiguration.value.isRenderCachingEnabled
-                ? cacheConfiguration.value.maximumRenderCost : 0)
-        let prepared = AutoChartPreparedTable(
-            snapshot: snapshot,
-            profiles: profiles,
-            fingerprint: fingerprint,
-            estimatedCost:
-                tableCostLimit > 0
-                ? estimatedTableCost(
-                    snapshot: snapshot,
-                    profiles: profiles,
-                    key: tableKey,
-                    limit: tableCostLimit)
-                : nil,
-            cacheConfigurationRevision: cacheConfiguration.revision)
-        return core(
-            table: cacheTable(prepared, for: tableKey) ?? prepared,
-            tableKey: tableKey,
-            recommendation: recommendation)
-    }
-
-    private func core(
-        table: AutoChartPreparedTable,
-        tableKey: AutoChartRenderTableCacheKey,
-        recommendation: AutoChartRecommendation
-    ) -> AutoChartRenderCore {
-        let key = AutoChartRenderCacheKey(
-            table: tableKey,
-            specification: recommendation.specification)
-        if let cached = value(for: key, matching: table) { return cached }
-        let specification = recommendation.specification
-        let data = AutoChartDataPreparation.data(
-            snapshot: table.snapshot,
-            specification: specification,
-            profiles: table.profiles)
-        let core = AutoChartRenderCore(
-            table: table,
-            data: data,
-            validation: AutoChartEngine.validate(
-                specification: specification,
-                snapshot: table.snapshot,
-                profiles: table.profiles,
-                preparedData: data),
-            presentation: AutoChartRenderPresentation(
-                snapshot: table.snapshot,
-                specification: specification,
-                profiles: table.profiles,
-                data: data))
-        insert(core, for: key, specification: specification)
-        return core
-    }
-
-    private func tableValue(
-        for key: AutoChartRenderTableCacheKey
-    ) -> AutoChartPreparedTable? {
-        lock.lock()
-        defer { lock.unlock() }
-        guard let value = tableEntries[key] else { return nil }
-        tableRecency.removeAll { $0 == key }
-        tableRecency.append(key)
-        return value
-    }
-
-    private func tableValue(
-        for key: AutoChartRenderTableCacheKey,
-        matching snapshot: AutoChartSnapshot
-    ) -> AutoChartPreparedTable? {
-        lock.lock()
-        guard let value = tableEntries[key] else {
-            lock.unlock()
-            return nil
-        }
-        lock.unlock()
-
-        let matches = value.snapshot.hasSameContent(as: snapshot)
-        lock.lock()
-        defer { lock.unlock() }
-        guard let current = tableEntries[key], current === value
-        else { return nil }
-        guard matches else {
-            // A fingerprint collision, so only entries sharing this table are
-            // stale. Render-owned snapshots under the key are compared against
-            // the caller's content before they are reused.
-            removeTable(for: key)
-            return nil
-        }
-        tableRecency.removeAll { $0 == key }
-        tableRecency.append(key)
-        return value
-    }
-
-    /// Reuses a snapshot already retained and budgeted by the render layer.
-    /// Identity and version are the caller's content-stability contract.
-    private func renderOwnedTableValue(
-        for key: AutoChartRenderTableCacheKey
-    ) -> AutoChartPreparedTable? {
-        lock.lock()
-        defer { lock.unlock() }
-        // Disabling table caching drains `tableEntries`, so every entry under
-        // this key holds a render-owned snapshot.
-        guard !activeConfiguration.isTableCachingEnabled,
-            let renderKey = recency.last(where: { $0.table == key }),
-            let value = entries[renderKey]
-        else { return nil }
-        return value.table
-    }
-
-    /// Reuses render-owned storage after fingerprint lookup confirms the key and
-    /// a full comparison confirms the snapshot content.
-    private func renderOwnedTableValue(
-        for key: AutoChartRenderTableCacheKey,
-        matching snapshot: AutoChartSnapshot
-    ) -> AutoChartPreparedTable? {
-        lock.lock()
-        guard !activeConfiguration.isTableCachingEnabled else {
-            lock.unlock()
-            return nil
-        }
-        var seen: Set<ObjectIdentifier> = []
-        let candidates = recency.reversed().compactMap { renderKey -> AutoChartPreparedTable? in
-            guard renderKey.table == key,
-                let table = entries[renderKey]?.table,
-                tableEntries[key] !== table,
-                seen.insert(ObjectIdentifier(table)).inserted
-            else { return nil }
-            return table
-        }
-        lock.unlock()
-
-        for candidate in candidates where candidate.snapshot.hasSameContent(as: snapshot) {
-            lock.lock()
-            let isRetained = !activeConfiguration.isTableCachingEnabled
-                && entries.contains { renderKey, value in
-                    renderKey.table == key && value.table === candidate
-                }
-            lock.unlock()
-            if isRetained { return candidate }
-        }
-        return nil
-    }
-
-    private func value(
-        for key: AutoChartRenderCacheKey
-    ) -> AutoChartRenderCore? {
-        lock.lock()
-        defer { lock.unlock() }
-        guard let value = entries[key] else { return nil }
-        touchRender(for: key, table: value.table)
-        return value
-    }
-
-    private func value(
-        for key: AutoChartRenderCacheKey,
-        matching table: AutoChartPreparedTable
-    ) -> AutoChartRenderCore? {
-        lock.lock()
-        guard let value = entries[key] else {
-            lock.unlock()
-            return nil
-        }
-        if value.table === table {
-            touchRender(for: key, table: table)
-            lock.unlock()
-            return value
-        }
-        lock.unlock()
-
-        let matches = value.table.snapshot.hasSameContent(as: table.snapshot)
-        lock.lock()
-        defer { lock.unlock() }
-        guard let current = entries[key], current.table === value.table else {
-            return nil
-        }
-        guard matches else {
-            removeRender(for: key)
-            return nil
-        }
-        touchRender(for: key, table: current.table)
-        return current
-    }
-
-    /// Updates render recency and, when applicable, its shared table entry.
-    ///
-    /// - Precondition: The caller already holds `lock`.
-    private func touchRender(
-        for key: AutoChartRenderCacheKey,
-        table: AutoChartPreparedTable
-    ) {
-        recency.removeAll { $0 == key }
-        recency.append(key)
-        if tableEntries[key.table] === table {
-            tableRecency.removeAll { $0 == key.table }
-            tableRecency.append(key.table)
-        }
-    }
-
-    private func insert(
-        _ value: AutoChartRenderCore,
-        for key: AutoChartRenderCacheKey,
-        specification: AutoChartSpecification
-    ) {
-        let cacheConfiguration = configurationSnapshot()
-        guard cacheConfiguration.value.isRenderCachingEnabled,
-            let renderCost = estimatedCost(
-            data: value.data,
-            presentation: value.presentation,
-            validation: value.validation,
-            specification: specification,
-            limit: cacheConfiguration.value.maximumRenderCost)
-        else { return }
-        if cacheConfiguration.value.isTableCachingEnabled {
-            _ = cacheTable(
-                value.table,
-                for: key.table,
-                expectedConfigurationRevision: cacheConfiguration.revision)
-        }
-        lock.lock()
-        defer { lock.unlock() }
-        guard cacheConfiguration.revision == configurationRevision else { return }
-        var ownedTable: (table: AutoChartPreparedTable, cost: Int)?
-        if tableEntries[key.table] !== value.table {
-            // Sharing an already-charged snapshot only defers the charge: this
-            // entry keeps that snapshot alive once the entries it joined are
-            // evicted, so it has to fit the budget alongside it either way.
-            // Admitting one that cannot would drain the cache on the trim below
-            // instead of leaving the entries already resident alone.
-            guard let tableCost = value.table.estimatedCost, tableCost >= 0,
-                tableCost <= activeConfiguration.maximumRenderCost - renderCost
-            else { return }
-            ownedTable = (value.table, tableCost)
-        }
-        replaceRenderTableRetention(with: ownedTable, for: key)
-        if let previousCost = costs[key] { totalCost -= previousCost }
-        entries[key] = value
-        costs[key] = renderCost
-        totalCost += renderCost
-        recency.removeAll { $0 == key }
-        recency.append(key)
-        trimRenderLocked()
-    }
-
-    private func cacheTable(
-        _ value: AutoChartPreparedTable,
-        for key: AutoChartRenderTableCacheKey,
-        expectedConfigurationRevision: UInt64? = nil
-    ) -> AutoChartPreparedTable? {
-        let maximumAttempts = 3
-        var attempts = 0
-        while attempts < maximumAttempts {
-            lock.lock()
-            if let expectedConfigurationRevision,
-                expectedConfigurationRevision != configurationRevision
-            {
-                lock.unlock()
-                return nil
-            }
-            if let existing = tableEntries[key] {
-                // Storing a render entry commonly reuses the same prepared table.
-                if existing === value {
-                    tableRecency.removeAll { $0 == key }
-                    tableRecency.append(key)
-                    lock.unlock()
-                    return existing
-                }
-                lock.unlock()
-
-                let matches = existing.snapshot.hasSameContent(as: value.snapshot)
-                lock.lock()
-                guard expectedConfigurationRevision == nil
-                        || expectedConfigurationRevision == configurationRevision,
-                    let current = tableEntries[key], current === existing
-                else {
-                    lock.unlock()
-                    attempts += 1
-                    continue
-                }
-                if matches {
-                    tableRecency.removeAll { $0 == key }
-                    tableRecency.append(key)
-                    lock.unlock()
-                    return existing
-                }
-                // Identity and version promised stable content and did not
-                // deliver it, so every render entry under this key is stale —
-                // including render-owned snapshots served without a comparison.
-                removeTable(for: key, invalidatingRenderEntries: true)
-            }
-            guard activeConfiguration.isTableCachingEnabled,
-                value.cacheConfigurationRevision == configurationRevision,
-                let estimatedCost = value.estimatedCost,
-                estimatedCost <= activeConfiguration.maximumTableCost
-            else {
-                lock.unlock()
-                return nil
-            }
-            tableEntries[key] = value
-            tableTotalCost += estimatedCost
-            tableRecency.removeAll { $0 == key }
-            tableRecency.append(key)
-            trimTableLocked()
-            let result = tableEntries[key]
-            lock.unlock()
-            return result
-        }
-        return nil
-    }
-
-    /// Removes the shared table entry for `key`.
-    ///
-    /// - Parameter invalidatingRenderEntries: Pass `true` when the caller broke
-    ///   the identity and version contract `key` was built from, so every render
-    ///   entry under it is stale — the identity-keyed lookups serve those
-    ///   entries without comparing content. Plain eviction passes `false` and
-    ///   preserves render-owned snapshots, which every other lookup verifies.
-    private func removeTable(
-        for key: AutoChartRenderTableCacheKey,
-        invalidatingRenderEntries: Bool = false
-    ) {
-        tableRecency.removeAll { $0 == key }
-        guard let removed = tableEntries.removeValue(forKey: key) else { return }
-        tableTotalCost -= removed.estimatedCost ?? 0
-        let related = recency.filter { renderKey in
-            renderKey.table == key
-                && (invalidatingRenderEntries || entries[renderKey]?.table === removed)
-        }
-        for renderKey in related {
-            removeRender(for: renderKey)
-        }
-    }
-
-    /// Removes one render entry and its accounted cost.
-    ///
-    /// - Precondition: The caller already holds `lock`.
-    private func removeRender(for key: AutoChartRenderCacheKey) {
-        entries.removeValue(forKey: key)
-        totalCost -= costs.removeValue(forKey: key) ?? 0
-        releaseRenderTable(for: key)
-        recency.removeAll { $0 == key }
-    }
-
-    /// Replaces the render-owned table retained by `key`, refunding its previous
-    /// table and charging the replacement on first retention only. Passing
-    /// `nil` leaves `key` with no render-owned table.
-    ///
-    /// - Precondition: The caller already holds `lock`.
-    private func replaceRenderTableRetention(
-        with ownedTable: (table: AutoChartPreparedTable, cost: Int)?,
-        for key: AutoChartRenderCacheKey
-    ) {
-        releaseRenderTable(for: key)
-        guard let ownedTable else { return }
-        let id = ObjectIdentifier(ownedTable.table)
-        renderEntryTables[key] = id
-        if renderTableRetainers[id] == nil {
-            renderTableRetainers[id] = []
-            renderTableCosts[id] = ownedTable.cost
-            totalCost += ownedTable.cost
-        }
-        renderTableRetainers[id]?.insert(key)
-    }
-
-    /// Drops `key` from its render-owned table, refunding the table once the
-    /// last retaining entry is gone.
-    ///
-    /// - Precondition: The caller already holds `lock`.
-    private func releaseRenderTable(for key: AutoChartRenderCacheKey) {
-        guard let id = renderEntryTables.removeValue(forKey: key),
-            var retainers = renderTableRetainers[id]
-        else { return }
-        retainers.remove(key)
-        if retainers.isEmpty {
-            renderTableRetainers.removeValue(forKey: id)
-            totalCost -= renderTableCosts.removeValue(forKey: id) ?? 0
-        } else {
-            renderTableRetainers[id] = retainers
-        }
-    }
-
-    private func estimatedTableCost(
+    static func prepare(
         snapshot: AutoChartSnapshot,
         profiles: [AutoChartColumnID: AutoChartColumnProfile],
-        key: AutoChartRenderTableCacheKey,
-        limit: Int
-    ) -> Int? {
-        let storageCost = snapshot.estimatedStorageCost
-        guard storageCost <= limit else { return nil }
-        var cost = storageCost
-        guard add(128, to: &cost, limit: limit),
-            add(key.tableType.utf8.count, to: &cost, limit: limit),
-            add(key.tableIdentity?.utf8.count ?? 0, to: &cost, limit: limit),
-            add(key.contentIdentity.utf8.count, to: &cost, limit: limit)
-        else { return nil }
-        for profile in profiles.values {
-            guard add(160, to: &cost, limit: limit),
-                add(
-                    profile.temporalValues.count,
-                    multipliedBy: MemoryLayout<Date>.stride,
-                    to: &cost,
-                    limit: limit)
-            else { return nil }
-        }
-        return cost
-    }
-
-    private func estimatedCost(
-        data: [AutoChartDatum],
-        presentation: AutoChartRenderPresentation,
-        validation: AutoChartValidationResult,
-        specification: AutoChartSpecification,
-        limit: Int
-    ) -> Int? {
-        var cost = 256
-        guard
-            add(
-                specification.title.utf8.count,
-                to: &cost,
-                limit: limit)
-        else { return nil }
-        let presentationTitles = [
-            presentation.xTitle, presentation.yTitle,
-            presentation.seriesTitle, presentation.facetTitle,
-        ]
-        for title in presentationTitles {
-            guard add(title.utf8.count, to: &cost, limit: limit) else { return nil }
-        }
-        for id in specification.encoding.columnIDs {
-            guard add(id.rawValue.utf8.count, to: &cost, limit: limit) else {
-                return nil
-            }
-        }
-        for datum in data {
-            guard add(256, to: &cost, limit: limit) else {
-                return nil
-            }
-            let strings: [String?] = [
-                datum.id, datum.xIdentity, datum.xLabel, datum.yIdentity,
-                datum.yLabel, datum.seriesIdentity, datum.series,
-                datum.facetIdentity, datum.facet,
-            ]
-            for string in strings.compactMap({ $0 }) {
-                guard add(string.utf8.count, to: &cost, limit: limit) else {
-                    return nil
-                }
-            }
-            for rowID in datum.sourceRowIDs {
-                guard add(32, to: &cost, limit: limit),
-                    add(rowID.rawValue.utf8.count, to: &cost, limit: limit)
-                else { return nil }
-            }
-        }
-        let labelDictionaries = [
-            presentation.xDisplayLabels, presentation.yDisplayLabels,
-            presentation.seriesDisplayLabels, presentation.facetDisplayLabels,
-        ]
-        for labels in labelDictionaries {
-            for (identity, label) in labels {
-                guard add(64, to: &cost, limit: limit),
-                    add(identity.utf8.count, to: &cost, limit: limit),
-                    add(label.utf8.count, to: &cost, limit: limit)
-                else { return nil }
-            }
-        }
-        for category in presentation.sharedXCategoryDomain {
-            guard add(32, to: &cost, limit: limit),
-                add(category.utf8.count, to: &cost, limit: limit)
-            else { return nil }
-        }
-        for issue in validation.issues {
-            guard add(64, to: &cost, limit: limit),
-                add(issue.message.utf8.count, to: &cost, limit: limit)
-            else { return nil }
-        }
-        return cost
-    }
-
-}
-
-private extension AutoChartRenderPreparationCache {
-    func add(_ amount: Int, to cost: inout Int, limit: Int) -> Bool {
-        guard amount >= 0, amount <= limit - cost else { return false }
-        cost += amount
-        return true
-    }
-
-    func add(
-        _ count: Int,
-        multipliedBy unitCost: Int,
-        to cost: inout Int,
-        limit: Int
-    ) -> Bool {
-        guard count >= 0, unitCost >= 0,
-            count <= (limit - cost) / max(1, unitCost)
-        else { return false }
-        cost += count * unitCost
-        return true
-    }
-
-    var configuration: AutoChartRenderCacheConfiguration {
-        lock.lock()
-        defer { lock.unlock() }
-        return activeConfiguration
-    }
-
-    var tableEntryCount: Int {
-        lock.lock()
-        defer { lock.unlock() }
-        return tableEntries.count
-    }
-
-    var renderEntryCount: Int {
-        lock.lock()
-        defer { lock.unlock() }
-        return entries.count
-    }
-
-    var totalRenderCost: Int {
-        lock.lock()
-        defer { lock.unlock() }
-        return totalCost
-    }
-
-    func configure(_ configuration: AutoChartRenderCacheConfiguration) {
-        lock.lock()
-        defer { lock.unlock() }
-        guard configuration != activeConfiguration else { return }
-        activeConfiguration = configuration
-        configurationRevision &+= 1
-        trimLocked()
-    }
-
-    func removeAll() {
-        lock.lock()
-        defer { lock.unlock() }
-        // Prevent preparation already in flight from repopulating the cache after
-        // an explicit purge or memory-pressure notification.
-        configurationRevision &+= 1
-        tableEntries.removeAll(keepingCapacity: false)
-        tableRecency.removeAll(keepingCapacity: false)
-        tableTotalCost = 0
-        entries.removeAll(keepingCapacity: false)
-        costs.removeAll(keepingCapacity: false)
-        recency.removeAll(keepingCapacity: false)
-        renderTableCosts.removeAll(keepingCapacity: false)
-        renderTableRetainers.removeAll(keepingCapacity: false)
-        renderEntryTables.removeAll(keepingCapacity: false)
-        totalCost = 0
-    }
-
-    private func configurationSnapshot() -> ConfigurationSnapshot {
-        lock.lock()
-        defer { lock.unlock() }
-        return ConfigurationSnapshot(
-            value: activeConfiguration,
-            revision: configurationRevision)
-    }
-
-    /// Evicts table and render entries that exceed the active limits.
-    ///
-    /// - Precondition: The caller already holds `lock`, which is not recursive.
-    func trimLocked() {
-        trimTableLocked()
-        trimRenderLocked()
-    }
-
-    /// Evicts table entries beyond the active limits.
-    ///
-    /// - Precondition: The caller already holds `lock`.
-    private func trimTableLocked() {
-        while !tableRecency.isEmpty,
-            tableRecency.count > activeConfiguration.maximumTableEntries
-                || tableTotalCost > activeConfiguration.maximumTableCost
-        {
-            removeTable(for: tableRecency.removeFirst())
-        }
-    }
-
-    /// Evicts render entries beyond the active limits.
-    ///
-    /// - Precondition: The caller already holds `lock`.
-    private func trimRenderLocked() {
-        while !recency.isEmpty,
-            recency.count > activeConfiguration.maximumRenderEntries
-                || totalCost > activeConfiguration.maximumRenderCost
-        {
-            removeRender(for: recency[0])
-        }
+        recommendation: AutoChartRecommendation
+    ) -> AutoChartRenderCore {
+        let specification = recommendation.specification
+        let data = AutoChartDataPreparation.data(
+            snapshot: snapshot,
+            specification: specification,
+            profiles: profiles)
+        let table = AutoChartPreparedTable(
+            snapshot: snapshot,
+            profiles: profiles,
+            fingerprint: snapshot.contentFingerprint,
+            estimatedCost: snapshot.estimatedStorageCost,
+            cacheConfigurationRevision: 0)
+        return AutoChartRenderCore(
+            table: table,
+            data: data,
+            validation: AutoChartRecommendationEngine.validate(
+                specification: specification,
+                snapshot: snapshot,
+                profiles: profiles,
+                preparedData: data),
+            presentation: AutoChartRenderPresentation(
+                snapshot: snapshot,
+                specification: specification,
+                profiles: profiles,
+                data: data))
     }
 }
 
@@ -1821,40 +1045,73 @@ private enum AutoChartFacetSelectionAxis {
     case y
 }
 
-/// A native Swift Charts view for an AutoTableCharts recommendation or specification.
-///
-/// The view reuses cached snapshot, profiling, validation, and mark preparation
-/// when table identity permits. Preparation never mutates source storage, and
-/// bound selection state preserves contributing ``AutoChartRowID`` values.
-public struct AutoChartView: View {
-    private let snapshot: AutoChartSnapshot
-    private let recommendation: AutoChartRecommendation
-    private let validation: AutoChartValidationResult
-    private let data: [AutoChartDatum]
-    private let sizeBounds: (minimum: Double, maximum: Double)?
-    private let sharedYDomain: ClosedRange<Double>?
-    private let sharedXDateDomain: ClosedRange<Date>?
-    private let sharedXNumberDomain: ClosedRange<Double>?
-    private let sharedXCategoryDomain: [String]
-    private let facetBaseFamily: AutoChartFamily?
-    private let interaction: AutoChartInteraction
-    private let chartHeight: CGFloat
-    private let snapshotFingerprint: Int
-    private let xTitle: String
-    private let yTitle: String
-    private let seriesTitle: String
-    private let facetTitle: String
-    private let xSemanticType: AutoChartSemanticType?
-    private let xDisplayLabels: [String: String]
-    private let yDisplayLabels: [String: String]
-    private let seriesDisplayLabels: [String: String]
-    private let facetDisplayLabels: [String: String]
-    private let uniqueXCount: Int
-    private let timeZoomValueCount: Int
-    private let timeZoomSpan: TimeInterval
-    private let numberZoomValueCount: Int
-    private let numberZoomSpan: Double
-    @Binding private var selection: AutoChartSelection?
+public struct AutoChartChrome: OptionSet, Hashable, Codable, Sendable {
+    public let rawValue: Int
+    public init(rawValue: Int) { self.rawValue = rawValue }
+    public static let title = AutoChartChrome(rawValue: 1 << 0)
+    public static let diagnostics = AutoChartChrome(rawValue: 1 << 1)
+    public static let selectionSummary = AutoChartChrome(rawValue: 1 << 2)
+    public static let zoomControls = AutoChartChrome(rawValue: 1 << 3)
+    public static let all: AutoChartChrome = [.title, .diagnostics, .selectionSummary, .zoomControls]
+}
+
+public struct AutoChartInteractions: OptionSet, Hashable, Codable, Sendable {
+    public let rawValue: Int
+    public init(rawValue: Int) { self.rawValue = rawValue }
+    public static let selection = AutoChartInteractions(rawValue: 1 << 0)
+    public static let scrolling = AutoChartInteractions(rawValue: 1 << 1)
+    public static let zoom = AutoChartInteractions(rawValue: 1 << 2)
+    public static let all: AutoChartInteractions = [.selection, .scrolling, .zoom]
+}
+
+public enum AutoChartTypography: String, Hashable, Codable, Sendable {
+    case compact
+    case standard
+}
+
+public struct AutoChartPresentation: Hashable, Sendable {
+    public var plotHeight: CGFloat?
+    public var chrome: AutoChartChrome
+    public var interactions: AutoChartInteractions
+    public var typography: AutoChartTypography
+
+    public init(
+        plotHeight: CGFloat? = nil,
+        chrome: AutoChartChrome = .all,
+        interactions: AutoChartInteractions = .all,
+        typography: AutoChartTypography = .standard
+    ) {
+        self.plotHeight = plotHeight
+        self.chrome = chrome
+        self.interactions = interactions
+        self.typography = typography
+    }
+
+    public static func preview(plotHeight: CGFloat) -> Self {
+        Self(
+            plotHeight: plotHeight,
+            chrome: [.diagnostics],
+            interactions: [],
+            typography: .compact)
+    }
+
+    public static func explorer(plotHeight: CGFloat? = nil) -> Self {
+        Self(plotHeight: plotHeight)
+    }
+}
+
+private enum AutoChartViewContent<RowID: Hashable & Sendable>: Sendable {
+    case chart(AutoChartPreparedChart<RowID>)
+    case fallback(AutoChartFallback)
+}
+
+/// Convenience composition of a prepared plot and optional package chrome.
+public struct AutoChartView<RowID: Hashable & Sendable>: View {
+    private let content: AutoChartViewContent<RowID>
+    private let presentation: AutoChartPresentation
+    private let formatters: AutoChartFormatters
+    private let textResolver: AutoChartTextResolver
+    @Binding private var selection: AutoChartSelection<RowID>?
 
     @State private var selectedCategory: String?
     @State private var selectedDate: Date?
@@ -1863,122 +1120,124 @@ public struct AutoChartView: View {
     @State private var zoomScale = 1.0
     @State private var zoomAnchor = 1.0
 
-    /// Creates a chart from an engine-generated recommendation.
-    ///
-    /// Use this initializer when you want the recommendation's explanation and
-    /// warnings to remain attached to the rendered chart.
-    ///
-    /// - Parameters:
-    ///   - table: The same typed table used to generate the recommendation.
-    ///   - recommendation: A validated engine result.
-    ///   - selection: Optional linked selection state containing source-row IDs.
-    ///   - interaction: Compact preview or exploratory interaction behavior.
-    ///   - height: The requested chart height in points.
-    public init<Table: AutoChartTable>(
-        table: Table,
-        recommendation: AutoChartRecommendation,
-        selection: Binding<AutoChartSelection?> = .constant(nil),
-        interaction: AutoChartInteraction = .explore,
-        height: CGFloat = 280
+    public init(
+        preparedChart: AutoChartPreparedChart<RowID>,
+        selection: Binding<AutoChartSelection<RowID>?> = .constant(nil),
+        presentation: AutoChartPresentation = .explorer(),
+        formatters: AutoChartFormatters = .init(),
+        textResolver: AutoChartTextResolver = .default
     ) {
-        let core = AutoChartRenderPreparationCache.shared.core(
-            table: table,
-            recommendation: recommendation)
-        let presentation = core.presentation
-        self.snapshot = core.snapshot
-        self.recommendation = recommendation
-        validation = core.validation
-        data = core.data
-        sizeBounds = presentation.sizeBounds
-        sharedYDomain = presentation.sharedYDomain
-        sharedXDateDomain = presentation.sharedXDateDomain
-        sharedXNumberDomain = presentation.sharedXNumberDomain
-        sharedXCategoryDomain = presentation.sharedXCategoryDomain
-        facetBaseFamily = presentation.facetBaseFamily
+        content = .chart(preparedChart)
         self._selection = selection
-        self.interaction = interaction
-        chartHeight = height
-        snapshotFingerprint = core.fingerprint
-        xTitle = presentation.xTitle
-        yTitle = presentation.yTitle
-        seriesTitle = presentation.seriesTitle
-        facetTitle = presentation.facetTitle
-        xSemanticType = presentation.xSemanticType
-        xDisplayLabels = presentation.xDisplayLabels
-        yDisplayLabels = presentation.yDisplayLabels
-        seriesDisplayLabels = presentation.seriesDisplayLabels
-        facetDisplayLabels = presentation.facetDisplayLabels
-        uniqueXCount = presentation.uniqueXCount
-        timeZoomValueCount = presentation.timeZoomValueCount
-        timeZoomSpan = presentation.timeZoomSpan
-        numberZoomValueCount = presentation.numberZoomValueCount
-        numberZoomSpan = presentation.numberZoomSpan
+        self.presentation = presentation
+        self.formatters = formatters
+        self.textResolver = textResolver
     }
 
-    /// Creates a chart from a caller-provided specification.
-    ///
-    /// The view validates the specification and displays diagnostics instead of
-    /// an invalid chart. Call ``AutoChartEngine/validate(specification:for:)``
-    /// first when the surrounding UI needs to react to errors.
-    ///
-    /// - Parameters:
-    ///   - table: The typed table represented by the specification.
-    ///   - specification: A caller-authored chart description.
-    ///   - selection: Optional linked selection state containing source-row IDs.
-    ///   - interaction: Compact preview or exploratory interaction behavior.
-    ///   - height: The requested chart height in points.
-    public init<Table: AutoChartTable>(
-        table: Table,
-        specification: AutoChartSpecification,
-        selection: Binding<AutoChartSelection?> = .constant(nil),
-        interaction: AutoChartInteraction = .explore,
-        height: CGFloat = 280
+    public init(
+        analysis: AutoChartAnalysis<RowID>,
+        selection: Binding<AutoChartSelection<RowID>?> = .constant(nil),
+        presentation: AutoChartPresentation = .explorer(),
+        formatters: AutoChartFormatters = .init(),
+        textResolver: AutoChartTextResolver = .default
     ) {
-        let warnings =
-            table.chartMetadata.isTruncated
-            ? ["Based on the first returned rows; totals and composition are suppressed."]
-            : []
-        self.init(
-            table: table,
-            recommendation: AutoChartRecommendation(
-                specification: specification,
-                score: 0,
-                rationale: ["Caller-provided specification."],
-                warnings: warnings),
-            selection: selection,
-            interaction: interaction,
-            height: height)
+        if let primary = analysis.primaryChart {
+            content = .chart(primary)
+        } else if case .tableFallback(let fallback) = analysis.outcome {
+            content = .fallback(fallback)
+        } else {
+            content = .fallback(
+                AutoChartFallback(
+                    message: AutoChartMessage(
+                        category: .fallback,
+                        code: .noSafeChart,
+                        defaultText: "No prepared chart is available.")))
+        }
+        self._selection = selection
+        self.presentation = presentation
+        self.formatters = formatters
+        self.textResolver = textResolver
     }
 
+    private var preparedChart: AutoChartPreparedChart<RowID> {
+        guard case .chart(let chart) = content else { preconditionFailure("No chart content") }
+        return chart
+    }
+    private var snapshot: AutoChartSnapshot { preparedChart.core.snapshot }
+    private var recommendation: AutoChartRecommendation { preparedChart.recommendation }
+    private var validation: AutoChartValidationResult { preparedChart.validation }
+    private var data: [AutoChartDatum] { preparedChart.core.data }
+    private var renderPresentation: AutoChartRenderPresentation { preparedChart.core.presentation }
+    private var sizeBounds: (minimum: Double, maximum: Double)? { renderPresentation.sizeBounds }
+    private var sharedYDomain: ClosedRange<Double>? { renderPresentation.sharedYDomain }
+    private var sharedXDateDomain: ClosedRange<Date>? { renderPresentation.sharedXDateDomain }
+    private var sharedXNumberDomain: ClosedRange<Double>? { renderPresentation.sharedXNumberDomain }
+    private var sharedXCategoryDomain: [String] { renderPresentation.sharedXCategoryDomain }
+    private var facetBaseFamily: AutoChartFamily? { renderPresentation.facetBaseFamily }
+    private var snapshotFingerprint: Int { preparedChart.core.fingerprint }
+    private var xTitle: String { renderPresentation.xTitle }
+    private var yTitle: String { renderPresentation.yTitle }
+    private var seriesTitle: String { renderPresentation.seriesTitle }
+    private var facetTitle: String { renderPresentation.facetTitle }
+    private var xSemanticType: AutoChartSemanticType? { renderPresentation.xSemanticType }
+    private var xDisplayLabels: [String: String] { renderPresentation.xDisplayLabels }
+    private var yDisplayLabels: [String: String] { renderPresentation.yDisplayLabels }
+    private var seriesDisplayLabels: [String: String] { renderPresentation.seriesDisplayLabels }
+    private var facetDisplayLabels: [String: String] { renderPresentation.facetDisplayLabels }
+    private var uniqueXCount: Int { renderPresentation.uniqueXCount }
+    private var timeZoomValueCount: Int { renderPresentation.timeZoomValueCount }
+    private var timeZoomSpan: TimeInterval { renderPresentation.timeZoomSpan }
+    private var numberZoomValueCount: Int { renderPresentation.numberZoomValueCount }
+    private var numberZoomSpan: Double { renderPresentation.numberZoomSpan }
     private var specification: AutoChartSpecification { recommendation.specification }
+    private var isCompact: Bool { presentation.typography == .compact }
+    private var interactions: AutoChartInteractions { presentation.interactions }
 
-    /// The validated chart, warnings, selection summary, and exploration controls.
+    @ViewBuilder
     public var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            if !specification.title.isEmpty {
+        switch content {
+        case .fallback(let fallback):
+            ContentUnavailableView(
+                "Chart unavailable",
+                systemImage: "tablecells",
+                description: Text(textResolver(fallback.message)))
+        case .chart:
+            VStack(alignment: .leading, spacing: 10) {
+            if presentation.chrome.contains(.title), !specification.title.isEmpty {
                 Text(specification.title)
-                    .font(interaction == .preview ? .subheadline.weight(.semibold) : .headline)
-                    .lineLimit(interaction == .preview ? 2 : nil)
+                    .font(isCompact ? .subheadline.weight(.semibold) : .headline)
+                    .lineLimit(isCompact ? 2 : nil)
             }
             if validation.isValid {
                 chartBody
-                    .frame(minHeight: interaction == .explore ? chartHeight : 180)
-                if interaction == .explore, let selection {
+                    .frame(height: presentation.plotHeight)
+                if presentation.chrome.contains(.selectionSummary), let selection {
+                    let summary = selection.presentation(
+                        columns: snapshot.columns,
+                        formatters: formatters,
+                        textResolver: textResolver)
                     HStack(alignment: .firstTextBaseline) {
                         VStack(alignment: .leading, spacing: 2) {
-                            Text(selection.label).font(.subheadline.weight(.semibold))
-                            Text(selection.valueDescription).font(.caption).foregroundStyle(
+                            Text(summary.label).font(.subheadline.weight(.semibold))
+                            Text(summary.valueDescription).font(.caption).foregroundStyle(
                                 .secondary)
                         }
                         Spacer()
-                        Button("Clear") { clearSelection() }
+                        Button(textResolver(.init(
+                            category: .interface,
+                            code: .clearSelection,
+                            defaultText: "Clear"))) { clearSelection() }
                             .buttonStyle(.borderless)
                             .accessibilityIdentifier("auto-chart-clear-selection")
                     }
                     .accessibilityElement(children: .combine)
+                    .accessibilityLabel(summary.accessibilityDescription)
                 }
-                if interaction == .explore, zoomScale > 1.01 {
-                    Button("Reset Zoom", systemImage: "arrow.counterclockwise") {
+                if presentation.chrome.contains(.zoomControls), zoomScale > 1.01 {
+                    Button(textResolver(.init(
+                        category: .interface,
+                        code: .resetZoom,
+                        defaultText: "Reset Zoom")), systemImage: "arrow.counterclockwise") {
                         zoomScale = 1
                         zoomAnchor = 1
                     }
@@ -1992,12 +1251,14 @@ public struct AutoChartView: View {
                     description: Text(
                         validation.issues.map(\.message).joined(separator: " ")))
             }
-            ForEach(recommendation.warnings, id: \.self) { warning in
-                Label(warning, systemImage: "exclamationmark.triangle.fill")
+            if presentation.chrome.contains(.diagnostics) {
+                ForEach(Array(preparedChart.diagnostics.enumerated()), id: \.offset) { _, diagnostic in
+                Label(textResolver(diagnostic.messageValue), systemImage: "exclamationmark.triangle.fill")
                     .font(.caption)
                     .foregroundStyle(.orange)
+                }
             }
-        }
+            }
         .accessibilityElement(children: .contain)
         .accessibilityLabel(
             specification.title.isEmpty ? specification.family.displayName : specification.title
@@ -2009,17 +1270,12 @@ public struct AutoChartView: View {
         .onChange(of: snapshotFingerprint) { _, _ in
             resetInteractionState()
         }
+        }
     }
 
     @ViewBuilder
     private var chartBody: some View {
         switch specification.family {
-        case .table:
-            ContentUnavailableView(
-                "Use the table view",
-                systemImage: "tablecells",
-                description: Text(
-                    recommendation.rationale.first ?? "No safe chart is available."))
         case .kpi:
             kpiView
         case .bar, .groupedBar, .stackedBar, .normalizedBar:
@@ -2053,7 +1309,7 @@ public struct AutoChartView: View {
             Text(value.map(formatted) ?? "—")
                 .font(
                     .system(
-                        size: interaction == .preview ? 34 : 52, weight: .bold, design: .rounded
+                        size: isCompact ? 34 : 52, weight: .bold, design: .rounded
                     )
                 )
                 .minimumScaleFactor(0.6)
@@ -2078,6 +1334,7 @@ public struct AutoChartView: View {
             }
             .chartXAxisLabel(yTitle)
             .chartYAxisLabel(xTitle)
+            .chartXAxis { numericAxis(columnID: specification.encoding.y) }
             selectableCategoryY(verticalZoom(chart, categoryCount: uniqueXCount))
         } else {
             let chart = Chart(data) { datum in
@@ -2088,6 +1345,7 @@ public struct AutoChartView: View {
             }
             .chartXAxisLabel(xTitle)
             .chartYAxisLabel(yTitle)
+            .chartYAxis { numericAxis(columnID: specification.encoding.y) }
             selectableCategoryX(horizontalZoom(chart, categoryCount: uniqueXCount))
         }
     }
@@ -2109,6 +1367,7 @@ public struct AutoChartView: View {
         }
         .chartXAxisLabel(yTitle)
         .chartYAxisLabel(xTitle)
+        .chartXAxis { numericAxis(columnID: specification.encoding.y) }
         return selectableCategoryY(verticalZoom(chart, categoryCount: uniqueXCount))
     }
 
@@ -2124,6 +1383,8 @@ public struct AutoChartView: View {
             }
             .chartXAxisLabel(xTitle)
             .chartYAxisLabel(yTitle)
+            .chartXAxis { temporalAxis(columnID: specification.encoding.x) }
+            .chartYAxis { numericAxis(columnID: specification.encoding.y) }
             .environment(\.timeZone, .gmt)
             selectableDateX(timeZoom(chart))
         } else if xSemanticType == .quantitative {
@@ -2136,6 +1397,8 @@ public struct AutoChartView: View {
             }
             .chartXAxisLabel(xTitle)
             .chartYAxisLabel(yTitle)
+            .chartXAxis { numericAxis(columnID: specification.encoding.x) }
+            .chartYAxis { numericAxis(columnID: specification.encoding.y) }
             selectableNumberX(numberZoom(chart))
         } else {
             let chart = Chart(data) { datum in
@@ -2147,6 +1410,7 @@ public struct AutoChartView: View {
             }
             .chartXAxisLabel(xTitle)
             .chartYAxisLabel(yTitle)
+            .chartYAxis { numericAxis(columnID: specification.encoding.y) }
             selectableCategoryX(horizontalZoom(chart, categoryCount: uniqueXCount))
         }
     }
@@ -2162,6 +1426,8 @@ public struct AutoChartView: View {
             }
             .chartXAxisLabel(xTitle)
             .chartYAxisLabel(yTitle)
+            .chartXAxis { temporalAxis(columnID: specification.encoding.x) }
+            .chartYAxis { numericAxis(columnID: specification.encoding.y) }
             .environment(\.timeZone, .gmt)
             selectableDateX(timeZoom(chart))
         } else {
@@ -2173,6 +1439,8 @@ public struct AutoChartView: View {
             }
             .chartXAxisLabel(xTitle)
             .chartYAxisLabel(yTitle)
+            .chartXAxis { numericAxis(columnID: specification.encoding.x) }
+            .chartYAxis { numericAxis(columnID: specification.encoding.y) }
             selectableNumberX(numberZoom(chart))
         }
     }
@@ -2188,6 +1456,8 @@ public struct AutoChartView: View {
         }
         .chartXAxisLabel(xTitle)
         .chartYAxisLabel("Count")
+        .chartXAxis { numericAxis(columnID: specification.encoding.x) }
+        .chartYAxis { numericAxis(columnID: nil) }
         return selectableNumberX(numberZoom(chart))
     }
 
@@ -2223,6 +1493,7 @@ public struct AutoChartView: View {
             }
         }
         .chartYAxisLabel(yTitle)
+        .chartYAxis { numericAxis(columnID: specification.encoding.y) }
         return selectableCategoryIdentityX(horizontalZoom(chart, categoryCount: uniqueXCount))
     }
 
@@ -2235,18 +1506,7 @@ public struct AutoChartView: View {
                 y: .value(yTitle, datum.yIdentity ?? "")
             )
             .foregroundStyle(by: .value("Count", datum.yNumber ?? 0))
-            .accessibilityLabel(
-                AutoChartAccessibility.heatmapLabel(
-                    for: datum,
-                    xCategoryName: disambiguatedCategoryValue(
-                        identity: datum.xIdentity,
-                        label: datum.xLabel,
-                        labels: xLabels),
-                    yCategoryName: disambiguatedCategoryValue(
-                        identity: datum.yIdentity,
-                        label: datum.yLabel,
-                        labels: yLabels))
-            )
+            .accessibilityLabel(heatmapAccessibilityLabel(for: datum))
         }
         .chartXAxisLabel(xTitle)
         .chartXAxis {
@@ -2314,6 +1574,7 @@ public struct AutoChartView: View {
         }
         .chartXAxisLabel("Date")
         .chartYAxisLabel(xTitle)
+        .chartXAxis { temporalAxis(columnID: specification.encoding.start) }
         .environment(\.timeZone, .gmt)
         return selectableCategoryY(timeZoom(chart))
     }
@@ -2570,7 +1831,6 @@ public struct AutoChartView: View {
                             }
                         }
                     }
-                    .frame(height: 180)
                 }
             }
         }
@@ -2601,15 +1861,76 @@ public struct AutoChartView: View {
     }
 
     private func markAccessibilityLabel(for datum: AutoChartDatum) -> String {
-        AutoChartAccessibility.markLabel(
-            for: datum,
-            family: specification.family,
-            xSemanticType: xSemanticType,
-            xCategoryName: xCategoryValue(for: datum),
-            seriesName: specification.encoding.series == nil
-                ? nil : seriesValue(for: datum),
-            facetDescription: specification.encoding.facet == nil
-                ? nil : "\(facetTitle): \(facetValue(for: datum))")
+        let xColumn = specification.encoding.x.flatMap(snapshot.column)
+        let yColumn = specification.encoding.y.flatMap(snapshot.column)
+        let name: String
+        if specification.family == .histogram {
+            name = datum.xLabel ?? "Value"
+        } else if [
+            .bar, .groupedBar, .stackedBar, .normalizedBar, .rankedDot,
+            .boxPlot, .donut, .range,
+        ].contains(specification.family) {
+            name = xCategoryValue(for: datum)
+        } else if let date = datum.xDate {
+            name = formatters.format(
+                column: xColumn, value: .date(date), context: .markAccessibility)
+        } else if let number = datum.xNumber {
+            name = formatters.format(
+                column: xColumn, value: .double(number), context: .markAccessibility)
+        } else {
+            name = xCategoryValue(for: datum)
+        }
+        let valueDescription: String? = {
+            if specification.family == .range, let start = datum.startDate {
+                let startText = formatters.format(
+                    column: specification.encoding.start.flatMap(snapshot.column),
+                    value: .date(start),
+                    context: .markAccessibility)
+                guard let end = datum.endDate, end != start else { return "Date: \(startText)" }
+                let endText = formatters.format(
+                    column: specification.encoding.end.flatMap(snapshot.column),
+                    value: .date(end),
+                    context: .markAccessibility)
+                return "From \(startText) to \(endText)"
+            }
+            let number = datum.yNumber ?? datum.median
+            return number.map {
+                formatters.format(
+                    column: yColumn, value: .double($0), context: .markAccessibility)
+            }
+        }()
+        let fallback = datum.accessibilityLabel(
+            name: name,
+            series: specification.encoding.series == nil ? nil : seriesValue(for: datum),
+            facet: specification.encoding.facet == nil
+                ? nil : "\(facetTitle): \(facetValue(for: datum))",
+            valueDescription: valueDescription)
+        return textResolver(
+            AutoChartMessage(
+                category: .accessibility,
+                code: .markAccessibility,
+                defaultText: fallback))
+    }
+
+    private func heatmapAccessibilityLabel(for datum: AutoChartDatum) -> String {
+        let xName = disambiguatedCategoryValue(
+            identity: datum.xIdentity,
+            label: datum.xLabel,
+            labels: xDisplayLabels)
+        let yName = disambiguatedCategoryValue(
+            identity: datum.yIdentity,
+            label: datum.yLabel,
+            labels: yDisplayLabels)
+        let count = datum.yNumber.map {
+            formatters.format(column: nil, value: .double($0), context: .markAccessibility)
+        }
+        let fallback = datum.accessibilityLabel(
+            name: xName, context: [yName], valueDescription: count)
+        return textResolver(
+            AutoChartMessage(
+                category: .accessibility,
+                code: .markAccessibility,
+                defaultText: fallback))
     }
 
     private func selectionLabel(
@@ -2650,24 +1971,49 @@ public struct AutoChartView: View {
     }
 
     private func formatted(_ value: AutoChartValue) -> String {
-        guard let id = specification.encoding.y,
-            let unit = snapshot.column(id)?.hints.unit,
-            let numeric = value.numericValue
-        else { return value.displayString }
-        switch unit {
-        case .currency(let code):
-            return numeric.formatted(.currency(code: code))
-        case .percent(let fractional):
-            return (fractional ? numeric : numeric / 100).formatted(
-                .percent.precision(.fractionLength(0...2)))
-        default:
-            return value.displayString
+        formatters.format(
+            column: specification.encoding.y.flatMap(snapshot.column),
+            value: value,
+            context: specification.family == .kpi ? .kpi : .detail)
+    }
+
+    @AxisContentBuilder
+    private func numericAxis(columnID: AutoChartColumnID?) -> some AxisContent {
+        AxisMarks { value in
+            AxisGridLine()
+            AxisTick()
+            AxisValueLabel {
+                if let number = value.as(Double.self) {
+                    Text(
+                        formatters.format(
+                            column: columnID.flatMap(snapshot.column),
+                            value: .double(number),
+                            context: .axisTick))
+                }
+            }
+        }
+    }
+
+    @AxisContentBuilder
+    private func temporalAxis(columnID: AutoChartColumnID?) -> some AxisContent {
+        AxisMarks { value in
+            AxisGridLine()
+            AxisTick()
+            AxisValueLabel {
+                if let date = value.as(Date.self) {
+                    Text(
+                        formatters.format(
+                            column: columnID.flatMap(snapshot.column),
+                            value: .date(date),
+                            context: .axisTick))
+                }
+            }
         }
     }
 
     @ViewBuilder
     private func selectableCategoryX<Content: View>(_ content: Content) -> some View {
-        if interaction == .explore {
+        if interactions.contains(.selection) {
             content
                 .chartXSelection(value: $selectedCategory)
                 .onChange(of: selectedCategory) { _, value in select(category: value) }
@@ -2678,7 +2024,7 @@ public struct AutoChartView: View {
 
     @ViewBuilder
     private func selectableCategoryY<Content: View>(_ content: Content) -> some View {
-        if interaction == .explore {
+        if interactions.contains(.selection) {
             content
                 .chartYSelection(value: $selectedCategory)
                 .onChange(of: selectedCategory) { _, value in select(category: value) }
@@ -2689,7 +2035,7 @@ public struct AutoChartView: View {
 
     @ViewBuilder
     private func selectableCategoryIdentityX<Content: View>(_ content: Content) -> some View {
-        if interaction == .explore {
+        if interactions.contains(.selection) {
             content
                 .chartXSelection(value: $selectedCategory)
                 .onChange(of: selectedCategory) { _, value in
@@ -2702,7 +2048,7 @@ public struct AutoChartView: View {
 
     @ViewBuilder
     private func selectableHeatmap<Content: View>(_ content: Content) -> some View {
-        if interaction == .explore {
+        if interactions.contains(.selection) {
             content.chartOverlay { proxy in
                 GeometryReader { geometry in
                     Rectangle()
@@ -2741,7 +2087,7 @@ public struct AutoChartView: View {
         as _: Value.Type,
         onSelect: @escaping (Value) -> Void
     ) -> some View {
-        if interaction == .explore {
+        if interactions.contains(.selection) {
             content.chartOverlay { proxy in
                 GeometryReader { geometry in
                     Rectangle()
@@ -2777,7 +2123,7 @@ public struct AutoChartView: View {
 
     @ViewBuilder
     private func selectableDateX<Content: View>(_ content: Content) -> some View {
-        if interaction == .explore {
+        if interactions.contains(.selection) {
             content
                 .chartXSelection(value: $selectedDate)
                 .onChange(of: selectedDate) { _, value in select(date: value) }
@@ -2788,7 +2134,7 @@ public struct AutoChartView: View {
 
     @ViewBuilder
     private func selectableNumberX<Content: View>(_ content: Content) -> some View {
-        if interaction == .explore {
+        if interactions.contains(.selection) {
             content
                 .chartXSelection(value: $selectedNumber)
                 .onChange(of: selectedNumber) { _, value in select(number: value) }
@@ -2799,7 +2145,7 @@ public struct AutoChartView: View {
 
     @ViewBuilder
     private func selectableAngle<Content: View>(_ content: Content) -> some View {
-        if interaction == .explore {
+        if interactions.contains(.selection) {
             content
                 .chartAngleSelection(value: $selectedAngle)
                 .onChange(of: selectedAngle) { _, value in select(angle: value) }
@@ -2813,12 +2159,21 @@ public struct AutoChartView: View {
         _ content: Content,
         categoryCount: Int
     ) -> some View {
-        if interaction == .explore, categoryCount > 10 {
+        if interactions.contains([.scrolling, .zoom]), categoryCount > 10 {
             content
                 .chartScrollableAxes(.horizontal)
                 .chartXVisibleDomain(
                     length: max(3, Int(Double(min(categoryCount, 10)) / zoomScale))
                 )
+                .simultaneousGesture(zoomGesture)
+        } else if interactions.contains(.scrolling), categoryCount > 10 {
+            content
+                .chartScrollableAxes(.horizontal)
+                .chartXVisibleDomain(length: min(categoryCount, 10))
+        } else if interactions.contains(.zoom), categoryCount > 10 {
+            content
+                .chartXVisibleDomain(
+                    length: max(3, Int(Double(min(categoryCount, 10)) / zoomScale)))
                 .simultaneousGesture(zoomGesture)
         } else {
             content
@@ -2830,12 +2185,21 @@ public struct AutoChartView: View {
         _ content: Content,
         categoryCount: Int
     ) -> some View {
-        if interaction == .explore, categoryCount > 10 {
+        if interactions.contains([.scrolling, .zoom]), categoryCount > 10 {
             content
                 .chartScrollableAxes(.vertical)
                 .chartYVisibleDomain(
                     length: max(3, Int(Double(min(categoryCount, 10)) / zoomScale))
                 )
+                .simultaneousGesture(zoomGesture)
+        } else if interactions.contains(.scrolling), categoryCount > 10 {
+            content
+                .chartScrollableAxes(.vertical)
+                .chartYVisibleDomain(length: min(categoryCount, 10))
+        } else if interactions.contains(.zoom), categoryCount > 10 {
+            content
+                .chartYVisibleDomain(
+                    length: max(3, Int(Double(min(categoryCount, 10)) / zoomScale)))
                 .simultaneousGesture(zoomGesture)
         } else {
             content
@@ -2844,9 +2208,17 @@ public struct AutoChartView: View {
 
     @ViewBuilder
     private func timeZoom<Content: View>(_ content: Content) -> some View {
-        if interaction == .explore, timeZoomValueCount > 12 {
+        if interactions.contains([.scrolling, .zoom]), timeZoomValueCount > 12 {
             content
                 .chartScrollableAxes(.horizontal)
+                .chartXVisibleDomain(length: max(86_400, timeZoomSpan / zoomScale))
+                .simultaneousGesture(zoomGesture)
+        } else if interactions.contains(.scrolling), timeZoomValueCount > 12 {
+            content
+                .chartScrollableAxes(.horizontal)
+                .chartXVisibleDomain(length: max(86_400, timeZoomSpan))
+        } else if interactions.contains(.zoom), timeZoomValueCount > 12 {
+            content
                 .chartXVisibleDomain(length: max(86_400, timeZoomSpan / zoomScale))
                 .simultaneousGesture(zoomGesture)
         } else {
@@ -2856,9 +2228,17 @@ public struct AutoChartView: View {
 
     @ViewBuilder
     private func numberZoom<Content: View>(_ content: Content) -> some View {
-        if interaction == .explore, numberZoomValueCount > 30 {
+        if interactions.contains([.scrolling, .zoom]), numberZoomValueCount > 30 {
             content
                 .chartScrollableAxes(.horizontal)
+                .chartXVisibleDomain(length: numberZoomSpan / zoomScale)
+                .simultaneousGesture(zoomGesture)
+        } else if interactions.contains(.scrolling), numberZoomValueCount > 30 {
+            content
+                .chartScrollableAxes(.horizontal)
+                .chartXVisibleDomain(length: numberZoomSpan)
+        } else if interactions.contains(.zoom), numberZoomValueCount > 30 {
+            content
                 .chartXVisibleDomain(length: numberZoomSpan / zoomScale)
                 .simultaneousGesture(zoomGesture)
         } else {
@@ -2990,10 +2370,61 @@ public struct AutoChartView: View {
     }
 
     private func applySelection(_ matches: [AutoChartDatum], label: String) {
-        selection = AutoChartSelectionPreparation.selection(
+        guard let offsetSelection = AutoChartSelectionPreparation.selection(
             for: matches,
             label: label,
             aggregation: specification.aggregation)
+        else {
+            selection = nil
+            return
+        }
+        let first = matches[0]
+        var dimensions: [AutoChartSelectedDimension] = []
+        if let x = specification.encoding.x {
+            let value: AutoChartValue = first.xDate.map(AutoChartValue.date)
+                ?? first.xNumber.map(AutoChartValue.double)
+                ?? .text(first.xLabel ?? label)
+            dimensions.append(.init(columnID: x, value: value))
+        }
+        if let series = specification.encoding.series {
+            dimensions.append(.init(columnID: series, value: .text(first.series ?? "—")))
+        }
+        if let facet = specification.encoding.facet {
+            dimensions.append(.init(columnID: facet, value: .text(first.facet ?? "—")))
+        }
+        let markValue: AutoChartMarkValue? = {
+            if let start = first.startDate, let end = first.endDate {
+                return .temporalRange(start: start, end: end)
+            }
+            if let lower = first.lower, let upper = first.upper,
+                let quartile1 = first.quartile1, let median = first.median,
+                let quartile3 = first.quartile3
+            {
+                return .distribution(
+                    lower: lower,
+                    quartile1: quartile1,
+                    median: median,
+                    quartile3: quartile3,
+                    upper: upper)
+            }
+            if let lower = first.lower, let upper = first.upper {
+                return .numericRange(lower: lower, upper: upper)
+            }
+            if let value = first.yNumber { return .scalar(.double(value)) }
+            return nil
+        }()
+        selection = AutoChartSelection(
+            sourceRowIDs: preparedChart.rowIDs(for: offsetSelection.sourceRowOffsets),
+            dimensions: dimensions,
+            measure: markValue.map {
+                AutoChartSelectedMeasure(
+                    columnID: specification.encoding.y,
+                    aggregation: specification.aggregation,
+                    value: $0)
+            },
+            family: specification.family,
+            specificationID: specification.id,
+            markID: matches.map(\.id).joined(separator: "|"))
     }
 
     private func clearSelection() {
@@ -3008,6 +2439,44 @@ public struct AutoChartView: View {
         clearSelection()
         zoomScale = 1
         zoomAnchor = 1
+    }
+}
+
+/// Plot-only rendering for a prepared chart.
+public struct AutoChartPlot<RowID: Hashable & Sendable>: View {
+    private let chart: AutoChartPreparedChart<RowID>
+    private let selection: Binding<AutoChartSelection<RowID>?>
+    private let plotHeight: CGFloat?
+    private let interactions: AutoChartInteractions
+    private let formatters: AutoChartFormatters
+    private let textResolver: AutoChartTextResolver
+
+    public init(
+        preparedChart: AutoChartPreparedChart<RowID>,
+        selection: Binding<AutoChartSelection<RowID>?> = .constant(nil),
+        plotHeight: CGFloat? = nil,
+        interactions: AutoChartInteractions = .all,
+        formatters: AutoChartFormatters = .init(),
+        textResolver: AutoChartTextResolver = .default
+    ) {
+        self.chart = preparedChart
+        self.selection = selection
+        self.plotHeight = plotHeight
+        self.interactions = interactions
+        self.formatters = formatters
+        self.textResolver = textResolver
+    }
+
+    public var body: some View {
+        AutoChartView(
+            preparedChart: chart,
+            selection: selection,
+            presentation: AutoChartPresentation(
+                plotHeight: plotHeight,
+                chrome: [],
+                interactions: interactions),
+            formatters: formatters,
+            textResolver: textResolver)
     }
 }
 #endif

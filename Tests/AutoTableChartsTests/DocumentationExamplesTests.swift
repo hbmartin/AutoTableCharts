@@ -1,5 +1,7 @@
 import AutoTableCharts
 import Testing
+import AutoTableCharts
+import Testing
 
 #if canImport(SwiftUI)
 import SwiftUI
@@ -10,7 +12,7 @@ private struct DocumentationHoldingRow: AutoChartRow {
     let propertyType: String
     let marketValue: Double
 
-    var chartRowID: AutoChartRowID { AutoChartRowID(rawValue: id) }
+    var chartRowID: String { id }
 
     func chartValue(for columnID: AutoChartColumnID) -> AutoChartValue {
         switch columnID {
@@ -40,8 +42,10 @@ private struct DocumentationHoldingsTable: AutoChartTable {
                 semanticType: .quantitative,
                 role: .measure,
                 unit: .currency(code: "USD"),
-                aggregation: .sum,
-                aggregationSafety: .alreadyAggregated
+                measureSemantics: AutoChartMeasureSemantics(
+                    source: .rowLevel,
+                    rollup: .additive
+                )
             )
         ),
     ]
@@ -61,15 +65,16 @@ private struct DocumentationHoldingsTable: AutoChartTable {
                 id: "industrial", propertyType: "Industrial", marketValue: 15),
         ])
 
-        let result = AutoChartEngine.recommendations(
-            for: table,
+        let analyzer = AutoChartAnalyzer()
+        let analysis = try await analyzer.analyze(
+            table,
             context: AutoChartContext(
                 goal: .comparison,
                 title: "Current Market Value by Property Type"
             )
         )
-        let recommendation = try #require(result.chartRecommendations.first)
-        #expect(recommendation.specification.family == .bar)
+        let primary = try #require(analysis.primaryChart)
+        #expect(primary.recommendation.specification.family == .bar)
 
         let specification = AutoChartSpecification(
             family: .bar,
@@ -79,27 +84,30 @@ private struct DocumentationHoldingsTable: AutoChartTable {
             sort: .descending,
             title: "Property Types by Market Value"
         )
-        let validation = AutoChartEngine.validate(specification: specification, for: table)
-        #expect(validation.isValid)
+        #expect(analysis.validate(specification).isValid)
+        let customChart = try await analysis.prepare(specification)
 
         let selection = AutoChartSelection(
             sourceRowIDs: ["office"],
-            label: "Office",
-            valueDescription: "$20"
+            dimensions: [
+                AutoChartSelectedDimension(columnID: "propertyType", value: .text("Office"))
+            ],
+            measure: AutoChartSelectedMeasure(
+                columnID: "marketValue",
+                aggregation: .none,
+                value: .scalar(.double(20))),
+            family: .bar,
+            specificationID: specification.id,
+            markID: "office"
         )
         #expect(selection.sourceRowIDs == ["office"])
 
         #if canImport(SwiftUI) && canImport(Charts)
-        // Building the view mutates the process-wide render preparation cache
-        // that `RenderCacheTests` asserts exact counts on. Keeping the touch
-        // inside one `MainActor.run` body is what keeps the two suites from
-        // interleaving — see the note above `RenderCacheTests`.
         await MainActor.run {
             let view = AutoChartView(
-                table: table,
-                recommendation: recommendation,
-                selection: Binding<AutoChartSelection?>.constant(selection),
-                interaction: .explore
+                preparedChart: customChart,
+                selection: Binding<AutoChartSelection<String>?>.constant(selection),
+                presentation: .explorer(plotHeight: 280)
             )
             _ = view
         }

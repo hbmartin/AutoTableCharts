@@ -1,39 +1,30 @@
 # ``AutoChartTable``
 
-Expose typed rows, column meaning, and result completeness to the engine.
+Expose typed rows, stable lineage, semantic hints, and completeness.
 
 ## Overview
 
-Conformance is an adapter over caller-owned storage. The table supplies a stable
-column schema, rows conforming to ``AutoChartRow``, and metadata that defines the
-trust boundary for totals and composition. Recommendation snapshots these values
-for one synchronous run and doesn't mutate the table.
+The table has a primary associated `RowID: Hashable & Sendable`. Every row ID
+must be unique within a snapshot and is preserved in prepared marks and
+``AutoChartSelection``. The analyzer validates duplicate column IDs, duplicate
+row IDs, and inconsistent row values before profiling.
 
-Declare semantic and aggregation hints whenever inference could confuse an
-identifier, date, year, rate, balance, or preaggregated measure.
+Use ``AutoChartDataset`` when data is already row-major. It validates eagerly,
+shares its immutable flat storage with analyzer snapshots, and supplies offset
+IDs for `AutoChartDataset<Int>`.
+
+Custom conformances supply columns, rows, metadata, and optionally
+``AutoChartTable/chartDataKey``. The key is a performance contract, not a source
+of truth: change its revision whenever any chart-affecting input changes.
 
 ## Topics
 
-### Required Data
-
-- ``chartColumns``
-- ``chartRows``
-- ``chartMetadata``
 - ``AutoChartRow``
-
-### Rendering Cache Identity
-
-- ``chartDataIdentity``
-- ``chartDataVersion``
-
-### Schema and Meaning
-
+- ``AutoChartDataset``
+- ``AutoChartDatasetError``
 - ``AutoChartColumn``
 - ``AutoChartColumnHints``
 - ``AutoChartTableMetadata``
 - ``AutoChartValue``
-
-### Guides
-
+- ``AutoChartDataKey``
 - <doc:ModelingTypedTables>
-- <doc:SafetySemanticsAndCompleteness>
