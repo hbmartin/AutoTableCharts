@@ -1036,12 +1036,13 @@ private let date = AutoChartColumn(
                 snapshot: AutoChartSnapshot(input),
                 specification: $0.specification)
         }
-        #expect(
-            Dictionary(
-                uniqueKeysWithValues: data?.compactMap { datum in
-                    guard let label = datum.xLabel, let value = datum.yNumber else { return nil }
-                    return (label, value)
-                } ?? []) == ["A": 2, "B": 1])
+        let sectors = data?.compactMap { datum -> (label: String, value: Double)? in
+            guard let label = datum.xLabel, let value = datum.yNumber else { return nil }
+            return (label, value)
+        } ?? []
+        let valuesByLabel = Dictionary(grouping: sectors) { $0.label }
+            .mapValues { sectors in sectors.map { $0.value } }
+        #expect(valuesByLabel == ["A": [2], "B": [1]])
     }
 
     /// A distinct count does not partition — per-category distinct counts
@@ -1064,6 +1065,7 @@ private let date = AutoChartColumn(
             for: input,
             context: AutoChartContext(goal: .composition)
         ).chartRecommendations
+        #expect(!recommendations.isEmpty)
         #expect(!recommendations.contains { $0.specification.family == .donut })
         #expect(!recommendations.contains { $0.specification.family == .stackedBar })
     }
@@ -1091,7 +1093,10 @@ private let date = AutoChartColumn(
         #expect(!validation.isValid)
         #expect(
             validation.issues.contains {
-                $0.severity == .error && $0.messageValue.code == .unsafeAggregation
+                $0.severity == .error
+                    && $0.messageValue.code == .unsafeAggregation
+                    && $0.message
+                        == "Aggregation cannot sum a measure whose source is already a non-additive summary."
             })
         #expect(
             !AutoChartRecommendationEngine.recommendations(for: input)

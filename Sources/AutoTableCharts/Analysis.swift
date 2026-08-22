@@ -72,7 +72,14 @@ public enum AutoChartCacheTrimTarget: Hashable, Codable, Sendable {
 public struct AutoChartCacheLayerStatistics: Hashable, Codable, Sendable {
     public var entries: Int
     public var retainedCost: Int
+    /// Lookups satisfied by a completed retained entry.
+    ///
+    /// A request that joins matching work already in flight increments neither
+    /// `hits` nor ``misses`` because it neither reuses a retained entry nor
+    /// starts new work.
     public var hits: Int
+    /// Lookups that started new work because no completed retained entry or
+    /// matching in-flight work was available.
     public var misses: Int
     public var evictions: Int
 
@@ -339,6 +346,7 @@ public struct AutoChartAnalysis<RowID: Hashable & Sendable>: Sendable {
         do {
             return try await provider.prepare(specification).validation
         } catch AutoChartPreparationError.invalidSpecification(let validation) {
+            try Task.checkCancellation()
             return validation
         }
     }
