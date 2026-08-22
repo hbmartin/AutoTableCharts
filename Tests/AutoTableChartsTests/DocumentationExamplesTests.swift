@@ -1,7 +1,5 @@
 import AutoTableCharts
 import Testing
-import AutoTableCharts
-import Testing
 
 #if canImport(SwiftUI)
 import SwiftUI

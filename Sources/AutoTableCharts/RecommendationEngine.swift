@@ -538,7 +538,7 @@ enum AutoChartRecommendationEngine {
             // being reported as a missing value.
             if profile.isTemporal,
                 profile.nonNullCount == snapshot.rows.count,
-                profile.temporalValues.count + profile.nonFiniteDateCount
+                profile.temporalValueCount + profile.nonFiniteDateCount
                     == profile.nonNullCount,
                 profile.hasNonFiniteDateValues
             {
@@ -825,7 +825,7 @@ enum AutoChartRecommendationEngine {
             ].compactMap { $0 })
         for id in temporalReferences {
             guard let profile = profiles[id], profile.isTemporal,
-                profile.temporalValues.count + profile.nonFiniteDateCount
+                profile.temporalValueCount + profile.nonFiniteDateCount
                     != profile.nonNullCount
             else { continue }
             issues.append(
@@ -1012,7 +1012,7 @@ enum AutoChartRecommendationEngine {
                     .init(
                         severity: .error,
                         code: .unsafeAggregation,
-                        message: "Composition requires an explicitly additive measure."))
+                        message: "Composition requires an additive or safely counted measure."))
             }
             // Missing, non-numeric, and non-finite measures all shrink the
             // renderable count and are reported above, so this error is reserved
@@ -1168,10 +1168,19 @@ enum AutoChartRecommendationEngine {
         target == actual ? 18 : 0
     }
 
+    /// Composition marks must partition a whole, so contributions have to be
+    /// non-negative and add up to a meaningful total. Summing an additive
+    /// measure qualifies, and so does counting rows, which stays honest even
+    /// for a measure containing negative values. Distinct counts are excluded
+    /// because per-category distinct counts overlap and do not partition.
     private static func compositionIsSafe(_ hints: AutoChartColumnHints) -> Bool {
-        guard let semantics = hints.measureSemantics else { return false }
-        return semantics.rollup == .additive
-            && sourceSupportsAdditiveRollup(semantics.source)
+        guard let aggregation = safeRollupAggregation(hints) else { return false }
+        switch aggregation {
+        case .sum, .count:
+            return true
+        case .none, .mean, .minimum, .maximum, .countDistinct:
+            return false
+        }
     }
 
     private static func safeRollupAggregation(
@@ -1183,6 +1192,11 @@ enum AutoChartRecommendationEngine {
             guard sourceSupportsAdditiveRollup(semantics.source) else { return nil }
             return .sum
         case .safe(let operation):
+            // A named safe operation still cannot make an upstream summary
+            // summable; only summation combines values additively, so it is
+            // the one operation the source has to vouch for.
+            guard operation != .sum || sourceSupportsAdditiveRollup(semantics.source)
+            else { return nil }
             return operation
         case .nonAdditive, .unknown:
             return nil

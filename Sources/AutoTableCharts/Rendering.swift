@@ -35,126 +35,85 @@ struct AutoChartDatum: Identifiable, Sendable {
     var median: Double?
     var quartile3: Double?
     var upper: Double?
-
-    var intervalAccessibilityDescription: String? {
-        guard let startDate else { return nil }
-        let style = Date.FormatStyle(
-            date: .abbreviated,
-            time: .shortened,
-            timeZone: TimeZone.gmt)
-        let start = startDate.formatted(style)
-        guard let endDate, endDate != startDate else { return "Date: \(start)" }
-        return "From \(start) to \(endDate.formatted(style))"
-    }
-
-    func accessibilityLabel(
-        name: String,
-        context: [String?],
-        valueDescription: String? = nil
-    ) -> String {
-        let valueDescription =
-            valueDescription ?? yNumber?.formatted(.number.precision(.fractionLength(0...3)))
-            ?? median?.formatted(.number.precision(.fractionLength(0...3)))
-        return ([name] + context + [valueDescription])
-            .compactMap { component in
-                guard let component, !component.isEmpty else { return nil }
-                return component
-            }
-            .joined(separator: ", ")
-    }
-
-    func accessibilityLabel(
-        name: String,
-        series: String?,
-        facet: String? = nil,
-        valueDescription: String? = nil
-    ) -> String {
-        accessibilityLabel(
-            name: name,
-            context: [series, facet],
-            valueDescription: valueDescription)
-    }
 }
 
+/// The single place mark accessibility labels are assembled.
+///
+/// Callers pass components already formatted with the chart's own formatters,
+/// so the timezone, locale, and unit a mark shows are the ones its label reads
+/// out. The components also reach the resolver as arguments: a host that wants
+/// to translate or reorder a label needs the pieces, not one English sentence
+/// it can only pass through unchanged.
 enum AutoChartAccessibility {
     static func markLabel(
-        for datum: AutoChartDatum,
-        family: AutoChartFamily,
-        xSemanticType: AutoChartSemanticType?,
-        xCategoryName: @autoclosure () -> String,
-        seriesName: String? = nil,
-        facetDescription: String? = nil
+        name: String,
+        series: String? = nil,
+        facet: String? = nil,
+        valueDescription: String? = nil,
+        textResolver: AutoChartTextResolver = .default
     ) -> String {
-        let name: String = {
-            switch family {
-            case .histogram:
-                return datum.xLabel ?? "Value"
-            case .bar, .groupedBar, .stackedBar, .normalizedBar, .rankedDot,
-                .boxPlot, .donut, .range:
-                return xCategoryName()
-            default:
-                switch xSemanticType {
-                case .temporal:
-                    return datum.xDate?.formatted(
-                        Date.FormatStyle(
-                            date: .abbreviated,
-                            time: .shortened,
-                            timeZone: TimeZone.gmt)) ?? "Value"
-                case .quantitative:
-                    return datum.xNumber?.formatted() ?? "Value"
-                default:
-                    return xCategoryName()
-                }
-            }
-        }()
-        return datum.accessibilityLabel(
-            name: name,
-            series: seriesName,
-            facet: facetDescription,
-            valueDescription: family == .range
-                ? datum.intervalAccessibilityDescription : nil)
+        label(
+            components: [
+                ("name", name),
+                ("series", series),
+                ("facet", facet),
+                ("value", valueDescription),
+            ],
+            textResolver: textResolver)
     }
 
     static func heatmapLabel(
-        for datum: AutoChartDatum,
-        xCategoryName: String,
-        yCategoryName: String
+        category: String,
+        secondaryCategory: String,
+        valueDescription: String? = nil,
+        textResolver: AutoChartTextResolver = .default
     ) -> String {
-        datum.accessibilityLabel(
-            name: xCategoryName,
-            context: [yCategoryName])
+        label(
+            components: [
+                ("category", category),
+                ("secondaryCategory", secondaryCategory),
+                ("value", valueDescription),
+            ],
+            textResolver: textResolver)
+    }
+
+    private static func label(
+        components: [(key: String, value: String?)],
+        textResolver: AutoChartTextResolver
+    ) -> String {
+        let present = components.compactMap { component -> (String, String)? in
+            guard let value = component.value, !value.isEmpty else { return nil }
+            return (component.key, value)
+        }
+        return textResolver(
+            AutoChartMessage(
+                category: .accessibility,
+                code: .markAccessibility,
+                arguments: Dictionary(
+                    uniqueKeysWithValues: present.map {
+                        ($0.0, AutoChartMessageArgument.string($0.1))
+                    }),
+                defaultText: present.map(\.1).joined(separator: ", ")))
     }
 }
 
 enum AutoChartSelectionPreparation {
-    struct OffsetSelection: Sendable {
-        var sourceRowOffsets: Set<Int>
-        var label: String
-        var valueDescription: String
-    }
-
     struct SemanticValues: Sendable {
         var dimensions: [AutoChartSelectedDimension]
         var rangeDimensions: [AutoChartSelectedRangeDimension]
         var measure: AutoChartSelectedMeasure?
     }
 
-    static func selection(
-        for matches: [AutoChartDatum],
-        label: String,
-        aggregation: AutoChartAggregation
-    ) -> OffsetSelection? {
+    /// The union of source-row offsets behind the selected marks, or `nil`
+    /// when the selection has no lineage to report. Label and value text come
+    /// from ``AutoChartSelection/presentation(columns:formatters:textResolver:)``,
+    /// which resolves and formats them for the host.
+    static func sourceRowOffsets(for matches: [AutoChartDatum]) -> Set<Int>? {
         guard !matches.isEmpty else { return nil }
         let rowIDs = matches.reduce(into: Set<Int>()) {
             $0.formUnion($1.sourceRowIDs)
         }
-        guard !rowIDs.isEmpty else { return nil }
-        return OffsetSelection(
-            sourceRowOffsets: rowIDs,
-            label: label,
-            valueDescription: valueDescription(
-                for: matches,
-                aggregation: aggregation))
+        return rowIDs.isEmpty ? nil : rowIDs
     }
 
     static func angleMatch(
@@ -217,29 +176,6 @@ enum AutoChartSelectionPreparation {
             })?.1
         else { return [] }
         return eligible.filter { $0.1 == nearestNumber }.map(\.0)
-    }
-
-    static func valueDescription(
-        for matches: [AutoChartDatum],
-        aggregation: AutoChartAggregation
-    ) -> String {
-        let rowIDs = matches.reduce(into: Set<Int>()) {
-            $0.formUnion($1.sourceRowIDs)
-        }
-        let numericMatches = matches.compactMap(\.yNumber)
-        let combinedValue = aggregatedNumericValue(
-            for: matches,
-            aggregation: aggregation)
-        let rowDescription =
-            "\(rowIDs.count) source row\(rowIDs.count == 1 ? "" : "s")"
-        if let combinedValue {
-            return
-                "\(combinedValue.formatted(.number.precision(.fractionLength(0...3)))) · \(rowDescription)"
-        }
-        if numericMatches.count > 1 {
-            return "\(numericMatches.count) marks · \(rowDescription)"
-        }
-        return rowDescription
     }
 
     static func aggregatedNumericValue(
@@ -1428,11 +1364,19 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
                     .accessibilityIdentifier("auto-chart-reset-zoom")
                 }
             } else {
+                // Every issue is an `AutoChartDiagnostic` carrying a coded
+                // `messageValue`, so route them through the resolver rather
+                // than concatenating raw `defaultText` the host cannot localize.
                 ContentUnavailableView(
-                    "Chart unavailable",
+                    textResolver(.init(
+                        category: .interface,
+                        code: .chartUnavailable,
+                        defaultText: "Chart unavailable")),
                     systemImage: "chart.xyaxis.line",
                     description: Text(
-                        validation.issues.map(\.message).joined(separator: " ")))
+                        validation.issues
+                            .map { textResolver($0.messageValue) }
+                            .joined(separator: " ")))
             }
             if presentation.chrome.contains(.diagnostics) {
                 ForEach(Array(preparedChart.diagnostics.enumerated()), id: \.offset) { _, diagnostic in
@@ -2147,17 +2091,13 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
                     column: yColumn, value: .double($0), context: .markAccessibility)
             }
         }()
-        let fallback = datum.accessibilityLabel(
+        return AutoChartAccessibility.markLabel(
             name: name,
             series: specification.encoding.series == nil ? nil : seriesValue(for: datum),
             facet: specification.encoding.facet == nil
                 ? nil : "\(facetTitle): \(facetValue(for: datum))",
-            valueDescription: valueDescription)
-        return textResolver(
-            AutoChartMessage(
-                category: .accessibility,
-                code: .markAccessibility,
-                defaultText: fallback))
+            valueDescription: valueDescription,
+            textResolver: textResolver)
     }
 
     private func heatmapAccessibilityLabel(for datum: AutoChartDatum) -> String {
@@ -2172,13 +2112,11 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         let count = datum.yNumber.map {
             formatters.format(column: nil, value: .double($0), context: .markAccessibility)
         }
-        let fallback = datum.accessibilityLabel(
-            name: xName, context: [yName], valueDescription: count)
-        return textResolver(
-            AutoChartMessage(
-                category: .accessibility,
-                code: .markAccessibility,
-                defaultText: fallback))
+        return AutoChartAccessibility.heatmapLabel(
+            category: xName,
+            secondaryCategory: yName,
+            valueDescription: count,
+            textResolver: textResolver)
     }
 
     private func selectionLabel(
@@ -2623,10 +2561,8 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     }
 
     private func applySelection(_ matches: [AutoChartDatum], label: String) {
-        guard let offsetSelection = AutoChartSelectionPreparation.selection(
-            for: matches,
-            label: label,
-            aggregation: specification.aggregation)
+        guard let sourceRowOffsets = AutoChartSelectionPreparation.sourceRowOffsets(
+            for: matches)
         else {
             selection = nil
             return
@@ -2636,7 +2572,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             specification: specification,
             label: label)
         selection = AutoChartSelection(
-            sourceRowIDs: preparedChart.rowIDs(for: offsetSelection.sourceRowOffsets),
+            sourceRowIDs: preparedChart.rowIDs(for: sourceRowOffsets),
             dimensions: semanticValues.dimensions,
             rangeDimensions: semanticValues.rangeDimensions,
             measure: semanticValues.measure,

@@ -235,9 +235,16 @@ extension AutoChartDataset: Codable where RowID: Codable {
 
     public func encode(to encoder: any Encoder) throws {
         var values = encoder.container(keyedBy: CodingKeys.self)
-        let matrix = (0..<storage.rowCount).map { rowIndex in
-            storage.columns.map { storage.value(row: rowIndex, columnID: $0.id) }
-        }
+        // `storage.values` is already row-major, so slice it rather than pay a
+        // column-ID hash lookup for every cell of the matrix.
+        let width = storage.columns.count
+        let matrix: [[AutoChartValue]] =
+            width == 0
+            ? Array(repeating: [], count: storage.rowCount)
+            : (0..<storage.rowCount).map { rowIndex in
+                let start = rowIndex * width
+                return Array(storage.values[start..<(start + width)])
+            }
         try values.encode(storage.columns, forKey: .columns)
         try values.encode(matrix, forKey: .rows)
         try values.encode(rows.map(\.chartRowID), forKey: .rowIDs)

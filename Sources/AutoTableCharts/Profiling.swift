@@ -56,8 +56,13 @@ struct AutoChartSnapshot: Sendable {
         checkingCancellation: Bool = true
     ) throws {
         validationIdentity = UUID()
+        // `chartColumns` is a protocol requirement a conformance may compute,
+        // so read it once: reading it per row rebuilt the array inside the
+        // ingestion loop, and a conformance returning a fresh array each time
+        // could otherwise desynchronize the flat matrix from its column list.
+        let columns = table.chartColumns
         var seenColumnIDs: Set<AutoChartColumnID> = []
-        for column in table.chartColumns where !seenColumnIDs.insert(column.id).inserted {
+        for column in columns where !seenColumnIDs.insert(column.id).inserted {
             throw AutoChartDatasetError(
                 code: .duplicateColumnID,
                 identifier: column.id.rawValue)
@@ -80,17 +85,17 @@ struct AutoChartSnapshot: Sendable {
                 }
             }
             var flat: [AutoChartValue] = []
-            flat.reserveCapacity(chartRows.count * table.chartColumns.count)
+            flat.reserveCapacity(chartRows.count * columns.count)
             for (index, row) in chartRows.enumerated() {
                 if checkingCancellation, index.isMultiple(of: 256) {
                     try Task.checkCancellation()
                 }
-                for column in table.chartColumns {
+                for column in columns {
                     flat.append(row.chartValue(for: column.id))
                 }
             }
             storage = AutoChartMatrixStorage(
-                columns: table.chartColumns,
+                columns: columns,
                 values: flat,
                 rowCount: chartRows.count,
                 metadata: table.chartMetadata)
@@ -287,11 +292,66 @@ public struct AutoChartColumnProfile: Sendable {
     /// composition that could only ever render part of a whole.
     public var allNumericValuesPositive: Bool
     public var averageTextLength: Double
-    var temporalValues: [Date]
+    /// Typed dates that can position a mark on a finite axis.
+    ///
+    /// A profile is a summary: it keeps this count rather than the dates
+    /// themselves, so profiling a long temporal column costs nothing to retain
+    /// and the analyzer's flat per-profile cost charge stays accurate.
+    public var temporalValueCount: Int
     public var temporalMinimum: Date?
     public var temporalMaximum: Date?
     /// Typed dates whose interval cannot be positioned on a finite chart axis.
     public var nonFiniteDateCount: Int
+
+    /// The bytes this profile keeps alive, charged against the analyzer's
+    /// retention budget.
+    ///
+    /// Flat, and it stays flat only because every stored property is a scalar
+    /// summary. Anything row-proportional added here has to be charged for, or
+    /// the cache will admit more than the host asked for.
+    var estimatedRetainedCost: Int { 192 }
+
+    /// Creates a column profile.
+    ///
+    /// Profiles are ordinarily produced by analysis. This initializer exists so
+    /// a host can build one directly — a test double, or a profile computed
+    /// elsewhere. The counts are not cross-checked against each other or
+    /// against `column`, so a profile is only as coherent as its arguments.
+    public init(
+        column: AutoChartColumn,
+        semanticType: AutoChartSemanticType,
+        nonNullCount: Int,
+        numericTypeCount: Int = 0,
+        numericValueCount: Int = 0,
+        renderableValueCount: Int,
+        renderableDistinctCount: Int,
+        distinctCount: Int,
+        numericMinimum: Double? = nil,
+        numericMaximum: Double? = nil,
+        allNumericValuesPositive: Bool = false,
+        averageTextLength: Double = 0,
+        temporalValueCount: Int = 0,
+        temporalMinimum: Date? = nil,
+        temporalMaximum: Date? = nil,
+        nonFiniteDateCount: Int = 0
+    ) {
+        self.column = column
+        self.semanticType = semanticType
+        self.nonNullCount = nonNullCount
+        self.numericTypeCount = numericTypeCount
+        self.numericValueCount = numericValueCount
+        self.renderableValueCount = renderableValueCount
+        self.renderableDistinctCount = renderableDistinctCount
+        self.distinctCount = distinctCount
+        self.numericMinimum = numericMinimum
+        self.numericMaximum = numericMaximum
+        self.allNumericValuesPositive = allNumericValuesPositive
+        self.averageTextLength = averageTextLength
+        self.temporalValueCount = temporalValueCount
+        self.temporalMinimum = temporalMinimum
+        self.temporalMaximum = temporalMaximum
+        self.nonFiniteDateCount = nonFiniteDateCount
+    }
 
     public var isQuantitative: Bool { semanticType == .quantitative }
     public var isTemporal: Bool { semanticType == .temporal }
@@ -404,7 +464,7 @@ enum AutoChartProfiler {
             }
         }
         let numeric = nonNull.compactMap(\.numericValue)
-        var dates: [Date] = []
+        var temporalValueCount = 0
         var temporalMinimum: Date?
         var temporalMaximum: Date?
         var nonFiniteDateCount = 0
@@ -416,7 +476,7 @@ enum AutoChartProfiler {
                 continue
             }
             guard let date = dateValue(value) else { continue }
-            dates.append(date)
+            temporalValueCount += 1
             temporalMinimum = min(temporalMinimum ?? date, date)
             temporalMaximum = max(temporalMaximum ?? date, date)
         }
@@ -430,7 +490,7 @@ enum AutoChartProfiler {
             values: nonNull,
             numericTypeCount: numericTyped.count,
             numericCount: numeric.count,
-            temporalTypeCount: dates.count + nonFiniteDateCount,
+            temporalTypeCount: temporalValueCount + nonFiniteDateCount,
             distinctCount: raw.distinct.count)
         let renderable =
             resolvesToRawIdentity(type)
@@ -452,7 +512,7 @@ enum AutoChartProfiler {
                 && numeric.allSatisfy { $0 > 0 },
             averageTextLength: textLengths.isEmpty
                 ? 0 : Double(textLengths.reduce(0, +)) / Double(textLengths.count),
-            temporalValues: dates,
+            temporalValueCount: temporalValueCount,
             temporalMinimum: temporalMinimum,
             temporalMaximum: temporalMaximum,
             nonFiniteDateCount: nonFiniteDateCount)
