@@ -1047,11 +1047,25 @@ enum AutoChartRecommendationEngine {
                         ))
                 }
             } else {
+                let rejectsSummationFromSource =
+                    profile.column.hints.measureSemantics.map { semantics in
+                        guard !sourceSupportsAdditiveRollup(semantics.source) else {
+                            return false
+                        }
+                        switch semantics.rollup {
+                        case .additive, .safe(.sum):
+                            return true
+                        case .safe, .nonAdditive, .unknown:
+                            return false
+                        }
+                    } ?? false
                 issues.append(
                     .init(
                         severity: .error,
                         code: .unsafeAggregation,
-                        message: "Aggregation requires an explicitly safe measure."))
+                        message: rejectsSummationFromSource
+                            ? "Aggregation cannot sum a measure whose source is already a non-additive summary."
+                            : "Aggregation requires an explicitly safe measure."))
             }
         }
         let markFields: [AutoChartColumnID?] =

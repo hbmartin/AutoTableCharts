@@ -797,7 +797,13 @@ private struct FirstReadBlockingTable: AutoChartTable {
         async let pending = analyzer.analyze(dataset)
         // Trim only once the request has begun; a trim that lands first would
         // be observed by the request and caching would be legitimate.
+        var attempts = 0
         while await analyzer.cacheStatistics.inFlightRequests == 0 {
+            attempts += 1
+            guard attempts < 100_000 else {
+                Issue.record("The analysis never reported an in-flight request.")
+                return
+            }
             await Task.yield()
         }
         await analyzer.trim(to: .minimum)
@@ -856,6 +862,45 @@ private struct FirstReadBlockingTable: AutoChartTable {
         // Documented on `validation(for:)`: only a valid specification is left
         // in the cache, so a rejected candidate cannot evict a wanted entry.
         #expect(await analyzer.cacheStatistics.preparedCharts.entries == entriesBefore)
+    }
+
+    /// Converting an invalid preparation into a validation result must not
+    /// override cancellation that arrived while that preparation was running.
+    @Test func asyncValidationPreservesCancellationForInvalidSpecifications() async throws {
+        let dataset = try AutoChartDataset<Int>(
+            columns: [v2Category, v2Measure],
+            rows: (0..<50_000).map {
+                [.text("Category \($0)"), .double(-1)]
+            })
+        let analyzer = AutoChartAnalyzer()
+        let analysis = try await analyzer.analyze(dataset)
+        let invalid = AutoChartSpecification(
+            family: .donut,
+            encoding: .init(x: v2Category.id, y: v2Measure.id),
+            aggregation: .sum)
+        let missesBefore = await analyzer.cacheStatistics.preparedCharts.misses
+        let pending = Task {
+            try await analysis.validation(for: invalid)
+        }
+
+        // Cancel only after chart preparation is registered. Cancelling before
+        // then exercises the entry check rather than the invalid-result catch.
+        var attempts = 0
+        while await analyzer.cacheStatistics.preparedCharts.misses == missesBefore {
+            attempts += 1
+            guard attempts < 100_000 else {
+                pending.cancel()
+                _ = try? await pending.value
+                Issue.record("The validation never registered chart preparation.")
+                return
+            }
+            await Task.yield()
+        }
+        pending.cancel()
+
+        await #expect(throws: CancellationError.self) {
+            try await pending.value
+        }
     }
 
     @Test func malformedAutoChartValueRepresentationsAreRejected() {
