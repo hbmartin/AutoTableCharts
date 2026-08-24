@@ -438,6 +438,40 @@ private let date = AutoChartColumn(
         #expect(statistics.preparedCharts.entries == 1)
     }
 
+    @Test func keyedAnalysisHitDoesNotReingestAnEvictedTableLayer() async throws {
+        let counter = ChartValueReadCounter()
+        let rows = (0..<6).map { index in
+            CountingRow(
+                chartRowID: "r\(index)",
+                values: [
+                    category.id: .text(index.isMultiple(of: 2) ? "Office" : "Retail"),
+                    measure.id: .double(Double(index + 1)),
+                ],
+                counter: counter)
+        }
+        let input = VersionedCountingTable(
+            chartColumns: [category, measure],
+            chartRows: rows,
+            chartDataIdentity: "analysis-only",
+            chartDataVersion: "revision-1")
+        let analyzer = AutoChartAnalyzer(
+            configuration: AutoChartAnalyzerConfiguration(
+                tables: .init(maximumEntries: 0),
+                analyses: .init(maximumEntries: 4),
+                preparedCharts: .init(maximumEntries: 0),
+                maximumRetainedCost: 1_024 * 1_024))
+
+        _ = try await analyzer.analyze(input)
+        let readsAfterFirstAnalysis = counter.count
+        _ = try await analyzer.analyze(input)
+
+        #expect(readsAfterFirstAnalysis == rows.count * 2)
+        #expect(counter.count == readsAfterFirstAnalysis)
+        let statistics = await analyzer.cacheStatistics
+        #expect(statistics.tables.entries == 0)
+        #expect(statistics.analyses.hits == 1)
+    }
+
     @Test func alternativesPrepareExplicitlyAndCacheWithinOneAnalyzer() async throws {
         let input = table(
             columns: [category, measure],
@@ -1252,6 +1286,8 @@ private let date = AutoChartColumn(
         #expect(recommendation.specification.encoding.series == series.id)
         #expect(recommendation.specification.encoding.facet == facet.id)
         #expect(recommendation.specification.facetBaseFamily == .line)
+        #expect(!recommendation.diagnostics.isEmpty)
+        #expect(recommendation.diagnostics.allSatisfy { $0.family == .faceted })
     }
 
     @Test func facetedBarsPreserveHorizontalBaseOrientation() throws {
@@ -3327,6 +3363,14 @@ private let date = AutoChartColumn(
         #expect(semantics.measure?.columnID == nil)
         #expect(semantics.measure?.aggregation == .countDistinct)
         #expect(semantics.measure?.value == .scalar(.double(2)))
+        #expect(
+            AutoChartSelection(
+                sourceRowIDs: Set(["r0", "r1"]),
+                measure: semantics.measure,
+                family: .bar,
+                specificationID: specification.id,
+                markID: "distinct"
+            ).presentation(columns: [category, measure]).valueDescription == "2")
     }
 
     @Test func selectionDimensionsPreserveTypedSourceValuesInsteadOfLabels() {

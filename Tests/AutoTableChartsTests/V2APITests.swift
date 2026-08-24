@@ -133,6 +133,33 @@ private struct FirstReadBlockingTable: AutoChartTable {
     var chartRows: [DuplicateIDRow] { gate.read(rows) }
 }
 
+private final class ChartRowsReadCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+
+    func read<Row>(_ rows: [Row]) -> [Row] {
+        lock.lock()
+        value += 1
+        lock.unlock()
+        return rows
+    }
+
+    var count: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+}
+
+private struct CountingChartRowsTable: AutoChartTable {
+    let rows: [DuplicateIDRow]
+    let counter: ChartRowsReadCounter
+    let chartColumns = [v2Measure]
+    let chartMetadata = AutoChartTableMetadata()
+
+    var chartRows: [DuplicateIDRow] { counter.read(rows) }
+}
+
 @Suite struct V2DatasetTests {
     @Test func datasetsRejectEveryStructuralMismatch() {
         #expect(throws: AutoChartDatasetError.self) {
@@ -167,6 +194,21 @@ private struct FirstReadBlockingTable: AutoChartTable {
         #expect(throws: AutoChartDatasetError.self) {
             try AutoChartSnapshot(validating: input)
         }
+    }
+
+    @Test func analyzerReadsChartRowsOncePerAttempt() async throws {
+        let counter = ChartRowsReadCounter()
+        let input = CountingChartRowsTable(
+            rows: [
+                .init(chartRowID: 1, value: 10),
+                .init(chartRowID: 2, value: 20),
+            ],
+            counter: counter)
+
+        let analysis = try await AutoChartAnalyzer().analyze(input)
+
+        #expect(analysis.primaryChart != nil)
+        #expect(counter.count == 1)
     }
 
     @Test func integerAndUUIDLineageReachPreparedMarks() async throws {
@@ -504,6 +546,10 @@ private struct FirstReadBlockingTable: AutoChartTable {
 
     #if canImport(Charts) && canImport(SwiftUI)
     @Test func previewUsesExactHeightAndIndependentControls() {
+        #expect(AutoChartPresentation().plotHeight == 280)
+        #expect(AutoChartPresentation.explorer().plotHeight == 280)
+        #expect(AutoChartPresentation.explorer(plotHeight: nil).plotHeight == nil)
+
         let preview = AutoChartPresentation.preview(plotHeight: 156)
         #expect(preview.plotHeight == 156)
         #expect(preview.chrome == [.diagnostics])

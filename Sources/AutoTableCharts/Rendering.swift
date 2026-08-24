@@ -1149,6 +1149,8 @@ public enum AutoChartTypography: String, Hashable, Codable, Sendable {
 }
 
 public struct AutoChartPresentation: Hashable, Sendable {
+    /// The exact plot-region height. Pass `nil` only when the surrounding layout
+    /// supplies a bounded height; the standard presentation defaults to 280 points.
     public var plotHeight: CGFloat?
     public var chrome: AutoChartChrome
     public var interactions: AutoChartInteractions
@@ -1174,6 +1176,7 @@ public struct AutoChartPresentation: Hashable, Sendable {
             typography: .compact)
     }
 
+    /// Creates the standard interactive presentation, 280 points tall by default.
     public static func explorer(plotHeight: CGFloat? = 280) -> Self {
         Self(plotHeight: plotHeight)
     }
@@ -2535,6 +2538,10 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
 }
 
 /// Plot-only rendering for a prepared chart.
+///
+/// The plot defaults to a 180-point height so it remains visible in unbounded
+/// containers such as a vertical `ScrollView`. Pass `nil` when the host supplies
+/// a bounded height through its surrounding layout.
 public struct AutoChartPlot<RowID: Hashable & Sendable>: View {
     private let chart: AutoChartPreparedChart<RowID>
     private let selection: Binding<AutoChartSelection<RowID>?>
