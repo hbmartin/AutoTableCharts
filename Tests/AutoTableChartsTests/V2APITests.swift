@@ -37,44 +37,6 @@ private struct DuplicateIDTable: AutoChartTable {
     let chartMetadata = AutoChartTableMetadata()
 }
 
-private final class FirstRowReadGate: @unchecked Sendable {
-    private let lock = NSLock()
-    private let entered = DispatchSemaphore(value: 0)
-    private let release = DispatchSemaphore(value: 0)
-    private var reads = 0
-
-    func read<Row>(_ rows: [Row]) -> [Row] {
-        lock.lock()
-        reads += 1
-        let shouldBlock = reads == 1
-        lock.unlock()
-        if shouldBlock {
-            entered.signal()
-            release.wait()
-        }
-        return rows
-    }
-
-    func waitUntilFirstRead() async {
-        await withCheckedContinuation { continuation in
-            DispatchQueue.global().async {
-                self.entered.wait()
-                continuation.resume()
-            }
-        }
-    }
-
-    func resumeFirstRead() {
-        release.signal()
-    }
-
-    var readCount: Int {
-        lock.lock()
-        defer { lock.unlock() }
-        return reads
-    }
-}
-
 private actor OneShotPreparationGate {
     private var armed = false
     private var blocked = false
@@ -124,15 +86,6 @@ private func receivesSignalPromptly(_ semaphore: DispatchSemaphore) async -> Boo
     }
 }
 
-private struct FirstReadBlockingTable: AutoChartTable {
-    let rows: [DuplicateIDRow]
-    let gate: FirstRowReadGate
-    let chartColumns = [v2Measure]
-    let chartMetadata = AutoChartTableMetadata()
-
-    var chartRows: [DuplicateIDRow] { gate.read(rows) }
-}
-
 private final class ChartRowsReadCounter: @unchecked Sendable {
     private let lock = NSLock()
     private var value = 0
@@ -156,6 +109,7 @@ private struct CountingChartRowsTable: AutoChartTable {
     let counter: ChartRowsReadCounter
     let chartColumns = [v2Measure]
     let chartMetadata = AutoChartTableMetadata()
+    var chartDataKey: AutoChartDataKey? = nil
 
     var chartRows: [DuplicateIDRow] { counter.read(rows) }
 }
@@ -209,6 +163,19 @@ private struct CountingChartRowsTable: AutoChartTable {
 
         #expect(analysis.primaryChart != nil)
         #expect(counter.count == 1)
+    }
+
+    @Test func rowIDCostIncludesItsContainerAndDynamicPayload() {
+        let baseCost = MemoryLayout<AnyHashable>.stride
+        let scalarCost = AutoChartErasedRowID(1).estimatedRetainedCost
+        let stringCost = AutoChartErasedRowID(
+            String(repeating: "x", count: 256)).estimatedRetainedCost
+        let dataCost = AutoChartErasedRowID(
+            Data(repeating: 0, count: 256)).estimatedRetainedCost
+
+        #expect(scalarCost == baseCost)
+        #expect(stringCost == baseCost + 256)
+        #expect(dataCost == baseCost + 256)
     }
 
     @Test func integerAndUUIDLineageReachPreparedMarks() async throws {
@@ -544,6 +511,24 @@ private struct CountingChartRowsTable: AutoChartTable {
         #expect(duplicatePresentation.valueDescription == "First")
     }
 
+    @Test func distinctCountSelectionKeepsLineageButFormatsAsAUnitlessCount() {
+        let selection = AutoChartSelection(
+            sourceRowIDs: Set([1, 2]),
+            measure: AutoChartSelectedMeasure(
+                columnID: v2Measure.id,
+                aggregation: .countDistinct,
+                value: .scalar(.double(2))),
+            family: .bar,
+            specificationID: AutoChartSpecification.bar(
+                category: v2Category.id,
+                measure: v2Measure.id,
+                aggregation: .countDistinct).id,
+            markID: "distinct")
+
+        #expect(selection.measure?.columnID == v2Measure.id)
+        #expect(selection.presentation(columns: [v2Measure]).valueDescription == "2")
+    }
+
     #if canImport(Charts) && canImport(SwiftUI)
     @Test func previewUsesExactHeightAndIndependentControls() {
         #expect(AutoChartPresentation().plotHeight == 280)
@@ -585,6 +570,32 @@ private struct CountingChartRowsTable: AutoChartTable {
         #expect(statistics.tables.misses == 1)
         #expect(statistics.analyses.misses == 1)
         #expect(statistics.inFlightRequests == 0)
+    }
+
+    @Test func keyedAnalysisHitsDoNotReadRowsOrMissTheTableLayerAgain() async throws {
+        let counter = ChartRowsReadCounter()
+        let table = CountingChartRowsTable(
+            rows: [
+                .init(chartRowID: 1, value: 10),
+                .init(chartRowID: 2, value: 20),
+            ],
+            counter: counter,
+            chartDataKey: .init(identity: "counted", revision: "1"))
+        let analyzer = AutoChartAnalyzer(
+            configuration: AutoChartAnalyzerConfiguration(
+                tables: .init(maximumEntries: 0),
+                analyses: .init(maximumEntries: 4),
+                preparedCharts: .init(maximumEntries: 0),
+                maximumRetainedCost: 1_024 * 1_024))
+
+        _ = try await analyzer.analyze(table)
+        let baseline = await analyzer.cacheStatistics
+        _ = try await analyzer.analyze(table)
+        let reused = await analyzer.cacheStatistics
+
+        #expect(counter.count == 1)
+        #expect(reused.tables.misses == baseline.tables.misses)
+        #expect(reused.analyses.hits == baseline.analyses.hits + 1)
     }
 
     @Test func identicalUnkeyedRequestsCoalesceAfterFingerprintComparison() async throws {
@@ -794,23 +805,27 @@ private struct CountingChartRowsTable: AutoChartTable {
     }
 
     @Test func removeAllDoesNotFailConcurrentAnalyzeCallers() async throws {
-        let gate = FirstRowReadGate()
-        let table = FirstReadBlockingTable(
+        let gate = OneShotPreparationGate()
+        let counter = ChartRowsReadCounter()
+        let table = CountingChartRowsTable(
             rows: (0..<2_000).map {
                 DuplicateIDRow(chartRowID: $0, value: Double($0))
             },
-            gate: gate)
-        let analyzer = AutoChartAnalyzer()
+            counter: counter)
+        await gate.arm()
+        let analyzer = AutoChartAnalyzer {
+            await gate.waitWhenArmed()
+        }
         let task = Task { try await analyzer.analyze(table) }
 
-        await gate.waitUntilFirstRead()
+        await gate.waitUntilBlocked()
         #expect(await analyzer.cacheStatistics.inFlightRequests == 1)
         await analyzer.removeAll()
-        gate.resumeFirstRead()
+        await gate.resume()
         let analysis = try await task.value
 
         #expect(analysis.primaryChart != nil)
-        #expect(gate.readCount >= 2)
+        #expect(counter.count >= 2)
         #expect(await analyzer.cacheStatistics.inFlightRequests == 0)
     }
 
@@ -885,19 +900,23 @@ private struct CountingChartRowsTable: AutoChartTable {
     /// trimmed must not repopulate the cache it was asked to empty, and it must
     /// still hand its caller a result.
     @Test func trimStopsInFlightWorkFromRepopulatingTheCache() async throws {
-        let gate = FirstRowReadGate()
-        let table = FirstReadBlockingTable(
+        let gate = OneShotPreparationGate()
+        let counter = ChartRowsReadCounter()
+        let table = CountingChartRowsTable(
             rows: (0..<2_000).map {
                 DuplicateIDRow(chartRowID: $0, value: Double($0))
             },
-            gate: gate)
-        let analyzer = AutoChartAnalyzer()
+            counter: counter)
+        await gate.arm()
+        let analyzer = AutoChartAnalyzer {
+            await gate.waitWhenArmed()
+        }
         let pending = Task { try await analyzer.analyze(table) }
 
-        await gate.waitUntilFirstRead()
+        await gate.waitUntilBlocked()
         #expect(await analyzer.cacheStatistics.inFlightRequests == 1)
         await analyzer.trim(to: .minimum)
-        gate.resumeFirstRead()
+        await gate.resume()
         let analysis = try await pending.value
 
         let statistics = await analyzer.cacheStatistics

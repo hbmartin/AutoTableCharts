@@ -270,7 +270,7 @@ enum AutoChartSelectionPreparation {
         }()
         let measure = markValue.map {
             AutoChartSelectedMeasure(
-                columnID: [.count, .countDistinct].contains(specification.aggregation)
+                columnID: specification.aggregation == .count
                     ? nil : specification.encoding.y,
                 aggregation: specification.aggregation,
                 value: $0)
@@ -1278,7 +1278,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     /// Whether plotted y values are counts that must not inherit the source
     /// measure column's unit hints.
     private var yValueUsesCountFormatting: Bool {
-        specification.aggregation == .count || specification.aggregation == .countDistinct
+        specification.aggregation.usesCountFormatting
     }
 
     /// The column whose unit hints apply to the numeric value axis, or `nil`
@@ -2448,7 +2448,10 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             let match = data.first(where: {
                 $0.xIdentity == heatmapXIdentity && $0.yIdentity == yIdentity
             })
-        else { return }
+        else {
+            selection = nil
+            return
+        }
         applySelection([match])
     }
 

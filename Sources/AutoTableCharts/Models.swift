@@ -373,6 +373,14 @@ public enum AutoChartAggregation: String, CaseIterable, Codable, Sendable {
     case countDistinct
 }
 
+extension AutoChartAggregation {
+    /// Whether an aggregate produces a unitless count rather than a value in
+    /// the source measure's unit.
+    var usesCountFormatting: Bool {
+        self == .count || self == .countDistinct
+    }
+}
+
 /// Declares whether a measure may be aggregated without changing its meaning.
 ///
 /// Recommendation safety is conservative: unknown or unsafe aggregation blocks
@@ -1576,6 +1584,8 @@ public enum AutoChartMarkValue: Hashable, Codable, Sendable {
 }
 
 public struct AutoChartSelectedMeasure: Hashable, Codable, Sendable {
+    /// The source measure column, or `nil` for a structural row count that is
+    /// not derived from a measure column.
     public var columnID: AutoChartColumnID?
     public var aggregation: AutoChartAggregation
     public var value: AutoChartMarkValue

@@ -3360,7 +3360,7 @@ private let date = AutoChartColumn(
                     id: "distinct", sourceRowIDs: [0, 1], xLabel: "A", yNumber: 2)
             ],
             specification: specification)
-        #expect(semantics.measure?.columnID == nil)
+        #expect(semantics.measure?.columnID == measure.id)
         #expect(semantics.measure?.aggregation == .countDistinct)
         #expect(semantics.measure?.value == .scalar(.double(2)))
         #expect(
