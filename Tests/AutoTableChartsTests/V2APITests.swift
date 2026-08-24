@@ -119,6 +119,15 @@ private actor InvocationCounter {
     }
 }
 
+private func receivesSignalPromptly(_ semaphore: DispatchSemaphore) async -> Bool {
+    await withCheckedContinuation { continuation in
+        DispatchQueue.global().async {
+            continuation.resume(
+                returning: semaphore.wait(timeout: .now() + 5) == .success)
+        }
+    }
+}
+
 private struct FirstReadBlockingTable: AutoChartTable {
     let rows: [DuplicateIDRow]
     let gate: FirstRowReadGate
@@ -921,8 +930,10 @@ private struct FirstReadBlockingTable: AutoChartTable {
             aggregation: .sum)
         let missesBefore = await analyzer.cacheStatistics.preparedCharts.misses
         gate.arm()
+        let completed = DispatchSemaphore(value: 0)
         let pending = Task {
-            try await analysis.validation(for: invalid)
+            defer { completed.signal() }
+            return try await analysis.validation(for: invalid)
         }
 
         // The barrier runs after the cache miss is registered but before the
@@ -931,8 +942,41 @@ private struct FirstReadBlockingTable: AutoChartTable {
         await gate.waitUntilBlocked()
         #expect(await analyzer.cacheStatistics.preparedCharts.misses == missesBefore + 1)
         pending.cancel()
+        let returnedWhilePreparationWasBlocked = await receivesSignalPromptly(completed)
         gate.resume()
 
+        #expect(returnedWhilePreparationWasBlocked)
+        await #expect(throws: CancellationError.self) {
+            try await pending.value
+        }
+    }
+
+    @Test func prepareCancellationTakesPriorityOverInvalidSpecification() async throws {
+        let gate = OneShotPreparationGate()
+        let dataset = try AutoChartDataset<Int>(
+            columns: [v2Category, v2Measure],
+            rows: (0..<2_000).map {
+                [.text("Category \($0)"), .double(-1)]
+            })
+        let analyzer = AutoChartAnalyzer(chartPreparationWillBegin: gate.waitWhenArmed)
+        let analysis = try await analyzer.analyze(dataset)
+        let invalid = AutoChartSpecification(
+            family: .donut,
+            encoding: .init(x: v2Category.id, y: v2Measure.id),
+            aggregation: .sum)
+        gate.arm()
+        let completed = DispatchSemaphore(value: 0)
+        let pending = Task {
+            defer { completed.signal() }
+            return try await analysis.prepare(invalid)
+        }
+
+        await gate.waitUntilBlocked()
+        pending.cancel()
+        let returnedWhilePreparationWasBlocked = await receivesSignalPromptly(completed)
+        gate.resume()
+
+        #expect(returnedWhilePreparationWasBlocked)
         await #expect(throws: CancellationError.self) {
             try await pending.value
         }

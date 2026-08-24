@@ -1036,7 +1036,8 @@ enum AutoChartRecommendationEngine {
             let y = specification.encoding.y,
             let profile = profiles[y]
         {
-            if let safeAggregation = safeRollupAggregation(profile.column.hints) {
+            switch safeRollupResolution(profile.column.hints) {
+            case .allowed(let safeAggregation):
                 if specification.aggregation != safeAggregation {
                     issues.append(
                         .init(
@@ -1046,27 +1047,20 @@ enum AutoChartRecommendationEngine {
                                 "Aggregation must use the declared safe \(safeAggregation.rawValue) operation."
                         ))
                 }
-            } else {
-                let rejectsSummationFromSource =
-                    specification.aggregation == .sum
-                    && profile.column.hints.measureSemantics.map { semantics in
-                        guard !sourceSupportsAdditiveRollup(semantics.source) else {
-                            return false
-                        }
-                        switch semantics.rollup {
-                        case .additive, .safe(.sum):
-                            return true
-                        case .safe, .nonAdditive, .unknown:
-                            return false
-                        }
-                    } ?? false
+            case .rejectsSummationFromSource where specification.aggregation == .sum:
+                issues.append(
+                    .init(
+                        severity: .error,
+                        code: .nonAdditiveSourceSummation,
+                        message:
+                            "Aggregation cannot sum a measure whose source is already a non-additive summary."
+                    ))
+            case .rejectsSummationFromSource, .unavailable:
                 issues.append(
                     .init(
                         severity: .error,
                         code: .unsafeAggregation,
-                        message: rejectsSummationFromSource
-                            ? "Aggregation cannot sum a measure whose source is already a non-additive summary."
-                            : "Aggregation requires an explicitly safe measure."))
+                        message: "Aggregation requires an explicitly safe measure."))
             }
         }
         let markFields: [AutoChartColumnID?] =
@@ -1198,24 +1192,41 @@ enum AutoChartRecommendationEngine {
         }
     }
 
-    private static func safeRollupAggregation(
+    private enum SafeRollupResolution {
+        case allowed(AutoChartAggregation)
+        case rejectsSummationFromSource
+        case unavailable
+    }
+
+    private static func safeRollupResolution(
         _ hints: AutoChartColumnHints
-    ) -> AutoChartAggregation? {
-        guard let semantics = hints.measureSemantics else { return nil }
+    ) -> SafeRollupResolution {
+        guard let semantics = hints.measureSemantics else { return .unavailable }
         switch semantics.rollup {
         case .additive:
-            guard sourceSupportsAdditiveRollup(semantics.source) else { return nil }
-            return .sum
+            guard sourceSupportsAdditiveRollup(semantics.source) else {
+                return .rejectsSummationFromSource
+            }
+            return .allowed(.sum)
         case .safe(let operation):
             // A named safe operation still cannot make an upstream summary
             // summable; only summation combines values additively, so it is
             // the one operation the source has to vouch for.
             guard operation != .sum || sourceSupportsAdditiveRollup(semantics.source)
-            else { return nil }
-            return operation
+            else { return .rejectsSummationFromSource }
+            return .allowed(operation)
         case .nonAdditive, .unknown:
+            return .unavailable
+        }
+    }
+
+    private static func safeRollupAggregation(
+        _ hints: AutoChartColumnHints
+    ) -> AutoChartAggregation? {
+        guard case .allowed(let aggregation) = safeRollupResolution(hints) else {
             return nil
         }
+        return aggregation
     }
 
     /// Already-aggregated measures are additive only for upstream sums and

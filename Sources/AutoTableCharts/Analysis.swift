@@ -76,7 +76,9 @@ public struct AutoChartCacheLayerStatistics: Hashable, Codable, Sendable {
     ///
     /// A request that joins matching work already in flight increments neither
     /// `hits` nor ``misses`` because it neither reuses a retained entry nor
-    /// starts new work.
+    /// starts new work. Cross-layer reuse is credited to the layer whose retained
+    /// entry supplied the reusable state, even when the lookup began at another
+    /// layer.
     public var hits: Int
     /// Lookups that started new work because no completed retained entry or
     /// matching in-flight work was available.
@@ -230,6 +232,7 @@ final class AutoChartAnalysisPreparationProvider<RowID: Hashable & Sendable>: Se
     func prepare(_ recommendationID: AutoChartRecommendationID) async throws
         -> AutoChartPreparedChart<RowID>
     {
+        try Task.checkCancellation()
         guard let recommendation = recommendations.first(where: { $0.id == recommendationID })
         else { throw AutoChartPreparationError.recommendationUnavailable(recommendationID) }
         return try await analyzer.prepare(recommendation, source: source)
@@ -238,6 +241,7 @@ final class AutoChartAnalysisPreparationProvider<RowID: Hashable & Sendable>: Se
     func prepare(_ specification: AutoChartSpecification) async throws
         -> AutoChartPreparedChart<RowID>
     {
+        try Task.checkCancellation()
         let recommendation = AutoChartRecommendation(
             specification: specification,
             score: 0,
@@ -358,12 +362,22 @@ public struct AutoChartAnalysis<RowID: Hashable & Sendable>: Sendable {
         }
     }
 
+    /// Prepares the recommendation identified by `recommendationID`.
+    ///
+    /// - Throws: `CancellationError` if the calling task is cancelled, or
+    ///   ``AutoChartPreparationError/recommendationUnavailable(_:)`` if this
+    ///   analysis does not contain the identifier.
     public func prepare(
         _ recommendationID: AutoChartRecommendationID
     ) async throws -> AutoChartPreparedChart<RowID> {
         try await provider.prepare(recommendationID)
     }
 
+    /// Validates and prepares a caller-provided specification.
+    ///
+    /// - Throws: `CancellationError` if the calling task is cancelled, or
+    ///   ``AutoChartPreparationError/invalidSpecification(_:)`` if the
+    ///   specification cannot be prepared safely.
     public func prepare(
         _ specification: AutoChartSpecification
     ) async throws -> AutoChartPreparedChart<RowID> {
@@ -491,14 +505,28 @@ public actor AutoChartAnalyzer {
         var task: Task<AutoChartAnyCacheBox, Error>
     }
 
+    private typealias ChartPreparationStream = AsyncThrowingStream<
+        AutoChartAnyCacheBox,
+        Error
+    >
+
+    private struct ChartFlightIdentity: Hashable, Sendable {
+        var key: ChartKey
+        var id: UUID
+    }
+
     private struct InFlightChart: Sendable {
         var id: UUID
         var task: Task<AutoChartAnyCacheBox, Error>
+        var waiterContinuations: [UUID: ChartPreparationStream.Continuation]
     }
 
     private enum ChartPreparationRegistration: Sendable {
         case cached(AutoChartAnyCacheBox)
-        case inFlight(Task<AutoChartAnyCacheBox, Error>)
+        case inFlight(
+            identity: ChartFlightIdentity,
+            waiterToken: UUID,
+            stream: ChartPreparationStream)
     }
 
     private enum SourceCandidateOrigin: Hashable, Sendable {
@@ -1186,8 +1214,28 @@ public actor AutoChartAnalyzer {
         switch registration {
         case .cached(let cached):
             box = cached
-        case .inFlight(let task):
-            box = try await task.value
+        case .inFlight(let identity, let waiterToken, let stream):
+            box = try await withTaskCancellationHandler {
+                do {
+                    var iterator = stream.makeAsyncIterator()
+                    guard let prepared = try await iterator.next() else {
+                        try Task.checkCancellation()
+                        throw CancellationError()
+                    }
+                    try Task.checkCancellation()
+                    return prepared
+                } catch {
+                    try Task.checkCancellation()
+                    throw error
+                }
+            } onCancel: {
+                Task {
+                    await self.releaseChartWaiter(
+                        identity,
+                        waiterToken: waiterToken,
+                        cancelWhenEmpty: true)
+                }
+            }
         }
         try Task.checkCancellation()
         guard let prepared = box.value as? AutoChartPreparedChart<RowID> else {
@@ -1207,53 +1255,112 @@ public actor AutoChartAnalyzer {
             touch(key, in: &chartRecency)
             return .cached(AutoChartAnyCacheBox(cached, cost: 0))
         }
-        if let existing = inFlightCharts[key] {
-            return .inFlight(existing.task)
+        let waiterToken = UUID()
+        let (stream, continuation) = ChartPreparationStream.makeStream()
+        if var existing = inFlightCharts[key] {
+            existing.waiterContinuations[waiterToken] = continuation
+            inFlightCharts[key] = existing
+            return .inFlight(
+                identity: ChartFlightIdentity(key: key, id: existing.id),
+                waiterToken: waiterToken,
+                stream: stream)
         }
         statistics.preparedCharts.misses += 1
         let flightID = UUID()
         let preparedEpoch = requestToken?.cacheEpoch ?? cacheEpoch
         let preparationHook = chartPreparationWillBegin
         let task = Task.detached {
-            [recommendation, source, key, flightID, preparedEpoch, preparationHook] in
+            [recommendation, source, key, preparedEpoch, preparationHook] in
+            try Task.checkCancellation()
+            preparationHook?()
+            try Task.checkCancellation()
+            let core = AutoChartRenderCore.prepare(
+                snapshot: source.snapshot,
+                profiles: source.profiles,
+                contentFingerprint: source.contentFingerprint,
+                estimatedStorageCost: source.estimatedStorageCost,
+                recommendation: recommendation)
+            guard core.validation.isValid else {
+                throw AutoChartPreparationError.invalidSpecification(core.validation)
+            }
+            try Task.checkCancellation()
+            let prepared = AutoChartPreparedChart(
+                source: source,
+                recommendation: recommendation,
+                core: core)
+            try Task.checkCancellation()
+            let stored = await self.storePreparedChart(
+                prepared,
+                key: key,
+                cost: self.estimatedChartCost(core),
+                source: source,
+                cacheEpoch: preparedEpoch)
+            return AutoChartAnyCacheBox(stored, cost: 0)
+        }
+        inFlightCharts[key] = InFlightChart(
+            id: flightID,
+            task: task,
+            waiterContinuations: [waiterToken: continuation])
+        Task { [task, key, flightID] in
             do {
-                try Task.checkCancellation()
-                preparationHook?()
-                try Task.checkCancellation()
-                let core = AutoChartRenderCore.prepare(
-                    snapshot: source.snapshot,
-                    profiles: source.profiles,
-                    contentFingerprint: source.contentFingerprint,
-                    estimatedStorageCost: source.estimatedStorageCost,
-                    recommendation: recommendation)
-                guard core.validation.isValid else {
-                    throw AutoChartPreparationError.invalidSpecification(core.validation)
-                }
-                try Task.checkCancellation()
-                let prepared = AutoChartPreparedChart(
-                    source: source,
-                    recommendation: recommendation,
-                    core: core)
-                let stored = await self.storePreparedChart(
-                    prepared,
+                finishChartPreparation(
                     key: key,
-                    cost: self.estimatedChartCost(core),
-                    source: source,
-                    cacheEpoch: preparedEpoch)
-                await self.finishChartPreparation(key: key, flightID: flightID)
-                return AutoChartAnyCacheBox(stored, cost: 0)
+                    flightID: flightID,
+                    result: try await task.value)
             } catch {
-                await self.finishChartPreparation(key: key, flightID: flightID)
-                throw error
+                failChartPreparation(
+                    key: key,
+                    flightID: flightID,
+                    error: error)
             }
         }
-        inFlightCharts[key] = InFlightChart(id: flightID, task: task)
-        return .inFlight(task)
+        return .inFlight(
+            identity: ChartFlightIdentity(key: key, id: flightID),
+            waiterToken: waiterToken,
+            stream: stream)
     }
 
-    private func finishChartPreparation(key: ChartKey, flightID: UUID) {
-        guard inFlightCharts[key]?.id == flightID else { return }
+    private func finishChartPreparation(
+        key: ChartKey,
+        flightID: UUID,
+        result: AutoChartAnyCacheBox
+    ) {
+        guard let flight = inFlightCharts[key], flight.id == flightID else { return }
         inFlightCharts.removeValue(forKey: key)
+        for continuation in flight.waiterContinuations.values {
+            continuation.yield(result)
+            continuation.finish()
+        }
+    }
+
+    private func failChartPreparation(
+        key: ChartKey,
+        flightID: UUID,
+        error: Error
+    ) {
+        guard let flight = inFlightCharts[key], flight.id == flightID else { return }
+        inFlightCharts.removeValue(forKey: key)
+        for continuation in flight.waiterContinuations.values {
+            continuation.finish(throwing: error)
+        }
+    }
+
+    private func releaseChartWaiter(
+        _ identity: ChartFlightIdentity,
+        waiterToken: UUID,
+        cancelWhenEmpty: Bool
+    ) {
+        guard var flight = inFlightCharts[identity.key],
+            flight.id == identity.id,
+            let continuation = flight.waiterContinuations.removeValue(forKey: waiterToken)
+        else { return }
+        continuation.finish(throwing: CancellationError())
+        if flight.waiterContinuations.isEmpty {
+            if cancelWhenEmpty { flight.task.cancel() }
+            inFlightCharts.removeValue(forKey: identity.key)
+        } else {
+            inFlightCharts[identity.key] = flight
+        }
     }
 
     private func storePreparedChart<RowID: Hashable & Sendable>(
@@ -1312,7 +1419,12 @@ public actor AutoChartAnalyzer {
         generation &+= 1
         cacheEpoch &+= 1
         for flight in inFlightAnalyses.values { flight.task.cancel() }
-        for flight in inFlightCharts.values { flight.task.cancel() }
+        for flight in inFlightCharts.values {
+            flight.task.cancel()
+            for continuation in flight.waiterContinuations.values {
+                continuation.finish(throwing: CancellationError())
+            }
+        }
         inFlightAnalyses.removeAll(keepingCapacity: false)
         inFlightCharts.removeAll(keepingCapacity: false)
         tableEntries.removeAll(keepingCapacity: false)

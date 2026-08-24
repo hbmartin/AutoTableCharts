@@ -1000,6 +1000,7 @@ private let date = AutoChartColumn(
         let result = AutoChartRecommendationEngine.recommendations(
             for: input,
             context: AutoChartContext(goal: .composition))
+        #expect(!result.chartRecommendations.isEmpty)
         #expect(!result.chartRecommendations.contains { $0.specification.family == .donut })
         #expect(!result.chartRecommendations.contains { $0.specification.family == .bar })
     }
@@ -1094,9 +1095,7 @@ private let date = AutoChartColumn(
         #expect(
             validation.issues.contains {
                 $0.severity == .error
-                    && $0.messageValue.code == .unsafeAggregation
-                    && $0.message
-                        == "Aggregation cannot sum a measure whose source is already a non-additive summary."
+                    && $0.messageValue.code == .nonAdditiveSourceSummation
             })
         #expect(
             !AutoChartRecommendationEngine.recommendations(for: input)
@@ -1132,8 +1131,7 @@ private let date = AutoChartColumn(
             })
         #expect(
             !validation.issues.contains {
-                $0.message
-                    == "Aggregation cannot sum a measure whose source is already a non-additive summary."
+                $0.messageValue.code == .nonAdditiveSourceSummation
             })
     }
 
