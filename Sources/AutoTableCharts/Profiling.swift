@@ -17,6 +17,15 @@ struct AutoChartErasedRowID: @unchecked Sendable, Hashable, CustomStringConverti
     }
 
     var description: String { String(describing: value.base) }
+
+    var estimatedRetainedCost: Int {
+        switch value.base {
+        case let value as String: return value.utf8.count
+        case let value as Data: return value.count
+        case is UUID: return 16
+        default: return MemoryLayout<AnyHashable>.stride
+        }
+    }
 }
 
 struct AutoChartSnapshot: Sendable {
@@ -26,6 +35,10 @@ struct AutoChartSnapshot: Sendable {
 
         subscript(columnID: AutoChartColumnID) -> AutoChartValue? {
             storage.value(row: rowIndex, columnID: columnID)
+        }
+
+        subscript(columnIndex: Int) -> AutoChartValue {
+            storage.value(row: rowIndex, columnIndex: columnIndex)
         }
     }
 
@@ -55,6 +68,17 @@ struct AutoChartSnapshot: Sendable {
         validating table: Table,
         checkingCancellation: Bool = true
     ) throws {
+        try self.init(
+            validating: table,
+            chartRows: Array(table.chartRows),
+            checkingCancellation: checkingCancellation)
+    }
+
+    init<Table: AutoChartTable>(
+        validating table: Table,
+        chartRows: [Table.ChartRows.Element],
+        checkingCancellation: Bool = true
+    ) throws {
         validationIdentity = UUID()
         // `chartColumns` is a protocol requirement a conformance may compute,
         // so read it once: reading it per row rebuilt the array inside the
@@ -72,7 +96,6 @@ struct AutoChartSnapshot: Sendable {
             storage = dataset._autoChartMatrixStorage
             rowIdentities = dataset._autoChartErasedRowIDs
         } else {
-            let chartRows = Array(table.chartRows)
             var seenRows: Set<Table.RowID> = []
             for (index, row) in chartRows.enumerated() {
                 if checkingCancellation, index.isMultiple(of: 256) {
@@ -120,9 +143,9 @@ struct AutoChartSnapshot: Sendable {
         hasher.combine(rows.count)
         for row in rows {
             hasher.combine(rowIdentities[row.id])
-            for column in columns {
+            for columnIndex in columns.indices {
                 Self.combineContent(
-                    row.values[column.id] ?? .null,
+                    row.values[columnIndex],
                     into: &hasher)
             }
         }
@@ -137,9 +160,9 @@ struct AutoChartSnapshot: Sendable {
         for (index, row) in rows.enumerated() {
             if index.isMultiple(of: 256) { try Task.checkCancellation() }
             hasher.combine(rowIdentities[row.id])
-            for column in columns {
+            for columnIndex in columns.indices {
                 Self.combineContent(
-                    row.values[column.id] ?? .null,
+                    row.values[columnIndex],
                     into: &hasher)
             }
         }
@@ -158,9 +181,9 @@ struct AutoChartSnapshot: Sendable {
         }
         for row in rows {
             Self.addStorageCost(128, to: &storageCost)
-            Self.addStorageCost(rowIdentities[row.id].description.utf8.count, to: &storageCost)
-            for column in columns {
-                let value = row.values[column.id] ?? .null
+            Self.addStorageCost(rowIdentities[row.id].estimatedRetainedCost, to: &storageCost)
+            for columnIndex in columns.indices {
+                let value = row.values[columnIndex]
                 Self.addStorageCost(96, to: &storageCost)
                 Self.addStorageCost(Self.payloadCost(value), to: &storageCost)
             }
@@ -181,10 +204,10 @@ struct AutoChartSnapshot: Sendable {
         else { return false }
         return zip(rows, other.rows).allSatisfy { left, right in
             guard left.id == right.id else { return false }
-            return columns.allSatisfy { column in
+            return columns.indices.allSatisfy { columnIndex in
                 Self.valuesMatch(
-                    left.values[column.id] ?? .null,
-                    right.values[column.id] ?? .null)
+                    left.values[columnIndex],
+                    right.values[columnIndex])
             }
         }
     }
@@ -199,9 +222,9 @@ struct AutoChartSnapshot: Sendable {
             if index.isMultiple(of: 256) { try Task.checkCancellation() }
             let (left, right) = pair
             guard left.id == right.id else { return false }
-            for column in columns where !Self.valuesMatch(
-                left.values[column.id] ?? .null,
-                right.values[column.id] ?? .null)
+            for columnIndex in columns.indices where !Self.valuesMatch(
+                left.values[columnIndex],
+                right.values[columnIndex])
             {
                 return false
             }
@@ -381,8 +404,8 @@ enum AutoChartProfiler {
     private static let posixLocale = Locale(identifier: "en_US_POSIX")
 
     static func profiles(_ snapshot: AutoChartSnapshot) -> [AutoChartColumnProfile] {
-        snapshot.columns.map { column in
-            profile(column, rows: snapshot.rows)
+        snapshot.columns.enumerated().map { columnIndex, column in
+            profile(column, columnIndex: columnIndex, rows: snapshot.rows)
         }
     }
 
@@ -405,21 +428,26 @@ enum AutoChartProfiler {
     ) throws -> [AutoChartColumnID: AutoChartColumnProfile] {
         var profiles: [AutoChartColumnProfile] = []
         profiles.reserveCapacity(snapshot.columns.count)
-        for column in snapshot.columns {
+        for (columnIndex, column) in snapshot.columns.enumerated() {
             try Task.checkCancellation()
             profiles.append(
-                try profile(column, rows: snapshot.rows, checkingCancellation: true))
+                try profile(
+                    column,
+                    columnIndex: columnIndex,
+                    rows: snapshot.rows,
+                    checkingCancellation: true))
         }
         return profileIndex(profiles)
     }
 
     static func profile(
         _ column: AutoChartColumn,
+        columnIndex: Int,
         rows: [AutoChartSnapshot.Row]
     ) -> AutoChartColumnProfile {
         // The nonthrowing entry point is retained for synchronous validation
         // helpers and tests. Analyzer work uses the cancellable variant below.
-        let values = rows.map { $0.values[column.id] ?? .null }
+        let values = rows.map { $0.values[columnIndex] }
         return makeProfile(column, values: values) { values, semanticType in
             identitySummary(values, semanticType: semanticType)
         }
@@ -427,6 +455,7 @@ enum AutoChartProfiler {
 
     private static func profile(
         _ column: AutoChartColumn,
+        columnIndex: Int,
         rows: [AutoChartSnapshot.Row],
         checkingCancellation: Bool
     ) throws -> AutoChartColumnProfile {
@@ -436,7 +465,7 @@ enum AutoChartProfiler {
             if checkingCancellation, index.isMultiple(of: 256) {
                 try Task.checkCancellation()
             }
-            values.append(row.values[column.id] ?? .null)
+            values.append(row.values[columnIndex])
         }
         try Task.checkCancellation()
         return try makeProfile(column, values: values) { values, semanticType in

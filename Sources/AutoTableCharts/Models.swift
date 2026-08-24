@@ -387,7 +387,9 @@ public enum AutoChartMeasureSource: Hashable, Codable, Sendable {
 
 /// Whether and how values may be rolled up into one visual mark.
 public enum AutoChartRollupPolicy: Hashable, Codable, Sendable {
-    /// Values may be summed, including values already aggregated upstream.
+    /// Values may be summed when their source supports additive rollup. An
+    /// upstream aggregate qualifies only when it is itself a sum or ordinary
+    /// count; means, distinct counts, and other summaries remain non-additive.
     case additive
     /// Values must not be combined automatically.
     case nonAdditive
@@ -1278,6 +1280,7 @@ public struct AutoChartMessage: Hashable, Codable, Sendable {
         case nonFiniteValueOmitted
         case missingValue
         case unsafeAggregation
+        case nonAdditiveSourceSummation
         case duplicateMark
         case invalidTemporalRange
         case chartUnavailable

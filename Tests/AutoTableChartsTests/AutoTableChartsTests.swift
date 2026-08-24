@@ -438,6 +438,40 @@ private let date = AutoChartColumn(
         #expect(statistics.preparedCharts.entries == 1)
     }
 
+    @Test func keyedAnalysisHitDoesNotReingestAnEvictedTableLayer() async throws {
+        let counter = ChartValueReadCounter()
+        let rows = (0..<6).map { index in
+            CountingRow(
+                chartRowID: "r\(index)",
+                values: [
+                    category.id: .text(index.isMultiple(of: 2) ? "Office" : "Retail"),
+                    measure.id: .double(Double(index + 1)),
+                ],
+                counter: counter)
+        }
+        let input = VersionedCountingTable(
+            chartColumns: [category, measure],
+            chartRows: rows,
+            chartDataIdentity: "analysis-only",
+            chartDataVersion: "revision-1")
+        let analyzer = AutoChartAnalyzer(
+            configuration: AutoChartAnalyzerConfiguration(
+                tables: .init(maximumEntries: 0),
+                analyses: .init(maximumEntries: 4),
+                preparedCharts: .init(maximumEntries: 0),
+                maximumRetainedCost: 1_024 * 1_024))
+
+        _ = try await analyzer.analyze(input)
+        let readsAfterFirstAnalysis = counter.count
+        _ = try await analyzer.analyze(input)
+
+        #expect(readsAfterFirstAnalysis == rows.count * 2)
+        #expect(counter.count == readsAfterFirstAnalysis)
+        let statistics = await analyzer.cacheStatistics
+        #expect(statistics.tables.entries == 0)
+        #expect(statistics.analyses.hits == 1)
+    }
+
     @Test func alternativesPrepareExplicitlyAndCacheWithinOneAnalyzer() async throws {
         let input = table(
             columns: [category, measure],
@@ -1000,6 +1034,7 @@ private let date = AutoChartColumn(
         let result = AutoChartRecommendationEngine.recommendations(
             for: input,
             context: AutoChartContext(goal: .composition))
+        #expect(!result.chartRecommendations.isEmpty)
         #expect(!result.chartRecommendations.contains { $0.specification.family == .donut })
         #expect(!result.chartRecommendations.contains { $0.specification.family == .bar })
     }
@@ -1094,14 +1129,44 @@ private let date = AutoChartColumn(
         #expect(
             validation.issues.contains {
                 $0.severity == .error
-                    && $0.messageValue.code == .unsafeAggregation
-                    && $0.message
-                        == "Aggregation cannot sum a measure whose source is already a non-additive summary."
+                    && $0.messageValue.code == .nonAdditiveSourceSummation
             })
         #expect(
             !AutoChartRecommendationEngine.recommendations(for: input)
                 .chartRecommendations
                 .contains { $0.specification.aggregation == .sum })
+    }
+
+    @Test func nonSumRequestsDoNotReportTheSummationDiagnostic() {
+        let mean = AutoChartColumn(
+            id: "mean", name: "average_price",
+            hints: AutoChartColumnHints(
+                semanticType: .quantitative,
+                measureSemantics: .init(
+                    source: .aggregated(.mean), rollup: .additive)))
+        let input = table(
+            columns: [category, mean],
+            rows: [
+                [.text("A"), .double(10)],
+                [.text("A"), .double(20)],
+                [.text("B"), .double(30)],
+            ])
+        let validation = AutoChartRecommendationEngine.validate(
+            specification: AutoChartSpecification.bar(
+                category: category.id, measure: mean.id, aggregation: .mean),
+            snapshot: AutoChartSnapshot(input))
+
+        #expect(!validation.isValid)
+        #expect(
+            validation.issues.contains {
+                $0.severity == .error
+                    && $0.messageValue.code == .unsafeAggregation
+                    && $0.message == "Aggregation requires an explicitly safe measure."
+            })
+        #expect(
+            !validation.issues.contains {
+                $0.messageValue.code == .nonAdditiveSourceSummation
+            })
     }
 
     @Test func intervalEndHintsDoNotBecomeRangeStarts() {
@@ -1221,6 +1286,8 @@ private let date = AutoChartColumn(
         #expect(recommendation.specification.encoding.series == series.id)
         #expect(recommendation.specification.encoding.facet == facet.id)
         #expect(recommendation.specification.facetBaseFamily == .line)
+        #expect(!recommendation.diagnostics.isEmpty)
+        #expect(recommendation.diagnostics.allSatisfy { $0.family == .faceted })
     }
 
     @Test func facetedBarsPreserveHorizontalBaseOrientation() throws {
@@ -3164,8 +3231,7 @@ private let date = AutoChartColumn(
             encoding: .init(x: date.id, y: measure.id, series: category.id))
         let semantics = AutoChartSelectionPreparation.semanticValues(
             for: nearest,
-            specification: specification,
-            label: "Jan 1, 2026")
+            specification: specification)
         #expect(semantics.measure == nil)
         let presentation = AutoChartSelection(
             sourceRowIDs: Set(["r0", "r1"]),
@@ -3188,19 +3254,13 @@ private let date = AutoChartColumn(
                 id: "second", sourceRowIDs: [1], xLabel: "10–20",
                 xNumber: 15, yNumber: 2, lower: 10, upper: 20),
         ]
-        #expect(
-            AutoChartSelectionPreparation.numberSelectionLabel(
-                for: [bins[0]],
-                selectedNumber: 5,
-                family: .histogram) == "0–10")
         #expect(AutoChartSelectionPreparation.angleMatch(to: 2, in: bins)?.id == "second")
         #expect(AutoChartSelectionPreparation.angleMatch(to: 4, in: bins) == nil)
 
         let specification = AutoChartSpecification.histogram(value: measure.id)
         let semantics = AutoChartSelectionPreparation.semanticValues(
             for: [bins[0]],
-            specification: specification,
-            label: "0–10")
+            specification: specification)
         #expect(
             semantics.rangeDimensions
                 == [
@@ -3260,8 +3320,7 @@ private let date = AutoChartColumn(
                 specification: AutoChartSpecification(
                     family: .bar,
                     encoding: .init(x: category.id, y: measure.id),
-                    aggregation: .mean),
-                label: "A"
+                    aggregation: .mean)
             ).measure
                 == AutoChartSelectedMeasure(
                     columnID: measure.id,
@@ -3272,8 +3331,7 @@ private let date = AutoChartColumn(
             specification: AutoChartSpecification(
                 family: .bar,
                 encoding: .init(x: category.id, y: measure.id),
-                aggregation: .countDistinct),
-            label: "A")
+                aggregation: .countDistinct))
         #expect(distinctSemantics.measure == nil)
         #expect(
             AutoChartSelection(
@@ -3301,11 +3359,18 @@ private let date = AutoChartColumn(
                 AutoChartDatum(
                     id: "distinct", sourceRowIDs: [0, 1], xLabel: "A", yNumber: 2)
             ],
-            specification: specification,
-            label: "A")
-        #expect(semantics.measure?.columnID == measure.id)
+            specification: specification)
+        #expect(semantics.measure?.columnID == nil)
         #expect(semantics.measure?.aggregation == .countDistinct)
         #expect(semantics.measure?.value == .scalar(.double(2)))
+        #expect(
+            AutoChartSelection(
+                sourceRowIDs: Set(["r0", "r1"]),
+                measure: semantics.measure,
+                family: .bar,
+                specificationID: specification.id,
+                markID: "distinct"
+            ).presentation(columns: [category, measure]).valueDescription == "2")
     }
 
     @Test func selectionDimensionsPreserveTypedSourceValuesInsteadOfLabels() {
@@ -3337,8 +3402,7 @@ private let date = AutoChartColumn(
             facet: "false")
         let semantics = AutoChartSelectionPreparation.semanticValues(
             for: [typed],
-            specification: specification,
-            label: "1")
+            specification: specification)
         #expect(
             semantics.dimensions
                 == [
@@ -3365,8 +3429,7 @@ private let date = AutoChartColumn(
             facet: "false")
         let mixed = AutoChartSelectionPreparation.semanticValues(
             for: [typed, duplicateLabelsWithDifferentValues],
-            specification: specification,
-            label: "1")
+            specification: specification)
         #expect(mixed.dimensions.isEmpty)
     }
 

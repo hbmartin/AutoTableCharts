@@ -131,20 +131,6 @@ enum AutoChartSelectionPreparation {
         return nil
     }
 
-    static func numberSelectionLabel(
-        for matches: [AutoChartDatum],
-        selectedNumber: Double,
-        family: AutoChartFamily
-    ) -> String {
-        if family == .histogram,
-            let range = matches.first?.xLabel,
-            !range.isEmpty
-        {
-            return range
-        }
-        return selectedNumber.formatted()
-    }
-
     static func nearestDateMatches(
         to selectedDate: Date,
         in candidates: [AutoChartDatum]
@@ -214,8 +200,7 @@ enum AutoChartSelectionPreparation {
 
     static func semanticValues(
         for matches: [AutoChartDatum],
-        specification: AutoChartSpecification,
-        label: String
+        specification: AutoChartSpecification
     ) -> SemanticValues {
         var dimensions: [AutoChartSelectedDimension] = []
         var rangeDimensions: [AutoChartSelectedRangeDimension] = []
@@ -285,7 +270,7 @@ enum AutoChartSelectionPreparation {
         }()
         let measure = markValue.map {
             AutoChartSelectedMeasure(
-                columnID: specification.aggregation == .count
+                columnID: [.count, .countDistinct].contains(specification.aggregation)
                     ? nil : specification.encoding.y,
                 aggregation: specification.aggregation,
                 value: $0)
@@ -1164,13 +1149,15 @@ public enum AutoChartTypography: String, Hashable, Codable, Sendable {
 }
 
 public struct AutoChartPresentation: Hashable, Sendable {
+    /// The exact plot-region height. Pass `nil` only when the surrounding layout
+    /// supplies a bounded height; the standard presentation defaults to 280 points.
     public var plotHeight: CGFloat?
     public var chrome: AutoChartChrome
     public var interactions: AutoChartInteractions
     public var typography: AutoChartTypography
 
     public init(
-        plotHeight: CGFloat? = nil,
+        plotHeight: CGFloat? = 280,
         chrome: AutoChartChrome = .all,
         interactions: AutoChartInteractions = .all,
         typography: AutoChartTypography = .standard
@@ -1189,7 +1176,8 @@ public struct AutoChartPresentation: Hashable, Sendable {
             typography: .compact)
     }
 
-    public static func explorer(plotHeight: CGFloat? = nil) -> Self {
+    /// Creates the standard interactive presentation, 280 points tall by default.
+    public static func explorer(plotHeight: CGFloat? = 280) -> Self {
         Self(plotHeight: plotHeight)
     }
 }
@@ -2119,25 +2107,6 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             textResolver: textResolver)
     }
 
-    private func selectionLabel(
-        base: String,
-        matches: [AutoChartDatum]
-    ) -> String {
-        var context: [String] = []
-        if specification.encoding.series != nil {
-            let series = Array(Set(matches.map { seriesValue(for: $0) })).sorted()
-            if !series.isEmpty { context.append(series.joined(separator: ", ")) }
-        }
-        if specification.encoding.facet != nil {
-            let facets = Array(Set(matches.map { facetValue(for: $0) })).sorted()
-            if !facets.isEmpty {
-                context.append("\(facetTitle): \(facets.joined(separator: ", "))")
-            }
-        }
-        guard !context.isEmpty else { return base }
-        return ([base] + context).joined(separator: " · ")
-    }
-
     private func symbolSize(for value: Double?) -> Double {
         guard specification.family == .bubble else { return 45 }
         guard let value, value.isFinite, let sizeBounds else { return 40 }
@@ -2462,9 +2431,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             return
         }
         let matches = candidates.filter { xCategoryValue(for: $0) == category }
-        applySelection(
-            matches,
-            label: selectionLabel(base: category, matches: matches))
+        applySelection(matches)
     }
 
     private func select(categoryIdentity: String?) {
@@ -2473,9 +2440,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             return
         }
         let matches = data.filter { $0.xIdentity == categoryIdentity }
-        applySelection(
-            matches,
-            label: matches.first.map { xCategoryValue(for: $0) } ?? categoryIdentity)
+        applySelection(matches)
     }
 
     private func select(heatmapXIdentity: String, yIdentity: String) {
@@ -2484,17 +2449,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
                 $0.xIdentity == heatmapXIdentity && $0.yIdentity == yIdentity
             })
         else { return }
-        let label = [
-            disambiguatedCategoryValue(
-                identity: match.xIdentity,
-                label: match.xLabel,
-                labels: xDisplayLabels),
-            disambiguatedCategoryValue(
-                identity: match.yIdentity,
-                label: match.yLabel,
-                labels: yDisplayLabels),
-        ].joined(separator: ", ")
-        applySelection([match], label: label)
+        applySelection([match])
     }
 
     private func select(date: Date?) {
@@ -2509,17 +2464,11 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         let matches = AutoChartSelectionPreparation.nearestDateMatches(
             to: date,
             in: candidates)
-        guard let nearestDate = matches.first?.xDate else {
+        guard !matches.isEmpty else {
             selection = nil
             return
         }
-        let base = formatters.format(
-            column: specification.encoding.x.flatMap(snapshot.column),
-            value: .date(nearestDate),
-            context: .selectionSummary)
-        applySelection(
-            matches,
-            label: selectionLabel(base: base, matches: matches))
+        applySelection(matches)
     }
 
     private func select(number: Double?) {
@@ -2534,18 +2483,11 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         let matches = AutoChartSelectionPreparation.nearestNumberMatches(
             to: number,
             in: candidates)
-        guard let nearestNumber = matches.first?.xNumber else {
+        guard !matches.isEmpty else {
             selection = nil
             return
         }
-        applySelection(
-            matches,
-            label: selectionLabel(
-                base: AutoChartSelectionPreparation.numberSelectionLabel(
-                    for: matches,
-                    selectedNumber: nearestNumber,
-                    family: specification.family),
-                matches: matches))
+        applySelection(matches)
     }
 
     private func select(angle: Double?) {
@@ -2557,10 +2499,10 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             selection = nil
             return
         }
-        applySelection([datum], label: xCategoryValue(for: datum))
+        applySelection([datum])
     }
 
-    private func applySelection(_ matches: [AutoChartDatum], label: String) {
+    private func applySelection(_ matches: [AutoChartDatum]) {
         guard let sourceRowOffsets = AutoChartSelectionPreparation.sourceRowOffsets(
             for: matches)
         else {
@@ -2569,8 +2511,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         }
         let semanticValues = AutoChartSelectionPreparation.semanticValues(
             for: matches,
-            specification: specification,
-            label: label)
+            specification: specification)
         selection = AutoChartSelection(
             sourceRowIDs: preparedChart.rowIDs(for: sourceRowOffsets),
             dimensions: semanticValues.dimensions,
@@ -2597,6 +2538,10 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
 }
 
 /// Plot-only rendering for a prepared chart.
+///
+/// The plot defaults to a 180-point height so it remains visible in unbounded
+/// containers such as a vertical `ScrollView`. Pass `nil` when the host supplies
+/// a bounded height through its surrounding layout.
 public struct AutoChartPlot<RowID: Hashable & Sendable>: View {
     private let chart: AutoChartPreparedChart<RowID>
     private let selection: Binding<AutoChartSelection<RowID>?>
@@ -2608,7 +2553,7 @@ public struct AutoChartPlot<RowID: Hashable & Sendable>: View {
     public init(
         preparedChart: AutoChartPreparedChart<RowID>,
         selection: Binding<AutoChartSelection<RowID>?> = .constant(nil),
-        plotHeight: CGFloat? = nil,
+        plotHeight: CGFloat? = 180,
         interactions: AutoChartInteractions = .all,
         formatters: AutoChartFormatters = .init(),
         textResolver: AutoChartTextResolver = .default

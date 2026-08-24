@@ -33,8 +33,10 @@ pipeline stages and bounded row chunks; shared work is cancelled only when its
 last waiter leaves. `trim(to: .minimum)` evicts completed reusable entries while
 preserving work in flight. ``AutoChartAnalyzer/removeAll()`` cancels shared work
 in flight and resets retained state; `analyze` callers whose own tasks were not
-cancelled restart transparently against the reset analyzer instead of receiving
-a spurious `CancellationError`.
+cancelled retry transparently against the reset analyzer up to three times. If
+`removeAll()` invalidates the initial attempt and all three retries, the call
+throws ``AutoChartAnalyzerError/resetRetryLimitExceeded(maximumRetries:)``
+instead of retrying indefinitely.
 
 Inspect ``AutoChartAnalyzer/cacheStatistics`` for per-layer entries, cost, hits,
 misses, evictions, and the number of in-flight requests.
@@ -42,6 +44,7 @@ misses, evictions, and the number of in-flight requests.
 ## Topics
 
 - ``AutoChartAnalyzerConfiguration``
+- ``AutoChartAnalyzerError``
 - ``AutoChartCacheTrimTarget``
 - ``AutoChartCacheStatistics``
 - ``AutoChartDataKey``
