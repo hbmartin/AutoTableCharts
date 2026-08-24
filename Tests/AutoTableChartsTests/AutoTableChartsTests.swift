@@ -3195,8 +3195,7 @@ private let date = AutoChartColumn(
             encoding: .init(x: date.id, y: measure.id, series: category.id))
         let semantics = AutoChartSelectionPreparation.semanticValues(
             for: nearest,
-            specification: specification,
-            label: "Jan 1, 2026")
+            specification: specification)
         #expect(semantics.measure == nil)
         let presentation = AutoChartSelection(
             sourceRowIDs: Set(["r0", "r1"]),
@@ -3219,19 +3218,13 @@ private let date = AutoChartColumn(
                 id: "second", sourceRowIDs: [1], xLabel: "10–20",
                 xNumber: 15, yNumber: 2, lower: 10, upper: 20),
         ]
-        #expect(
-            AutoChartSelectionPreparation.numberSelectionLabel(
-                for: [bins[0]],
-                selectedNumber: 5,
-                family: .histogram) == "0–10")
         #expect(AutoChartSelectionPreparation.angleMatch(to: 2, in: bins)?.id == "second")
         #expect(AutoChartSelectionPreparation.angleMatch(to: 4, in: bins) == nil)
 
         let specification = AutoChartSpecification.histogram(value: measure.id)
         let semantics = AutoChartSelectionPreparation.semanticValues(
             for: [bins[0]],
-            specification: specification,
-            label: "0–10")
+            specification: specification)
         #expect(
             semantics.rangeDimensions
                 == [
@@ -3291,8 +3284,7 @@ private let date = AutoChartColumn(
                 specification: AutoChartSpecification(
                     family: .bar,
                     encoding: .init(x: category.id, y: measure.id),
-                    aggregation: .mean),
-                label: "A"
+                    aggregation: .mean)
             ).measure
                 == AutoChartSelectedMeasure(
                     columnID: measure.id,
@@ -3303,8 +3295,7 @@ private let date = AutoChartColumn(
             specification: AutoChartSpecification(
                 family: .bar,
                 encoding: .init(x: category.id, y: measure.id),
-                aggregation: .countDistinct),
-            label: "A")
+                aggregation: .countDistinct))
         #expect(distinctSemantics.measure == nil)
         #expect(
             AutoChartSelection(
@@ -3332,9 +3323,8 @@ private let date = AutoChartColumn(
                 AutoChartDatum(
                     id: "distinct", sourceRowIDs: [0, 1], xLabel: "A", yNumber: 2)
             ],
-            specification: specification,
-            label: "A")
-        #expect(semantics.measure?.columnID == measure.id)
+            specification: specification)
+        #expect(semantics.measure?.columnID == nil)
         #expect(semantics.measure?.aggregation == .countDistinct)
         #expect(semantics.measure?.value == .scalar(.double(2)))
     }
@@ -3368,8 +3358,7 @@ private let date = AutoChartColumn(
             facet: "false")
         let semantics = AutoChartSelectionPreparation.semanticValues(
             for: [typed],
-            specification: specification,
-            label: "1")
+            specification: specification)
         #expect(
             semantics.dimensions
                 == [
@@ -3396,8 +3385,7 @@ private let date = AutoChartColumn(
             facet: "false")
         let mixed = AutoChartSelectionPreparation.semanticValues(
             for: [typed, duplicateLabelsWithDifferentValues],
-            specification: specification,
-            label: "1")
+            specification: specification)
         #expect(mixed.dimensions.isEmpty)
     }
 

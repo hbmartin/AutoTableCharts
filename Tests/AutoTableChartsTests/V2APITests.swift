@@ -75,39 +75,35 @@ private final class FirstRowReadGate: @unchecked Sendable {
     }
 }
 
-private final class OneShotPreparationGate: @unchecked Sendable {
-    private let lock = NSLock()
-    private let entered = DispatchSemaphore(value: 0)
-    private let release = DispatchSemaphore(value: 0)
+private actor OneShotPreparationGate {
     private var armed = false
+    private var blocked = false
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+    private var enteredContinuations: [CheckedContinuation<Void, Never>] = []
 
     func arm() {
-        lock.lock()
         armed = true
-        lock.unlock()
     }
 
-    func waitWhenArmed() {
-        lock.lock()
-        let shouldBlock = armed
+    func waitWhenArmed() async {
+        guard armed else { return }
         armed = false
-        lock.unlock()
-        guard shouldBlock else { return }
-        entered.signal()
-        release.wait()
+        blocked = true
+        let waiters = enteredContinuations
+        enteredContinuations.removeAll()
+        waiters.forEach { $0.resume() }
+        await withCheckedContinuation { releaseContinuation = $0 }
     }
 
     func waitUntilBlocked() async {
-        await withCheckedContinuation { continuation in
-            DispatchQueue.global().async {
-                self.entered.wait()
-                continuation.resume()
-            }
-        }
+        guard !blocked else { return }
+        await withCheckedContinuation { enteredContinuations.append($0) }
     }
 
     func resume() {
-        release.signal()
+        blocked = false
+        releaseContinuation?.resume()
+        releaseContinuation = nil
     }
 }
 
@@ -890,6 +886,28 @@ private struct FirstReadBlockingTable: AutoChartTable {
         #expect(statistics.hits > baseline.hits)
     }
 
+    @Test func removeAllRetriesUncancelledPreparedChartWaiters() async throws {
+        let gate = OneShotPreparationGate()
+        let dataset = try AutoChartDataset<Int>(
+            columns: [v2Category, v2Measure],
+            rows: [[.text("A"), .double(1)], [.text("B"), .double(2)]])
+        let analyzer = AutoChartAnalyzer {
+            await gate.waitWhenArmed()
+        }
+        let analysis = try await analyzer.analyze(dataset)
+        let specification = AutoChartSpecification.histogram(value: v2Measure.id)
+
+        await gate.arm()
+        let pending = Task { try await analysis.prepare(specification) }
+        await gate.waitUntilBlocked()
+        await analyzer.removeAll()
+        await gate.resume()
+
+        let prepared = try await pending.value
+        #expect(prepared.validation.isValid)
+        #expect(!Task.isCancelled)
+    }
+
     /// An invalid specification reports its issues rather than surfacing as a
     /// thrown preparation error the caller has to unwrap.
     @Test func asyncValidationReportsInvalidSpecificationsWithoutThrowing() async throws {
@@ -922,14 +940,16 @@ private struct FirstReadBlockingTable: AutoChartTable {
             rows: (0..<2_000).map {
                 [.text("Category \($0)"), .double(-1)]
             })
-        let analyzer = AutoChartAnalyzer(chartPreparationWillBegin: gate.waitWhenArmed)
+        let analyzer = AutoChartAnalyzer {
+            await gate.waitWhenArmed()
+        }
         let analysis = try await analyzer.analyze(dataset)
         let invalid = AutoChartSpecification(
             family: .donut,
             encoding: .init(x: v2Category.id, y: v2Measure.id),
             aggregation: .sum)
         let missesBefore = await analyzer.cacheStatistics.preparedCharts.misses
-        gate.arm()
+        await gate.arm()
         let completed = DispatchSemaphore(value: 0)
         let pending = Task {
             defer { completed.signal() }
@@ -943,7 +963,7 @@ private struct FirstReadBlockingTable: AutoChartTable {
         #expect(await analyzer.cacheStatistics.preparedCharts.misses == missesBefore + 1)
         pending.cancel()
         let returnedWhilePreparationWasBlocked = await receivesSignalPromptly(completed)
-        gate.resume()
+        await gate.resume()
 
         #expect(returnedWhilePreparationWasBlocked)
         await #expect(throws: CancellationError.self) {
@@ -958,13 +978,15 @@ private struct FirstReadBlockingTable: AutoChartTable {
             rows: (0..<2_000).map {
                 [.text("Category \($0)"), .double(-1)]
             })
-        let analyzer = AutoChartAnalyzer(chartPreparationWillBegin: gate.waitWhenArmed)
+        let analyzer = AutoChartAnalyzer {
+            await gate.waitWhenArmed()
+        }
         let analysis = try await analyzer.analyze(dataset)
         let invalid = AutoChartSpecification(
             family: .donut,
             encoding: .init(x: v2Category.id, y: v2Measure.id),
             aggregation: .sum)
-        gate.arm()
+        await gate.arm()
         let completed = DispatchSemaphore(value: 0)
         let pending = Task {
             defer { completed.signal() }
@@ -974,7 +996,7 @@ private struct FirstReadBlockingTable: AutoChartTable {
         await gate.waitUntilBlocked()
         pending.cancel()
         let returnedWhilePreparationWasBlocked = await receivesSignalPromptly(completed)
-        gate.resume()
+        await gate.resume()
 
         #expect(returnedWhilePreparationWasBlocked)
         await #expect(throws: CancellationError.self) {

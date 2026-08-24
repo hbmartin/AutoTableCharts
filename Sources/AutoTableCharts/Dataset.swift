@@ -68,7 +68,13 @@ final class AutoChartMatrixStorage: Sendable {
         guard let column = columnIndexes[columnID],
             row >= 0, row < rowCount
         else { return .null }
-        return values[row * columns.count + column]
+        return value(row: row, columnIndex: column)
+    }
+
+    func value(row: Int, columnIndex: Int) -> AutoChartValue {
+        guard row >= 0, row < rowCount, columns.indices.contains(columnIndex)
+        else { return .null }
+        return values[row * columns.count + columnIndex]
     }
 }
 

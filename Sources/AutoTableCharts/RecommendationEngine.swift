@@ -395,6 +395,11 @@ enum AutoChartRecommendationEngine {
             faceted.specification.family = .faceted
             faceted.specification.facetBaseFamily = baseFamily
             faceted.specification.encoding.facet = facet.column.id
+            faceted.diagnostics = faceted.diagnostics.map { diagnostic in
+                var diagnostic = diagnostic
+                if diagnostic.family == baseFamily { diagnostic.family = .faceted }
+                return diagnostic
+            }
             faceted.score -= 4
             faceted.rationale = [
                 AutoChartMessage(
@@ -420,10 +425,13 @@ enum AutoChartRecommendationEngine {
             ranked,
             limit: options.maximumRecommendations,
             isValid: { cachedPreparedValidation($0.specification).isValid })
-        let rankedIDs = Dictionary(
-            uniqueKeysWithValues: diverse.enumerated().map { ($0.element.id, $0.offset) })
         let decisions: [AutoChartCandidateDecision] = options.includesDecisionTrace
-            ? best.map { candidate in
+            ? {
+                let rankedIDs = Dictionary(
+                    uniqueKeysWithValues: diverse.enumerated().map {
+                        ($0.element.id, $0.offset)
+                    })
+                return best.map { candidate in
                 let structural = cachedStructuralValidation(candidate.specification)
                 if let rank = rankedIDs[candidate.id] {
                     return AutoChartCandidateDecision(
@@ -456,7 +464,8 @@ enum AutoChartRecommendationEngine {
                     specificationID: candidate.specification.id,
                     family: candidate.specification.family,
                     disposition: .pruned(.candidateLimit))
-            }
+                }
+            }()
             : []
         guard !diverse.isEmpty else {
             let reason = "No safe chart can represent this result without changing its meaning."

@@ -209,6 +209,17 @@ public struct AutoChartPreparedChart<RowID: Hashable & Sendable>: Sendable {
         }
     }
 
+    init(
+        adapting cached: AutoChartPreparedChart<RowID>,
+        recommendation: AutoChartRecommendation
+    ) {
+        self.recommendation = recommendation
+        self.validation = cached.validation
+        self.marks = cached.marks
+        self.sourceRowIDs = cached.sourceRowIDs
+        self.core = cached.core
+    }
+
     func rowIDs(for offsets: Set<Int>) -> Set<RowID> {
         Set(offsets.compactMap { sourceRowIDs.indices.contains($0) ? sourceRowIDs[$0] : nil })
     }
@@ -235,7 +246,9 @@ final class AutoChartAnalysisPreparationProvider<RowID: Hashable & Sendable>: Se
         try Task.checkCancellation()
         guard let recommendation = recommendations.first(where: { $0.id == recommendationID })
         else { throw AutoChartPreparationError.recommendationUnavailable(recommendationID) }
-        return try await analyzer.prepare(recommendation, source: source)
+        return try await AutoChartAnalyzer.retryingGenerationInvalidations {
+            try await self.analyzer.prepare(recommendation, source: self.source)
+        }
     }
 
     func prepare(_ specification: AutoChartSpecification) async throws
@@ -251,7 +264,9 @@ final class AutoChartAnalysisPreparationProvider<RowID: Hashable & Sendable>: Se
                     code: .recommendationRationale,
                     defaultText: "Caller-provided specification.")
             ])
-        return try await analyzer.prepare(recommendation, source: source)
+        return try await AutoChartAnalyzer.retryingGenerationInvalidations {
+            try await self.analyzer.prepare(recommendation, source: self.source)
+        }
     }
 }
 
@@ -350,7 +365,8 @@ public struct AutoChartAnalysis<RowID: Hashable & Sendable>: Sendable {
     ///
     /// - Throws: `CancellationError` if the calling task is cancelled. An
     ///   invalid specification is reported through the returned result, not by
-    ///   throwing.
+    ///   throwing. Repeated analyzer resets can throw
+    ///   ``AutoChartAnalyzerError/resetRetryLimitExceeded(maximumRetries:)``.
     public func validation(
         for specification: AutoChartSpecification
     ) async throws -> AutoChartValidationResult {
@@ -366,7 +382,8 @@ public struct AutoChartAnalysis<RowID: Hashable & Sendable>: Sendable {
     ///
     /// - Throws: `CancellationError` if the calling task is cancelled, or
     ///   ``AutoChartPreparationError/recommendationUnavailable(_:)`` if this
-    ///   analysis does not contain the identifier.
+    ///   analysis does not contain the identifier. Repeated analyzer resets can
+    ///   throw ``AutoChartAnalyzerError/resetRetryLimitExceeded(maximumRetries:)``.
     public func prepare(
         _ recommendationID: AutoChartRecommendationID
     ) async throws -> AutoChartPreparedChart<RowID> {
@@ -377,7 +394,8 @@ public struct AutoChartAnalysis<RowID: Hashable & Sendable>: Sendable {
     ///
     /// - Throws: `CancellationError` if the calling task is cancelled, or
     ///   ``AutoChartPreparationError/invalidSpecification(_:)`` if the
-    ///   specification cannot be prepared safely.
+    ///   specification cannot be prepared safely. Repeated analyzer resets can
+    ///   throw ``AutoChartAnalyzerError/resetRetryLimitExceeded(maximumRetries:)``.
     public func prepare(
         _ specification: AutoChartSpecification
     ) async throws -> AutoChartPreparedChart<RowID> {
@@ -457,7 +475,7 @@ public actor AutoChartAnalyzer {
     /// Keyed by structural specification identity rather than by the whole
     /// specification: `AutoChartSpecification.id` deliberately excludes the
     /// title, so two identically shaped charts with different titles share one
-    /// preparation and `adapted(_:to:source:)` swaps in the caller's title.
+    /// preparation and `adapted(_:to:)` swaps in the caller's title.
     private struct ChartKey: Hashable, Sendable {
         var table: TableKey
         var specificationID: AutoChartSpecificationID
@@ -479,7 +497,9 @@ public actor AutoChartAnalyzer {
     }
 
     private enum RequestContent: Sendable {
-        case keyed(AutoChartDataKey)
+        case keyed(
+            dataKey: AutoChartDataKey,
+            snapshot: @Sendable () throws -> AutoChartSnapshot)
         case fingerprinted(snapshot: AutoChartSnapshot, contentFingerprint: Int)
     }
 
@@ -554,7 +574,7 @@ public actor AutoChartAnalyzer {
     private let configuration: AutoChartAnalyzerConfiguration
     /// An internal synchronization seam used by concurrency regression tests.
     /// Production analyzers leave it unset and pay only the nil check.
-    private let chartPreparationWillBegin: (@Sendable () -> Void)?
+    private let chartPreparationWillBegin: (@Sendable () async -> Void)?
     private var tableEntries: [TableKey: AutoChartAnyCacheBox] = [:]
     private var tableRecency: [TableKey] = []
     private var analysisEntries: [AnalysisKey: AutoChartAnyCacheBox] = [:]
@@ -578,7 +598,7 @@ public actor AutoChartAnalyzer {
 
     init(
         configuration: AutoChartAnalyzerConfiguration = .standard,
-        chartPreparationWillBegin: @escaping @Sendable () -> Void
+        chartPreparationWillBegin: @escaping @Sendable () async -> Void
     ) {
         self.configuration = configuration
         self.chartPreparationWillBegin = chartPreparationWillBegin
@@ -601,7 +621,8 @@ public actor AutoChartAnalyzer {
     /// times. This bound prevents a host that continuously resets the analyzer
     /// from keeping one call alive indefinitely.
     ///
-    /// - Throws: `CancellationError` when the calling task is cancelled, or
+    /// - Throws: `CancellationError` when the calling task is cancelled,
+    ///   ``AutoChartDatasetError`` when a table violates structural invariants, or
     ///   ``AutoChartAnalyzerError/resetRetryLimitExceeded(maximumRetries:)``
     ///   when the initial attempt and all three retries are invalidated.
     public nonisolated func analyze<Table: AutoChartTable>(
@@ -647,7 +668,7 @@ public actor AutoChartAnalyzer {
             }
             let contentIdentity: String
             switch preparation.content {
-            case .keyed(let dataKey):
+            case .keyed(let dataKey, _):
                 contentIdentity =
                     "key:\(dataKey.identity.utf8.count):\(dataKey.identity)|"
                     + "\(dataKey.revision.utf8.count):\(dataKey.revision)"
@@ -719,11 +740,18 @@ public actor AutoChartAnalyzer {
         _ table: Table
     ) throws -> RequestPreparation<Table.RowID> {
         try Task.checkCancellation()
-        let rowIDs = table.chartRows.map(\.chartRowID)
+        let chartRows = Array(table.chartRows)
+        let rowIDs = chartRows.map(\.chartRowID)
         if let dataKey = table.chartDataKey {
-            return RequestPreparation(rowIDs: rowIDs, content: .keyed(dataKey))
+            return RequestPreparation(
+                rowIDs: rowIDs,
+                content: .keyed(
+                    dataKey: dataKey,
+                    snapshot: {
+                        try AutoChartSnapshot(validating: table, chartRows: chartRows)
+                    }))
         }
-        let snapshot = try AutoChartSnapshot(validating: table)
+        let snapshot = try AutoChartSnapshot(validating: table, chartRows: chartRows)
         let fingerprint = try snapshot.contentFingerprintCheckingCancellation()
         try Task.checkCancellation()
         return RequestPreparation(
@@ -790,12 +818,26 @@ public actor AutoChartAnalyzer {
             source = nil
         }
 
+        if source == nil, case .keyed = preparation.content {
+            let analysisKey = AnalysisKey(
+                table: requestTableKey,
+                context: context,
+                options: options,
+                policyVersion: AutoTableCharts.recommendationPolicyVersion)
+            if let cached: AutoChartCachedAnalysis<Table.RowID> = await cachedAnalysis(
+                for: analysisKey,
+                countMiss: false)
+            {
+                return makeAnalysis(cached)
+            }
+        }
+
         if source == nil {
             let snapshot: AutoChartSnapshot
             let fingerprint: Int
             switch preparation.content {
-            case .keyed:
-                snapshot = try AutoChartSnapshot(validating: table)
+            case .keyed(_, let makeSnapshot):
+                snapshot = try makeSnapshot()
                 fingerprint = try snapshot.contentFingerprintCheckingCancellation()
             case .fingerprinted(let preparedSnapshot, let preparedFingerprint):
                 snapshot = preparedSnapshot
@@ -1066,7 +1108,8 @@ public actor AutoChartAnalyzer {
                         origin: .table),
                     source: source))
         }
-        for (key, box) in analysisEntries where isCollisionFamily(key.table, of: base) {
+        for key in analysisRecency.reversed() where isCollisionFamily(key.table, of: base) {
+            guard let box = analysisEntries[key] else { continue }
             guard let analysis = box.value as? AutoChartCachedAnalysis<RowID> else { continue }
             candidates.append(
                 SourceCandidate(
@@ -1076,7 +1119,8 @@ public actor AutoChartAnalyzer {
                         origin: .analysis(key)),
                     source: analysis.source))
         }
-        for (key, box) in chartEntries where isCollisionFamily(key.table, of: base) {
+        for key in chartRecency.reversed() where isCollisionFamily(key.table, of: base) {
+            guard let box = chartEntries[key] else { continue }
             guard let source = box.sharedObject as? AutoChartPreparedSource<RowID> else {
                 continue
             }
@@ -1144,14 +1188,15 @@ public actor AutoChartAnalyzer {
     }
 
     private func cachedAnalysis<RowID: Hashable & Sendable>(
-        for key: AnalysisKey
+        for key: AnalysisKey,
+        countMiss: Bool = true
     ) -> AutoChartCachedAnalysis<RowID>? {
         if let cached = analysisEntries[key]?.value as? AutoChartCachedAnalysis<RowID> {
             statistics.analyses.hits += 1
             touch(key, in: &analysisRecency)
             return cached
         }
-        statistics.analyses.misses += 1
+        if countMiss { statistics.analyses.misses += 1 }
         return nil
     }
 
@@ -1241,7 +1286,7 @@ public actor AutoChartAnalyzer {
         guard let prepared = box.value as? AutoChartPreparedChart<RowID> else {
             preconditionFailure("Coalesced chart preparation row-ID type mismatch.")
         }
-        return adapted(prepared, to: recommendation, source: source)
+        return adapted(prepared, to: recommendation)
     }
 
     private func registerChartPreparation<RowID: Hashable & Sendable>(
@@ -1272,7 +1317,7 @@ public actor AutoChartAnalyzer {
         let task = Task.detached {
             [recommendation, source, key, preparedEpoch, preparationHook] in
             try Task.checkCancellation()
-            preparationHook?()
+            await preparationHook?()
             try Task.checkCancellation()
             let core = AutoChartRenderCore.prepare(
                 snapshot: source.snapshot,
@@ -1372,7 +1417,7 @@ public actor AutoChartAnalyzer {
     ) -> AutoChartPreparedChart<RowID> {
         if let cached = chartEntries[key]?.value as? AutoChartPreparedChart<RowID> {
             touch(key, in: &chartRecency)
-            return adapted(cached, to: prepared.recommendation, source: source)
+            return adapted(cached, to: prepared.recommendation)
         }
         if preparedEpoch == cacheEpoch {
             insertChart(prepared, key: key, cost: cost, source: source)
@@ -1387,14 +1432,10 @@ public actor AutoChartAnalyzer {
     /// diagnostics.
     private nonisolated func adapted<RowID: Hashable & Sendable>(
         _ cached: AutoChartPreparedChart<RowID>,
-        to recommendation: AutoChartRecommendation,
-        source: AutoChartPreparedSource<RowID>
+        to recommendation: AutoChartRecommendation
     ) -> AutoChartPreparedChart<RowID> {
         guard cached.recommendation != recommendation else { return cached }
-        return AutoChartPreparedChart(
-            source: source,
-            recommendation: recommendation,
-            core: cached.core)
+        return AutoChartPreparedChart(adapting: cached, recommendation: recommendation)
     }
 
     public func trim(to target: AutoChartCacheTrimTarget) {
@@ -1422,7 +1463,7 @@ public actor AutoChartAnalyzer {
         for flight in inFlightCharts.values {
             flight.task.cancel()
             for continuation in flight.waiterContinuations.values {
-                continuation.finish(throwing: CancellationError())
+                continuation.finish(throwing: GenerationInvalidatedError())
             }
         }
         inFlightAnalyses.removeAll(keepingCapacity: false)
@@ -1567,22 +1608,22 @@ public actor AutoChartAnalyzer {
     }
 
     private func evictTable(_ key: TableKey) {
-        guard tableEntries.removeValue(forKey: key) != nil else { return }
         tableRecency.removeAll { $0 == key }
+        guard tableEntries.removeValue(forKey: key) != nil else { return }
         statistics.tables.evictions += 1
         for analysis in analysisRecency.filter({ $0.table == key }) { evictAnalysis(analysis) }
         for chart in chartRecency.filter({ $0.table == key }) { evictChart(chart) }
     }
 
     private func evictAnalysis(_ key: AnalysisKey) {
-        guard analysisEntries.removeValue(forKey: key) != nil else { return }
         analysisRecency.removeAll { $0 == key }
+        guard analysisEntries.removeValue(forKey: key) != nil else { return }
         statistics.analyses.evictions += 1
     }
 
     private func evictChart(_ key: ChartKey) {
-        guard chartEntries.removeValue(forKey: key) != nil else { return }
         chartRecency.removeAll { $0 == key }
+        guard chartEntries.removeValue(forKey: key) != nil else { return }
         statistics.preparedCharts.evictions += 1
     }
 
