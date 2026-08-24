@@ -118,6 +118,15 @@ private let date = AutoChartColumn(
     hints: AutoChartColumnHints(semanticType: .temporal, role: .dimension))
 
 @Suite struct ModelTests {
+    @Test func erasedRowIDRetainedCostUsesAConsistentBaseline() {
+        let baseline = MemoryLayout<AnyHashable>.stride
+
+        #expect(AutoChartErasedRowID(1).estimatedRetainedCost == baseline)
+        #expect(AutoChartErasedRowID(UUID()).estimatedRetainedCost == baseline)
+        #expect(AutoChartErasedRowID("id").estimatedRetainedCost == baseline + 2)
+        #expect(AutoChartErasedRowID(Data([1, 2, 3])).estimatedRetainedCost == baseline + 3)
+    }
+
     @Test func numericValuesRejectNonFiniteDecimals() {
         #expect(AutoChartValue.decimal(.nan).numericValue == nil)
         #expect(AutoChartValue.double(.infinity).numericValue == nil)
@@ -463,13 +472,15 @@ private let date = AutoChartColumn(
 
         _ = try await analyzer.analyze(input)
         let readsAfterFirstAnalysis = counter.count
+        let baseline = await analyzer.cacheStatistics
         _ = try await analyzer.analyze(input)
 
         #expect(readsAfterFirstAnalysis == rows.count * 2)
         #expect(counter.count == readsAfterFirstAnalysis)
         let statistics = await analyzer.cacheStatistics
         #expect(statistics.tables.entries == 0)
-        #expect(statistics.analyses.hits == 1)
+        #expect(statistics.tables.misses == baseline.tables.misses)
+        #expect(statistics.analyses.hits == baseline.analyses.hits + 1)
     }
 
     @Test func alternativesPrepareExplicitlyAndCacheWithinOneAnalyzer() async throws {
@@ -3360,7 +3371,7 @@ private let date = AutoChartColumn(
                     id: "distinct", sourceRowIDs: [0, 1], xLabel: "A", yNumber: 2)
             ],
             specification: specification)
-        #expect(semantics.measure?.columnID == nil)
+        #expect(semantics.measure?.columnID == measure.id)
         #expect(semantics.measure?.aggregation == .countDistinct)
         #expect(semantics.measure?.value == .scalar(.double(2)))
         #expect(

@@ -270,7 +270,7 @@ enum AutoChartSelectionPreparation {
         }()
         let measure = markValue.map {
             AutoChartSelectedMeasure(
-                columnID: [.count, .countDistinct].contains(specification.aggregation)
+                columnID: specification.aggregation == .count
                     ? nil : specification.encoding.y,
                 aggregation: specification.aggregation,
                 value: $0)
@@ -1124,6 +1124,12 @@ private enum AutoChartFacetSelectionAxis {
     case y
 }
 
+@usableFromInline
+enum AutoChartDefaultPlotHeight {
+    @usableFromInline static let explorer: CGFloat = 280
+    @usableFromInline static let plotOnly: CGFloat = 180
+}
+
 public struct AutoChartChrome: OptionSet, Hashable, Codable, Sendable {
     public let rawValue: Int
     public init(rawValue: Int) { self.rawValue = rawValue }
@@ -1157,7 +1163,7 @@ public struct AutoChartPresentation: Hashable, Sendable {
     public var typography: AutoChartTypography
 
     public init(
-        plotHeight: CGFloat? = 280,
+        plotHeight: CGFloat? = AutoChartDefaultPlotHeight.explorer,
         chrome: AutoChartChrome = .all,
         interactions: AutoChartInteractions = .all,
         typography: AutoChartTypography = .standard
@@ -1177,7 +1183,9 @@ public struct AutoChartPresentation: Hashable, Sendable {
     }
 
     /// Creates the standard interactive presentation, 280 points tall by default.
-    public static func explorer(plotHeight: CGFloat? = 280) -> Self {
+    public static func explorer(
+        plotHeight: CGFloat? = AutoChartDefaultPlotHeight.explorer
+    ) -> Self {
         Self(plotHeight: plotHeight)
     }
 }
@@ -1278,7 +1286,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     /// Whether plotted y values are counts that must not inherit the source
     /// measure column's unit hints.
     private var yValueUsesCountFormatting: Bool {
-        specification.aggregation == .count || specification.aggregation == .countDistinct
+        specification.aggregation.usesCountFormatting
     }
 
     /// The column whose unit hints apply to the numeric value axis, or `nil`
@@ -2448,7 +2456,10 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             let match = data.first(where: {
                 $0.xIdentity == heatmapXIdentity && $0.yIdentity == yIdentity
             })
-        else { return }
+        else {
+            selection = nil
+            return
+        }
         applySelection([match])
     }
 
@@ -2553,7 +2564,7 @@ public struct AutoChartPlot<RowID: Hashable & Sendable>: View {
     public init(
         preparedChart: AutoChartPreparedChart<RowID>,
         selection: Binding<AutoChartSelection<RowID>?> = .constant(nil),
-        plotHeight: CGFloat? = 180,
+        plotHeight: CGFloat? = AutoChartDefaultPlotHeight.plotOnly,
         interactions: AutoChartInteractions = .all,
         formatters: AutoChartFormatters = .init(),
         textResolver: AutoChartTextResolver = .default

@@ -138,7 +138,8 @@ extension AutoChartSelection {
         let label = (scalarLabels + rangeLabels).joined(separator: ", ")
         let valueMessage: AutoChartMessage
         if let measure {
-            let column = measure.columnID.flatMap { columnIndex[$0] }
+            let column = measure.aggregation.usesCountFormatting
+                ? nil : measure.columnID.flatMap { columnIndex[$0] }
             switch measure.value {
             case .scalar(let value):
                 let formatted = formatters.format(

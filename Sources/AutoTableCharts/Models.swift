@@ -373,6 +373,17 @@ public enum AutoChartAggregation: String, CaseIterable, Codable, Sendable {
     case countDistinct
 }
 
+extension AutoChartAggregation {
+    /// Count results are dimensionless even when they originate from a column
+    /// that carries currency, percent, or other unit metadata.
+    var usesCountFormatting: Bool {
+        switch self {
+        case .count, .countDistinct: true
+        default: false
+        }
+    }
+}
+
 /// Declares whether a measure may be aggregated without changing its meaning.
 ///
 /// Recommendation safety is conservative: unknown or unsafe aggregation blocks

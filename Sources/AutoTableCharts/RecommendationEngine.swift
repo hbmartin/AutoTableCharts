@@ -432,38 +432,38 @@ enum AutoChartRecommendationEngine {
                         ($0.element.id, $0.offset)
                     })
                 return best.map { candidate in
-                let structural = cachedStructuralValidation(candidate.specification)
-                if let rank = rankedIDs[candidate.id] {
+                    let structural = cachedStructuralValidation(candidate.specification)
+                    if let rank = rankedIDs[candidate.id] {
+                        return AutoChartCandidateDecision(
+                            specificationID: candidate.specification.id,
+                            family: candidate.specification.family,
+                            disposition: .recommended(rank: rank, score: candidate.score))
+                    }
+                    if !structural.isValid {
+                        return AutoChartCandidateDecision(
+                            specificationID: candidate.specification.id,
+                            family: candidate.specification.family,
+                            disposition: .rejected(
+                                structural.issues.filter { $0.severity == .error }
+                                    .map { $0.messageValue.code }))
+                    }
+                    // `diversify` prepares only candidates it actually considers.
+                    // Do not turn trace construction into a full data-preparation
+                    // pass over candidates already excluded by the result limit.
+                    if let prepared = preparedValidationResults[candidate.specification],
+                        !prepared.isValid
+                    {
+                        return AutoChartCandidateDecision(
+                            specificationID: candidate.specification.id,
+                            family: candidate.specification.family,
+                            disposition: .rejected(
+                                prepared.issues.filter { $0.severity == .error }
+                                    .map { $0.messageValue.code }))
+                    }
                     return AutoChartCandidateDecision(
                         specificationID: candidate.specification.id,
                         family: candidate.specification.family,
-                        disposition: .recommended(rank: rank, score: candidate.score))
-                }
-                if !structural.isValid {
-                    return AutoChartCandidateDecision(
-                        specificationID: candidate.specification.id,
-                        family: candidate.specification.family,
-                        disposition: .rejected(
-                            structural.issues.filter { $0.severity == .error }
-                                .map { $0.messageValue.code }))
-                }
-                // `diversify` prepares only candidates it actually considers.
-                // Do not turn trace construction into a full data-preparation
-                // pass over candidates already excluded by the result limit.
-                if let prepared = preparedValidationResults[candidate.specification],
-                    !prepared.isValid
-                {
-                    return AutoChartCandidateDecision(
-                        specificationID: candidate.specification.id,
-                        family: candidate.specification.family,
-                        disposition: .rejected(
-                            prepared.issues.filter { $0.severity == .error }
-                                .map { $0.messageValue.code }))
-                }
-                return AutoChartCandidateDecision(
-                    specificationID: candidate.specification.id,
-                    family: candidate.specification.family,
-                    disposition: .pruned(.candidateLimit))
+                        disposition: .pruned(.candidateLimit))
                 }
             }()
             : []

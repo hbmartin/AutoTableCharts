@@ -571,6 +571,12 @@ public actor AutoChartAnalyzer {
         var tableKey: TableKey
     }
 
+    private enum KeyedCacheResolution<RowID: Hashable & Sendable>: Sendable {
+        case source(AutoChartPreparedSource<RowID>)
+        case analysis(AutoChartCachedAnalysis<RowID>)
+        case miss
+    }
+
     private let configuration: AutoChartAnalyzerConfiguration
     /// An internal synchronization seam used by concurrency regression tests.
     /// Production analyzers leave it unset and pay only the nil check.
@@ -810,26 +816,28 @@ public actor AutoChartAnalyzer {
         requestToken: RequestToken
     ) async throws -> AutoChartAnalysis<Table.RowID> {
         try Task.checkCancellation()
+        let requestAnalysisKey = AnalysisKey(
+            table: requestTableKey,
+            context: context,
+            options: options,
+            policyVersion: AutoTableCharts.recommendationPolicyVersion)
         var source: AutoChartPreparedSource<Table.RowID>?
         switch preparation.content {
         case .keyed:
-            source = await cachedKeyedSource(for: requestTableKey)
+            let resolution: KeyedCacheResolution<Table.RowID> = await cachedKeyedValue(
+                for: requestTableKey,
+                analysisKey: requestAnalysisKey,
+                requestToken: requestToken)
+            switch resolution {
+            case .source(let cachedSource):
+                source = cachedSource
+            case .analysis(let cachedAnalysis):
+                return makeAnalysis(cachedAnalysis)
+            case .miss:
+                source = nil
+            }
         case .fingerprinted:
             source = nil
-        }
-
-        if source == nil, case .keyed = preparation.content {
-            let analysisKey = AnalysisKey(
-                table: requestTableKey,
-                context: context,
-                options: options,
-                policyVersion: AutoTableCharts.recommendationPolicyVersion)
-            if let cached: AutoChartCachedAnalysis<Table.RowID> = await cachedAnalysis(
-                for: analysisKey,
-                countMiss: false)
-            {
-                return makeAnalysis(cached)
-            }
         }
 
         if source == nil {
@@ -1081,16 +1089,54 @@ public actor AutoChartAnalyzer {
             task: task)
     }
 
-    private func cachedKeyedSource<RowID: Hashable & Sendable>(
-        for key: TableKey
-    ) -> AutoChartPreparedSource<RowID>? {
-        if let cached = tableEntries[key]?.value as? AutoChartPreparedSource<RowID> {
+    private func cachedKeyedValue<RowID: Hashable & Sendable>(
+        for tableKey: TableKey,
+        analysisKey: AnalysisKey,
+        requestToken: RequestToken
+    ) -> KeyedCacheResolution<RowID> {
+        if let cached = tableEntries[tableKey]?.value as? AutoChartPreparedSource<RowID> {
             statistics.tables.hits += 1
-            touch(key, in: &tableRecency)
-            return cached
+            touch(tableKey, in: &tableRecency)
+            return .source(cached)
         }
+
+        if let cached = analysisEntries[analysisKey]?.value
+            as? AutoChartCachedAnalysis<RowID>
+        {
+            statistics.analyses.hits += 1
+            touch(analysisKey, in: &analysisRecency)
+            insertTableIfCurrent(cached.source, requestToken: requestToken)
+            return .analysis(cached)
+        }
+
+        if let providingKey = analysisRecency.reversed().first(where: { candidate in
+            candidate.table == tableKey
+                && analysisEntries[candidate]?.value is AutoChartCachedAnalysis<RowID>
+        }),
+            let cached = analysisEntries[providingKey]?.value
+                as? AutoChartCachedAnalysis<RowID>
+        {
+            statistics.analyses.hits += 1
+            touch(providingKey, in: &analysisRecency)
+            insertTableIfCurrent(cached.source, requestToken: requestToken)
+            return .source(cached.source)
+        }
+
+        if let providingKey = chartRecency.reversed().first(where: { candidate in
+            candidate.table == tableKey
+                && chartEntries[candidate]?.sharedObject is AutoChartPreparedSource<RowID>
+        }),
+            let source = chartEntries[providingKey]?.sharedObject
+                as? AutoChartPreparedSource<RowID>
+        {
+            statistics.preparedCharts.hits += 1
+            touch(providingKey, in: &chartRecency)
+            insertTableIfCurrent(source, requestToken: requestToken)
+            return .source(source)
+        }
+
         statistics.tables.misses += 1
-        return nil
+        return .miss
     }
 
     private func sourceCandidates<RowID: Hashable & Sendable>(
@@ -1188,15 +1234,14 @@ public actor AutoChartAnalyzer {
     }
 
     private func cachedAnalysis<RowID: Hashable & Sendable>(
-        for key: AnalysisKey,
-        countMiss: Bool = true
+        for key: AnalysisKey
     ) -> AutoChartCachedAnalysis<RowID>? {
         if let cached = analysisEntries[key]?.value as? AutoChartCachedAnalysis<RowID> {
             statistics.analyses.hits += 1
             touch(key, in: &analysisRecency)
             return cached
         }
-        if countMiss { statistics.analyses.misses += 1 }
+        statistics.analyses.misses += 1
         return nil
     }
 
