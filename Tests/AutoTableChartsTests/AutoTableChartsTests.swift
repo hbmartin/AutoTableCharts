@@ -1104,6 +1104,39 @@ private let date = AutoChartColumn(
                 .contains { $0.specification.aggregation == .sum })
     }
 
+    @Test func nonSumRequestsDoNotReportTheSummationDiagnostic() {
+        let mean = AutoChartColumn(
+            id: "mean", name: "average_price",
+            hints: AutoChartColumnHints(
+                semanticType: .quantitative,
+                measureSemantics: .init(
+                    source: .aggregated(.mean), rollup: .additive)))
+        let input = table(
+            columns: [category, mean],
+            rows: [
+                [.text("A"), .double(10)],
+                [.text("A"), .double(20)],
+                [.text("B"), .double(30)],
+            ])
+        let validation = AutoChartRecommendationEngine.validate(
+            specification: AutoChartSpecification.bar(
+                category: category.id, measure: mean.id, aggregation: .mean),
+            snapshot: AutoChartSnapshot(input))
+
+        #expect(!validation.isValid)
+        #expect(
+            validation.issues.contains {
+                $0.severity == .error
+                    && $0.messageValue.code == .unsafeAggregation
+                    && $0.message == "Aggregation requires an explicitly safe measure."
+            })
+        #expect(
+            !validation.issues.contains {
+                $0.message
+                    == "Aggregation cannot sum a measure whose source is already a non-additive summary."
+            })
+    }
+
     @Test func intervalEndHintsDoNotBecomeRangeStarts() {
         let end = AutoChartColumn(
             id: "end", name: "end",

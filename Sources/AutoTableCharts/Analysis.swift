@@ -122,6 +122,13 @@ public enum AutoChartPreparationError: Error, Sendable {
     case invalidSpecification(AutoChartValidationResult)
 }
 
+/// Failures caused by analyzer lifecycle operations rather than by chart data.
+public enum AutoChartAnalyzerError: Error, Hashable, Sendable {
+    /// ``AutoChartAnalyzer/removeAll()`` invalidated one analysis attempt and
+    /// every permitted transparent retry.
+    case resetRetryLimitExceeded(maximumRetries: Int)
+}
+
 /// A prepared mark with caller-defined source lineage.
 public struct AutoChartPreparedMark<RowID: Hashable & Sendable>: Hashable, Sendable {
     public let identity: String
@@ -409,7 +416,7 @@ private struct AutoChartCachedAnalysis<RowID: Hashable & Sendable>: Sendable {
 
 /// Instance-owned analysis, preparation, and cache lifecycle service.
 public actor AutoChartAnalyzer {
-    private struct GenerationInvalidatedError: Error {}
+    struct GenerationInvalidatedError: Error {}
 
     /// The cache state a request observed when it began. `generation` decides
     /// whether the request is still valid; `cacheEpoch` decides whether its
@@ -517,6 +524,9 @@ public actor AutoChartAnalyzer {
     }
 
     private let configuration: AutoChartAnalyzerConfiguration
+    /// An internal synchronization seam used by concurrency regression tests.
+    /// Production analyzers leave it unset and pay only the nil check.
+    private let chartPreparationWillBegin: (@Sendable () -> Void)?
     private var tableEntries: [TableKey: AutoChartAnyCacheBox] = [:]
     private var tableRecency: [TableKey] = []
     private var analysisEntries: [AnalysisKey: AutoChartAnyCacheBox] = [:]
@@ -535,6 +545,15 @@ public actor AutoChartAnalyzer {
 
     public init(configuration: AutoChartAnalyzerConfiguration = .standard) {
         self.configuration = configuration
+        self.chartPreparationWillBegin = nil
+    }
+
+    init(
+        configuration: AutoChartAnalyzerConfiguration = .standard,
+        chartPreparationWillBegin: @escaping @Sendable () -> Void
+    ) {
+        self.configuration = configuration
+        self.chartPreparationWillBegin = chartPreparationWillBegin
     }
 
     public var cacheStatistics: AutoChartCacheStatistics {
@@ -548,19 +567,37 @@ public actor AutoChartAnalyzer {
         return value
     }
 
+    /// Analyzes a table and prepares its primary recommendation when available.
+    ///
+    /// Calls invalidated by ``removeAll()`` restart transparently up to three
+    /// times. This bound prevents a host that continuously resets the analyzer
+    /// from keeping one call alive indefinitely.
+    ///
+    /// - Throws: `CancellationError` when the calling task is cancelled, or
+    ///   ``AutoChartAnalyzerError/resetRetryLimitExceeded(maximumRetries:)``
+    ///   when the initial attempt and all three retries are invalidated.
     public nonisolated func analyze<Table: AutoChartTable>(
         _ table: Table,
         context: AutoChartContext = .init(),
         options: AutoChartOptions = .init()
     ) async throws -> AutoChartAnalysis<Table.RowID> {
+        try await Self.retryingGenerationInvalidations {
+            try await self.analyzeOnce(table, context: context, options: options)
+        }
+    }
+
+    static func retryingGenerationInvalidations<Result: Sendable>(
+        _ operation: @Sendable () async throws -> Result
+    ) async throws -> Result {
         var generationRetries = 0
         while true {
             do {
-                return try await analyzeOnce(table, context: context, options: options)
+                return try await operation()
             } catch is GenerationInvalidatedError {
                 try Task.checkCancellation()
                 guard generationRetries < Self.maximumGenerationRetries else {
-                    throw CancellationError()
+                    throw AutoChartAnalyzerError.resetRetryLimitExceeded(
+                        maximumRetries: Self.maximumGenerationRetries)
                 }
                 generationRetries += 1
                 await Task.yield()
@@ -1176,36 +1213,39 @@ public actor AutoChartAnalyzer {
         statistics.preparedCharts.misses += 1
         let flightID = UUID()
         let preparedEpoch = requestToken?.cacheEpoch ?? cacheEpoch
+        let preparationHook = chartPreparationWillBegin
         let task = Task.detached {
-            [recommendation, source, key, flightID, preparedEpoch] in
+            [recommendation, source, key, flightID, preparedEpoch, preparationHook] in
             do {
                 try Task.checkCancellation()
-        let core = AutoChartRenderCore.prepare(
-            snapshot: source.snapshot,
-            profiles: source.profiles,
-            contentFingerprint: source.contentFingerprint,
-            estimatedStorageCost: source.estimatedStorageCost,
-            recommendation: recommendation)
-        guard core.validation.isValid else {
-            throw AutoChartPreparationError.invalidSpecification(core.validation)
-        }
-        try Task.checkCancellation()
-        let prepared = AutoChartPreparedChart(
-            source: source,
-            recommendation: recommendation,
-            core: core)
+                preparationHook?()
+                try Task.checkCancellation()
+                let core = AutoChartRenderCore.prepare(
+                    snapshot: source.snapshot,
+                    profiles: source.profiles,
+                    contentFingerprint: source.contentFingerprint,
+                    estimatedStorageCost: source.estimatedStorageCost,
+                    recommendation: recommendation)
+                guard core.validation.isValid else {
+                    throw AutoChartPreparationError.invalidSpecification(core.validation)
+                }
+                try Task.checkCancellation()
+                let prepared = AutoChartPreparedChart(
+                    source: source,
+                    recommendation: recommendation,
+                    core: core)
                 let stored = await self.storePreparedChart(
-            prepared,
-            key: key,
+                    prepared,
+                    key: key,
                     cost: self.estimatedChartCost(core),
-            source: source,
+                    source: source,
                     cacheEpoch: preparedEpoch)
                 await self.finishChartPreparation(key: key, flightID: flightID)
                 return AutoChartAnyCacheBox(stored, cost: 0)
             } catch {
                 await self.finishChartPreparation(key: key, flightID: flightID)
                 throw error
-    }
+            }
         }
         inFlightCharts[key] = InFlightChart(id: flightID, task: task)
         return .inFlight(task)

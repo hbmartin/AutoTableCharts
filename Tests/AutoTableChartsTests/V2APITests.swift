@@ -75,6 +75,50 @@ private final class FirstRowReadGate: @unchecked Sendable {
     }
 }
 
+private final class OneShotPreparationGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private let entered = DispatchSemaphore(value: 0)
+    private let release = DispatchSemaphore(value: 0)
+    private var armed = false
+
+    func arm() {
+        lock.lock()
+        armed = true
+        lock.unlock()
+    }
+
+    func waitWhenArmed() {
+        lock.lock()
+        let shouldBlock = armed
+        armed = false
+        lock.unlock()
+        guard shouldBlock else { return }
+        entered.signal()
+        release.wait()
+    }
+
+    func waitUntilBlocked() async {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global().async {
+                self.entered.wait()
+                continuation.resume()
+            }
+        }
+    }
+
+    func resume() {
+        release.signal()
+    }
+}
+
+private actor InvocationCounter {
+    private(set) var count = 0
+
+    func increment() {
+        count += 1
+    }
+}
+
 private struct FirstReadBlockingTable: AutoChartTable {
     let rows: [DuplicateIDRow]
     let gate: FirstRowReadGate
@@ -790,24 +834,20 @@ private struct FirstReadBlockingTable: AutoChartTable {
     /// trimmed must not repopulate the cache it was asked to empty, and it must
     /// still hand its caller a result.
     @Test func trimStopsInFlightWorkFromRepopulatingTheCache() async throws {
-        let dataset = try AutoChartDataset<Int>(
-            columns: [v2Category, v2Measure],
-            rows: (0..<50_000).map { [.text("Category \($0 % 50)"), .double(Double($0))] })
+        let gate = FirstRowReadGate()
+        let table = FirstReadBlockingTable(
+            rows: (0..<2_000).map {
+                DuplicateIDRow(chartRowID: $0, value: Double($0))
+            },
+            gate: gate)
         let analyzer = AutoChartAnalyzer()
-        async let pending = analyzer.analyze(dataset)
-        // Trim only once the request has begun; a trim that lands first would
-        // be observed by the request and caching would be legitimate.
-        var attempts = 0
-        while await analyzer.cacheStatistics.inFlightRequests == 0 {
-            attempts += 1
-            guard attempts < 100_000 else {
-                Issue.record("The analysis never reported an in-flight request.")
-                return
-            }
-            await Task.yield()
-        }
+        let pending = Task { try await analyzer.analyze(table) }
+
+        await gate.waitUntilFirstRead()
+        #expect(await analyzer.cacheStatistics.inFlightRequests == 1)
         await analyzer.trim(to: .minimum)
-        let analysis = try await pending
+        gate.resumeFirstRead()
+        let analysis = try await pending.value
 
         let statistics = await analyzer.cacheStatistics
         #expect(statistics.tables.entries == 0)
@@ -867,40 +907,52 @@ private struct FirstReadBlockingTable: AutoChartTable {
     /// Converting an invalid preparation into a validation result must not
     /// override cancellation that arrived while that preparation was running.
     @Test func asyncValidationPreservesCancellationForInvalidSpecifications() async throws {
+        let gate = OneShotPreparationGate()
         let dataset = try AutoChartDataset<Int>(
             columns: [v2Category, v2Measure],
-            rows: (0..<50_000).map {
+            rows: (0..<2_000).map {
                 [.text("Category \($0)"), .double(-1)]
             })
-        let analyzer = AutoChartAnalyzer()
+        let analyzer = AutoChartAnalyzer(chartPreparationWillBegin: gate.waitWhenArmed)
         let analysis = try await analyzer.analyze(dataset)
         let invalid = AutoChartSpecification(
             family: .donut,
             encoding: .init(x: v2Category.id, y: v2Measure.id),
             aggregation: .sum)
         let missesBefore = await analyzer.cacheStatistics.preparedCharts.misses
+        gate.arm()
         let pending = Task {
             try await analysis.validation(for: invalid)
         }
 
-        // Cancel only after chart preparation is registered. Cancelling before
-        // then exercises the entry check rather than the invalid-result catch.
-        var attempts = 0
-        while await analyzer.cacheStatistics.preparedCharts.misses == missesBefore {
-            attempts += 1
-            guard attempts < 100_000 else {
-                pending.cancel()
-                _ = try? await pending.value
-                Issue.record("The validation never registered chart preparation.")
-                return
-            }
-            await Task.yield()
-        }
+        // The barrier runs after the cache miss is registered but before the
+        // invalid result is produced, so cancellation deterministically reaches
+        // `validation(for:)`'s invalid-result conversion path.
+        await gate.waitUntilBlocked()
+        #expect(await analyzer.cacheStatistics.preparedCharts.misses == missesBefore + 1)
         pending.cancel()
+        gate.resume()
 
         await #expect(throws: CancellationError.self) {
             try await pending.value
         }
+    }
+
+    @Test func generationRetryExhaustionHasADistinctError() async {
+        let attempts = InvocationCounter()
+
+        do {
+            let _: Int = try await AutoChartAnalyzer.retryingGenerationInvalidations {
+                await attempts.increment()
+                throw AutoChartAnalyzer.GenerationInvalidatedError()
+            }
+            Issue.record("Generation invalidation retries unexpectedly succeeded.")
+        } catch let error as AutoChartAnalyzerError {
+            #expect(error == .resetRetryLimitExceeded(maximumRetries: 3))
+        } catch {
+            Issue.record("Unexpected retry exhaustion error: \(error)")
+        }
+        #expect(await attempts.count == 4)
     }
 
     @Test func malformedAutoChartValueRepresentationsAreRejected() {

@@ -1048,7 +1048,8 @@ enum AutoChartRecommendationEngine {
                 }
             } else {
                 let rejectsSummationFromSource =
-                    profile.column.hints.measureSemantics.map { semantics in
+                    specification.aggregation == .sum
+                    && profile.column.hints.measureSemantics.map { semantics in
                         guard !sourceSupportsAdditiveRollup(semantics.source) else {
                             return false
                         }
