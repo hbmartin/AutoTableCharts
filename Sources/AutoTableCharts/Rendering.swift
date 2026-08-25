@@ -270,8 +270,8 @@ enum AutoChartSelectionPreparation {
         }()
         let measure = markValue.map {
             AutoChartSelectedMeasure(
-                columnID: specification.aggregation == .count
-                    ? nil : specification.encoding.y,
+                columnID: specification.aggregation.preservesMeasureLineage
+                    ? specification.encoding.y : nil,
                 aggregation: specification.aggregation,
                 value: $0)
         }
@@ -1126,6 +1126,11 @@ private enum AutoChartFacetSelectionAxis {
     case y
 }
 
+enum AutoChartMeasureFormattingSurface {
+    case axisTick
+    case markAccessibility
+}
+
 @usableFromInline
 enum AutoChartDefaultPlotHeight {
     @usableFromInline static let explorer: CGFloat = 280
@@ -1285,13 +1290,15 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     private var isCompact: Bool { presentation.typography == .compact }
     private var interactions: AutoChartInteractions { presentation.interactions }
 
-    /// The source column supplied to host formatter overrides for numeric y values.
-    /// Ordinary row counts and normalized proportions have no measure lineage.
-    private var yAxisColumnID: AutoChartColumnID? {
-        if specification.aggregation == .count || specification.stacking == .normalized {
-            return nil
-        }
-        return specification.encoding.y
+    private func resolvedColumn(_ id: AutoChartColumnID?) -> AutoChartColumn? {
+        id.flatMap { preparedChart.core.table.profiles[$0]?.column }
+    }
+
+    /// The source measure for raw and normalized values. Structural row counts
+    /// are the only aggregation without source-column lineage.
+    private var sourceMeasureColumn: AutoChartColumn? {
+        guard specification.aggregation.preservesMeasureLineage else { return nil }
+        return resolvedColumn(specification.encoding.y)
     }
 
     @ViewBuilder
@@ -1435,7 +1442,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
                 )
                 .minimumScaleFactor(0.6)
             Text(
-                specification.encoding.y.flatMap { snapshot.column($0) }
+                resolvedColumn(specification.encoding.y)
                     .map(AutoChartProfiler.displayName) ?? "Value"
             )
             .font(.caption)
@@ -1455,10 +1462,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             }
             .chartXAxisLabel(yTitle)
             .chartYAxisLabel(xTitle)
-            .chartXAxis {
-                yNumericAxis(
-                    asPercentage: specification.stacking == .normalized)
-            }
+            .chartXAxis { yNumericAxis() }
             selectableCategoryY(verticalZoom(chart, categoryCount: uniqueXCount))
         } else {
             let chart = Chart(data) { datum in
@@ -1469,10 +1473,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             }
             .chartXAxisLabel(xTitle)
             .chartYAxisLabel(yTitle)
-            .chartYAxis {
-                yNumericAxis(
-                    asPercentage: specification.stacking == .normalized)
-            }
+            .chartYAxis { yNumericAxis() }
             selectableCategoryX(horizontalZoom(chart, categoryCount: uniqueXCount))
         }
     }
@@ -2044,9 +2045,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     }
 
     private func markAccessibilityLabel(for datum: AutoChartDatum) -> String {
-        let xColumn = specification.encoding.x.flatMap(snapshot.column)
-        let yColumn = specification.aggregation == .count
-            ? nil : specification.encoding.y.flatMap(snapshot.column)
+        let xColumn = resolvedColumn(specification.encoding.x)
         let name: String
         if specification.family == .histogram {
             name = datum.xLabel ?? "Value"
@@ -2067,23 +2066,19 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         let valueDescription: String? = {
             if specification.family == .range, let start = datum.startDate {
                 let startText = formatters.format(
-                    column: specification.encoding.start.flatMap(snapshot.column),
+                    column: resolvedColumn(specification.encoding.start),
                     value: .date(start),
                     context: .markAccessibility)
                 guard let end = datum.endDate, end != start else { return "Date: \(startText)" }
                 let endText = formatters.format(
-                    column: specification.encoding.end.flatMap(snapshot.column),
+                    column: resolvedColumn(specification.encoding.end),
                     value: .date(end),
                     context: .markAccessibility)
                 return "From \(startText) to \(endText)"
             }
             let number = datum.yNumber ?? datum.median
             return number.map {
-                formattedMeasureValue(
-                    $0,
-                    column: yColumn,
-                    aggregation: specification.aggregation,
-                    context: .markAccessibility)
+                formattedMeasureValue($0, for: .markAccessibility)
             }
         }()
         return AutoChartAccessibility.markLabel(
@@ -2134,73 +2129,69 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
 
     private func formatted(_ value: AutoChartValue) -> String {
         formatters.format(
-            column: specification.encoding.y.flatMap(snapshot.column),
+            column: resolvedColumn(specification.encoding.y),
             value: value,
             context: specification.family == .kpi ? .kpi : .detail)
     }
 
     @AxisContentBuilder
-    private func yNumericAxis(asPercentage: Bool = false) -> some AxisContent {
-        numericAxis(
-            columnID: yAxisColumnID,
-            aggregation: specification.aggregation,
-            asPercentage: asPercentage)
+    private func yNumericAxis() -> some AxisContent {
+        AxisMarks { value in
+            AxisGridLine()
+            AxisTick()
+            AxisValueLabel {
+                if let number = value.as(Double.self) {
+                    Text(formattedMeasureValue(number, for: .axisTick))
+                }
+            }
+        }
     }
 
     @AxisContentBuilder
-    private func numericAxis(
-        columnID: AutoChartColumnID?,
-        aggregation: AutoChartAggregation = .none,
-        asPercentage: Bool = false
-    ) -> some AxisContent {
-        let column = columnID.flatMap(snapshot.column)
+    private func numericAxis(columnID: AutoChartColumnID?) -> some AxisContent {
+        let column = resolvedColumn(columnID)
         AxisMarks { value in
             AxisGridLine()
             AxisTick()
             AxisValueLabel {
                 if let number = value.as(Double.self) {
                     Text(
-                        formattedNumericAxisValue(
-                            number,
+                        formatters.format(
                             column: column,
-                            aggregation: aggregation,
-                            asPercentage: asPercentage))
+                            value: .double(number),
+                            context: .axisTick))
                 }
             }
         }
     }
 
-    func formattedNumericAxisValue(
-        _ number: Double,
-        column: AutoChartColumn?,
-        aggregation: AutoChartAggregation,
-        asPercentage: Bool
-    ) -> String {
-        if asPercentage {
-            return formatters.formatNormalizedFraction(number, context: .axisTick)
-        }
-        return formattedMeasureValue(
-            number,
-            column: column,
-            aggregation: aggregation,
-            context: .axisTick)
-    }
-
     func formattedMeasureValue(
         _ number: Double,
-        column: AutoChartColumn?,
-        aggregation: AutoChartAggregation,
-        context: AutoChartFormattingContext
+        for surface: AutoChartMeasureFormattingSurface
     ) -> String {
-        formatters.format(
-            column: column,
-            aggregation: aggregation,
-            value: .double(number),
-            context: context)
+        let context: AutoChartFormattingContext
+        let purpose: AutoChartFormattingPurpose
+        switch surface {
+        case .axisTick:
+            context = .axisTick
+            purpose = specification.stacking == .normalized
+                ? .normalizedFraction(specification.aggregation)
+                : .aggregatedMeasure(specification.aggregation)
+        case .markAccessibility:
+            context = .markAccessibility
+            purpose = .aggregatedMeasure(specification.aggregation)
+        }
+        return formatters.format(
+            AutoChartFormattingRequest(
+                column: sourceMeasureColumn,
+                value: .double(number),
+                context: context,
+                purpose: purpose))
     }
 
     @AxisContentBuilder
     private func temporalAxis(columnID: AutoChartColumnID?) -> some AxisContent {
+        let column = resolvedColumn(columnID)
         AxisMarks { value in
             AxisGridLine()
             AxisTick()
@@ -2208,7 +2199,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
                 if let date = value.as(Date.self) {
                     Text(
                         formatters.format(
-                            column: columnID.flatMap(snapshot.column),
+                            column: column,
                             value: .date(date),
                             context: .axisTick))
                 }

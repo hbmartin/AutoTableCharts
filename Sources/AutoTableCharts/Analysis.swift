@@ -446,6 +446,20 @@ private struct AutoChartCachedAnalysis<RowID: Hashable & Sendable>: Sendable {
     let recommendations: [AutoChartRecommendation]
 }
 
+/// Internal synchronization points used only by deterministic concurrency tests.
+struct AutoChartAnalyzerTestHooks: Sendable {
+    var chartPreparationWillBegin: (@Sendable () async -> Void)?
+    var keyedMaterializationWillBegin: (@Sendable () async -> Void)?
+
+    init(
+        chartPreparationWillBegin: (@Sendable () async -> Void)? = nil,
+        keyedMaterializationWillBegin: (@Sendable () async -> Void)? = nil
+    ) {
+        self.chartPreparationWillBegin = chartPreparationWillBegin
+        self.keyedMaterializationWillBegin = keyedMaterializationWillBegin
+    }
+}
+
 /// Instance-owned analysis, preparation, and cache lifecycle service.
 public actor AutoChartAnalyzer {
     struct GenerationInvalidatedError: Error {}
@@ -581,12 +595,7 @@ public actor AutoChartAnalyzer {
     }
 
     private let configuration: AutoChartAnalyzerConfiguration
-    /// An internal synchronization seam used by concurrency regression tests.
-    /// Production analyzers leave it unset and pay only the nil check.
-    private let chartPreparationWillBegin: (@Sendable () async -> Void)?
-    /// An internal synchronization seam for cancellation immediately before a
-    /// keyed request materializes its deferred rows.
-    private let keyedMaterializationWillBegin: (@Sendable () async -> Void)?
+    private let testHooks: AutoChartAnalyzerTestHooks
     private var tableEntries: [TableKey: AutoChartAnyCacheBox] = [:]
     private var tableRecency: [TableKey] = []
     private var analysisEntries: [AnalysisKey: AutoChartAnyCacheBox] = [:]
@@ -605,18 +614,15 @@ public actor AutoChartAnalyzer {
 
     public init(configuration: AutoChartAnalyzerConfiguration = .standard) {
         self.configuration = configuration
-        self.chartPreparationWillBegin = nil
-        self.keyedMaterializationWillBegin = nil
+        self.testHooks = AutoChartAnalyzerTestHooks()
     }
 
     init(
         configuration: AutoChartAnalyzerConfiguration = .standard,
-        chartPreparationWillBegin: @escaping @Sendable () async -> Void,
-        keyedMaterializationWillBegin: (@Sendable () async -> Void)? = nil
+        testHooks: AutoChartAnalyzerTestHooks
     ) {
         self.configuration = configuration
-        self.chartPreparationWillBegin = chartPreparationWillBegin
-        self.keyedMaterializationWillBegin = keyedMaterializationWillBegin
+        self.testHooks = testHooks
     }
 
     public var cacheStatistics: AutoChartCacheStatistics {
@@ -853,7 +859,7 @@ public actor AutoChartAnalyzer {
             let fingerprint: Int
             switch preparation {
             case .keyed(_, let materialize):
-                await keyedMaterializationWillBegin?()
+                await testHooks.keyedMaterializationWillBegin?()
                 try Task.checkCancellation()
                 let materialized = try materialize()
                 snapshot = materialized.snapshot
@@ -1374,7 +1380,7 @@ public actor AutoChartAnalyzer {
         statistics.preparedCharts.misses += 1
         let flightID = UUID()
         let preparedEpoch = requestToken?.cacheEpoch ?? cacheEpoch
-        let preparationHook = chartPreparationWillBegin
+        let preparationHook = testHooks.chartPreparationWillBegin
         let task = Task.detached {
             [recommendation, source, key, preparedEpoch, preparationHook] in
             try Task.checkCancellation()

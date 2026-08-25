@@ -382,6 +382,10 @@ extension AutoChartAggregation {
         case .none, .sum, .mean, .minimum, .maximum: false
         }
     }
+
+    /// Structural row counts have no source-measure lineage. Every other
+    /// aggregation, including distinct count, remains derived from its column.
+    var preservesMeasureLineage: Bool { self != .count }
 }
 
 /// Declares whether a measure may be aggregated without changing its meaning.

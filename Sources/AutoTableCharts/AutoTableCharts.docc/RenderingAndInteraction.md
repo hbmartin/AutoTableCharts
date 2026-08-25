@@ -38,8 +38,18 @@ reanalysis or re-preparation.
 
 Custom renderers should use
 ``AutoChartFormatters/format(column:aggregation:value:context:)`` for aggregated
-measure values. It preserves the source column for a host override while keeping
-ordinary and distinct counts unitless under the default formatter.
+measure values and
+``AutoChartFormatters/formatNormalizedFraction(_:column:aggregation:context:)``
+for zero-through-one values on a normalized axis. Both preserve source-column
+lineage for aggregation-aware request overrides while applying unitless count
+and percentage defaults correctly.
+
+When a host override depends on those semantics, use
+``AutoChartFormatters/init(locale:timeZone:request:)``. Its
+``AutoChartFormattingRequest`` distinguishes source values, aggregated measures,
+and normalized fractions and includes the aggregation. The compatibility
+`value` override remains available for source-value formatting; because it has
+no aggregation parameter, count requests provide it no unit-bearing column.
 
 ``AutoChartTextResolver`` can override diagnostics, rationale, fallback,
 accessibility, and built-in controls using stable typed messages. Return `nil`
