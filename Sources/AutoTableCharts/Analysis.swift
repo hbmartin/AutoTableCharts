@@ -584,6 +584,9 @@ public actor AutoChartAnalyzer {
     /// An internal synchronization seam used by concurrency regression tests.
     /// Production analyzers leave it unset and pay only the nil check.
     private let chartPreparationWillBegin: (@Sendable () async -> Void)?
+    /// An internal synchronization seam for cancellation immediately before a
+    /// keyed request materializes its deferred rows.
+    private let keyedMaterializationWillBegin: (@Sendable () async -> Void)?
     private var tableEntries: [TableKey: AutoChartAnyCacheBox] = [:]
     private var tableRecency: [TableKey] = []
     private var analysisEntries: [AnalysisKey: AutoChartAnyCacheBox] = [:]
@@ -603,14 +606,17 @@ public actor AutoChartAnalyzer {
     public init(configuration: AutoChartAnalyzerConfiguration = .standard) {
         self.configuration = configuration
         self.chartPreparationWillBegin = nil
+        self.keyedMaterializationWillBegin = nil
     }
 
     init(
         configuration: AutoChartAnalyzerConfiguration = .standard,
-        chartPreparationWillBegin: @escaping @Sendable () async -> Void
+        chartPreparationWillBegin: @escaping @Sendable () async -> Void,
+        keyedMaterializationWillBegin: (@Sendable () async -> Void)? = nil
     ) {
         self.configuration = configuration
         self.chartPreparationWillBegin = chartPreparationWillBegin
+        self.keyedMaterializationWillBegin = keyedMaterializationWillBegin
     }
 
     public var cacheStatistics: AutoChartCacheStatistics {
@@ -847,6 +853,7 @@ public actor AutoChartAnalyzer {
             let fingerprint: Int
             switch preparation {
             case .keyed(_, let materialize):
+                await keyedMaterializationWillBegin?()
                 try Task.checkCancellation()
                 let materialized = try materialize()
                 snapshot = materialized.snapshot

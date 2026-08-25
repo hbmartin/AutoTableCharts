@@ -36,6 +36,11 @@ The same formatters are used for axes, marks, accessibility, selection copy, and
 details. Because they run at presentation time, changing locale does not require
 reanalysis or re-preparation.
 
+Custom renderers should use
+``AutoChartFormatters/format(column:aggregation:value:context:)`` for aggregated
+measure values. It preserves the source column for a host override while keeping
+ordinary and distinct counts unitless under the default formatter.
+
 ``AutoChartTextResolver`` can override diagnostics, rationale, fallback,
 accessibility, and built-in controls using stable typed messages. Return `nil`
 to use the package English fallback.

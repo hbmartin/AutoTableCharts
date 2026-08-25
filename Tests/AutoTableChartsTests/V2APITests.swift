@@ -60,13 +60,18 @@ private actor OneShotPreparationGate {
     }
 
     func waitWhenArmed() async {
-        guard armed, !Task.isCancelled else { return }
+        guard armed else { return }
+        guard !Task.isCancelled else {
+            cancelEnteredWaiters()
+            return
+        }
         armed = false
         let token = UUID()
         await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
                 guard !Task.isCancelled else {
                     armed = true
+                    cancelEnteredWaiters()
                     continuation.resume()
                     return
                 }
@@ -93,7 +98,9 @@ private actor OneShotPreparationGate {
         }
     }
 
-    func waitUntilBlocked() async throws {
+    func waitUntilBlocked(
+        onWaiting: (@Sendable () -> Void)? = nil
+    ) async throws {
         guard !blocked else { return }
         let token = UUID()
         try await withTaskCancellationHandler {
@@ -118,6 +125,7 @@ private actor OneShotPreparationGate {
                 enteredWaiters[token] = EnteredWaiter(
                     continuation: continuation,
                     timeoutTask: timeoutTask)
+                onWaiting?()
             }
         } onCancel: {
             Task { await self.cancelEnteredWaiter(token: token) }
@@ -153,6 +161,15 @@ private actor OneShotPreparationGate {
         guard let waiter = enteredWaiters.removeValue(forKey: token) else { return }
         waiter.timeoutTask.cancel()
         waiter.continuation.resume(throwing: CancellationError())
+    }
+
+    private func cancelEnteredWaiters() {
+        let waiters = Array(enteredWaiters.values)
+        enteredWaiters.removeAll()
+        waiters.forEach {
+            $0.timeoutTask.cancel()
+            $0.continuation.resume(throwing: CancellationError())
+        }
     }
 
     var activeTimeoutTaskCount: Int {
@@ -543,34 +560,22 @@ private struct CountingChartRowsTable: AutoChartTable {
             formatters: formatter)
 
         #expect(presentation.valueDescription == "selectionSummary:\(v2Measure.id.rawValue)")
-        for context in [
-            AutoChartFormattingContext.axisTick,
-            .markAccessibility,
-            .selectionSummary,
-        ] {
-            #expect(
-                formatter.formatMeasure(
-                    column: v2Measure,
-                    aggregation: .countDistinct,
-                    value: .double(2),
-                    context: context)
-                    == "\(context.rawValue):\(v2Measure.id.rawValue)")
-        }
-
-        let defaults = AutoChartFormatters(locale: Locale(identifier: "en_US"))
-        for context in [
-            AutoChartFormattingContext.axisTick,
-            .markAccessibility,
-            .selectionSummary,
-        ] {
-            let formatted = defaults.formatMeasure(
+        #expect(
+            formatter.format(
                 column: v2Measure,
                 aggregation: .countDistinct,
                 value: .double(2),
-                context: context)
-            #expect(!formatted.contains("$"))
-            #expect(!formatted.contains("USD"))
-        }
+                context: .axisTick)
+                == "axisTick:\(v2Measure.id.rawValue)")
+
+        let defaults = AutoChartFormatters(locale: Locale(identifier: "en_US"))
+        let formatted = defaults.format(
+            column: v2Measure,
+            aggregation: .countDistinct,
+            value: .double(2),
+            context: .axisTick)
+        #expect(!formatted.contains("$"))
+        #expect(!formatted.contains("USD"))
     }
 
     @Test func defaultsFormatUnitsAndDatesWithExplicitLocaleAndTimeZone() {
@@ -644,6 +649,69 @@ private struct CountingChartRowsTable: AutoChartTable {
     }
 
     #if canImport(Charts) && canImport(SwiftUI)
+    @MainActor
+    @Test func distinctCountRenderingPathsPreserveLineageWithoutApplyingUnits() async throws {
+        let distinctMeasure = AutoChartColumn(
+            id: "distinct-measure",
+            name: "Customer ID",
+            hints: .init(
+                semanticType: .quantitative,
+                role: .measure,
+                unit: .currency(code: "USD"),
+                measureSemantics: .init(
+                    source: .rowLevel,
+                    rollup: .safe(.countDistinct))))
+        let dataset = try AutoChartDataset<Int>(
+            columns: [v2Category, distinctMeasure],
+            rows: [
+                [.text("A"), .integer(1)],
+                [.text("A"), .integer(2)],
+            ])
+        let analysis = try await AutoChartAnalyzer().analyze(dataset)
+        let prepared = try await analysis.prepare(
+            AutoChartSpecification(
+                family: .bar,
+                encoding: .init(x: v2Category.id, y: distinctMeasure.id),
+                aggregation: .countDistinct))
+        let formatter = AutoChartFormatters { column, _, context, _, _ in
+            "\(context.rawValue):\(column?.id.rawValue ?? "nil")"
+        }
+        let view = AutoChartView(preparedChart: prepared, formatters: formatter)
+
+        #expect(
+            view.formattedNumericAxisValue(
+                2,
+                column: distinctMeasure,
+                aggregation: .countDistinct,
+                asPercentage: false)
+                == "axisTick:\(distinctMeasure.id.rawValue)")
+        #expect(
+            view.formattedMeasureValue(
+                2,
+                column: distinctMeasure,
+                aggregation: .countDistinct,
+                context: .markAccessibility)
+                == "markAccessibility:\(distinctMeasure.id.rawValue)")
+
+        let defaultView = AutoChartView(
+            preparedChart: prepared,
+            formatters: AutoChartFormatters(locale: Locale(identifier: "en_US")))
+        let axisValue = defaultView.formattedNumericAxisValue(
+            2,
+            column: distinctMeasure,
+            aggregation: .countDistinct,
+            asPercentage: false)
+        let accessibilityValue = defaultView.formattedMeasureValue(
+            2,
+            column: distinctMeasure,
+            aggregation: .countDistinct,
+            context: .markAccessibility)
+        #expect(!axisValue.contains("$"))
+        #expect(!axisValue.contains("USD"))
+        #expect(!accessibilityValue.contains("$"))
+        #expect(!accessibilityValue.contains("USD"))
+    }
+
     @Test func previewUsesExactHeightAndIndependentControls() {
         #expect(AutoChartDefaultPlotHeight.explorer == 280)
         #expect(AutoChartDefaultPlotHeight.plotOnly == 180)
@@ -677,10 +745,25 @@ private struct CountingChartRowsTable: AutoChartTable {
             for await _ in stream {}
             await gate.waitWhenArmed()
         }
+        let registration = DispatchSemaphore(value: 0)
+        let blockedWaiter = Task {
+            try await gate.waitUntilBlocked {
+                registration.signal()
+            }
+        }
+        let waiterRegistered = await receivesSignalPromptly(registration)
+        if !waiterRegistered {
+            blockedWaiter.cancel()
+        }
+        try #require(waiterRegistered)
 
         cancelledPreparation.cancel()
-        await cancelledPreparation.value
         continuation.finish()
+        await cancelledPreparation.value
+        await #expect(throws: CancellationError.self) {
+            try await blockedWaiter.value
+        }
+        #expect(await gate.activeTimeoutTaskCount == 0)
 
         let remainedArmed = await gate.isArmed
         #expect(remainedArmed)
@@ -1060,6 +1143,39 @@ private struct CountingChartRowsTable: AutoChartTable {
         let task = Task { try await analyzer.analyze(dataset) }
         task.cancel()
         await #expect(throws: CancellationError.self) { try await task.value }
+    }
+
+    @Test func cancellationBeforeKeyedMaterializationDoesNotReadRows() async throws {
+        let gate = OneShotPreparationGate()
+        let counter = ChartRowsReadCounter()
+        let table = CountingChartRowsTable(
+            rows: (0..<2_000).map {
+                DuplicateIDRow(chartRowID: $0, value: Double($0))
+            },
+            counter: counter,
+            chartDataKey: .init(identity: "cancel-before-materialization", revision: "1"))
+        let analyzer = AutoChartAnalyzer(
+            chartPreparationWillBegin: {},
+            keyedMaterializationWillBegin: {
+                await gate.waitWhenArmed()
+            })
+        await gate.arm()
+        let completed = DispatchSemaphore(value: 0)
+        let pending = Task {
+            defer { completed.signal() }
+            return try await analyzer.analyze(table)
+        }
+
+        try await gate.waitUntilBlocked()
+        pending.cancel()
+        let returnedPromptly = await receivesSignalPromptly(completed)
+        await gate.resume()
+
+        #expect(returnedPromptly)
+        await #expect(throws: CancellationError.self) {
+            try await pending.value
+        }
+        #expect(counter.count == 0)
     }
 }
 

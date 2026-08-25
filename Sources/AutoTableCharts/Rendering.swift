@@ -1285,12 +1285,6 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     private var isCompact: Bool { presentation.typography == .compact }
     private var interactions: AutoChartInteractions { presentation.interactions }
 
-    /// Whether plotted y values are counts that must not inherit the source
-    /// measure column's unit hints.
-    private var yValueUsesCountFormatting: Bool {
-        specification.aggregation.usesCountFormatting
-    }
-
     /// The source column supplied to host formatter overrides for numeric y values.
     /// Ordinary row counts and normalized proportions have no measure lineage.
     private var yAxisColumnID: AutoChartColumnID? {
@@ -2085,10 +2079,10 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             }
             let number = datum.yNumber ?? datum.median
             return number.map {
-                formatters.formatMeasure(
+                formattedMeasureValue(
+                    $0,
                     column: yColumn,
                     aggregation: specification.aggregation,
-                    value: .double($0),
                     context: .markAccessibility)
             }
         }()
@@ -2156,9 +2150,10 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     @AxisContentBuilder
     private func numericAxis(
         columnID: AutoChartColumnID?,
-        aggregation: AutoChartAggregation? = nil,
+        aggregation: AutoChartAggregation = .none,
         asPercentage: Bool = false
     ) -> some AxisContent {
+        let column = columnID.flatMap(snapshot.column)
         AxisMarks { value in
             AxisGridLine()
             AxisTick()
@@ -2167,7 +2162,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
                     Text(
                         formattedNumericAxisValue(
                             number,
-                            columnID: columnID,
+                            column: column,
                             aggregation: aggregation,
                             asPercentage: asPercentage))
                 }
@@ -2175,27 +2170,33 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         }
     }
 
-    private func formattedNumericAxisValue(
+    func formattedNumericAxisValue(
         _ number: Double,
-        columnID: AutoChartColumnID?,
-        aggregation: AutoChartAggregation?,
+        column: AutoChartColumn?,
+        aggregation: AutoChartAggregation,
         asPercentage: Bool
     ) -> String {
         if asPercentage {
             return formatters.formatNormalizedFraction(number, context: .axisTick)
         }
-        let column = columnID.flatMap(snapshot.column)
-        if let aggregation {
-            return formatters.formatMeasure(
-                column: column,
-                aggregation: aggregation,
-                value: .double(number),
-                context: .axisTick)
-        }
-        return formatters.format(
+        return formattedMeasureValue(
+            number,
             column: column,
-            value: .double(number),
+            aggregation: aggregation,
             context: .axisTick)
+    }
+
+    func formattedMeasureValue(
+        _ number: Double,
+        column: AutoChartColumn?,
+        aggregation: AutoChartAggregation,
+        context: AutoChartFormattingContext
+    ) -> String {
+        formatters.format(
+            column: column,
+            aggregation: aggregation,
+            value: .double(number),
+            context: context)
     }
 
     @AxisContentBuilder
