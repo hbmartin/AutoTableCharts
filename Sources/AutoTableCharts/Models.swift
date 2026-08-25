@@ -379,7 +379,7 @@ extension AutoChartAggregation {
     var usesCountFormatting: Bool {
         switch self {
         case .count, .countDistinct: true
-        default: false
+        case .none, .sum, .mean, .minimum, .maximum: false
         }
     }
 }
@@ -1587,6 +1587,8 @@ public enum AutoChartMarkValue: Hashable, Codable, Sendable {
 }
 
 public struct AutoChartSelectedMeasure: Hashable, Codable, Sendable {
+    /// The source measure column, or `nil` for a structural row count that is
+    /// not derived from a measure column.
     public var columnID: AutoChartColumnID?
     public var aggregation: AutoChartAggregation
     public var value: AutoChartMarkValue

@@ -33,10 +33,23 @@ public struct AutoChartFormatters: Sendable {
         value: AutoChartValue,
         context: AutoChartFormattingContext
     ) -> String {
+        format(
+            column: column,
+            value: value,
+            context: context,
+            defaultColumn: column)
+    }
+
+    func format(
+        column: AutoChartColumn?,
+        value: AutoChartValue,
+        context: AutoChartFormattingContext,
+        defaultColumn: AutoChartColumn?
+    ) -> String {
         if let formatted = override?(column, value, context, locale, timeZone) {
             return formatted
         }
-        return defaultFormat(column: column, value: value)
+        return defaultFormat(column: defaultColumn, value: value)
     }
 
     func formatNormalizedFraction(
@@ -138,46 +151,43 @@ extension AutoChartSelection {
         let label = (scalarLabels + rangeLabels).joined(separator: ", ")
         let valueMessage: AutoChartMessage
         if let measure {
-            let column = measure.aggregation.usesCountFormatting
-                ? nil : measure.columnID.flatMap { columnIndex[$0] }
-            switch measure.value {
-            case .scalar(let value):
-                let formatted = formatters.format(
+            let column = measure.columnID.flatMap { columnIndex[$0] }
+            let defaultColumn = measure.aggregation.usesCountFormatting ? nil : column
+            func formatted(_ value: AutoChartValue) -> String {
+                formatters.format(
                     column: column,
                     value: value,
-                    context: .selectionSummary)
+                    context: .selectionSummary,
+                    defaultColumn: defaultColumn)
+            }
+            switch measure.value {
+            case .scalar(let value):
+                let formatted = formatted(value)
                 valueMessage = AutoChartMessage(
                     category: .interface,
                     code: .selectionValue,
                     arguments: ["value": .string(formatted)],
                     defaultText: formatted)
             case .numericRange(let lower, let upper):
-                let lower = formatters.format(
-                    column: column, value: .double(lower), context: .selectionSummary)
-                let upper = formatters.format(
-                    column: column, value: .double(upper), context: .selectionSummary)
+                let lower = formatted(.double(lower))
+                let upper = formatted(.double(upper))
                 valueMessage = AutoChartMessage(
                     category: .interface,
                     code: .selectionRange,
                     arguments: ["lower": .string(lower), "upper": .string(upper)],
                     defaultText: "\(lower)–\(upper)")
             case .temporalRange(let start, let end):
-                let start = formatters.format(
-                    column: column, value: .date(start), context: .selectionSummary)
-                let end = formatters.format(
-                    column: column, value: .date(end), context: .selectionSummary)
+                let start = formatted(.date(start))
+                let end = formatted(.date(end))
                 valueMessage = AutoChartMessage(
                     category: .interface,
                     code: .selectionRange,
                     arguments: ["lower": .string(start), "upper": .string(end)],
                     defaultText: "\(start)–\(end)")
             case .distribution(let lower, _, let median, _, let upper):
-                let median = formatters.format(
-                    column: column, value: .double(median), context: .selectionSummary)
-                let lower = formatters.format(
-                    column: column, value: .double(lower), context: .selectionSummary)
-                let upper = formatters.format(
-                    column: column, value: .double(upper), context: .selectionSummary)
+                let median = formatted(.double(median))
+                let lower = formatted(.double(lower))
+                let upper = formatted(.double(upper))
                 valueMessage = AutoChartMessage(
                     category: .interface,
                     code: .selectionDistribution,
