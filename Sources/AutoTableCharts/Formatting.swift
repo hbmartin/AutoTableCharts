@@ -131,6 +131,10 @@ public struct AutoChartFormatters: Sendable {
     }
 
     /// Formats a zero-through-one contribution as a percentage by default.
+    ///
+    /// Aggregation-aware request overrides receive the supplied source column.
+    /// Compatibility value overrides receive `nil` because their callback cannot
+    /// distinguish a normalized fraction from an ordinary source value.
     public func formatNormalizedFraction(
         _ value: Double,
         column: AutoChartColumn? = nil,
@@ -149,9 +153,7 @@ public struct AutoChartFormatters: Sendable {
         for request: AutoChartFormattingRequest
     ) -> AutoChartColumn? {
         switch request.purpose {
-        case .value:
-            request.column
-        case .aggregatedMeasure:
+        case .value, .aggregatedMeasure:
             request.column
         case .normalizedFraction:
             nil

@@ -49,9 +49,10 @@ When a host override depends on those semantics, use
 ``AutoChartFormattingRequest`` distinguishes source values, aggregated measures,
 and normalized fractions and includes the aggregation. The compatibility
 `value` override remains available and continues to receive the supplied source
-column for aggregated values. Because it has no aggregation parameter, use the
-request override whenever formatting depends on count, distinct-count, or
-normalized-fraction semantics.
+column for raw and aggregated values. Normalized-fraction requests pass `nil`
+as its column. Because it has no aggregation parameter, use the request override
+whenever formatting depends on count, distinct-count, or normalized-fraction
+semantics.
 
 ``AutoChartTextResolver`` can override diagnostics, rationale, fallback,
 accessibility, and built-in controls using stable typed messages. Return `nil`
