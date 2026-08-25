@@ -448,15 +448,35 @@ private struct AutoChartCachedAnalysis<RowID: Hashable & Sendable>: Sendable {
 
 /// Internal synchronization points used only by deterministic concurrency tests.
 struct AutoChartAnalyzerTestHooks: Sendable {
-    var chartPreparationWillBegin: (@Sendable () async -> Void)?
-    var keyedMaterializationWillBegin: (@Sendable () async -> Void)?
+    let chartPreparationWillBegin: (@Sendable () async -> Void)?
+    let keyedMaterializationWillBegin: (@Sendable () async -> Void)?
 
     init(
-        chartPreparationWillBegin: (@Sendable () async -> Void)? = nil,
-        keyedMaterializationWillBegin: (@Sendable () async -> Void)? = nil
+        chartPreparationWillBegin: (@Sendable () async -> Void)?,
+        keyedMaterializationWillBegin: (@Sendable () async -> Void)?
     ) {
         self.chartPreparationWillBegin = chartPreparationWillBegin
         self.keyedMaterializationWillBegin = keyedMaterializationWillBegin
+    }
+
+    static let disabled = Self(
+        chartPreparationWillBegin: nil,
+        keyedMaterializationWillBegin: nil)
+
+    static func chartPreparation(
+        _ hook: @escaping @Sendable () async -> Void
+    ) -> Self {
+        Self(
+            chartPreparationWillBegin: hook,
+            keyedMaterializationWillBegin: nil)
+    }
+
+    static func keyedMaterialization(
+        _ hook: @escaping @Sendable () async -> Void
+    ) -> Self {
+        Self(
+            chartPreparationWillBegin: nil,
+            keyedMaterializationWillBegin: hook)
     }
 }
 
@@ -614,7 +634,7 @@ public actor AutoChartAnalyzer {
 
     public init(configuration: AutoChartAnalyzerConfiguration = .standard) {
         self.configuration = configuration
-        self.testHooks = AutoChartAnalyzerTestHooks()
+        self.testHooks = .disabled
     }
 
     init(

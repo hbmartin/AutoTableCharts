@@ -48,8 +48,10 @@ When a host override depends on those semantics, use
 ``AutoChartFormatters/init(locale:timeZone:request:)``. Its
 ``AutoChartFormattingRequest`` distinguishes source values, aggregated measures,
 and normalized fractions and includes the aggregation. The compatibility
-`value` override remains available for source-value formatting; because it has
-no aggregation parameter, count requests provide it no unit-bearing column.
+`value` override remains available and continues to receive the supplied source
+column for aggregated values. Because it has no aggregation parameter, use the
+request override whenever formatting depends on count, distinct-count, or
+normalized-fraction semantics.
 
 ``AutoChartTextResolver`` can override diagnostics, rationale, fallback,
 accessibility, and built-in controls using stable typed messages. Return `nil`
