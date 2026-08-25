@@ -52,7 +52,11 @@ public struct AutoChartFormatters: Sendable {
         return defaultFormat(column: defaultColumn, value: value)
     }
 
-    func formatMeasure(
+    /// Formats a measure while preserving its source column for host overrides.
+    ///
+    /// Count results remain unitless under the default formatter even when the
+    /// source column carries currency, percent, or other unit metadata.
+    public func format(
         column: AutoChartColumn?,
         aggregation: AutoChartAggregation,
         value: AutoChartValue,
@@ -166,7 +170,7 @@ extension AutoChartSelection {
         if let measure {
             let column = measure.columnID.flatMap { columnIndex[$0] }
             func formatted(_ value: AutoChartValue) -> String {
-                formatters.formatMeasure(
+                formatters.format(
                     column: column,
                     aggregation: measure.aggregation,
                     value: value,
