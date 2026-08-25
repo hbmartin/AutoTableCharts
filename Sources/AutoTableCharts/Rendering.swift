@@ -1291,10 +1291,12 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         specification.aggregation.usesCountFormatting
     }
 
-    /// The column whose unit hints apply to the numeric value axis, or `nil`
-    /// when the axis shows counts or normalized proportions.
+    /// The source column supplied to host formatter overrides for numeric y values.
+    /// Ordinary row counts and normalized proportions have no measure lineage.
     private var yAxisColumnID: AutoChartColumnID? {
-        if yValueUsesCountFormatting || specification.stacking == .normalized { return nil }
+        if specification.aggregation == .count || specification.stacking == .normalized {
+            return nil
+        }
         return specification.encoding.y
     }
 
@@ -1460,8 +1462,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             .chartXAxisLabel(yTitle)
             .chartYAxisLabel(xTitle)
             .chartXAxis {
-                numericAxis(
-                    columnID: yAxisColumnID,
+                yNumericAxis(
                     asPercentage: specification.stacking == .normalized)
             }
             selectableCategoryY(verticalZoom(chart, categoryCount: uniqueXCount))
@@ -1475,8 +1476,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             .chartXAxisLabel(xTitle)
             .chartYAxisLabel(yTitle)
             .chartYAxis {
-                numericAxis(
-                    columnID: yAxisColumnID,
+                yNumericAxis(
                     asPercentage: specification.stacking == .normalized)
             }
             selectableCategoryX(horizontalZoom(chart, categoryCount: uniqueXCount))
@@ -1500,7 +1500,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         }
         .chartXAxisLabel(yTitle)
         .chartYAxisLabel(xTitle)
-        .chartXAxis { numericAxis(columnID: yAxisColumnID) }
+        .chartXAxis { yNumericAxis() }
         return selectableCategoryY(verticalZoom(chart, categoryCount: uniqueXCount))
     }
 
@@ -1517,7 +1517,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             .chartXAxisLabel(xTitle)
             .chartYAxisLabel(yTitle)
             .chartXAxis { temporalAxis(columnID: specification.encoding.x) }
-            .chartYAxis { numericAxis(columnID: yAxisColumnID) }
+            .chartYAxis { yNumericAxis() }
             .environment(\.timeZone, formatters.timeZone)
             selectableDateX(timeZoom(chart))
         } else if xSemanticType == .quantitative {
@@ -1531,7 +1531,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             .chartXAxisLabel(xTitle)
             .chartYAxisLabel(yTitle)
             .chartXAxis { numericAxis(columnID: specification.encoding.x) }
-            .chartYAxis { numericAxis(columnID: yAxisColumnID) }
+            .chartYAxis { yNumericAxis() }
             selectableNumberX(numberZoom(chart))
         } else {
             let chart = Chart(data) { datum in
@@ -1543,7 +1543,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             }
             .chartXAxisLabel(xTitle)
             .chartYAxisLabel(yTitle)
-            .chartYAxis { numericAxis(columnID: yAxisColumnID) }
+            .chartYAxis { yNumericAxis() }
             selectableCategoryX(horizontalZoom(chart, categoryCount: uniqueXCount))
         }
     }
@@ -1560,7 +1560,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             .chartXAxisLabel(xTitle)
             .chartYAxisLabel(yTitle)
             .chartXAxis { temporalAxis(columnID: specification.encoding.x) }
-            .chartYAxis { numericAxis(columnID: yAxisColumnID) }
+            .chartYAxis { yNumericAxis() }
             .environment(\.timeZone, formatters.timeZone)
             selectableDateX(timeZoom(chart))
         } else {
@@ -1573,7 +1573,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             .chartXAxisLabel(xTitle)
             .chartYAxisLabel(yTitle)
             .chartXAxis { numericAxis(columnID: specification.encoding.x) }
-            .chartYAxis { numericAxis(columnID: yAxisColumnID) }
+            .chartYAxis { yNumericAxis() }
             selectableNumberX(numberZoom(chart))
         }
     }
@@ -1626,7 +1626,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             }
         }
         .chartYAxisLabel(yTitle)
-        .chartYAxis { numericAxis(columnID: yAxisColumnID) }
+        .chartYAxis { yNumericAxis() }
         return selectableCategoryIdentityX(horizontalZoom(chart, categoryCount: uniqueXCount))
     }
 
@@ -2051,7 +2051,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
 
     private func markAccessibilityLabel(for datum: AutoChartDatum) -> String {
         let xColumn = specification.encoding.x.flatMap(snapshot.column)
-        let yColumn = yValueUsesCountFormatting
+        let yColumn = specification.aggregation == .count
             ? nil : specification.encoding.y.flatMap(snapshot.column)
         let name: String
         if specification.family == .histogram {
@@ -2085,8 +2085,11 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             }
             let number = datum.yNumber ?? datum.median
             return number.map {
-                formatters.format(
-                    column: yColumn, value: .double($0), context: .markAccessibility)
+                formatters.formatMeasure(
+                    column: yColumn,
+                    aggregation: specification.aggregation,
+                    value: .double($0),
+                    context: .markAccessibility)
             }
         }()
         return AutoChartAccessibility.markLabel(
@@ -2143,8 +2146,17 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     }
 
     @AxisContentBuilder
+    private func yNumericAxis(asPercentage: Bool = false) -> some AxisContent {
+        numericAxis(
+            columnID: yAxisColumnID,
+            aggregation: specification.aggregation,
+            asPercentage: asPercentage)
+    }
+
+    @AxisContentBuilder
     private func numericAxis(
         columnID: AutoChartColumnID?,
+        aggregation: AutoChartAggregation? = nil,
         asPercentage: Bool = false
     ) -> some AxisContent {
         AxisMarks { value in
@@ -2152,17 +2164,38 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             AxisTick()
             AxisValueLabel {
                 if let number = value.as(Double.self) {
-                    let formatted =
-                        asPercentage
-                        ? formatters.formatNormalizedFraction(number, context: .axisTick)
-                        : formatters.format(
-                            column: columnID.flatMap(snapshot.column),
-                            value: .double(number),
-                            context: .axisTick)
-                    Text(formatted)
+                    Text(
+                        formattedNumericAxisValue(
+                            number,
+                            columnID: columnID,
+                            aggregation: aggregation,
+                            asPercentage: asPercentage))
                 }
             }
         }
+    }
+
+    private func formattedNumericAxisValue(
+        _ number: Double,
+        columnID: AutoChartColumnID?,
+        aggregation: AutoChartAggregation?,
+        asPercentage: Bool
+    ) -> String {
+        if asPercentage {
+            return formatters.formatNormalizedFraction(number, context: .axisTick)
+        }
+        let column = columnID.flatMap(snapshot.column)
+        if let aggregation {
+            return formatters.formatMeasure(
+                column: column,
+                aggregation: aggregation,
+                value: .double(number),
+                context: .axisTick)
+        }
+        return formatters.format(
+            column: column,
+            value: .double(number),
+            context: .axisTick)
     }
 
     @AxisContentBuilder

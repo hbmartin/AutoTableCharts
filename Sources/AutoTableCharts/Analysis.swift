@@ -847,6 +847,7 @@ public actor AutoChartAnalyzer {
             let fingerprint: Int
             switch preparation {
             case .keyed(_, let materialize):
+                try Task.checkCancellation()
                 let materialized = try materialize()
                 snapshot = materialized.snapshot
                 rowIDs = materialized.rowIDs
