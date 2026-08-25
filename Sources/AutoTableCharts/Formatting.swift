@@ -52,6 +52,19 @@ public struct AutoChartFormatters: Sendable {
         return defaultFormat(column: defaultColumn, value: value)
     }
 
+    func formatMeasure(
+        column: AutoChartColumn?,
+        aggregation: AutoChartAggregation,
+        value: AutoChartValue,
+        context: AutoChartFormattingContext
+    ) -> String {
+        format(
+            column: column,
+            value: value,
+            context: context,
+            defaultColumn: aggregation.usesCountFormatting ? nil : column)
+    }
+
     func formatNormalizedFraction(
         _ value: Double,
         context: AutoChartFormattingContext
@@ -152,22 +165,21 @@ extension AutoChartSelection {
         let valueMessage: AutoChartMessage
         if let measure {
             let column = measure.columnID.flatMap { columnIndex[$0] }
-            let defaultColumn = measure.aggregation.usesCountFormatting ? nil : column
             func formatted(_ value: AutoChartValue) -> String {
-                formatters.format(
+                formatters.formatMeasure(
                     column: column,
+                    aggregation: measure.aggregation,
                     value: value,
-                    context: .selectionSummary,
-                    defaultColumn: defaultColumn)
+                    context: .selectionSummary)
             }
             switch measure.value {
             case .scalar(let value):
-                let formatted = formatted(value)
+                let formattedValue = formatted(value)
                 valueMessage = AutoChartMessage(
                     category: .interface,
                     code: .selectionValue,
-                    arguments: ["value": .string(formatted)],
-                    defaultText: formatted)
+                    arguments: ["value": .string(formattedValue)],
+                    defaultText: formattedValue)
             case .numericRange(let lower, let upper):
                 let lower = formatted(.double(lower))
                 let upper = formatted(.double(upper))

@@ -60,18 +60,13 @@ private actor OneShotPreparationGate {
     }
 
     func waitWhenArmed() async {
-        guard armed else { return }
+        guard armed, !Task.isCancelled else { return }
         armed = false
         let token = UUID()
         await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
                 guard !Task.isCancelled else {
-                    let waiters = Array(enteredWaiters.values)
-                    enteredWaiters.removeAll()
-                    waiters.forEach {
-                        $0.timeoutTask.cancel()
-                        $0.continuation.resume(throwing: CancellationError())
-                    }
+                    armed = true
                     continuation.resume()
                     return
                 }
@@ -163,6 +158,8 @@ private actor OneShotPreparationGate {
     var activeTimeoutTaskCount: Int {
         (releaseTimeoutTask == nil ? 0 : 1) + enteredWaiters.count
     }
+
+    var isArmed: Bool { armed }
 }
 
 private actor InvocationCounter {
@@ -524,7 +521,7 @@ private struct CountingChartRowsTable: AutoChartTable {
         }
     }
 
-    @Test func distinctCountFormatterOverrideReceivesSourceColumn() {
+    @Test func distinctCountFormatterReceivesSourceColumnWithoutApplyingItsUnit() {
         let specification = AutoChartSpecification(
             family: .bar,
             encoding: .init(x: v2Category.id, y: v2Measure.id),
@@ -538,13 +535,42 @@ private struct CountingChartRowsTable: AutoChartTable {
             family: .bar,
             specificationID: specification.id,
             markID: "distinct")
+        let formatter = AutoChartFormatters { column, _, context, _, _ in
+            "\(context.rawValue):\(column?.id.rawValue ?? "nil")"
+        }
         let presentation = selection.presentation(
             columns: [v2Category, v2Measure],
-            formatters: AutoChartFormatters { column, _, _, _, _ in
-                column?.id.rawValue
-            })
+            formatters: formatter)
 
-        #expect(presentation.valueDescription == v2Measure.id.rawValue)
+        #expect(presentation.valueDescription == "selectionSummary:\(v2Measure.id.rawValue)")
+        for context in [
+            AutoChartFormattingContext.axisTick,
+            .markAccessibility,
+            .selectionSummary,
+        ] {
+            #expect(
+                formatter.formatMeasure(
+                    column: v2Measure,
+                    aggregation: .countDistinct,
+                    value: .double(2),
+                    context: context)
+                    == "\(context.rawValue):\(v2Measure.id.rawValue)")
+        }
+
+        let defaults = AutoChartFormatters(locale: Locale(identifier: "en_US"))
+        for context in [
+            AutoChartFormattingContext.axisTick,
+            .markAccessibility,
+            .selectionSummary,
+        ] {
+            let formatted = defaults.formatMeasure(
+                column: v2Measure,
+                aggregation: .countDistinct,
+                value: .double(2),
+                context: context)
+            #expect(!formatted.contains("$"))
+            #expect(!formatted.contains("USD"))
+        }
     }
 
     @Test func defaultsFormatUnitsAndDatesWithExplicitLocaleAndTimeZone() {
@@ -643,6 +669,29 @@ private struct CountingChartRowsTable: AutoChartTable {
 }
 
 @Suite struct V2AnalyzerLifecycleTests {
+    @Test func preparationGatePreservesArmForAlreadyCancelledPreparation() async throws {
+        let gate = OneShotPreparationGate()
+        await gate.arm()
+        let (stream, continuation) = AsyncStream<Void>.makeStream()
+        let cancelledPreparation = Task {
+            for await _ in stream {}
+            await gate.waitWhenArmed()
+        }
+
+        cancelledPreparation.cancel()
+        await cancelledPreparation.value
+        continuation.finish()
+
+        let remainedArmed = await gate.isArmed
+        #expect(remainedArmed)
+        guard remainedArmed else { return }
+
+        let nextPreparation = Task { await gate.waitWhenArmed() }
+        try await gate.waitUntilBlocked()
+        await gate.resume()
+        await nextPreparation.value
+    }
+
     @Test func preparationGateCancelsTimeoutTaskAfterRelease() async throws {
         let gate = OneShotPreparationGate()
         await gate.arm()
