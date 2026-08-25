@@ -8,15 +8,58 @@ public enum AutoChartFormattingContext: String, CaseIterable, Hashable, Codable,
     case detail
 }
 
+/// The semantic role of a value being formatted for chart presentation.
+public enum AutoChartFormattingPurpose: Hashable, Sendable {
+    /// A source value that has not been aggregated by the chart.
+    case value
+    /// A source measure after applying the associated aggregation.
+    case aggregatedMeasure(AutoChartAggregation)
+    /// A zero-through-one contribution displayed by normalized stacking.
+    case normalizedFraction(AutoChartAggregation)
+}
+
+/// Complete presentation-time context for a chart value.
+public struct AutoChartFormattingRequest: Hashable, Sendable {
+    /// The source column, when the value has column lineage.
+    public var column: AutoChartColumn?
+    /// The value to format.
+    public var value: AutoChartValue
+    /// The presentation surface requesting the formatted value.
+    public var context: AutoChartFormattingContext
+    /// Whether the value is raw, aggregated, or a normalized fraction.
+    public var purpose: AutoChartFormattingPurpose
+
+    public init(
+        column: AutoChartColumn?,
+        value: AutoChartValue,
+        context: AutoChartFormattingContext,
+        purpose: AutoChartFormattingPurpose = .value
+    ) {
+        self.column = column
+        self.value = value
+        self.context = context
+        self.purpose = purpose
+    }
+}
+
 /// Host formatting hooks applied at presentation time.
 public struct AutoChartFormatters: Sendable {
+    /// A compatibility formatter for source values.
+    ///
+    /// Use ``RequestFormatter`` when formatting depends on aggregation or
+    /// normalized-stack semantics.
     public typealias ValueFormatter = @Sendable (
         AutoChartColumn?, AutoChartValue, AutoChartFormattingContext, Locale, TimeZone
+    ) -> String?
+    /// A formatter that receives the complete semantic formatting request.
+    public typealias RequestFormatter = @Sendable (
+        AutoChartFormattingRequest, Locale, TimeZone
     ) -> String?
 
     public var locale: Locale
     public var timeZone: TimeZone
-    private let override: ValueFormatter?
+    private let valueOverride: ValueFormatter?
+    private let requestOverride: RequestFormatter?
 
     public init(
         locale: Locale = .autoupdatingCurrent,
@@ -25,7 +68,20 @@ public struct AutoChartFormatters: Sendable {
     ) {
         self.locale = locale
         self.timeZone = timeZone
-        self.override = value
+        self.valueOverride = value
+        self.requestOverride = nil
+    }
+
+    /// Creates formatters with an aggregation-aware host override.
+    public init(
+        locale: Locale = .autoupdatingCurrent,
+        timeZone: TimeZone = .autoupdatingCurrent,
+        request: @escaping RequestFormatter
+    ) {
+        self.locale = locale
+        self.timeZone = timeZone
+        self.valueOverride = nil
+        self.requestOverride = request
     }
 
     public func format(
@@ -34,28 +90,35 @@ public struct AutoChartFormatters: Sendable {
         context: AutoChartFormattingContext
     ) -> String {
         format(
-            column: column,
-            value: value,
-            context: context,
-            defaultColumn: column)
+            AutoChartFormattingRequest(
+                column: column,
+                value: value,
+                context: context))
     }
 
-    func format(
-        column: AutoChartColumn?,
-        value: AutoChartValue,
-        context: AutoChartFormattingContext,
-        defaultColumn: AutoChartColumn?
-    ) -> String {
-        if let formatted = override?(column, value, context, locale, timeZone) {
+    /// Formats a complete semantic request.
+    public func format(_ request: AutoChartFormattingRequest) -> String {
+        if let formatted = requestOverride?(request, locale, timeZone) {
             return formatted
         }
-        return defaultFormat(column: defaultColumn, value: value)
+        if let formatted = valueOverride?(
+            legacyColumn(for: request),
+            request.value,
+            request.context,
+            locale,
+            timeZone)
+        {
+            return formatted
+        }
+        return defaultFormat(request)
     }
 
-    /// Formats a measure while preserving its source column for host overrides.
+    /// Formats a measure while preserving its source column for request overrides.
     ///
     /// Count results remain unitless under the default formatter even when the
-    /// source column carries currency, percent, or other unit metadata.
+    /// source column carries currency, percent, or other unit metadata. Legacy
+    /// value overrides receive `nil` as the column for count results because
+    /// their callback has no aggregation parameter.
     public func format(
         column: AutoChartColumn?,
         aggregation: AutoChartAggregation,
@@ -63,21 +126,54 @@ public struct AutoChartFormatters: Sendable {
         context: AutoChartFormattingContext
     ) -> String {
         format(
-            column: column,
-            value: value,
-            context: context,
-            defaultColumn: aggregation.usesCountFormatting ? nil : column)
+            AutoChartFormattingRequest(
+                column: column,
+                value: value,
+                context: context,
+                purpose: .aggregatedMeasure(aggregation)))
     }
 
-    func formatNormalizedFraction(
+    /// Formats a zero-through-one contribution as a percentage by default.
+    public func formatNormalizedFraction(
         _ value: Double,
+        column: AutoChartColumn? = nil,
+        aggregation: AutoChartAggregation = .none,
         context: AutoChartFormattingContext
     ) -> String {
-        if let formatted = override?(nil, .double(value), context, locale, timeZone) {
-            return formatted
+        format(
+            AutoChartFormattingRequest(
+                column: column,
+                value: .double(value),
+                context: context,
+                purpose: .normalizedFraction(aggregation)))
+    }
+
+    private func legacyColumn(for request: AutoChartFormattingRequest) -> AutoChartColumn? {
+        switch request.purpose {
+        case .value:
+            request.column
+        case .aggregatedMeasure(let aggregation):
+            aggregation.usesCountFormatting ? nil : request.column
+        case .normalizedFraction:
+            nil
         }
-        return value.formatted(
-            .percent.locale(locale).precision(.fractionLength(0...2)))
+    }
+
+    private func defaultFormat(_ request: AutoChartFormattingRequest) -> String {
+        switch request.purpose {
+        case .value:
+            return defaultFormat(column: request.column, value: request.value)
+        case .aggregatedMeasure(let aggregation):
+            return defaultFormat(
+                column: aggregation.usesCountFormatting ? nil : request.column,
+                value: request.value)
+        case .normalizedFraction:
+            guard let value = request.value.numericValue else {
+                return request.value.displayString
+            }
+            return value.formatted(
+                .percent.locale(locale).precision(.fractionLength(0...2)))
+        }
     }
 
     private func defaultFormat(

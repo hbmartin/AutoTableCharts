@@ -62,6 +62,8 @@ analyzer is trimmed or cleared.
 - ``AutoChartPlot``
 - ``AutoChartPresentation``
 - ``AutoChartFormatters``
+- ``AutoChartFormattingRequest``
+- ``AutoChartFormattingPurpose``
 - ``AutoChartSelection``
 - ``AutoChartTextResolver``
 
