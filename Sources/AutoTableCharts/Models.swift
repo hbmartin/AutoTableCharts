@@ -379,7 +379,7 @@ extension AutoChartAggregation {
     var usesCountFormatting: Bool {
         switch self {
         case .count, .countDistinct: true
-        default: false
+        case .none, .sum, .mean, .minimum, .maximum: false
         }
     }
 }

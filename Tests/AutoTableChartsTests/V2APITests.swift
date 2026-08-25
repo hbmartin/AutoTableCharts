@@ -42,12 +42,18 @@ private enum PreparationGateError: Error {
 }
 
 private actor OneShotPreparationGate {
+    private struct EnteredWaiter {
+        var continuation: CheckedContinuation<Void, any Error>
+        var timeoutTask: Task<Void, Never>
+    }
+
     private static let timeout: Duration = .seconds(30)
     private var armed = false
     private var blocked = false
     private var releaseToken: UUID?
     private var releaseContinuation: CheckedContinuation<Void, Never>?
-    private var enteredContinuations: [UUID: CheckedContinuation<Void, any Error>] = [:]
+    private var releaseTimeoutTask: Task<Void, Never>?
+    private var enteredWaiters: [UUID: EnteredWaiter] = [:]
 
     func arm() {
         armed = true
@@ -56,22 +62,35 @@ private actor OneShotPreparationGate {
     func waitWhenArmed() async {
         guard armed else { return }
         armed = false
-        blocked = true
-        let waiters = enteredContinuations.values
-        enteredContinuations.removeAll()
-        waiters.forEach { $0.resume() }
         let token = UUID()
         await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
                 guard !Task.isCancelled else {
+                    let waiters = Array(enteredWaiters.values)
+                    enteredWaiters.removeAll()
+                    waiters.forEach {
+                        $0.timeoutTask.cancel()
+                        $0.continuation.resume(throwing: CancellationError())
+                    }
                     continuation.resume()
                     return
                 }
                 releaseToken = token
                 releaseContinuation = continuation
-                Task {
-                    try? await Task.sleep(for: Self.timeout)
+                releaseTimeoutTask = Task {
+                    do {
+                        try await Task.sleep(for: Self.timeout)
+                    } catch {
+                        return
+                    }
                     self.releasePreparation(token: token)
+                }
+                blocked = true
+                let waiters = Array(enteredWaiters.values)
+                enteredWaiters.removeAll()
+                waiters.forEach {
+                    $0.timeoutTask.cancel()
+                    $0.continuation.resume()
                 }
             }
         } onCancel: {
@@ -93,11 +112,17 @@ private actor OneShotPreparationGate {
                     continuation.resume()
                     return
                 }
-                enteredContinuations[token] = continuation
-                Task {
-                    try? await Task.sleep(for: Self.timeout)
+                let timeoutTask = Task {
+                    do {
+                        try await Task.sleep(for: Self.timeout)
+                    } catch {
+                        return
+                    }
                     self.failEnteredWaiter(token: token)
                 }
+                enteredWaiters[token] = EnteredWaiter(
+                    continuation: continuation,
+                    timeoutTask: timeoutTask)
             }
         } onCancel: {
             Task { await self.cancelEnteredWaiter(token: token) }
@@ -113,21 +138,30 @@ private actor OneShotPreparationGate {
         guard releaseToken == token else { return }
         blocked = false
         releaseToken = nil
-        releaseContinuation?.resume()
+        releaseTimeoutTask?.cancel()
+        releaseTimeoutTask = nil
+        let continuation = releaseContinuation
         releaseContinuation = nil
+        continuation?.resume()
     }
 
     private func failEnteredWaiter(token: UUID) {
-        guard let continuation = enteredContinuations.removeValue(forKey: token) else {
+        guard let waiter = enteredWaiters.removeValue(forKey: token) else {
             return
         }
         armed = false
-        continuation.resume(throwing: PreparationGateError.timedOutWaitingForPreparation)
+        waiter.continuation.resume(
+            throwing: PreparationGateError.timedOutWaitingForPreparation)
     }
 
     private func cancelEnteredWaiter(token: UUID) {
-        enteredContinuations.removeValue(forKey: token)?.resume(
-            throwing: CancellationError())
+        guard let waiter = enteredWaiters.removeValue(forKey: token) else { return }
+        waiter.timeoutTask.cancel()
+        waiter.continuation.resume(throwing: CancellationError())
+    }
+
+    var activeTimeoutTaskCount: Int {
+        (releaseTimeoutTask == nil ? 0 : 1) + enteredWaiters.count
     }
 }
 
@@ -490,6 +524,29 @@ private struct CountingChartRowsTable: AutoChartTable {
         }
     }
 
+    @Test func distinctCountFormatterOverrideReceivesSourceColumn() {
+        let specification = AutoChartSpecification(
+            family: .bar,
+            encoding: .init(x: v2Category.id, y: v2Measure.id),
+            aggregation: .countDistinct)
+        let selection = AutoChartSelection(
+            sourceRowIDs: Set([1]),
+            measure: AutoChartSelectedMeasure(
+                columnID: v2Measure.id,
+                aggregation: .countDistinct,
+                value: .scalar(.double(2))),
+            family: .bar,
+            specificationID: specification.id,
+            markID: "distinct")
+        let presentation = selection.presentation(
+            columns: [v2Category, v2Measure],
+            formatters: AutoChartFormatters { column, _, _, _, _ in
+                column?.id.rawValue
+            })
+
+        #expect(presentation.valueDescription == v2Measure.id.rawValue)
+    }
+
     @Test func defaultsFormatUnitsAndDatesWithExplicitLocaleAndTimeZone() {
         let formatter = AutoChartFormatters(
             locale: Locale(identifier: "en_US"),
@@ -586,6 +643,19 @@ private struct CountingChartRowsTable: AutoChartTable {
 }
 
 @Suite struct V2AnalyzerLifecycleTests {
+    @Test func preparationGateCancelsTimeoutTaskAfterRelease() async throws {
+        let gate = OneShotPreparationGate()
+        await gate.arm()
+        let preparation = Task { await gate.waitWhenArmed() }
+
+        try await gate.waitUntilBlocked()
+        #expect(await gate.activeTimeoutTaskCount == 1)
+        await gate.resume()
+        await preparation.value
+
+        #expect(await gate.activeTimeoutTaskCount == 0)
+    }
+
     @Test func identicalKeyedRequestsCoalesce() async throws {
         let dataset = try AutoChartDataset<Int>(
             columns: [v2Category, v2Measure],

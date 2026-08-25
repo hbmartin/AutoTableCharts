@@ -447,7 +447,7 @@ private let date = AutoChartColumn(
         #expect(statistics.preparedCharts.entries == 1)
     }
 
-    @Test func keyedAnalysisHitDoesNotReingestAnEvictedTableLayer() async throws {
+    @Test func keyedAnalysisHitKeepsDisabledTableLayerEmpty() async throws {
         let counter = ChartValueReadCounter()
         let rows = (0..<6).map { index in
             CountingRow(
@@ -3382,6 +3382,45 @@ private let date = AutoChartColumn(
                 specificationID: specification.id,
                 markID: "distinct"
             ).presentation(columns: [category, measure]).valueDescription == "2")
+    }
+
+    @Test func distinctCountAxisTitleNamesTheCountedColumn() {
+        let distinctMeasure = AutoChartColumn(
+            id: "distinct-measure",
+            name: "customer_id",
+            hints: AutoChartColumnHints(
+                semanticType: .quantitative,
+                role: .measure,
+                unit: .currency(code: "USD"),
+                measureSemantics: .init(
+                    source: .rowLevel,
+                    rollup: .safe(.countDistinct))))
+        let input = table(
+            columns: [category, distinctMeasure],
+            rows: [
+                [.text("A"), .integer(1)],
+                [.text("A"), .integer(2)],
+                [.text("B"), .integer(2)],
+            ])
+        let snapshot = AutoChartSnapshot(input)
+        let profiles = AutoChartProfiler.profileIndex(snapshot)
+        let specification = AutoChartSpecification(
+            family: .bar,
+            encoding: .init(x: category.id, y: distinctMeasure.id),
+            aggregation: .countDistinct)
+        let data = AutoChartDataPreparation.data(
+            snapshot: snapshot,
+            specification: specification,
+            profiles: profiles)
+        let presentation = AutoChartRenderPresentation(
+            snapshot: snapshot,
+            specification: specification,
+            profiles: profiles,
+            data: data)
+
+        #expect(
+            presentation.yTitle
+                == "Distinct count of \(AutoChartProfiler.displayName(distinctMeasure))")
     }
 
     @Test func selectionDimensionsPreserveTypedSourceValuesInsteadOfLabels() {

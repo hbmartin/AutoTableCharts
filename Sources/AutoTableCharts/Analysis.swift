@@ -817,14 +817,14 @@ public actor AutoChartAnalyzer {
         requestToken: RequestToken
     ) async throws -> AutoChartAnalysis<RowID> {
         try Task.checkCancellation()
-        let requestAnalysisKey = AnalysisKey(
-            table: requestTableKey,
-            context: context,
-            options: options,
-            policyVersion: AutoTableCharts.recommendationPolicyVersion)
         var source: AutoChartPreparedSource<RowID>?
         switch preparation {
         case .keyed:
+            let requestAnalysisKey = AnalysisKey(
+                table: requestTableKey,
+                context: context,
+                options: options,
+                policyVersion: AutoTableCharts.recommendationPolicyVersion)
             let resolution: KeyedCacheResolution<RowID> = await cachedKeyedValue(
                 for: requestTableKey,
                 analysisKey: requestAnalysisKey,

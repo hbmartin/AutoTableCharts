@@ -1010,14 +1010,16 @@ struct AutoChartRenderPresentation: Sendable {
         xTitle =
             specification.encoding.x.flatMap { snapshot.column($0) }
             .map(AutoChartProfiler.displayName) ?? "Category"
-        let usesStructuralCountTitle =
-            specification.aggregation == .count
-            && ![.histogram, .heatmap].contains(specification.family)
-        yTitle =
-            usesStructuralCountTitle
-            ? "Count"
-            : specification.encoding.y.flatMap { snapshot.column($0) }
-                .map(AutoChartProfiler.displayName) ?? "Value"
+        let sourceYTitle = specification.encoding.y.flatMap { snapshot.column($0) }
+            .map(AutoChartProfiler.displayName)
+        yTitle = switch specification.aggregation {
+        case .count where ![.histogram, .heatmap].contains(specification.family):
+            "Count"
+        case .countDistinct:
+            sourceYTitle.map { "Distinct count of \($0)" } ?? "Distinct count"
+        case .none, .sum, .mean, .minimum, .maximum, .count:
+            sourceYTitle ?? "Value"
+        }
         seriesTitle =
             specification.encoding.series.flatMap { snapshot.column($0) }
             .map(AutoChartProfiler.displayName) ?? "Series"
