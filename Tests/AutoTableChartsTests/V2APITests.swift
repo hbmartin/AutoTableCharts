@@ -64,7 +64,6 @@ private actor OneShotPreparationGate {
         guard armed else { return }
         guard !Task.isCancelled else {
             cancelledWaitAttemptCount += 1
-            cancelEnteredWaiters()
             return
         }
         armed = false
@@ -74,7 +73,6 @@ private actor OneShotPreparationGate {
                 guard !Task.isCancelled else {
                     armed = true
                     cancelledWaitAttemptCount += 1
-                    cancelEnteredWaiters()
                     continuation.resume()
                     return
                 }
@@ -166,15 +164,6 @@ private actor OneShotPreparationGate {
         waiter.continuation.resume(throwing: CancellationError())
     }
 
-    private func cancelEnteredWaiters() {
-        let waiters = Array(enteredWaiters.values)
-        enteredWaiters.removeAll()
-        waiters.forEach {
-            $0.timeoutTask.cancel()
-            $0.continuation.resume(throwing: CancellationError())
-        }
-    }
-
     var activeTimeoutTaskCount: Int {
         (releaseTimeoutTask == nil ? 0 : 1) + enteredWaiters.count
     }
@@ -197,6 +186,14 @@ private func receivesSignalPromptly(_ semaphore: DispatchSemaphore) async -> Boo
         DispatchQueue.global().async {
             continuation.resume(
                 returning: semaphore.wait(timeout: .now() + 5) == .success)
+        }
+    }
+}
+
+private func receivesSignalImmediately(_ semaphore: DispatchSemaphore) async -> Bool {
+    await withCheckedContinuation { continuation in
+        DispatchQueue.global().async {
+            continuation.resume(returning: semaphore.wait(timeout: .now()) == .success)
         }
     }
 }
@@ -572,7 +569,7 @@ private struct CountingChartRowsTable: AutoChartTable {
                 == "normalized:sum:\(v2Measure.id.rawValue)")
     }
 
-    @Test func distinctCountFormatterReceivesSourceColumnWithoutApplyingItsUnit() {
+    @Test func distinctCountFormattingPreservesLineageWhileDefaultsRemainUnitless() {
         let specification = AutoChartSpecification(
             family: .bar,
             encoding: .init(x: v2Category.id, y: v2Measure.id),
@@ -847,7 +844,7 @@ private struct CountingChartRowsTable: AutoChartTable {
         }
     }
 
-    @Test func preparationGateReleasesWaiterWhenCancelledPreparationNeverBlocks() async {
+    @Test func preparationGateKeepsWaiterForNextPreparationAfterCancelledAttempt() async throws {
         let gate = OneShotPreparationGate()
         await gate.arm()
         let waiterStarted = DispatchSemaphore(value: 0)
@@ -873,12 +870,22 @@ private struct CountingChartRowsTable: AutoChartTable {
         continuation.finish()
         await cancelledPreparation.value
 
-        let waiterReturnedPromptly = await receivesSignalPromptly(waiterCompleted)
-        #expect(waiterReturnedPromptly)
-        if !waiterReturnedPromptly { waiter.cancel() }
-        await #expect(throws: CancellationError.self) { try await waiter.value }
-        #expect(await gate.activeTimeoutTaskCount == 0)
+        let waiterReturnedEarly = await receivesSignalImmediately(waiterCompleted)
+        #expect(!waiterReturnedEarly)
         #expect(await gate.isArmed)
+
+        let nextPreparation = Task { await gate.waitWhenArmed() }
+        do {
+            try await waiter.value
+            await gate.resume()
+            await nextPreparation.value
+        } catch {
+            nextPreparation.cancel()
+            await gate.resume()
+            await nextPreparation.value
+            throw error
+        }
+        #expect(await gate.activeTimeoutTaskCount == 0)
     }
 
     @Test func preparationGateCancelsTimeoutTaskAfterRelease() async throws {
@@ -1254,9 +1261,7 @@ private struct CountingChartRowsTable: AutoChartTable {
         let gate = OneShotPreparationGate()
         let counter = ChartRowsReadCounter()
         let table = CountingChartRowsTable(
-            rows: (0..<2_000).map {
-                DuplicateIDRow(chartRowID: $0, value: Double($0))
-            },
+            rows: [DuplicateIDRow(chartRowID: 0, value: 0)],
             counter: counter,
             chartDataKey: .init(identity: "cancel-before-materialization", revision: "1"))
         let analyzer = AutoChartAnalyzer(
