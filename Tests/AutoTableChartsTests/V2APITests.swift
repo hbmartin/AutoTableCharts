@@ -64,6 +64,7 @@ private actor OneShotPreparationGate {
         guard armed else { return }
         guard !Task.isCancelled else {
             cancelledWaitAttemptCount += 1
+            cancelEnteredWaiters()
             return
         }
         armed = false
@@ -73,6 +74,7 @@ private actor OneShotPreparationGate {
                 guard !Task.isCancelled else {
                     armed = true
                     cancelledWaitAttemptCount += 1
+                    cancelEnteredWaiters()
                     continuation.resume()
                     return
                 }
@@ -99,7 +101,9 @@ private actor OneShotPreparationGate {
         }
     }
 
-    func waitUntilBlocked() async throws {
+    func waitUntilBlocked(
+        onWaiting: (@Sendable () -> Void)? = nil
+    ) async throws {
         guard !blocked else { return }
         let token = UUID()
         try await withTaskCancellationHandler {
@@ -124,6 +128,7 @@ private actor OneShotPreparationGate {
                 enteredWaiters[token] = EnteredWaiter(
                     continuation: continuation,
                     timeoutTask: timeoutTask)
+                onWaiting?()
             }
         } onCancel: {
             Task { await self.cancelEnteredWaiter(token: token) }
@@ -159,6 +164,15 @@ private actor OneShotPreparationGate {
         guard let waiter = enteredWaiters.removeValue(forKey: token) else { return }
         waiter.timeoutTask.cancel()
         waiter.continuation.resume(throwing: CancellationError())
+    }
+
+    private func cancelEnteredWaiters() {
+        let waiters = Array(enteredWaiters.values)
+        enteredWaiters.removeAll()
+        waiters.forEach {
+            $0.timeoutTask.cancel()
+            $0.continuation.resume(throwing: CancellationError())
+        }
     }
 
     var activeTimeoutTaskCount: Int {
@@ -600,19 +614,18 @@ private struct CountingChartRowsTable: AutoChartTable {
         #expect(!defaultPresentation.valueDescription.contains("$"))
         #expect(!defaultPresentation.valueDescription.contains("USD"))
 
-        let legacyFormatter = AutoChartFormatters { column, value, _, locale, _ in
-            guard case .currency(let code) = column?.hints.unit,
-                let number = value.numericValue
-            else { return nil }
-            return number.formatted(.currency(code: code).locale(locale))
+        let legacyFormatter = AutoChartFormatters { column, _, context, _, _ in
+            "\(context.rawValue):\(column?.id.rawValue ?? "nil")"
         }
-        let legacyFormatted = legacyFormatter.format(
-            column: v2Measure,
-            aggregation: .countDistinct,
-            value: .double(2),
-            context: .axisTick)
-        #expect(!legacyFormatted.contains("$"))
-        #expect(!legacyFormatted.contains("USD"))
+        for aggregation in [AutoChartAggregation.count, .countDistinct] {
+            #expect(
+                legacyFormatter.format(
+                    column: v2Measure,
+                    aggregation: aggregation,
+                    value: .double(2),
+                    context: .axisTick)
+                    == "axisTick:\(v2Measure.id.rawValue)")
+        }
     }
 
     @Test func defaultsFormatUnitsAndDatesWithExplicitLocaleAndTimeZone() {
@@ -832,6 +845,40 @@ private struct CountingChartRowsTable: AutoChartTable {
             await nextPreparation.value
             throw error
         }
+    }
+
+    @Test func preparationGateReleasesWaiterWhenCancelledPreparationNeverBlocks() async {
+        let gate = OneShotPreparationGate()
+        await gate.arm()
+        let waiterStarted = DispatchSemaphore(value: 0)
+        let waiterCompleted = DispatchSemaphore(value: 0)
+        let waiter = Task {
+            defer { waiterCompleted.signal() }
+            try await gate.waitUntilBlocked(onWaiting: { waiterStarted.signal() })
+        }
+        let startedPromptly = await receivesSignalPromptly(waiterStarted)
+        #expect(startedPromptly)
+        guard startedPromptly else {
+            waiter.cancel()
+            _ = try? await waiter.value
+            return
+        }
+
+        let (stream, continuation) = AsyncStream<Void>.makeStream()
+        let cancelledPreparation = Task {
+            for await _ in stream {}
+            await gate.waitWhenArmed()
+        }
+        cancelledPreparation.cancel()
+        continuation.finish()
+        await cancelledPreparation.value
+
+        let waiterReturnedPromptly = await receivesSignalPromptly(waiterCompleted)
+        #expect(waiterReturnedPromptly)
+        if !waiterReturnedPromptly { waiter.cancel() }
+        await #expect(throws: CancellationError.self) { try await waiter.value }
+        #expect(await gate.activeTimeoutTaskCount == 0)
+        #expect(await gate.isArmed)
     }
 
     @Test func preparationGateCancelsTimeoutTaskAfterRelease() async throws {
@@ -1155,8 +1202,7 @@ private struct CountingChartRowsTable: AutoChartTable {
             },
             counter: counter)
         let analyzer = AutoChartAnalyzer(
-            testHooks: AutoChartAnalyzerTestHooks(
-                chartPreparationWillBegin: { await gate.waitWhenArmed() }))
+            testHooks: .chartPreparation { await gate.waitWhenArmed() })
         await gate.arm()
         let task = Task { try await analyzer.analyze(table) }
 
@@ -1208,12 +1254,13 @@ private struct CountingChartRowsTable: AutoChartTable {
         let gate = OneShotPreparationGate()
         let counter = ChartRowsReadCounter()
         let table = CountingChartRowsTable(
-            rows: [DuplicateIDRow(chartRowID: 0, value: 0)],
+            rows: (0..<2_000).map {
+                DuplicateIDRow(chartRowID: $0, value: Double($0))
+            },
             counter: counter,
             chartDataKey: .init(identity: "cancel-before-materialization", revision: "1"))
         let analyzer = AutoChartAnalyzer(
-            testHooks: AutoChartAnalyzerTestHooks(
-                keyedMaterializationWillBegin: { await gate.waitWhenArmed() }))
+            testHooks: .keyedMaterialization { await gate.waitWhenArmed() })
         await gate.arm()
         let completed = DispatchSemaphore(value: 0)
         let pending = Task {
@@ -1285,8 +1332,7 @@ private struct CountingChartRowsTable: AutoChartTable {
             },
             counter: ChartRowsReadCounter())
         let analyzer = AutoChartAnalyzer(
-            testHooks: AutoChartAnalyzerTestHooks(
-                chartPreparationWillBegin: { await gate.waitWhenArmed() }))
+            testHooks: .chartPreparation { await gate.waitWhenArmed() })
         await gate.arm()
         let pending = Task { try await analyzer.analyze(table) }
 
@@ -1334,8 +1380,7 @@ private struct CountingChartRowsTable: AutoChartTable {
             columns: [v2Category, v2Measure],
             rows: [[.text("A"), .double(1)], [.text("B"), .double(2)]])
         let analyzer = AutoChartAnalyzer(
-            testHooks: AutoChartAnalyzerTestHooks(
-                chartPreparationWillBegin: { await gate.waitWhenArmed() }))
+            testHooks: .chartPreparation { await gate.waitWhenArmed() })
         let analysis = try await analyzer.analyze(dataset)
         let specification = AutoChartSpecification.histogram(value: v2Measure.id)
 
@@ -1383,8 +1428,7 @@ private struct CountingChartRowsTable: AutoChartTable {
                 [.text("Category \($0)"), .double(-1)]
             })
         let analyzer = AutoChartAnalyzer(
-            testHooks: AutoChartAnalyzerTestHooks(
-                chartPreparationWillBegin: { await gate.waitWhenArmed() }))
+            testHooks: .chartPreparation { await gate.waitWhenArmed() })
         let analysis = try await analyzer.analyze(dataset)
         let invalid = AutoChartSpecification(
             family: .donut,
@@ -1421,8 +1465,7 @@ private struct CountingChartRowsTable: AutoChartTable {
                 [.text("Category \($0)"), .double(-1)]
             })
         let analyzer = AutoChartAnalyzer(
-            testHooks: AutoChartAnalyzerTestHooks(
-                chartPreparationWillBegin: { await gate.waitWhenArmed() }))
+            testHooks: .chartPreparation { await gate.waitWhenArmed() })
         let analysis = try await analyzer.analyze(dataset)
         let invalid = AutoChartSpecification(
             family: .donut,

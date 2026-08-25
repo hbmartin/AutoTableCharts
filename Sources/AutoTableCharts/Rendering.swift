@@ -1585,7 +1585,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         .chartXAxisLabel(xTitle)
         .chartYAxisLabel("Count")
         .chartXAxis { numericAxis(columnID: specification.encoding.x) }
-        .chartYAxis { numericAxis(columnID: nil) }
+        .chartYAxis { numericAxis(columnID: nil, aggregation: .count) }
         return selectableNumberX(numberZoom(chart))
     }
 
@@ -2100,7 +2100,11 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             label: datum.yLabel,
             labels: yDisplayLabels)
         let count = datum.yNumber.map {
-            formatters.format(column: nil, value: .double($0), context: .markAccessibility)
+            formatters.format(
+                column: nil,
+                aggregation: .count,
+                value: .double($0),
+                context: .markAccessibility)
         }
         return AutoChartAccessibility.heatmapLabel(
             category: xName,
@@ -2127,6 +2131,19 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         }
     }
 
+    /// Only bar marks currently apply `stackingMethod`. Keep percent-axis
+    /// semantics tied to that rendered behavior rather than to a specification
+    /// field that other families ignore.
+    private var usesNormalizedMeasureAxis: Bool {
+        guard specification.stacking == .normalized else { return false }
+        return switch specification.family {
+        case .bar, .groupedBar, .stackedBar, .normalizedBar:
+            true
+        default:
+            false
+        }
+    }
+
     private func formatted(_ value: AutoChartValue) -> String {
         formatters.format(
             column: resolvedColumn(specification.encoding.y),
@@ -2136,19 +2153,31 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
 
     @AxisContentBuilder
     private func yNumericAxis() -> some AxisContent {
+        let column = sourceMeasureColumn
+        let aggregation = specification.aggregation
+        let normalizedFraction = usesNormalizedMeasureAxis
         AxisMarks { value in
             AxisGridLine()
             AxisTick()
             AxisValueLabel {
                 if let number = value.as(Double.self) {
-                    Text(formattedMeasureValue(number, for: .axisTick))
+                    Text(
+                        formatMeasureValue(
+                            number,
+                            column: column,
+                            aggregation: aggregation,
+                            context: .axisTick,
+                            normalizedFraction: normalizedFraction))
                 }
             }
         }
     }
 
     @AxisContentBuilder
-    private func numericAxis(columnID: AutoChartColumnID?) -> some AxisContent {
+    private func numericAxis(
+        columnID: AutoChartColumnID?,
+        aggregation: AutoChartAggregation? = nil
+    ) -> some AxisContent {
         let column = resolvedColumn(columnID)
         AxisMarks { value in
             AxisGridLine()
@@ -2156,13 +2185,31 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             AxisValueLabel {
                 if let number = value.as(Double.self) {
                     Text(
-                        formatters.format(
+                        formattedNumericAxisValue(
+                            number,
                             column: column,
-                            value: .double(number),
-                            context: .axisTick))
+                            aggregation: aggregation))
                 }
             }
         }
+    }
+
+    private func formattedNumericAxisValue(
+        _ number: Double,
+        column: AutoChartColumn?,
+        aggregation: AutoChartAggregation?
+    ) -> String {
+        guard let aggregation else {
+            return formatters.format(
+                column: column,
+                value: .double(number),
+                context: .axisTick)
+        }
+        return formatters.format(
+            column: column,
+            aggregation: aggregation,
+            value: .double(number),
+            context: .axisTick)
     }
 
     func formattedMeasureValue(
@@ -2170,23 +2217,42 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         for surface: AutoChartMeasureFormattingSurface
     ) -> String {
         let context: AutoChartFormattingContext
-        let purpose: AutoChartFormattingPurpose
+        let normalizedFraction: Bool
         switch surface {
         case .axisTick:
             context = .axisTick
-            purpose = specification.stacking == .normalized
-                ? .normalizedFraction(specification.aggregation)
-                : .aggregatedMeasure(specification.aggregation)
+            normalizedFraction = usesNormalizedMeasureAxis
         case .markAccessibility:
             context = .markAccessibility
-            purpose = .aggregatedMeasure(specification.aggregation)
+            normalizedFraction = false
+        }
+        return formatMeasureValue(
+            number,
+            column: sourceMeasureColumn,
+            aggregation: specification.aggregation,
+            context: context,
+            normalizedFraction: normalizedFraction)
+    }
+
+    private func formatMeasureValue(
+        _ number: Double,
+        column: AutoChartColumn?,
+        aggregation: AutoChartAggregation,
+        context: AutoChartFormattingContext,
+        normalizedFraction: Bool
+    ) -> String {
+        if normalizedFraction {
+            return formatters.formatNormalizedFraction(
+                number,
+                column: column,
+                aggregation: aggregation,
+                context: context)
         }
         return formatters.format(
-            AutoChartFormattingRequest(
-                column: sourceMeasureColumn,
-                value: .double(number),
-                context: context,
-                purpose: purpose))
+            column: column,
+            aggregation: aggregation,
+            value: .double(number),
+            context: context)
     }
 
     @AxisContentBuilder

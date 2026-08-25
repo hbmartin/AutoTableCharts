@@ -58,8 +58,7 @@ public struct AutoChartFormatters: Sendable {
 
     public var locale: Locale
     public var timeZone: TimeZone
-    private let valueOverride: ValueFormatter?
-    private let requestOverride: RequestFormatter?
+    private let override: RequestFormatter?
 
     public init(
         locale: Locale = .autoupdatingCurrent,
@@ -68,8 +67,16 @@ public struct AutoChartFormatters: Sendable {
     ) {
         self.locale = locale
         self.timeZone = timeZone
-        self.valueOverride = value
-        self.requestOverride = nil
+        self.override = value.map { valueFormatter -> RequestFormatter in
+            { request, locale, timeZone in
+                valueFormatter(
+                    Self.legacyColumn(for: request),
+                    request.value,
+                    request.context,
+                    locale,
+                    timeZone)
+            }
+        }
     }
 
     /// Creates formatters with an aggregation-aware host override.
@@ -80,8 +87,7 @@ public struct AutoChartFormatters: Sendable {
     ) {
         self.locale = locale
         self.timeZone = timeZone
-        self.valueOverride = nil
-        self.requestOverride = request
+        self.override = request
     }
 
     public func format(
@@ -98,16 +104,7 @@ public struct AutoChartFormatters: Sendable {
 
     /// Formats a complete semantic request.
     public func format(_ request: AutoChartFormattingRequest) -> String {
-        if let formatted = requestOverride?(request, locale, timeZone) {
-            return formatted
-        }
-        if let formatted = valueOverride?(
-            legacyColumn(for: request),
-            request.value,
-            request.context,
-            locale,
-            timeZone)
-        {
+        if let formatted = override?(request, locale, timeZone) {
             return formatted
         }
         return defaultFormat(request)
@@ -117,8 +114,8 @@ public struct AutoChartFormatters: Sendable {
     ///
     /// Count results remain unitless under the default formatter even when the
     /// source column carries currency, percent, or other unit metadata. Legacy
-    /// value overrides receive `nil` as the column for count results because
-    /// their callback has no aggregation parameter.
+    /// value overrides continue to receive the supplied source column, but must
+    /// use ``RequestFormatter`` when their output depends on the aggregation.
     public func format(
         column: AutoChartColumn?,
         aggregation: AutoChartAggregation,
@@ -148,12 +145,14 @@ public struct AutoChartFormatters: Sendable {
                 purpose: .normalizedFraction(aggregation)))
     }
 
-    private func legacyColumn(for request: AutoChartFormattingRequest) -> AutoChartColumn? {
+    private static func legacyColumn(
+        for request: AutoChartFormattingRequest
+    ) -> AutoChartColumn? {
         switch request.purpose {
         case .value:
             request.column
-        case .aggregatedMeasure(let aggregation):
-            aggregation.usesCountFormatting ? nil : request.column
+        case .aggregatedMeasure:
+            request.column
         case .normalizedFraction:
             nil
         }
