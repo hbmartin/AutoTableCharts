@@ -122,6 +122,9 @@ own `RowID`; replace `aggregation`/`aggregationSafety` hints with
 instead of treating a table as a chart family. The global render cache and
 `AutoChartInteraction` are removed. Persist `AutoChartRecommendationID` and use
 `AutoChartPresentation` for independent chrome, interaction, and plot sizing.
+`AutoChartPresentation.plotHeight` now defaults to `280`, while
+`AutoChartPlot.plotHeight` defaults to `180`. Existing hosts that already supply
+a bounded plot height can pass `nil` to preserve SwiftUI-managed sizing.
 
 ## Documentation and development
 

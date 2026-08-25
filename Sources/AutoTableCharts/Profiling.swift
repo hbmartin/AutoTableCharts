@@ -19,12 +19,14 @@ struct AutoChartErasedRowID: @unchecked Sendable, Hashable, CustomStringConverti
     var description: String { String(describing: value.base) }
 
     var estimatedRetainedCost: Int {
-        switch value.base {
-        case let value as String: return value.utf8.count
-        case let value as Data: return value.count
-        case is UUID: return 16
-        default: return MemoryLayout<AnyHashable>.stride
+        let payloadCost = switch value.base {
+        case let value as String: value.utf8.count
+        case let value as Data: value.count
+        default: 0
         }
+        let (cost, overflow) = MemoryLayout<AnyHashable>.stride.addingReportingOverflow(
+            payloadCost)
+        return overflow ? Int.max : cost
     }
 }
 

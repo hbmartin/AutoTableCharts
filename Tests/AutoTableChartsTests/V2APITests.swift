@@ -37,49 +37,17 @@ private struct DuplicateIDTable: AutoChartTable {
     let chartMetadata = AutoChartTableMetadata()
 }
 
-private final class FirstRowReadGate: @unchecked Sendable {
-    private let lock = NSLock()
-    private let entered = DispatchSemaphore(value: 0)
-    private let release = DispatchSemaphore(value: 0)
-    private var reads = 0
-
-    func read<Row>(_ rows: [Row]) -> [Row] {
-        lock.lock()
-        reads += 1
-        let shouldBlock = reads == 1
-        lock.unlock()
-        if shouldBlock {
-            entered.signal()
-            release.wait()
-        }
-        return rows
-    }
-
-    func waitUntilFirstRead() async {
-        await withCheckedContinuation { continuation in
-            DispatchQueue.global().async {
-                self.entered.wait()
-                continuation.resume()
-            }
-        }
-    }
-
-    func resumeFirstRead() {
-        release.signal()
-    }
-
-    var readCount: Int {
-        lock.lock()
-        defer { lock.unlock() }
-        return reads
-    }
+private enum PreparationGateError: Error {
+    case timedOutWaitingForPreparation
 }
 
 private actor OneShotPreparationGate {
+    private static let timeout: Duration = .seconds(30)
     private var armed = false
     private var blocked = false
+    private var releaseToken: UUID?
     private var releaseContinuation: CheckedContinuation<Void, Never>?
-    private var enteredContinuations: [CheckedContinuation<Void, Never>] = []
+    private var enteredContinuations: [UUID: CheckedContinuation<Void, any Error>] = [:]
 
     func arm() {
         armed = true
@@ -89,21 +57,77 @@ private actor OneShotPreparationGate {
         guard armed else { return }
         armed = false
         blocked = true
-        let waiters = enteredContinuations
+        let waiters = enteredContinuations.values
         enteredContinuations.removeAll()
         waiters.forEach { $0.resume() }
-        await withCheckedContinuation { releaseContinuation = $0 }
+        let token = UUID()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                guard !Task.isCancelled else {
+                    continuation.resume()
+                    return
+                }
+                releaseToken = token
+                releaseContinuation = continuation
+                Task {
+                    try? await Task.sleep(for: Self.timeout)
+                    self.releasePreparation(token: token)
+                }
+            }
+        } onCancel: {
+            Task { await self.releasePreparation(token: token) }
+        }
     }
 
-    func waitUntilBlocked() async {
+    func waitUntilBlocked() async throws {
         guard !blocked else { return }
-        await withCheckedContinuation { enteredContinuations.append($0) }
+        let token = UUID()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation {
+                (continuation: CheckedContinuation<Void, any Error>) in
+                guard !Task.isCancelled else {
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                guard !blocked else {
+                    continuation.resume()
+                    return
+                }
+                enteredContinuations[token] = continuation
+                Task {
+                    try? await Task.sleep(for: Self.timeout)
+                    self.failEnteredWaiter(token: token)
+                }
+            }
+        } onCancel: {
+            Task { await self.cancelEnteredWaiter(token: token) }
+        }
     }
 
     func resume() {
+        guard let releaseToken else { return }
+        releasePreparation(token: releaseToken)
+    }
+
+    private func releasePreparation(token: UUID) {
+        guard releaseToken == token else { return }
         blocked = false
+        releaseToken = nil
         releaseContinuation?.resume()
         releaseContinuation = nil
+    }
+
+    private func failEnteredWaiter(token: UUID) {
+        guard let continuation = enteredContinuations.removeValue(forKey: token) else {
+            return
+        }
+        armed = false
+        continuation.resume(throwing: PreparationGateError.timedOutWaitingForPreparation)
+    }
+
+    private func cancelEnteredWaiter(token: UUID) {
+        enteredContinuations.removeValue(forKey: token)?.resume(
+            throwing: CancellationError())
     }
 }
 
@@ -122,15 +146,6 @@ private func receivesSignalPromptly(_ semaphore: DispatchSemaphore) async -> Boo
                 returning: semaphore.wait(timeout: .now() + 5) == .success)
         }
     }
-}
-
-private struct FirstReadBlockingTable: AutoChartTable {
-    let rows: [DuplicateIDRow]
-    let gate: FirstRowReadGate
-    let chartColumns = [v2Measure]
-    let chartMetadata = AutoChartTableMetadata()
-
-    var chartRows: [DuplicateIDRow] { gate.read(rows) }
 }
 
 private final class ChartRowsReadCounter: @unchecked Sendable {
@@ -546,6 +561,8 @@ private struct CountingChartRowsTable: AutoChartTable {
 
     #if canImport(Charts) && canImport(SwiftUI)
     @Test func previewUsesExactHeightAndIndependentControls() {
+        #expect(AutoChartDefaultPlotHeight.explorer == 280)
+        #expect(AutoChartDefaultPlotHeight.plotOnly == 180)
         #expect(AutoChartPresentation().plotHeight == 280)
         #expect(AutoChartPresentation.explorer().plotHeight == 280)
         #expect(AutoChartPresentation.explorer(plotHeight: nil).plotHeight == nil)
@@ -609,6 +626,39 @@ private struct CountingChartRowsTable: AutoChartTable {
         let dataset = try AutoChartDataset<Int>(
             columns: [v2Category, v2Measure],
             rows: [[.text("A"), .double(1)]])
+
+        let analysisBacked = AutoChartAnalyzer(
+            configuration: AutoChartAnalyzerConfiguration(
+                tables: .init(maximumEntries: 0),
+                analyses: .init(maximumEntries: 4),
+                preparedCharts: .init(maximumEntries: 0),
+                maximumRetainedCost: 1_024 * 1_024))
+        _ = try await analysisBacked.analyze(dataset)
+        let analysisBaseline = await analysisBacked.cacheStatistics
+        _ = try await analysisBacked.analyze(dataset)
+        let analysisReuse = await analysisBacked.cacheStatistics
+        #expect(analysisReuse.tables.misses == analysisBaseline.tables.misses)
+        #expect(analysisReuse.analyses.hits > analysisBaseline.analyses.hits)
+
+        let chartBacked = AutoChartAnalyzer(
+            configuration: AutoChartAnalyzerConfiguration(
+                tables: .init(maximumEntries: 0),
+                analyses: .init(maximumEntries: 0),
+                preparedCharts: .init(maximumEntries: 4),
+                maximumRetainedCost: 1_024 * 1_024))
+        _ = try await chartBacked.analyze(dataset)
+        let chartBaseline = await chartBacked.cacheStatistics
+        _ = try await chartBacked.analyze(dataset)
+        let chartReuse = await chartBacked.cacheStatistics
+        #expect(chartReuse.tables.misses == chartBaseline.tables.misses)
+        #expect(chartReuse.preparedCharts.hits > chartBaseline.preparedCharts.hits)
+    }
+
+    @Test func keyedCrossLayerSourceReuseIsChargedToTheProvidingLayer() async throws {
+        let dataset = try AutoChartDataset<Int>(
+            columns: [v2Category, v2Measure],
+            rows: [[.text("A"), .double(1)]],
+            key: .init(identity: "keyed-cross-layer", revision: "1"))
 
         let analysisBacked = AutoChartAnalyzer(
             configuration: AutoChartAnalyzerConfiguration(
@@ -794,23 +844,27 @@ private struct CountingChartRowsTable: AutoChartTable {
     }
 
     @Test func removeAllDoesNotFailConcurrentAnalyzeCallers() async throws {
-        let gate = FirstRowReadGate()
-        let table = FirstReadBlockingTable(
+        let gate = OneShotPreparationGate()
+        let counter = ChartRowsReadCounter()
+        let table = CountingChartRowsTable(
             rows: (0..<2_000).map {
                 DuplicateIDRow(chartRowID: $0, value: Double($0))
             },
-            gate: gate)
-        let analyzer = AutoChartAnalyzer()
+            counter: counter)
+        let analyzer = AutoChartAnalyzer {
+            await gate.waitWhenArmed()
+        }
+        await gate.arm()
         let task = Task { try await analyzer.analyze(table) }
 
-        await gate.waitUntilFirstRead()
+        try await gate.waitUntilBlocked()
         #expect(await analyzer.cacheStatistics.inFlightRequests == 1)
         await analyzer.removeAll()
-        gate.resumeFirstRead()
+        await gate.resume()
         let analysis = try await task.value
 
         #expect(analysis.primaryChart != nil)
-        #expect(gate.readCount >= 2)
+        #expect(counter.count >= 2)
         #expect(await analyzer.cacheStatistics.inFlightRequests == 0)
     }
 
@@ -885,19 +939,22 @@ private struct CountingChartRowsTable: AutoChartTable {
     /// trimmed must not repopulate the cache it was asked to empty, and it must
     /// still hand its caller a result.
     @Test func trimStopsInFlightWorkFromRepopulatingTheCache() async throws {
-        let gate = FirstRowReadGate()
-        let table = FirstReadBlockingTable(
+        let gate = OneShotPreparationGate()
+        let table = CountingChartRowsTable(
             rows: (0..<2_000).map {
                 DuplicateIDRow(chartRowID: $0, value: Double($0))
             },
-            gate: gate)
-        let analyzer = AutoChartAnalyzer()
+            counter: ChartRowsReadCounter())
+        let analyzer = AutoChartAnalyzer {
+            await gate.waitWhenArmed()
+        }
+        await gate.arm()
         let pending = Task { try await analyzer.analyze(table) }
 
-        await gate.waitUntilFirstRead()
+        try await gate.waitUntilBlocked()
         #expect(await analyzer.cacheStatistics.inFlightRequests == 1)
         await analyzer.trim(to: .minimum)
-        gate.resumeFirstRead()
+        await gate.resume()
         let analysis = try await pending.value
 
         let statistics = await analyzer.cacheStatistics
@@ -945,7 +1002,7 @@ private struct CountingChartRowsTable: AutoChartTable {
 
         await gate.arm()
         let pending = Task { try await analysis.prepare(specification) }
-        await gate.waitUntilBlocked()
+        try await gate.waitUntilBlocked()
         await analyzer.removeAll()
         await gate.resume()
 
@@ -1005,7 +1062,7 @@ private struct CountingChartRowsTable: AutoChartTable {
         // The barrier runs after the cache miss is registered but before the
         // invalid result is produced, so cancellation deterministically reaches
         // `validation(for:)`'s invalid-result conversion path.
-        await gate.waitUntilBlocked()
+        try await gate.waitUntilBlocked()
         #expect(await analyzer.cacheStatistics.preparedCharts.misses == missesBefore + 1)
         pending.cancel()
         let returnedWhilePreparationWasBlocked = await receivesSignalPromptly(completed)
@@ -1039,7 +1096,7 @@ private struct CountingChartRowsTable: AutoChartTable {
             return try await analysis.prepare(invalid)
         }
 
-        await gate.waitUntilBlocked()
+        try await gate.waitUntilBlocked()
         pending.cancel()
         let returnedWhilePreparationWasBlocked = await receivesSignalPromptly(completed)
         await gate.resume()
