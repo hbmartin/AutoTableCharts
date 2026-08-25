@@ -171,6 +171,7 @@ private struct CountingChartRowsTable: AutoChartTable {
     let counter: ChartRowsReadCounter
     let chartColumns = [v2Measure]
     let chartMetadata = AutoChartTableMetadata()
+    var chartDataKey: AutoChartDataKey? = nil
 
     var chartRows: [DuplicateIDRow] { counter.read(rows) }
 }
@@ -604,6 +605,32 @@ private struct CountingChartRowsTable: AutoChartTable {
         #expect(statistics.inFlightRequests == 0)
     }
 
+    @Test func keyedAnalysisHitsDoNotReadRowsOrMissTheTableLayerAgain() async throws {
+        let counter = ChartRowsReadCounter()
+        let table = CountingChartRowsTable(
+            rows: [
+                .init(chartRowID: 1, value: 10),
+                .init(chartRowID: 2, value: 20),
+            ],
+            counter: counter,
+            chartDataKey: .init(identity: "counted-analysis", revision: "1"))
+        let analyzer = AutoChartAnalyzer(
+            configuration: AutoChartAnalyzerConfiguration(
+                tables: .init(maximumEntries: 0),
+                analyses: .init(maximumEntries: 4),
+                preparedCharts: .init(maximumEntries: 0),
+                maximumRetainedCost: 1_024 * 1_024))
+
+        _ = try await analyzer.analyze(table)
+        let baseline = await analyzer.cacheStatistics
+        _ = try await analyzer.analyze(table)
+        let reused = await analyzer.cacheStatistics
+
+        #expect(counter.count == 1)
+        #expect(reused.tables.misses == baseline.tables.misses)
+        #expect(reused.analyses.hits == baseline.analyses.hits + 1)
+    }
+
     @Test func identicalUnkeyedRequestsCoalesceAfterFingerprintComparison() async throws {
         let dataset = try AutoChartDataset<Int>(
             columns: [v2Category, v2Measure],
@@ -655,34 +682,49 @@ private struct CountingChartRowsTable: AutoChartTable {
     }
 
     @Test func keyedCrossLayerSourceReuseIsChargedToTheProvidingLayer() async throws {
-        let dataset = try AutoChartDataset<Int>(
-            columns: [v2Category, v2Measure],
-            rows: [[.text("A"), .double(1)]],
-            key: .init(identity: "keyed-cross-layer", revision: "1"))
-
+        let analysisCounter = ChartRowsReadCounter()
+        let analysisTable = CountingChartRowsTable(
+            rows: [
+                .init(chartRowID: 1, value: 10),
+                .init(chartRowID: 2, value: 20),
+            ],
+            counter: analysisCounter,
+            chartDataKey: .init(identity: "keyed-analysis-layer", revision: "1"))
         let analysisBacked = AutoChartAnalyzer(
             configuration: AutoChartAnalyzerConfiguration(
                 tables: .init(maximumEntries: 0),
                 analyses: .init(maximumEntries: 4),
                 preparedCharts: .init(maximumEntries: 0),
                 maximumRetainedCost: 1_024 * 1_024))
-        _ = try await analysisBacked.analyze(dataset)
+        _ = try await analysisBacked.analyze(analysisTable)
         let analysisBaseline = await analysisBacked.cacheStatistics
-        _ = try await analysisBacked.analyze(dataset)
+        _ = try await analysisBacked.analyze(
+            analysisTable,
+            context: AutoChartContext(goal: .distribution))
         let analysisReuse = await analysisBacked.cacheStatistics
+        #expect(analysisCounter.count == 1)
         #expect(analysisReuse.tables.misses == analysisBaseline.tables.misses)
         #expect(analysisReuse.analyses.hits > analysisBaseline.analyses.hits)
 
+        let chartCounter = ChartRowsReadCounter()
+        let chartTable = CountingChartRowsTable(
+            rows: [
+                .init(chartRowID: 1, value: 10),
+                .init(chartRowID: 2, value: 20),
+            ],
+            counter: chartCounter,
+            chartDataKey: .init(identity: "keyed-chart-layer", revision: "1"))
         let chartBacked = AutoChartAnalyzer(
             configuration: AutoChartAnalyzerConfiguration(
                 tables: .init(maximumEntries: 0),
                 analyses: .init(maximumEntries: 0),
                 preparedCharts: .init(maximumEntries: 4),
                 maximumRetainedCost: 1_024 * 1_024))
-        _ = try await chartBacked.analyze(dataset)
+        _ = try await chartBacked.analyze(chartTable)
         let chartBaseline = await chartBacked.cacheStatistics
-        _ = try await chartBacked.analyze(dataset)
+        _ = try await chartBacked.analyze(chartTable)
         let chartReuse = await chartBacked.cacheStatistics
+        #expect(chartCounter.count == 1)
         #expect(chartReuse.tables.misses == chartBaseline.tables.misses)
         #expect(chartReuse.preparedCharts.hits > chartBaseline.preparedCharts.hits)
     }
