@@ -189,16 +189,19 @@ public struct AutoChartPreparedChart<RowID: Hashable & Sendable>: Sendable {
 
     let sourceRowIDs: [RowID]
     let core: AutoChartRenderCore
+    let specificationID: AutoChartSpecificationID
 
     init(
         source: AutoChartPreparedSource<RowID>,
         recommendation: AutoChartRecommendation,
+        specificationID: AutoChartSpecificationID,
         core: AutoChartRenderCore
     ) {
         self.recommendation = recommendation
         self.validation = core.validation
         self.sourceRowIDs = source.rowIDs
         self.core = core
+        self.specificationID = specificationID
         self.marks = core.data.map { datum in
             AutoChartPreparedMark(
                 identity: datum.id,
@@ -211,18 +214,20 @@ public struct AutoChartPreparedChart<RowID: Hashable & Sendable>: Sendable {
 
     init(
         adapting cached: AutoChartPreparedChart<RowID>,
-        recommendation: AutoChartRecommendation
+        recommendation: AutoChartRecommendation,
+        specificationID: AutoChartSpecificationID
     ) {
         // Cache sharing may replace recommendation metadata and titles, but the
         // prepared marks and presentation belong to one structural specification.
         precondition(
-            cached.recommendation.specification.id == recommendation.specification.id,
+            cached.specificationID == specificationID,
             "Prepared charts can only adapt to the same structural specification.")
         self.recommendation = recommendation
         self.validation = cached.validation
         self.marks = cached.marks
         self.sourceRowIDs = cached.sourceRowIDs
         self.core = cached.core
+        self.specificationID = specificationID
     }
 
     func rowIDs(for offsets: Set<Int>) -> Set<RowID> {
@@ -514,7 +519,7 @@ public actor AutoChartAnalyzer {
     /// Keyed by structural specification identity rather than by the whole
     /// specification: `AutoChartSpecification.id` deliberately excludes the
     /// title, so two identically shaped charts with different titles share one
-    /// preparation and `adapted(_:to:)` swaps in the caller's title.
+    /// preparation and `adapted(_:to:specificationID:)` swaps in the caller's title.
     private struct ChartKey: Hashable, Sendable {
         var table: TableKey
         var specificationID: AutoChartSpecificationID
@@ -1378,7 +1383,10 @@ public actor AutoChartAnalyzer {
         guard let prepared = box.value as? AutoChartPreparedChart<RowID> else {
             preconditionFailure("Coalesced chart preparation row-ID type mismatch.")
         }
-        return adapted(prepared, to: recommendation)
+        return adapted(
+            prepared,
+            to: recommendation,
+            specificationID: key.specificationID)
     }
 
     private func registerChartPreparation<RowID: Hashable & Sendable>(
@@ -1424,6 +1432,7 @@ public actor AutoChartAnalyzer {
             let prepared = AutoChartPreparedChart(
                 source: source,
                 recommendation: recommendation,
+                specificationID: key.specificationID,
                 core: core)
             try Task.checkCancellation()
             let stored = await self.storePreparedChart(
@@ -1509,7 +1518,10 @@ public actor AutoChartAnalyzer {
     ) -> AutoChartPreparedChart<RowID> {
         if let cached = chartEntries[key]?.value as? AutoChartPreparedChart<RowID> {
             touch(key, in: &chartRecency)
-            return adapted(cached, to: prepared.recommendation)
+            return adapted(
+                cached,
+                to: prepared.recommendation,
+                specificationID: key.specificationID)
         }
         if preparedEpoch == cacheEpoch {
             insertChart(prepared, key: key, cost: cost, source: source)
@@ -1524,10 +1536,14 @@ public actor AutoChartAnalyzer {
     /// diagnostics.
     private nonisolated func adapted<RowID: Hashable & Sendable>(
         _ cached: AutoChartPreparedChart<RowID>,
-        to recommendation: AutoChartRecommendation
+        to recommendation: AutoChartRecommendation,
+        specificationID: AutoChartSpecificationID
     ) -> AutoChartPreparedChart<RowID> {
         guard cached.recommendation != recommendation else { return cached }
-        return AutoChartPreparedChart(adapting: cached, recommendation: recommendation)
+        return AutoChartPreparedChart(
+            adapting: cached,
+            recommendation: recommendation,
+            specificationID: specificationID)
     }
 
     public func trim(to target: AutoChartCacheTrimTarget) {
