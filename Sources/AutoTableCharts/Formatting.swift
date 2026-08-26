@@ -46,8 +46,9 @@ public struct AutoChartFormattingRequest: Hashable, Sendable {
 public struct AutoChartFormatters: Sendable {
     /// A compatibility formatter for source values.
     ///
-    /// Use ``RequestFormatter`` when formatting depends on aggregation or
-    /// normalized-stack semantics.
+    /// Count and normalized-fraction requests receive a `nil` column because
+    /// this callback cannot distinguish them from ordinary source values. Use
+    /// ``RequestFormatter`` when formatting depends on those semantics.
     public typealias ValueFormatter = @Sendable (
         AutoChartColumn?, AutoChartValue, AutoChartFormattingContext, Locale, TimeZone
     ) -> String?
@@ -269,12 +270,21 @@ extension AutoChartSelection {
         let valueMessage: AutoChartMessage
         if let measure {
             let column = measure.columnID.flatMap { columnIndex[$0] }
-            func formattedMeasure(_ value: AutoChartValue) -> String {
-                formatters.format(
+            func formatted(_ value: AutoChartValue, column: AutoChartColumn?) -> String {
+                if measure.aggregation == .none {
+                    return formatters.format(
+                        column: column,
+                        value: value,
+                        context: .selectionSummary)
+                }
+                return formatters.format(
                     column: column,
                     aggregation: measure.aggregation,
                     value: value,
                     context: .selectionSummary)
+            }
+            func formattedMeasure(_ value: AutoChartValue) -> String {
+                formatted(value, column: column)
             }
             switch measure.value {
             case .scalar(let value):
@@ -293,22 +303,21 @@ extension AutoChartSelection {
                     arguments: ["lower": .string(lower), "upper": .string(upper)],
                     defaultText: "\(lower)–\(upper)")
             case .temporalRange(let start, let end):
-                let start = formatters.format(
-                    column: column, value: .date(start), context: .selectionSummary)
-                let end = formatters.format(
-                    column: column, value: .date(end), context: .selectionSummary)
+                let startColumn = measure.rangeStartColumnID.flatMap { columnIndex[$0] }
+                    ?? column
+                let endColumn = measure.rangeEndColumnID.flatMap { columnIndex[$0] }
+                    ?? column
+                let start = formatted(.date(start), column: startColumn)
+                let end = formatted(.date(end), column: endColumn)
                 valueMessage = AutoChartMessage(
                     category: .interface,
                     code: .selectionRange,
                     arguments: ["lower": .string(start), "upper": .string(end)],
                     defaultText: "\(start)–\(end)")
             case .distribution(let lower, _, let median, _, let upper):
-                let median = formatters.format(
-                    column: column, value: .double(median), context: .selectionSummary)
-                let lower = formatters.format(
-                    column: column, value: .double(lower), context: .selectionSummary)
-                let upper = formatters.format(
-                    column: column, value: .double(upper), context: .selectionSummary)
+                let median = formattedMeasure(.double(median))
+                let lower = formattedMeasure(.double(lower))
+                let upper = formattedMeasure(.double(upper))
                 valueMessage = AutoChartMessage(
                     category: .interface,
                     code: .selectionDistribution,

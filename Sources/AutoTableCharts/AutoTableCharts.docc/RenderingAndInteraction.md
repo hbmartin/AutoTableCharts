@@ -33,8 +33,9 @@ accessibility, selection summaries, KPI values, and detail text. Defaults handle
 currency, percent, area, duration, custom units, dates, and ordinary numbers.
 
 The same formatters are used for axes, marks, accessibility, selection copy, and
-details. Because they run at presentation time, changing locale does not require
-reanalysis or re-preparation.
+KPI values. Custom renderers can use the `.detail` context for their own detail
+text. Because formatters run at presentation time, changing locale does not
+require reanalysis or re-preparation.
 
 Custom renderers should use
 ``AutoChartFormatters/format(column:aggregation:value:context:)`` for aggregated
@@ -48,13 +49,13 @@ When a host override depends on those semantics, use
 ``AutoChartFormatters/init(locale:timeZone:request:)``. Its
 ``AutoChartFormattingRequest`` distinguishes source values, aggregated measures,
 and normalized fractions and includes the aggregation. The compatibility
-`value` override remains available and continues to receive the supplied source
-column for raw and aggregated values. Normalized-fraction requests made through
-the request override also retain that source column; only the compatibility
-`value` override receives `nil` for a normalized fraction. Because the
-compatibility override has no aggregation parameter, use the request override
-whenever formatting depends on count, distinct-count, or normalized-fraction
-semantics.
+`value` override remains available and receives the supplied source column for
+raw and non-count measure values. It receives `nil` for count, distinct-count,
+and normalized-fraction values because its callback cannot distinguish those
+dimensionless results from ordinary source values. Request overrides retain the
+source column for distinct counts and normalized fractions while receiving the
+complete semantic purpose. Use the request override whenever formatting depends
+on count, distinct-count, or normalized-fraction semantics.
 
 ``AutoChartTextResolver`` can override diagnostics, rationale, fallback,
 accessibility, and built-in controls using stable typed messages. Return `nil`
@@ -64,8 +65,9 @@ to use the package English fallback.
 
 ``AutoChartSelection`` contains typed source row IDs, ordered dimension
 column/value pairs, an optional measure with aggregation and scalar/range/
-distribution value, family, specification ID, and mark identity. It contains no
-preformatted label strings.
+distribution value, separate start/end column lineage for temporal ranges,
+family, specification ID, and mark identity. It contains no preformatted label
+strings.
 
 ```swift
 let selectedRows = dataset.chartRows.filter {

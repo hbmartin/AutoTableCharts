@@ -3313,6 +3313,59 @@ private let date = AutoChartColumn(
         #expect(AutoChartSelectionPreparation.sourceRowOffsets(for: [sectors[0]]) == nil)
     }
 
+    @Test func rangeSelectionPreservesSeparateEndpointLineage() throws {
+        let startColumn = AutoChartColumn(
+            id: "start", name: "Start",
+            hints: .init(semanticType: .temporal, role: .intervalStart))
+        let endColumn = AutoChartColumn(
+            id: "end", name: "End",
+            hints: .init(semanticType: .temporal, role: .intervalEnd))
+        let start = Date(timeIntervalSince1970: 0)
+        let end = Date(timeIntervalSince1970: 86_400)
+        let input = table(
+            columns: [category, startColumn, endColumn],
+            rows: [[.text("A"), .date(start), .date(end)]])
+        let snapshot = AutoChartSnapshot(input)
+        let specification = AutoChartSpecification.range(
+            label: category.id,
+            start: startColumn.id,
+            end: endColumn.id)
+        let prepared = AutoChartDataPreparation.preparedData(
+            snapshot: snapshot,
+            specification: specification,
+            profiles: AutoChartProfiler.profileIndex(snapshot))
+        let semantics = AutoChartSelectionPreparation.semanticValues(
+            for: prepared.data,
+            specification: specification,
+            measureSemantics: prepared.measureSemantics)
+        let measure = try #require(semantics.measure)
+
+        #expect(measure.rangeStartColumnID == startColumn.id)
+        #expect(measure.rangeEndColumnID == endColumn.id)
+        #expect(measure.value == .temporalRange(start: start, end: end))
+
+        let selection = AutoChartSelection(
+            sourceRowIDs: Set(["r0"]),
+            dimensions: semantics.dimensions,
+            rangeDimensions: semantics.rangeDimensions,
+            measure: measure,
+            family: .range,
+            specificationID: specification.id,
+            markID: "range")
+        let formatter = AutoChartFormatters { request, _, _ in
+            request.column?.id.rawValue ?? "nil"
+        }
+        #expect(
+            selection.presentation(
+                columns: [category, startColumn, endColumn],
+                formatters: formatter
+            ).valueDescription == "start–end")
+        #expect(
+            try JSONDecoder().decode(
+                AutoChartSelection<String>.self,
+                from: JSONEncoder().encode(selection)) == selection)
+    }
+
     @Test func selectionSummariesRespectNonadditiveAggregations() {
         let matches = [
             AutoChartDatum(id: "first", sourceRowIDs: [0], yNumber: 10),
@@ -3423,7 +3476,7 @@ private let date = AutoChartColumn(
                 == "Distinct count of \(AutoChartProfiler.displayName(distinctMeasure))")
     }
 
-    @Test func structuralAndDistributionFamiliesShareRenderedMeasureSemantics() {
+    @Test func preparationOwnsRenderedMeasureSemanticsAcrossFamilies() throws {
         let heatmapY = AutoChartColumn(
             id: "heatmap-y", name: "Region",
             hints: .init(semanticType: .nominal, role: .dimension))
@@ -3436,7 +3489,7 @@ private let date = AutoChartColumn(
             family: .heatmap,
             encoding: .init(x: category.id, y: heatmapY.id),
             aggregation: .sum)
-        let heatmapData = AutoChartDataPreparation.data(
+        let heatmapPrepared = AutoChartDataPreparation.preparedData(
             snapshot: heatmapSnapshot,
             specification: invalidHeatmap,
             profiles: heatmapProfiles)
@@ -3444,32 +3497,87 @@ private let date = AutoChartColumn(
             snapshot: heatmapSnapshot,
             specification: invalidHeatmap,
             profiles: heatmapProfiles,
-            data: heatmapData)
+            data: heatmapPrepared.data,
+            measureSemantics: heatmapPrepared.measureSemantics)
         let heatmapSelection = AutoChartSelectionPreparation.semanticValues(
-            for: heatmapData,
-            specification: invalidHeatmap)
+            for: heatmapPrepared.data,
+            specification: invalidHeatmap,
+            measureSemantics: heatmapPrepared.measureSemantics)
 
         #expect(heatmapPresentation.yTitle == AutoChartProfiler.displayName(heatmapY))
+        #expect(heatmapPrepared.measureSemantics.kind == .aggregated(.count))
         #expect(heatmapSelection.measure?.aggregation == .count)
         #expect(heatmapSelection.measure?.columnID == nil)
 
+        let boxInput = table(
+            columns: [category, measure],
+            rows: (1...5).map { [.text("A"), .double(Double($0))] })
+        let boxSnapshot = AutoChartSnapshot(boxInput)
+        let boxProfiles = AutoChartProfiler.profileIndex(boxSnapshot)
         let invalidBoxPlot = AutoChartSpecification(
             family: .boxPlot,
             encoding: .init(x: category.id, y: measure.id),
             aggregation: .count)
-        let distribution = AutoChartDatum(
-            id: "box", sourceRowIDs: [0], xIdentity: "A", xLabel: "A",
-            lower: 1, quartile1: 2, median: 3, quartile3: 4, upper: 5)
+        let boxPrepared = AutoChartDataPreparation.preparedData(
+            snapshot: boxSnapshot,
+            specification: invalidBoxPlot,
+            profiles: boxProfiles)
         let boxSelection = AutoChartSelectionPreparation.semanticValues(
-            for: [distribution],
-            specification: invalidBoxPlot)
+            for: boxPrepared.data,
+            specification: invalidBoxPlot,
+            measureSemantics: boxPrepared.measureSemantics)
 
+        #expect(boxPrepared.data.count == 1)
+        #expect(boxPrepared.measureSemantics.kind == .value)
         #expect(boxSelection.measure?.aggregation == AutoChartAggregation.none)
         #expect(boxSelection.measure?.columnID == measure.id)
         #expect(
             boxSelection.measure?.value
                 == .distribution(
                     lower: 1, quartile1: 2, median: 3, quartile3: 4, upper: 5))
+
+        let donutInput = table(
+            columns: [category, measure],
+            rows: [
+                [.text("A"), .double(1)],
+                [.text("A"), .double(2)],
+                [.text("B"), .double(4)],
+            ])
+        let donutSnapshot = AutoChartSnapshot(donutInput)
+        let invalidDonut = AutoChartSpecification(
+            family: .donut,
+            encoding: .init(x: category.id, y: measure.id),
+            aggregation: .none)
+        let donutPrepared = AutoChartDataPreparation.preparedData(
+            snapshot: donutSnapshot,
+            specification: invalidDonut,
+            profiles: AutoChartProfiler.profileIndex(donutSnapshot))
+        let donutA = try #require(
+            donutPrepared.data.first { $0.xLabel == "A" })
+        let donutSelection = AutoChartSelectionPreparation.semanticValues(
+            for: [donutA],
+            specification: invalidDonut,
+            measureSemantics: donutPrepared.measureSemantics)
+
+        #expect(donutA.yNumber == 3)
+        #expect(donutPrepared.measureSemantics.kind == .aggregated(.sum))
+        #expect(donutSelection.measure?.aggregation == .sum)
+        #expect(donutSelection.measure?.value == .scalar(.double(3)))
+
+        let kpiInput = table(columns: [measure], rows: [[.double(42)]])
+        let kpiSnapshot = AutoChartSnapshot(kpiInput)
+        let invalidKPI = AutoChartSpecification(
+            family: .kpi,
+            encoding: .init(y: measure.id),
+            aggregation: .count)
+        let kpiPrepared = AutoChartDataPreparation.preparedData(
+            snapshot: kpiSnapshot,
+            specification: invalidKPI,
+            profiles: AutoChartProfiler.profileIndex(kpiSnapshot))
+
+        #expect(kpiPrepared.data.first?.yNumber == 42)
+        #expect(kpiPrepared.measureSemantics.kind == .value)
+        #expect(kpiPrepared.measureSemantics.columnID == measure.id)
     }
 
     @Test func selectionDimensionsPreserveTypedSourceValuesInsteadOfLabels() {

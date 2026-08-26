@@ -1601,17 +1601,54 @@ public struct AutoChartSelectedMeasure: Hashable, Codable, Sendable {
     /// The source measure column, or `nil` for a structural row count that is
     /// not derived from a measure column.
     public var columnID: AutoChartColumnID?
+    /// The source column for the start of a temporal range, when the selected
+    /// value is backed by separate interval columns.
+    public var rangeStartColumnID: AutoChartColumnID?
+    /// The source column for the end of a temporal range, when the selected
+    /// value is backed by separate interval columns.
+    public var rangeEndColumnID: AutoChartColumnID?
     public var aggregation: AutoChartAggregation
     public var value: AutoChartMarkValue
 
     public init(
         columnID: AutoChartColumnID?,
+        rangeStartColumnID: AutoChartColumnID? = nil,
+        rangeEndColumnID: AutoChartColumnID? = nil,
         aggregation: AutoChartAggregation,
         value: AutoChartMarkValue
     ) {
         self.columnID = columnID
+        self.rangeStartColumnID = rangeStartColumnID
+        self.rangeEndColumnID = rangeEndColumnID
         self.aggregation = aggregation
         self.value = value
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case columnID, rangeStartColumnID, rangeEndColumnID, aggregation, value
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            columnID: try container.decodeIfPresent(
+                AutoChartColumnID.self, forKey: .columnID),
+            rangeStartColumnID: try container.decodeIfPresent(
+                AutoChartColumnID.self, forKey: .rangeStartColumnID),
+            rangeEndColumnID: try container.decodeIfPresent(
+                AutoChartColumnID.self, forKey: .rangeEndColumnID),
+            aggregation: try container.decode(
+                AutoChartAggregation.self, forKey: .aggregation),
+            value: try container.decode(AutoChartMarkValue.self, forKey: .value))
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(columnID, forKey: .columnID)
+        try container.encodeIfPresent(rangeStartColumnID, forKey: .rangeStartColumnID)
+        try container.encodeIfPresent(rangeEndColumnID, forKey: .rangeEndColumnID)
+        try container.encode(aggregation, forKey: .aggregation)
+        try container.encode(value, forKey: .value)
     }
 }
 
