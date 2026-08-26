@@ -985,13 +985,18 @@ private struct CountingChartRowsTable: AutoChartTable {
             adapting: donut,
             recommendation: invalidDonutRecommendation)
 
+        let adaptedKPIMeasure = AutoChartColumn(
+            id: "adapted-kpi-measure",
+            name: "Adapted KPI measure",
+            hints: .init(semanticType: .quantitative, role: .measure))
         let kpiDataset = try AutoChartDataset<Int>(
-            columns: [v2Measure],
-            rows: [[.double(42)]])
+            columns: [v2Measure, adaptedKPIMeasure],
+            rows: [[.double(42), .double(99)]])
         let kpiAnalysis = try await AutoChartAnalyzer().analyze(kpiDataset)
         let kpi = try await kpiAnalysis.prepare(.kpi(measure: v2Measure.id))
         var invalidKPIRecommendation = kpi.recommendation
         invalidKPIRecommendation.specification.aggregation = .count
+        invalidKPIRecommendation.specification.encoding.y = adaptedKPIMeasure.id
         let invalidKPI = AutoChartPreparedChart(
             adapting: kpi,
             recommendation: invalidKPIRecommendation)
@@ -1037,6 +1042,7 @@ private struct CountingChartRowsTable: AutoChartTable {
         let kpiView = AutoChartView(
             preparedChart: invalidKPI,
             formatters: formatter)
+        #expect(invalidKPI.core.data.first?.ySourceValue == .double(42))
         #expect(
             kpiView.formattedKPIValue(.double(42))
                 == "kpi:value:\(v2Measure.id.rawValue)")

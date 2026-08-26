@@ -3242,7 +3242,9 @@ private let date = AutoChartColumn(
             encoding: .init(x: date.id, y: measure.id, series: category.id))
         let semantics = AutoChartSelectionPreparation.semanticValues(
             for: nearest,
-            specification: specification)
+            specification: specification,
+            measureSemantics: AutoChartDataPreparation.measureSemantics(
+                for: specification))
         #expect(semantics.measure == nil)
         let presentation = AutoChartSelection(
             sourceRowIDs: Set(["r0", "r1"]),
@@ -3271,7 +3273,9 @@ private let date = AutoChartColumn(
         let specification = AutoChartSpecification.histogram(value: measure.id)
         let semantics = AutoChartSelectionPreparation.semanticValues(
             for: [bins[0]],
-            specification: specification)
+            specification: specification,
+            measureSemantics: AutoChartDataPreparation.measureSemantics(
+                for: specification))
         #expect(
             semantics.rangeDimensions
                 == [
@@ -3334,9 +3338,12 @@ private let date = AutoChartColumn(
             snapshot: snapshot,
             specification: specification,
             profiles: AutoChartProfiler.profileIndex(snapshot))
+        var adaptedSpecification = specification
+        adaptedSpecification.encoding.start = "adapted-start"
+        adaptedSpecification.encoding.end = "adapted-end"
         let semantics = AutoChartSelectionPreparation.semanticValues(
             for: prepared.data,
-            specification: specification,
+            specification: adaptedSpecification,
             measureSemantics: prepared.measureSemantics)
         let measure = try #require(semantics.measure)
 
@@ -3378,24 +3385,30 @@ private let date = AutoChartColumn(
         // A mean weights by source rows and reaches the summary as one value;
         // a distinct count over several marks has no combinable value, so the
         // summary reports rows instead of inventing a number.
+        let meanSpecification = AutoChartSpecification(
+            family: .bar,
+            encoding: .init(x: category.id, y: measure.id),
+            aggregation: .mean)
+        let meanSemantics = AutoChartSelectionPreparation.semanticValues(
+            for: matches,
+            specification: meanSpecification,
+            measureSemantics: AutoChartDataPreparation.measureSemantics(
+                for: meanSpecification))
         #expect(
-            AutoChartSelectionPreparation.semanticValues(
-                for: matches,
-                specification: AutoChartSpecification(
-                    family: .bar,
-                    encoding: .init(x: category.id, y: measure.id),
-                    aggregation: .mean)
-            ).measure
+            meanSemantics.measure
                 == AutoChartSelectedMeasure(
                     columnID: measure.id,
                     aggregation: .mean,
                     value: .scalar(.double(50.0 / 3.0))))
+        let distinctSpecification = AutoChartSpecification(
+            family: .bar,
+            encoding: .init(x: category.id, y: measure.id),
+            aggregation: .countDistinct)
         let distinctSemantics = AutoChartSelectionPreparation.semanticValues(
             for: matches,
-            specification: AutoChartSpecification(
-                family: .bar,
-                encoding: .init(x: category.id, y: measure.id),
-                aggregation: .countDistinct))
+            specification: distinctSpecification,
+            measureSemantics: AutoChartDataPreparation.measureSemantics(
+                for: distinctSpecification))
         #expect(distinctSemantics.measure == nil)
         #expect(
             AutoChartSelection(
@@ -3404,26 +3417,21 @@ private let date = AutoChartColumn(
                 rangeDimensions: distinctSemantics.rangeDimensions,
                 measure: distinctSemantics.measure,
                 family: .bar,
-                specificationID: AutoChartSpecification(
-                    family: .bar,
-                    encoding: .init(x: category.id, y: measure.id),
-                    aggregation: .countDistinct).id,
+                specificationID: distinctSpecification.id,
                 markID: "first|second"
             ).presentation(columns: [category, measure]).valueDescription
                 == "3 source rows")
         #expect(AutoChartSelectionPreparation.identicalValue(in: ["A", "A"]) == "A")
         #expect(AutoChartSelectionPreparation.identicalValue(in: ["A", "B"]) == nil)
 
-        let specification = AutoChartSpecification(
-            family: .bar,
-            encoding: .init(x: category.id, y: measure.id),
-            aggregation: .countDistinct)
         let semantics = AutoChartSelectionPreparation.semanticValues(
             for: [
                 AutoChartDatum(
                     id: "distinct", sourceRowIDs: [0, 1], xLabel: "A", yNumber: 2)
             ],
-            specification: specification)
+            specification: distinctSpecification,
+            measureSemantics: AutoChartDataPreparation.measureSemantics(
+                for: distinctSpecification))
         #expect(semantics.measure?.columnID == measure.id)
         #expect(semantics.measure?.aggregation == .countDistinct)
         #expect(semantics.measure?.value == .scalar(.double(2)))
@@ -3432,7 +3440,7 @@ private let date = AutoChartColumn(
                 sourceRowIDs: Set(["r0", "r1"]),
                 measure: semantics.measure,
                 family: .bar,
-                specificationID: specification.id,
+                specificationID: distinctSpecification.id,
                 markID: "distinct"
             ).presentation(columns: [category, measure]).valueDescription == "2")
     }
@@ -3461,7 +3469,7 @@ private let date = AutoChartColumn(
             family: .bar,
             encoding: .init(x: category.id, y: distinctMeasure.id),
             aggregation: .countDistinct)
-        let data = AutoChartDataPreparation.data(
+        let prepared = AutoChartDataPreparation.preparedData(
             snapshot: snapshot,
             specification: specification,
             profiles: profiles)
@@ -3469,7 +3477,8 @@ private let date = AutoChartColumn(
             snapshot: snapshot,
             specification: specification,
             profiles: profiles,
-            data: data)
+            data: prepared.data,
+            measureSemantics: prepared.measureSemantics)
 
         #expect(
             presentation.yTitle
@@ -3609,7 +3618,9 @@ private let date = AutoChartColumn(
             facet: "false")
         let semantics = AutoChartSelectionPreparation.semanticValues(
             for: [typed],
-            specification: specification)
+            specification: specification,
+            measureSemantics: AutoChartDataPreparation.measureSemantics(
+                for: specification))
         #expect(
             semantics.dimensions
                 == [
@@ -3636,7 +3647,9 @@ private let date = AutoChartColumn(
             facet: "false")
         let mixed = AutoChartSelectionPreparation.semanticValues(
             for: [typed, duplicateLabelsWithDifferentValues],
-            specification: specification)
+            specification: specification,
+            measureSemantics: AutoChartDataPreparation.measureSemantics(
+                for: specification))
         #expect(mixed.dimensions.isEmpty)
     }
 

@@ -200,17 +200,6 @@ enum AutoChartSelectionPreparation {
 
     static func semanticValues(
         for matches: [AutoChartDatum],
-        specification: AutoChartSpecification
-    ) -> SemanticValues {
-        semanticValues(
-            for: matches,
-            specification: specification,
-            measureSemantics: AutoChartDataPreparation.measureSemantics(
-                for: specification))
-    }
-
-    static func semanticValues(
-        for matches: [AutoChartDatum],
         specification: AutoChartSpecification,
         measureSemantics: AutoChartRenderedMeasureSemantics
     ) -> SemanticValues {
@@ -284,8 +273,8 @@ enum AutoChartSelectionPreparation {
             let rangeStartColumnID: AutoChartColumnID?
             let rangeEndColumnID: AutoChartColumnID?
             if case .temporalRange = $0 {
-                rangeStartColumnID = specification.encoding.start
-                rangeEndColumnID = specification.encoding.end
+                rangeStartColumnID = measureSemantics.rangeStartColumnID
+                rangeEndColumnID = measureSemantics.rangeEndColumnID
             } else {
                 rangeStartColumnID = nil
                 rangeEndColumnID = nil
@@ -351,6 +340,8 @@ enum AutoChartRenderedMeasureKind: Hashable, Sendable {
 /// from reinterpreting values that have already been grouped or transformed.
 struct AutoChartRenderedMeasureSemantics: Hashable, Sendable {
     var columnID: AutoChartColumnID?
+    var rangeStartColumnID: AutoChartColumnID? = nil
+    var rangeEndColumnID: AutoChartColumnID? = nil
     var kind: AutoChartRenderedMeasureKind
 
     var aggregation: AutoChartAggregation {
@@ -359,6 +350,18 @@ struct AutoChartRenderedMeasureSemantics: Hashable, Sendable {
             .none
         case .aggregated(let aggregation):
             aggregation
+        }
+    }
+
+    var formattingPurpose: AutoChartFormattingPurpose {
+        switch kind {
+        case .value:
+            return .value
+        case .aggregated(let aggregation):
+            if aggregation == .none {
+                preconditionFailure("Prepared aggregated measures require an aggregation.")
+            }
+            return .renderedMeasure(aggregation)
         }
     }
 }
@@ -452,6 +455,8 @@ enum AutoChartDataPreparation {
     ) -> Plan {
         let valueSemantics = AutoChartRenderedMeasureSemantics(
             columnID: specification.encoding.y,
+            rangeStartColumnID: specification.encoding.start,
+            rangeEndColumnID: specification.encoding.end,
             kind: .value)
         func aggregatedSemantics(
             _ aggregation: AutoChartAggregation
@@ -566,6 +571,9 @@ enum AutoChartDataPreparation {
         profiles: [AutoChartColumnID: AutoChartColumnProfile],
         aggregation: AutoChartAggregation
     ) -> [AutoChartDatum] {
+        if aggregation == .none {
+            preconditionFailure("Grouped preparation requires an effective aggregation.")
+        }
         let rawData = raw(
             snapshot: snapshot,
             specification: specification,
@@ -584,7 +592,9 @@ enum AutoChartDataPreparation {
             let values = group.compactMap { $0.yNumber }
             let result: Double =
                 switch aggregation {
-                case .none, .sum: values.reduce(0, +)
+                case .none:
+                    preconditionFailure("Grouped preparation requires an effective aggregation.")
+                case .sum: values.reduce(0, +)
                 case .mean: values.isEmpty ? 0 : values.reduce(0, +) / Double(values.count)
                 case .minimum: values.min() ?? 0
                 case .maximum: values.max() ?? 0
@@ -904,21 +914,6 @@ struct AutoChartRenderPresentation: Sendable {
     var timeZoomSpan: TimeInterval
     var numberZoomValueCount: Int
     var numberZoomSpan: Double
-
-    init(
-        snapshot: AutoChartSnapshot,
-        specification: AutoChartSpecification,
-        profiles: [AutoChartColumnID: AutoChartColumnProfile],
-        data: [AutoChartDatum]
-    ) {
-        self.init(
-            snapshot: snapshot,
-            specification: specification,
-            profiles: profiles,
-            data: data,
-            measureSemantics: AutoChartDataPreparation.measureSemantics(
-                for: specification))
-    }
 
     init(
         snapshot: AutoChartSnapshot,
@@ -1576,9 +1571,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     }
 
     private var kpiView: some View {
-        let value = specification.encoding.y.flatMap { id in
-            snapshot.rows.first?.values[id]
-        }
+        let value = data.first?.ySourceValue
         return VStack(alignment: .leading, spacing: 4) {
             Text(value.map(formattedKPIValue) ?? "—")
                 .font(
@@ -1588,8 +1581,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
                 )
                 .minimumScaleFactor(0.6)
             Text(
-                resolvedColumn(specification.encoding.y)
-                    .map(AutoChartProfiler.displayName) ?? "Value"
+                sourceMeasureColumn.map(AutoChartProfiler.displayName) ?? "Value"
             )
             .font(.caption)
             .foregroundStyle(.secondary)
@@ -2287,10 +2279,10 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     }
 
     func formattedKPIValue(_ value: AutoChartValue) -> String {
-        formatters.format(
-            column: resolvedColumn(specification.encoding.y),
-            value: value,
-            context: .kpi)
+        formattedRenderedMeasure(
+            value,
+            context: .kpi,
+            normalizedFraction: false)
     }
 
     @AxisContentBuilder
@@ -2338,26 +2330,26 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             context = .markAccessibility
             normalizedFraction = false
         }
-        if normalizedFraction {
-            return formatters.formatNormalizedFraction(
-                number,
+        return formattedRenderedMeasure(
+            .double(number),
+            context: context,
+            normalizedFraction: normalizedFraction)
+    }
+
+    private func formattedRenderedMeasure(
+        _ value: AutoChartValue,
+        context: AutoChartFormattingContext,
+        normalizedFraction: Bool
+    ) -> String {
+        let purpose: AutoChartFormattingPurpose = normalizedFraction
+            ? .normalizedFraction(renderedMeasureSemantics.aggregation)
+            : renderedMeasureSemantics.formattingPurpose
+        return formatters.format(
+            AutoChartFormattingRequest(
                 column: sourceMeasureColumn,
-                aggregation: renderedMeasureSemantics.aggregation,
-                context: context)
-        }
-        switch renderedMeasureSemantics.kind {
-        case .value:
-            return formatters.format(
-                column: sourceMeasureColumn,
-                value: .double(number),
-                context: context)
-        case .aggregated(let aggregation):
-            return formatters.format(
-                column: sourceMeasureColumn,
-                aggregation: aggregation,
-                value: .double(number),
-                context: context)
-        }
+                value: value,
+                context: context,
+                purpose: purpose))
     }
 
     @AxisContentBuilder
