@@ -1294,10 +1294,24 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         id.flatMap { preparedChart.core.table.profiles[$0]?.column }
     }
 
+    /// The aggregation represented by rendered measure values. Histograms and
+    /// heatmaps always render structural row counts, regardless of an invalid
+    /// caller-provided aggregation that validation will reject.
+    private var renderedMeasureAggregation: AutoChartAggregation {
+        switch specification.family {
+        case .histogram, .heatmap:
+            .count
+        case .kpi, .bar, .rankedDot, .groupedBar, .stackedBar, .normalizedBar,
+            .line, .pointLine, .area, .scatter, .bubble, .boxPlot, .donut,
+            .range, .faceted:
+            specification.aggregation
+        }
+    }
+
     /// The source measure for raw and normalized values. Structural row counts
     /// are the only aggregation without source-column lineage.
     private var sourceMeasureColumn: AutoChartColumn? {
-        guard specification.aggregation.preservesMeasureLineage else { return nil }
+        guard renderedMeasureAggregation.preservesMeasureLineage else { return nil }
         return resolvedColumn(specification.encoding.y)
     }
 
@@ -1585,9 +1599,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         .chartXAxisLabel(xTitle)
         .chartYAxisLabel("Count")
         .chartXAxis { numericAxis(columnID: specification.encoding.x) }
-        .chartYAxis {
-            numericAxis(columnID: nil, aggregation: specification.aggregation)
-        }
+        .chartYAxis { yNumericAxis() }
         return selectableNumberX(numberZoom(chart))
     }
 
@@ -2102,11 +2114,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             label: datum.yLabel,
             labels: yDisplayLabels)
         let count = datum.yNumber.map {
-            formatters.format(
-                column: nil,
-                aggregation: specification.aggregation,
-                value: .double($0),
-                context: .markAccessibility)
+            formattedMeasureValue($0, for: .markAccessibility)
         }
         return AutoChartAccessibility.heatmapLabel(
             category: xName,
@@ -2133,15 +2141,15 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         }
     }
 
-    /// Normalized-bar marks are the only marks that render normalized stacking.
-    /// Keep percent-axis semantics tied to that family and its validated stacking.
+    /// Keep percent-axis semantics tied to the bar marks that actually apply
+    /// normalized stacking, even if an invalid specification bypasses validation.
     private var usesNormalizedMeasureAxis: Bool {
+        guard specification.stacking == .normalized else { return false }
         return switch specification.family {
-        case .normalizedBar:
-            specification.stacking == .normalized
-        case .kpi, .bar, .rankedDot, .groupedBar, .stackedBar, .line, .pointLine,
-            .area, .scatter, .bubble, .histogram, .boxPlot, .heatmap, .donut,
-            .range, .faceted:
+        case .bar, .stackedBar, .normalizedBar:
+            true
+        case .kpi, .rankedDot, .groupedBar, .line, .pointLine, .area, .scatter,
+            .bubble, .histogram, .boxPlot, .heatmap, .donut, .range, .faceted:
             false
         }
     }
@@ -2156,18 +2164,20 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     @AxisContentBuilder
     private func yNumericAxis() -> some AxisContent {
         let column = sourceMeasureColumn
-        let aggregation = specification.aggregation
+        let aggregation = renderedMeasureAggregation
+        let normalizedFraction = usesNormalizedMeasureAxis
         AxisMarks { value in
             AxisGridLine()
             AxisTick()
             AxisValueLabel {
                 if let number = value.as(Double.self) {
                     Text(
-                        formattedMeasureValue(
+                        formatMeasureValue(
                             number,
-                            for: .axisTick,
                             column: column,
-                            aggregation: aggregation))
+                            aggregation: aggregation,
+                            context: .axisTick,
+                            normalizedFraction: normalizedFraction))
                 }
             }
         }
@@ -2175,22 +2185,6 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
 
     @AxisContentBuilder
     private func numericAxis(columnID: AutoChartColumnID?) -> some AxisContent {
-        numericAxis(columnID: columnID, purpose: .value)
-    }
-
-    @AxisContentBuilder
-    private func numericAxis(
-        columnID: AutoChartColumnID?,
-        aggregation: AutoChartAggregation
-    ) -> some AxisContent {
-        numericAxis(columnID: columnID, purpose: .aggregatedMeasure(aggregation))
-    }
-
-    @AxisContentBuilder
-    private func numericAxis(
-        columnID: AutoChartColumnID?,
-        purpose: AutoChartFormattingPurpose
-    ) -> some AxisContent {
         let column = resolvedColumn(columnID)
         AxisMarks { value in
             AxisGridLine()
@@ -2198,44 +2192,18 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             AxisValueLabel {
                 if let number = value.as(Double.self) {
                     Text(
-                        formattedNumericAxisValue(
-                            number,
+                        formatters.format(
                             column: column,
-                            purpose: purpose))
+                            value: .double(number),
+                            context: .axisTick))
                 }
             }
         }
     }
 
-    private func formattedNumericAxisValue(
-        _ number: Double,
-        column: AutoChartColumn?,
-        purpose: AutoChartFormattingPurpose
-    ) -> String {
-        formatters.format(
-            AutoChartFormattingRequest(
-                column: column,
-                value: .double(number),
-                context: .axisTick,
-                purpose: purpose))
-    }
-
     func formattedMeasureValue(
         _ number: Double,
         for surface: AutoChartMeasureFormattingSurface
-    ) -> String {
-        formattedMeasureValue(
-            number,
-            for: surface,
-            column: sourceMeasureColumn,
-            aggregation: specification.aggregation)
-    }
-
-    private func formattedMeasureValue(
-        _ number: Double,
-        for surface: AutoChartMeasureFormattingSurface,
-        column: AutoChartColumn?,
-        aggregation: AutoChartAggregation
     ) -> String {
         let context: AutoChartFormattingContext
         let normalizedFraction: Bool
@@ -2249,8 +2217,8 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         }
         return formatMeasureValue(
             number,
-            column: column,
-            aggregation: aggregation,
+            column: sourceMeasureColumn,
+            aggregation: renderedMeasureAggregation,
             context: context,
             normalizedFraction: normalizedFraction)
     }
