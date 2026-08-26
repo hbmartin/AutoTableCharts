@@ -155,7 +155,6 @@ private actor OneShotPreparationGate {
         guard let waiter = enteredWaiters.removeValue(forKey: token) else {
             return
         }
-        armed = false
         waiter.continuation.resume(
             throwing: PreparationGateError.timedOutWaitingForPreparation)
     }
@@ -167,11 +166,9 @@ private actor OneShotPreparationGate {
     }
 
     private func cancelEnteredWaiters() {
-        let waiters = Array(enteredWaiters.values)
-        enteredWaiters.removeAll()
-        waiters.forEach {
-            $0.timeoutTask.cancel()
-            $0.continuation.resume(throwing: CancellationError())
+        let tokens = Array(enteredWaiters.keys)
+        tokens.forEach {
+            cancelEnteredWaiter(token: $0)
         }
     }
 
@@ -624,8 +621,55 @@ private struct CountingChartRowsTable: AutoChartTable {
                     aggregation: aggregation,
                     value: .double(2),
                     context: .axisTick)
-                    == "axisTick:\(v2Measure.id.rawValue)")
+                    == "axisTick:nil")
         }
+    }
+
+    @Test func rawSelectionRangesUseValueFormattingPurpose() {
+        let formatter = AutoChartFormatters { request, _, _ in
+            switch request.purpose {
+            case .value:
+                "value"
+            case .aggregatedMeasure(let aggregation):
+                "aggregated:\(aggregation.rawValue)"
+            case .normalizedFraction:
+                "normalized"
+            }
+        }
+        let start = Date(timeIntervalSince1970: 0)
+        let end = Date(timeIntervalSince1970: 60)
+        let rangeSpecification = AutoChartSpecification(
+            family: .range,
+            encoding: .init(x: v2Category.id, start: "start", end: "end"))
+        let boxSpecification = AutoChartSpecification.boxPlot(
+            measure: v2Measure.id,
+            category: v2Category.id)
+        let temporal = AutoChartSelection<Int>(
+            sourceRowIDs: [1],
+            measure: .init(
+                columnID: nil,
+                aggregation: .none,
+                value: .temporalRange(start: start, end: end)),
+            family: .range,
+            specificationID: rangeSpecification.id,
+            markID: "range")
+        let distribution = AutoChartSelection<Int>(
+            sourceRowIDs: [1],
+            measure: .init(
+                columnID: v2Measure.id,
+                aggregation: .none,
+                value: .distribution(
+                    lower: 1, quartile1: 2, median: 3, quartile3: 4, upper: 5)),
+            family: .boxPlot,
+            specificationID: boxSpecification.id,
+            markID: "box")
+
+        #expect(
+            temporal.presentation(columns: [], formatters: formatter).valueDescription
+                == "value–value")
+        #expect(
+            distribution.presentation(columns: [v2Measure], formatters: formatter)
+                .valueDescription == "Median value; range value–value")
     }
 
     @Test func defaultsFormatUnitsAndDatesWithExplicitLocaleAndTimeZone() {
