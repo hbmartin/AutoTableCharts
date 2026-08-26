@@ -121,11 +121,14 @@ public struct AutoChartFormatters: Sendable {
 
     /// Formats a measure while preserving its source column for request overrides.
     ///
-    /// Count results remain unitless under the default formatter even when the
-    /// source column carries currency, percent, or other unit metadata.
-    /// Compatibility value overrides receive `nil` for count results because
-    /// their callback cannot distinguish counts from ordinary source values.
-    /// Use ``RequestFormatter`` to retain count lineage.
+    /// Count and distinct-count results remain unitless under the default
+    /// formatter even when the source column carries currency, percent, or other
+    /// unit metadata. Compatibility value overrides receive `nil` for those
+    /// results because their callback cannot distinguish counts from ordinary
+    /// source values. Use ``RequestFormatter`` to retain count lineage.
+    ///
+    /// Passing `.none` formats an untransformed source value with purpose
+    /// ``AutoChartFormattingPurpose/value``.
     public func format(
         column: AutoChartColumn?,
         aggregation: AutoChartAggregation,
@@ -137,7 +140,7 @@ public struct AutoChartFormatters: Sendable {
                 column: column,
                 value: value,
                 context: context,
-                purpose: .aggregatedMeasure(aggregation)))
+                purpose: .renderedMeasure(aggregation)))
     }
 
     /// Formats a zero-through-one contribution as a percentage by default.
