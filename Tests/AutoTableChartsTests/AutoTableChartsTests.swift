@@ -1349,7 +1349,17 @@ private let date = AutoChartColumn(
 }
 
 @Suite struct ValidationAndLineageTests {
-    @Test func everyDeclaredFamilyValidatesAndPreparesMarks() {
+    @Test func everyDeclaredFamilyValidatesPreparesAndOwnsRenderedSemantics() {
+        struct FamilyCase {
+            var specification: AutoChartSpecification
+            var kind: AutoChartRenderedMeasureKind
+            var columnID: AutoChartColumnID?
+            var rangeStartColumnID: AutoChartColumnID?
+            var rangeEndColumnID: AutoChartColumnID?
+            var formattingPurpose: AutoChartFormattingPurpose
+            var usesNormalizedMeasureAxis: Bool
+        }
+
         let series = AutoChartColumn(
             id: "series", name: "market",
             hints: AutoChartColumnHints(semanticType: .nominal, role: .series))
@@ -1392,42 +1402,112 @@ private let date = AutoChartColumn(
         let xy = AutoChartEncoding(x: category.id, y: measure.id)
         let grouped = AutoChartEncoding(
             x: category.id, y: measure.id, series: series.id)
-        let specifications: [AutoChartSpecification] = [
-            .init(family: .kpi, encoding: .init(y: measure.id)),
-            .init(family: .bar, encoding: xy),
-            .init(family: .rankedDot, encoding: xy),
-            .init(family: .groupedBar, encoding: grouped),
-            .init(family: .stackedBar, encoding: grouped, stacking: .standard),
-            .init(family: .normalizedBar, encoding: grouped, stacking: .normalized),
-            .init(family: .line, encoding: .init(x: date.id, y: measure.id)),
-            .init(family: .pointLine, encoding: .init(x: date.id, y: measure.id)),
-            .init(family: .area, encoding: .init(x: date.id, y: measure.id)),
-            .init(family: .scatter, encoding: .init(x: measure.id, y: secondMeasure.id)),
-            .init(
-                family: .bubble,
-                encoding: .init(
-                    x: measure.id, y: secondMeasure.id, size: size.id)),
-            .init(
-                family: .histogram, encoding: .init(x: measure.id),
-                aggregation: .count, binCount: 5),
-            .init(family: .boxPlot, encoding: xy),
-            .init(
-                family: .heatmap,
-                encoding: .init(x: category.id, y: series.id),
-                aggregation: .count),
-            .init(family: .donut, encoding: xy, aggregation: .sum),
-            .init(
-                family: .range,
-                encoding: .init(
-                    x: category.id, start: date.id, end: end.id)),
-            .init(
-                family: .faceted,
-                encoding: .init(
-                    x: date.id, y: measure.id, facet: facet.id)),
+        func valueCase(
+            _ specification: AutoChartSpecification,
+            columnID: AutoChartColumnID?,
+            rangeStartColumnID: AutoChartColumnID? = nil,
+            rangeEndColumnID: AutoChartColumnID? = nil
+        ) -> FamilyCase {
+            FamilyCase(
+                specification: specification,
+                kind: .value,
+                columnID: columnID,
+                rangeStartColumnID: rangeStartColumnID,
+                rangeEndColumnID: rangeEndColumnID,
+                formattingPurpose: .value,
+                usesNormalizedMeasureAxis: false)
+        }
+        func aggregateCase(
+            _ specification: AutoChartSpecification,
+            aggregation: AutoChartAggregation,
+            columnID: AutoChartColumnID?,
+            usesNormalizedMeasureAxis: Bool = false
+        ) -> FamilyCase {
+            FamilyCase(
+                specification: specification,
+                kind: .aggregated(aggregation),
+                columnID: columnID,
+                rangeStartColumnID: nil,
+                rangeEndColumnID: nil,
+                formattingPurpose: .aggregatedMeasure(aggregation),
+                usesNormalizedMeasureAxis: usesNormalizedMeasureAxis)
+        }
+        let cases: [FamilyCase] = [
+            valueCase(.init(family: .kpi, encoding: .init(y: measure.id)), columnID: measure.id),
+            aggregateCase(
+                .init(family: .bar, encoding: xy, aggregation: .sum),
+                aggregation: .sum, columnID: measure.id),
+            aggregateCase(
+                .init(family: .rankedDot, encoding: xy, aggregation: .sum),
+                aggregation: .sum, columnID: measure.id),
+            aggregateCase(
+                .init(family: .groupedBar, encoding: grouped, aggregation: .sum),
+                aggregation: .sum, columnID: measure.id),
+            aggregateCase(
+                .init(
+                    family: .stackedBar, encoding: grouped,
+                    aggregation: .sum, stacking: .standard),
+                aggregation: .sum, columnID: measure.id),
+            aggregateCase(
+                .init(
+                    family: .normalizedBar, encoding: grouped,
+                    aggregation: .sum, stacking: .normalized),
+                aggregation: .sum, columnID: measure.id,
+                usesNormalizedMeasureAxis: true),
+            valueCase(
+                .init(family: .line, encoding: .init(x: date.id, y: measure.id)),
+                columnID: measure.id),
+            valueCase(
+                .init(family: .pointLine, encoding: .init(x: date.id, y: measure.id)),
+                columnID: measure.id),
+            valueCase(
+                .init(family: .area, encoding: .init(x: date.id, y: measure.id)),
+                columnID: measure.id),
+            valueCase(
+                .init(
+                    family: .scatter,
+                    encoding: .init(x: measure.id, y: secondMeasure.id)),
+                columnID: secondMeasure.id),
+            valueCase(
+                .init(
+                    family: .bubble,
+                    encoding: .init(
+                        x: measure.id, y: secondMeasure.id, size: size.id)),
+                columnID: secondMeasure.id),
+            aggregateCase(
+                .init(
+                    family: .histogram, encoding: .init(x: measure.id),
+                    aggregation: .count, binCount: 5),
+                aggregation: .count, columnID: nil),
+            valueCase(.init(family: .boxPlot, encoding: xy), columnID: measure.id),
+            aggregateCase(
+                .init(
+                    family: .heatmap,
+                    encoding: .init(x: category.id, y: series.id),
+                    aggregation: .count),
+                aggregation: .count, columnID: nil),
+            aggregateCase(
+                .init(family: .donut, encoding: xy, aggregation: .sum),
+                aggregation: .sum, columnID: measure.id),
+            valueCase(
+                .init(
+                    family: .range,
+                    encoding: .init(
+                        x: category.id, start: date.id, end: end.id)),
+                columnID: nil,
+                rangeStartColumnID: date.id,
+                rangeEndColumnID: end.id),
+            valueCase(
+                .init(
+                    family: .faceted,
+                    encoding: .init(
+                        x: date.id, y: measure.id, facet: facet.id)),
+                columnID: measure.id),
         ]
 
-        #expect(Set(specifications.map(\.family)) == Set(AutoChartFamily.allCases))
-        for specification in specifications {
+        #expect(Set(cases.map(\.specification.family)) == Set(AutoChartFamily.allCases))
+        for testCase in cases {
+            let specification = testCase.specification
             let validationInput =
                 specification.family == .kpi
                 ? table(columns: [measure], rows: [[.double(20)]])
@@ -1437,12 +1517,26 @@ private let date = AutoChartColumn(
                     specification: specification, for: validationInput
                 ).isValid,
                 "\(specification.family) should validate")
+            let snapshot = AutoChartSnapshot(validationInput)
+            let prepared = AutoChartDataPreparation.preparedData(
+                snapshot: snapshot,
+                specification: specification,
+                profiles: AutoChartProfiler.profileIndex(snapshot))
+            #expect(!prepared.data.isEmpty, "\(specification.family) should prepare data")
+            #expect(prepared.measureSemantics.kind == testCase.kind)
+            #expect(prepared.measureSemantics.columnID == testCase.columnID)
             #expect(
-                !AutoChartDataPreparation.data(
-                    snapshot: AutoChartSnapshot(validationInput),
-                    specification: specification
-                ).isEmpty,
-                "\(specification.family) should prepare data")
+                prepared.measureSemantics.rangeStartColumnID
+                    == testCase.rangeStartColumnID)
+            #expect(
+                prepared.measureSemantics.rangeEndColumnID
+                    == testCase.rangeEndColumnID)
+            #expect(
+                prepared.measureSemantics.formattingPurpose
+                    == testCase.formattingPurpose)
+            #expect(
+                specification.usesNormalizedMeasureAxis
+                    == testCase.usesNormalizedMeasureAxis)
         }
     }
 
@@ -3349,6 +3443,7 @@ private let date = AutoChartColumn(
             columns: [category, startColumn, endColumn],
             rows: [[.text("A"), .date(start), .date(end)]])
         let snapshot = AutoChartSnapshot(input)
+        let profiles = AutoChartProfiler.profileIndex(snapshot)
         let specification = AutoChartSpecification.range(
             label: category.id,
             start: startColumn.id,
@@ -3356,7 +3451,7 @@ private let date = AutoChartColumn(
         let prepared = AutoChartDataPreparation.preparedData(
             snapshot: snapshot,
             specification: specification,
-            profiles: AutoChartProfiler.profileIndex(snapshot))
+            profiles: profiles)
         var conflictingSpecification = specification
         conflictingSpecification.encoding.start = "conflicting-start"
         conflictingSpecification.encoding.end = "conflicting-end"
@@ -3381,6 +3476,13 @@ private let date = AutoChartColumn(
         let formatter = AutoChartFormatters { request, _, _ in
             request.column?.id.rawValue ?? "nil"
         }
+        let datum = try #require(prepared.data.first)
+        #expect(
+            AutoChartAccessibility.rangeValueDescription(
+                for: datum,
+                measureSemantics: prepared.measureSemantics,
+                profiles: profiles,
+                formatters: formatter) == "From start to end")
         #expect(
             selection.presentation(
                 columns: [category, startColumn, endColumn],

@@ -156,12 +156,15 @@ private actor OneShotPreparationGate {
     }
 
     private func failEnteredWaiter(token: UUID) {
-        guard let waiter = enteredWaiters.removeValue(forKey: token) else {
-            return
-        }
+        guard enteredWaiters[token] != nil else { return }
         armed = false
-        waiter.continuation.resume(
-            throwing: PreparationGateError.timedOutWaitingForPreparation)
+        let waiters = Array(enteredWaiters.values)
+        enteredWaiters.removeAll()
+        waiters.forEach {
+            $0.timeoutTask.cancel()
+            $0.continuation.resume(
+                throwing: PreparationGateError.timedOutWaitingForPreparation)
+        }
     }
 
     private func cancelEnteredWaiter(token: UUID) {
@@ -990,14 +993,13 @@ private struct CountingChartRowsTable: AutoChartTable {
             donutView.formattedMeasureValue(3, for: .axisTick)
                 == "axisTick:sum:\(v2Measure.id.rawValue)")
 
-        let kpiView = AutoChartView(
+        let kpiContent = AutoChartKPIContent(
             preparedChart: kpi,
+            typography: .standard,
             formatters: formatter)
-        #expect(kpi.core.data.first?.ySourceValue == .double(42))
-        #expect(kpi.core.presentation.yTitle == "Revenue")
-        #expect(
-            kpiView.formattedKPIValue(.double(42))
-                == "kpi:value:\(kpiMeasure.id.rawValue)")
+        #expect(kpiContent.valueText == "kpi:value:\(kpiMeasure.id.rawValue)")
+        #expect(kpiContent.title == "Revenue")
+        #expect(!kpiContent.isCompact)
     }
 
     @Test func previewUsesExactHeightAndIndependentControls() {
@@ -1033,6 +1035,63 @@ private struct CountingChartRowsTable: AutoChartTable {
             try await gate.waitUntilBlocked()
         }
         #expect(!(await gate.isArmed))
+        #expect(await gate.activeTimeoutTaskCount == 0)
+    }
+
+    @Test func preparationGateTimesOutEveryConcurrentEntryWaiter() async {
+        let gate = OneShotPreparationGate(timeout: .milliseconds(100))
+        let waiterStarted = DispatchSemaphore(value: 0)
+        await gate.arm()
+        let waiters = (0..<32).map { _ in
+            Task {
+                try await gate.waitUntilBlocked(onWaiting: { waiterStarted.signal() })
+            }
+        }
+
+        for _ in waiters {
+            #expect(await receivesSignalPromptly(waiterStarted))
+        }
+        for waiter in waiters {
+            await #expect(throws: PreparationGateError.self) {
+                try await waiter.value
+            }
+        }
+
+        #expect(!(await gate.isArmed))
+        #expect(await gate.activeTimeoutTaskCount == 0)
+    }
+
+    @Test func preparationGateCancelsSomeWaitersAndReleasesTheRest() async throws {
+        let gate = OneShotPreparationGate(timeout: .seconds(5))
+        let waiterStarted = DispatchSemaphore(value: 0)
+        await gate.arm()
+        let waiters = (0..<32).map { _ in
+            Task {
+                try await gate.waitUntilBlocked(onWaiting: { waiterStarted.signal() })
+            }
+        }
+
+        for _ in waiters {
+            #expect(await receivesSignalPromptly(waiterStarted))
+        }
+        for waiter in waiters.enumerated() where waiter.offset.isMultiple(of: 2) {
+            waiter.element.cancel()
+        }
+        for waiter in waiters.enumerated() where waiter.offset.isMultiple(of: 2) {
+            await #expect(throws: CancellationError.self) {
+                try await waiter.element.value
+            }
+        }
+        #expect(await gate.activeTimeoutTaskCount == waiters.count / 2)
+
+        let preparation = Task { await gate.waitWhenArmed() }
+        for waiter in waiters.enumerated() where !waiter.offset.isMultiple(of: 2) {
+            try await waiter.element.value
+        }
+        #expect(await gate.activeTimeoutTaskCount == 1)
+        await gate.resume()
+        await preparation.value
+
         #expect(await gate.activeTimeoutTaskCount == 0)
     }
 

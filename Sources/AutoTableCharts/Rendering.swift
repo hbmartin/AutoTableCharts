@@ -77,6 +77,25 @@ enum AutoChartAccessibility {
             textResolver: textResolver)
     }
 
+    static func rangeValueDescription(
+        for datum: AutoChartDatum,
+        measureSemantics: AutoChartRenderedMeasureSemantics,
+        profiles: [AutoChartColumnID: AutoChartColumnProfile],
+        formatters: AutoChartFormatters
+    ) -> String? {
+        guard let start = datum.startDate else { return nil }
+        let startText = formatters.format(
+            column: measureSemantics.rangeStartColumnID.flatMap { profiles[$0]?.column },
+            value: .date(start),
+            context: .markAccessibility)
+        guard let end = datum.endDate, end != start else { return "Date: \(startText)" }
+        let endText = formatters.format(
+            column: measureSemantics.rangeEndColumnID.flatMap { profiles[$0]?.column },
+            value: .date(end),
+            context: .markAccessibility)
+        return "From \(startText) to \(endText)"
+    }
+
     private static func label(
         components: [(key: String, value: String?)],
         textResolver: AutoChartTextResolver
@@ -376,6 +395,13 @@ struct AutoChartRenderedMeasureSemantics: Hashable, Sendable {
 
     var formattingPurpose: AutoChartFormattingPurpose {
         .renderedMeasure(aggregation)
+    }
+}
+
+extension AutoChartSpecification {
+    /// Percent-axis semantics apply only to validated normalized bar marks.
+    var usesNormalizedMeasureAxis: Bool {
+        family == .normalizedBar && stacking == .normalized
     }
 }
 
@@ -1370,6 +1396,48 @@ private enum AutoChartViewContent<RowID: Hashable & Sendable>: Sendable {
     case fallback(AutoChartFallback)
 }
 
+struct AutoChartKPIContent<RowID: Hashable & Sendable>: View {
+    let valueText: String
+    let title: String
+    let isCompact: Bool
+
+    init(
+        preparedChart: AutoChartPreparedChart<RowID>,
+        typography: AutoChartTypography,
+        formatters: AutoChartFormatters
+    ) {
+        let core = preparedChart.core
+        let semantics = core.measureSemantics
+        let column = semantics.columnID.flatMap { core.table.profiles[$0]?.column }
+        valueText = core.data.first?.ySourceValue.map {
+            formatters.format(
+                AutoChartFormattingRequest(
+                    column: column,
+                    value: $0,
+                    context: .kpi,
+                    purpose: semantics.formattingPurpose))
+        } ?? "—"
+        title = core.presentation.yTitle
+        isCompact = typography == .compact
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(valueText)
+                .font(
+                    .system(
+                        size: isCompact ? 34 : 52, weight: .bold, design: .rounded
+                    )
+                )
+                .minimumScaleFactor(0.6)
+            Text(title)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+    }
+}
+
 /// Convenience composition of a prepared plot and optional package chrome.
 public struct AutoChartView<RowID: Hashable & Sendable>: View {
     private let content: AutoChartViewContent<RowID>
@@ -1601,20 +1669,10 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     }
 
     private var kpiView: some View {
-        let value = data.first?.ySourceValue
-        return VStack(alignment: .leading, spacing: 4) {
-            Text(value.map(formattedKPIValue) ?? "—")
-                .font(
-                    .system(
-                        size: isCompact ? 34 : 52, weight: .bold, design: .rounded
-                    )
-                )
-                .minimumScaleFactor(0.6)
-            Text(yTitle)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+        AutoChartKPIContent(
+            preparedChart: preparedChart,
+            typography: presentation.typography,
+            formatters: formatters)
     }
 
     @ViewBuilder
@@ -2230,17 +2288,14 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             name = xCategoryValue(for: datum)
         }
         let valueDescription: String? = {
-            if specification.family == .range, let start = datum.startDate {
-                let startText = formatters.format(
-                    column: resolvedColumn(renderedMeasureSemantics.rangeStartColumnID),
-                    value: .date(start),
-                    context: .markAccessibility)
-                guard let end = datum.endDate, end != start else { return "Date: \(startText)" }
-                let endText = formatters.format(
-                    column: resolvedColumn(renderedMeasureSemantics.rangeEndColumnID),
-                    value: .date(end),
-                    context: .markAccessibility)
-                return "From \(startText) to \(endText)"
+            if specification.family == .range,
+                let description = AutoChartAccessibility.rangeValueDescription(
+                    for: datum,
+                    measureSemantics: renderedMeasureSemantics,
+                    profiles: preparedChart.core.table.profiles,
+                    formatters: formatters)
+            {
+                return description
             }
             let number = datum.yNumber ?? datum.median
             return number.map {
@@ -2293,19 +2348,6 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         }
     }
 
-    /// Percent-axis semantics apply only to validated normalized bar marks.
-    private var usesNormalizedMeasureAxis: Bool {
-        specification.family == .normalizedBar
-            && specification.stacking == .normalized
-    }
-
-    func formattedKPIValue(_ value: AutoChartValue) -> String {
-        formattedRenderedMeasure(
-            value,
-            context: .kpi,
-            normalizedFraction: false)
-    }
-
     @AxisContentBuilder
     private func yNumericAxis() -> some AxisContent {
         AxisMarks { value in
@@ -2346,7 +2388,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         switch surface {
         case .axisTick:
             context = .axisTick
-            normalizedFraction = usesNormalizedMeasureAxis
+            normalizedFraction = specification.usesNormalizedMeasureAxis
         case .markAccessibility:
             context = .markAccessibility
             normalizedFraction = false
