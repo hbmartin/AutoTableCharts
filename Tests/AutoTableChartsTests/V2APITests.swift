@@ -64,6 +64,7 @@ private actor OneShotPreparationGate {
         guard armed else { return }
         guard !Task.isCancelled else {
             cancelledWaitAttemptCount += 1
+            cancelEnteredWaiters()
             return
         }
         armed = false
@@ -73,6 +74,7 @@ private actor OneShotPreparationGate {
                 guard !Task.isCancelled else {
                     armed = true
                     cancelledWaitAttemptCount += 1
+                    cancelEnteredWaiters()
                     continuation.resume()
                     return
                 }
@@ -164,6 +166,15 @@ private actor OneShotPreparationGate {
         waiter.continuation.resume(throwing: CancellationError())
     }
 
+    private func cancelEnteredWaiters() {
+        let waiters = Array(enteredWaiters.values)
+        enteredWaiters.removeAll()
+        waiters.forEach {
+            $0.timeoutTask.cancel()
+            $0.continuation.resume(throwing: CancellationError())
+        }
+    }
+
     var activeTimeoutTaskCount: Int {
         (releaseTimeoutTask == nil ? 0 : 1) + enteredWaiters.count
     }
@@ -186,14 +197,6 @@ private func receivesSignalPromptly(_ semaphore: DispatchSemaphore) async -> Boo
         DispatchQueue.global().async {
             continuation.resume(
                 returning: semaphore.wait(timeout: .now() + 5) == .success)
-        }
-    }
-}
-
-private func receivesSignalImmediately(_ semaphore: DispatchSemaphore) async -> Bool {
-    await withCheckedContinuation { continuation in
-        DispatchQueue.global().async {
-            continuation.resume(returning: semaphore.wait(timeout: .now()) == .success)
         }
     }
 }
@@ -787,6 +790,91 @@ private struct CountingChartRowsTable: AutoChartTable {
                 == "measure:sum:\(v2Measure.id.rawValue)")
     }
 
+    @MainActor
+    @Test func normalizedAxisFollowsRenderedBarStackingIfValidationIsBypassed() async throws {
+        let series = AutoChartColumn(
+            id: "series",
+            name: "Series",
+            hints: .init(semanticType: .nominal, role: .dimension))
+        let dataset = try AutoChartDataset<Int>(
+            columns: [v2Category, series, v2Measure],
+            rows: [
+                [.text("A"), .text("One"), .double(10)],
+                [.text("A"), .text("Two"), .double(30)],
+            ])
+        let analysis = try await AutoChartAnalyzer().analyze(dataset)
+        let prepared = try await analysis.prepare(
+            .normalizedBar(
+                category: v2Category.id,
+                measure: v2Measure.id,
+                series: series.id,
+                aggregation: .sum))
+        var invalidRecommendation = prepared.recommendation
+        invalidRecommendation.specification.family = .bar
+        let adapted = AutoChartPreparedChart(
+            adapting: prepared,
+            recommendation: invalidRecommendation)
+        let formatter = AutoChartFormatters { request, _, _ in
+            guard case .normalizedFraction(let aggregation) = request.purpose else {
+                return nil
+            }
+            return "normalized:\(aggregation.rawValue)"
+        }
+        let view = AutoChartView(preparedChart: adapted, formatters: formatter)
+
+        #expect(view.formattedMeasureValue(0.25, for: .axisTick) == "normalized:sum")
+    }
+
+    @MainActor
+    @Test func structuralCountsIgnoreInvalidSpecificationAggregation() async throws {
+        let histogramDataset = try AutoChartDataset<Int>(
+            columns: [v2Measure],
+            rows: [[.double(1)], [.double(2)]])
+        let histogramAnalysis = try await AutoChartAnalyzer().analyze(histogramDataset)
+        let histogram = try await histogramAnalysis.prepare(
+            .histogram(value: v2Measure.id, binCount: 2))
+        var invalidHistogramRecommendation = histogram.recommendation
+        invalidHistogramRecommendation.specification.aggregation = .sum
+        let invalidHistogram = AutoChartPreparedChart(
+            adapting: histogram,
+            recommendation: invalidHistogramRecommendation)
+
+        let secondaryCategory = AutoChartColumn(
+            id: "secondary-category",
+            name: "Secondary category",
+            hints: .init(semanticType: .nominal, role: .dimension))
+        let heatmapDataset = try AutoChartDataset<Int>(
+            columns: [v2Category, secondaryCategory],
+            rows: [
+                [.text("A"), .text("One")],
+                [.text("A"), .text("Two")],
+            ])
+        let heatmapAnalysis = try await AutoChartAnalyzer().analyze(heatmapDataset)
+        let heatmap = try await heatmapAnalysis.prepare(
+            .heatmap(x: v2Category.id, y: secondaryCategory.id))
+        var invalidHeatmapRecommendation = heatmap.recommendation
+        invalidHeatmapRecommendation.specification.aggregation = .sum
+        let invalidHeatmap = AutoChartPreparedChart(
+            adapting: heatmap,
+            recommendation: invalidHeatmapRecommendation)
+
+        let formatter = AutoChartFormatters { request, _, _ in
+            guard case .aggregatedMeasure(let aggregation) = request.purpose else {
+                return nil
+            }
+            return "\(request.context.rawValue):\(aggregation.rawValue):\(request.column?.id.rawValue ?? "nil")"
+        }
+        for prepared in [invalidHistogram, invalidHeatmap] {
+            let view = AutoChartView(preparedChart: prepared, formatters: formatter)
+            #expect(
+                view.formattedMeasureValue(2, for: .axisTick)
+                    == "axisTick:count:nil")
+            #expect(
+                view.formattedMeasureValue(2, for: .markAccessibility)
+                    == "markAccessibility:count:nil")
+        }
+    }
+
     @Test func previewUsesExactHeightAndIndependentControls() {
         #expect(AutoChartDefaultPlotHeight.explorer == 280)
         #expect(AutoChartDefaultPlotHeight.plotOnly == 180)
@@ -844,7 +932,7 @@ private struct CountingChartRowsTable: AutoChartTable {
         }
     }
 
-    @Test func preparationGateKeepsWaiterForNextPreparationAfterCancelledAttempt() async throws {
+    @Test func preparationGateFailsWaiterAndPreservesArmAfterCancelledAttempt() async throws {
         let gate = OneShotPreparationGate()
         await gate.arm()
         let waiterStarted = DispatchSemaphore(value: 0)
@@ -870,13 +958,23 @@ private struct CountingChartRowsTable: AutoChartTable {
         continuation.finish()
         await cancelledPreparation.value
 
-        let waiterReturnedEarly = await receivesSignalImmediately(waiterCompleted)
-        #expect(!waiterReturnedEarly)
-        #expect(await gate.isArmed)
+        let waiterReturnedPromptly = await receivesSignalPromptly(waiterCompleted)
+        #expect(waiterReturnedPromptly)
+        guard waiterReturnedPromptly else {
+            waiter.cancel()
+            _ = try? await waiter.value
+            return
+        }
+        await #expect(throws: CancellationError.self) { try await waiter.value }
+        #expect(await gate.activeTimeoutTaskCount == 0)
+
+        let remainedArmed = await gate.isArmed
+        #expect(remainedArmed)
+        guard remainedArmed else { return }
 
         let nextPreparation = Task { await gate.waitWhenArmed() }
         do {
-            try await waiter.value
+            try await gate.waitUntilBlocked()
             await gate.resume()
             await nextPreparation.value
         } catch {
@@ -885,7 +983,6 @@ private struct CountingChartRowsTable: AutoChartTable {
             await nextPreparation.value
             throw error
         }
-        #expect(await gate.activeTimeoutTaskCount == 0)
     }
 
     @Test func preparationGateCancelsTimeoutTaskAfterRelease() async throws {
@@ -1204,9 +1301,7 @@ private struct CountingChartRowsTable: AutoChartTable {
         let gate = OneShotPreparationGate()
         let counter = ChartRowsReadCounter()
         let table = CountingChartRowsTable(
-            rows: (0..<2_000).map {
-                DuplicateIDRow(chartRowID: $0, value: Double($0))
-            },
+            rows: [DuplicateIDRow(chartRowID: 0, value: 1)],
             counter: counter)
         let analyzer = AutoChartAnalyzer(
             testHooks: .chartPreparation { await gate.waitWhenArmed() })
@@ -1332,9 +1427,7 @@ private struct CountingChartRowsTable: AutoChartTable {
     @Test func trimStopsInFlightWorkFromRepopulatingTheCache() async throws {
         let gate = OneShotPreparationGate()
         let table = CountingChartRowsTable(
-            rows: (0..<2_000).map {
-                DuplicateIDRow(chartRowID: $0, value: Double($0))
-            },
+            rows: [DuplicateIDRow(chartRowID: 0, value: 1)],
             counter: ChartRowsReadCounter())
         let analyzer = AutoChartAnalyzer(
             testHooks: .chartPreparation { await gate.waitWhenArmed() })
@@ -1429,9 +1522,7 @@ private struct CountingChartRowsTable: AutoChartTable {
         let gate = OneShotPreparationGate()
         let dataset = try AutoChartDataset<Int>(
             columns: [v2Category, v2Measure],
-            rows: (0..<2_000).map {
-                [.text("Category \($0)"), .double(-1)]
-            })
+            rows: [[.text("A"), .double(-1)]])
         let analyzer = AutoChartAnalyzer(
             testHooks: .chartPreparation { await gate.waitWhenArmed() })
         let analysis = try await analyzer.analyze(dataset)
@@ -1466,9 +1557,7 @@ private struct CountingChartRowsTable: AutoChartTable {
         let gate = OneShotPreparationGate()
         let dataset = try AutoChartDataset<Int>(
             columns: [v2Category, v2Measure],
-            rows: (0..<2_000).map {
-                [.text("Category \($0)"), .double(-1)]
-            })
+            rows: [[.text("A"), .double(-1)]])
         let analyzer = AutoChartAnalyzer(
             testHooks: .chartPreparation { await gate.waitWhenArmed() })
         let analysis = try await analyzer.analyze(dataset)
