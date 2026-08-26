@@ -3,6 +3,27 @@ import Testing
 
 @testable import AutoTableCharts
 
+private func renderedValueSemantics(
+    columnID: AutoChartColumnID?,
+    rangeStartColumnID: AutoChartColumnID? = nil,
+    rangeEndColumnID: AutoChartColumnID? = nil
+) -> AutoChartRenderedMeasureSemantics {
+    AutoChartRenderedMeasureSemantics(
+        columnID: columnID,
+        rangeStartColumnID: rangeStartColumnID,
+        rangeEndColumnID: rangeEndColumnID,
+        kind: .value)
+}
+
+private func renderedAggregationSemantics(
+    _ aggregation: AutoChartAggregation,
+    columnID: AutoChartColumnID?
+) -> AutoChartRenderedMeasureSemantics {
+    AutoChartRenderedMeasureSemantics(
+        columnID: columnID,
+        kind: .aggregated(aggregation))
+}
+
 #if canImport(Charts) && canImport(SwiftUI)
 import Charts
 import SwiftUI
@@ -3243,8 +3264,7 @@ private let date = AutoChartColumn(
         let semantics = AutoChartSelectionPreparation.semanticValues(
             for: nearest,
             specification: specification,
-            measureSemantics: AutoChartDataPreparation.measureSemantics(
-                for: specification))
+            measureSemantics: renderedValueSemantics(columnID: measure.id))
         #expect(semantics.measure == nil)
         let presentation = AutoChartSelection(
             sourceRowIDs: Set(["r0", "r1"]),
@@ -3274,8 +3294,7 @@ private let date = AutoChartColumn(
         let semantics = AutoChartSelectionPreparation.semanticValues(
             for: [bins[0]],
             specification: specification,
-            measureSemantics: AutoChartDataPreparation.measureSemantics(
-                for: specification))
+            measureSemantics: renderedAggregationSemantics(.count, columnID: nil))
         #expect(
             semantics.rangeDimensions
                 == [
@@ -3338,12 +3357,9 @@ private let date = AutoChartColumn(
             snapshot: snapshot,
             specification: specification,
             profiles: AutoChartProfiler.profileIndex(snapshot))
-        var adaptedSpecification = specification
-        adaptedSpecification.encoding.start = "adapted-start"
-        adaptedSpecification.encoding.end = "adapted-end"
         let semantics = AutoChartSelectionPreparation.semanticValues(
             for: prepared.data,
-            specification: adaptedSpecification,
+            specification: specification,
             measureSemantics: prepared.measureSemantics)
         let measure = try #require(semantics.measure)
 
@@ -3392,8 +3408,9 @@ private let date = AutoChartColumn(
         let meanSemantics = AutoChartSelectionPreparation.semanticValues(
             for: matches,
             specification: meanSpecification,
-            measureSemantics: AutoChartDataPreparation.measureSemantics(
-                for: meanSpecification))
+            measureSemantics: renderedAggregationSemantics(
+                .mean,
+                columnID: measure.id))
         #expect(
             meanSemantics.measure
                 == AutoChartSelectedMeasure(
@@ -3404,11 +3421,13 @@ private let date = AutoChartColumn(
             family: .bar,
             encoding: .init(x: category.id, y: measure.id),
             aggregation: .countDistinct)
+        let distinctMeasureSemantics = renderedAggregationSemantics(
+            .countDistinct,
+            columnID: measure.id)
         let distinctSemantics = AutoChartSelectionPreparation.semanticValues(
             for: matches,
             specification: distinctSpecification,
-            measureSemantics: AutoChartDataPreparation.measureSemantics(
-                for: distinctSpecification))
+            measureSemantics: distinctMeasureSemantics)
         #expect(distinctSemantics.measure == nil)
         #expect(
             AutoChartSelection(
@@ -3430,8 +3449,7 @@ private let date = AutoChartColumn(
                     id: "distinct", sourceRowIDs: [0, 1], xLabel: "A", yNumber: 2)
             ],
             specification: distinctSpecification,
-            measureSemantics: AutoChartDataPreparation.measureSemantics(
-                for: distinctSpecification))
+            measureSemantics: distinctMeasureSemantics)
         #expect(semantics.measure?.columnID == measure.id)
         #expect(semantics.measure?.aggregation == .countDistinct)
         #expect(semantics.measure?.value == .scalar(.double(2)))
@@ -3619,8 +3637,7 @@ private let date = AutoChartColumn(
         let semantics = AutoChartSelectionPreparation.semanticValues(
             for: [typed],
             specification: specification,
-            measureSemantics: AutoChartDataPreparation.measureSemantics(
-                for: specification))
+            measureSemantics: renderedAggregationSemantics(.count, columnID: nil))
         #expect(
             semantics.dimensions
                 == [
@@ -3648,8 +3665,7 @@ private let date = AutoChartColumn(
         let mixed = AutoChartSelectionPreparation.semanticValues(
             for: [typed, duplicateLabelsWithDifferentValues],
             specification: specification,
-            measureSemantics: AutoChartDataPreparation.measureSemantics(
-                for: specification))
+            measureSemantics: renderedAggregationSemantics(.count, columnID: nil))
         #expect(mixed.dimensions.isEmpty)
     }
 

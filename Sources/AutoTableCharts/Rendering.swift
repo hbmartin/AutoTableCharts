@@ -336,13 +336,28 @@ enum AutoChartRenderedMeasureKind: Hashable, Sendable {
 }
 
 /// Presentation semantics produced by the same plan that prepares chart marks.
-/// Storing these with the prepared core prevents a later specification adapter
-/// from reinterpreting values that have already been grouped or transformed.
+/// Storing these with the prepared core keeps every presentation surface aligned
+/// with values that have already been grouped or transformed.
 struct AutoChartRenderedMeasureSemantics: Hashable, Sendable {
     var columnID: AutoChartColumnID?
     var rangeStartColumnID: AutoChartColumnID? = nil
     var rangeEndColumnID: AutoChartColumnID? = nil
     var kind: AutoChartRenderedMeasureKind
+
+    init(
+        columnID: AutoChartColumnID?,
+        rangeStartColumnID: AutoChartColumnID? = nil,
+        rangeEndColumnID: AutoChartColumnID? = nil,
+        kind: AutoChartRenderedMeasureKind
+    ) {
+        if case .aggregated(.none) = kind {
+            preconditionFailure("Prepared aggregated measures require an aggregation.")
+        }
+        self.columnID = columnID
+        self.rangeStartColumnID = rangeStartColumnID
+        self.rangeEndColumnID = rangeEndColumnID
+        self.kind = kind
+    }
 
     var aggregation: AutoChartAggregation {
         switch kind {
@@ -358,10 +373,7 @@ struct AutoChartRenderedMeasureSemantics: Hashable, Sendable {
         case .value:
             return .value
         case .aggregated(let aggregation):
-            if aggregation == .none {
-                preconditionFailure("Prepared aggregated measures require an aggregation.")
-            }
-            return .renderedMeasure(aggregation)
+            return .aggregatedMeasure(aggregation)
         }
     }
 }
@@ -442,12 +454,6 @@ enum AutoChartDataPreparation {
                 profiles: profiles)
         }
         return PreparedData(data: data, measureSemantics: plan.measureSemantics)
-    }
-
-    static func measureSemantics(
-        for specification: AutoChartSpecification
-    ) -> AutoChartRenderedMeasureSemantics {
-        preparationPlan(for: specification).measureSemantics
     }
 
     private static func preparationPlan(
@@ -571,8 +577,23 @@ enum AutoChartDataPreparation {
         profiles: [AutoChartColumnID: AutoChartColumnProfile],
         aggregation: AutoChartAggregation
     ) -> [AutoChartDatum] {
-        if aggregation == .none {
+        let aggregate: ([Double], Int) -> Double = switch aggregation {
+        case .none:
             preconditionFailure("Grouped preparation requires an effective aggregation.")
+        case .sum:
+            { values, _ in values.reduce(0, +) }
+        case .mean:
+            { values, _ in
+                values.isEmpty ? 0 : values.reduce(0, +) / Double(values.count)
+            }
+        case .minimum:
+            { values, _ in values.min() ?? 0 }
+        case .maximum:
+            { values, _ in values.max() ?? 0 }
+        case .count:
+            { _, count in Double(count) }
+        case .countDistinct:
+            { values, _ in Double(Set(values).count) }
         }
         let rawData = raw(
             snapshot: snapshot,
@@ -590,17 +611,7 @@ enum AutoChartDataPreparation {
         }.map { key, indexedGroup -> AutoChartDatum in
             let group = indexedGroup.map { $0.element }
             let values = group.compactMap { $0.yNumber }
-            let result: Double =
-                switch aggregation {
-                case .none:
-                    preconditionFailure("Grouped preparation requires an effective aggregation.")
-                case .sum: values.reduce(0, +)
-                case .mean: values.isEmpty ? 0 : values.reduce(0, +) / Double(values.count)
-                case .minimum: values.min() ?? 0
-                case .maximum: values.max() ?? 0
-                case .count: Double(group.count)
-                case .countDistinct: Double(Set(values).count)
-                }
+            let result = aggregate(values, group.count)
             let first = group[0]
             return AutoChartDatum(
                 id: "group-\(first.id)",
@@ -1571,22 +1582,27 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     }
 
     private var kpiView: some View {
-        let value = data.first?.ySourceValue
-        return VStack(alignment: .leading, spacing: 4) {
-            Text(value.map(formattedKPIValue) ?? "—")
+        VStack(alignment: .leading, spacing: 4) {
+            Text(renderedKPIValue.map(formattedKPIValue) ?? "—")
                 .font(
                     .system(
                         size: isCompact ? 34 : 52, weight: .bold, design: .rounded
                     )
                 )
                 .minimumScaleFactor(0.6)
-            Text(
-                sourceMeasureColumn.map(AutoChartProfiler.displayName) ?? "Value"
-            )
-            .font(.caption)
-            .foregroundStyle(.secondary)
+            Text(renderedKPITitle)
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+    }
+
+    var renderedKPIValue: AutoChartValue? {
+        data.first?.ySourceValue
+    }
+
+    var renderedKPITitle: String {
+        yTitle
     }
 
     @ViewBuilder

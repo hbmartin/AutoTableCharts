@@ -213,6 +213,11 @@ public struct AutoChartPreparedChart<RowID: Hashable & Sendable>: Sendable {
         adapting cached: AutoChartPreparedChart<RowID>,
         recommendation: AutoChartRecommendation
     ) {
+        // Cache sharing may replace recommendation metadata and titles, but the
+        // prepared marks and presentation belong to one structural specification.
+        precondition(
+            cached.recommendation.specification.id == recommendation.specification.id,
+            "Prepared charts can only adapt to the same structural specification.")
         self.recommendation = recommendation
         self.validation = cached.validation
         self.marks = cached.marks
