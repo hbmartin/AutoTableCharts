@@ -3357,9 +3357,12 @@ private let date = AutoChartColumn(
             snapshot: snapshot,
             specification: specification,
             profiles: AutoChartProfiler.profileIndex(snapshot))
+        var conflictingSpecification = specification
+        conflictingSpecification.encoding.start = "conflicting-start"
+        conflictingSpecification.encoding.end = "conflicting-end"
         let semantics = AutoChartSelectionPreparation.semanticValues(
             for: prepared.data,
-            specification: specification,
+            specification: conflictingSpecification,
             measureSemantics: prepared.measureSemantics)
         let measure = try #require(semantics.measure)
 
@@ -3501,6 +3504,56 @@ private let date = AutoChartColumn(
         #expect(
             presentation.yTitle
                 == "Distinct count of \(AutoChartProfiler.displayName(distinctMeasure))")
+    }
+
+    @Test func preparationDerivesValueAndAggregationLineage() {
+        let input = table(
+            columns: [category, measure],
+            rows: [[.text("A"), .double(1)], [.text("A"), .double(2)]])
+        let snapshot = AutoChartSnapshot(input)
+        let profiles = AutoChartProfiler.profileIndex(snapshot)
+        func semantics(
+            for aggregation: AutoChartAggregation
+        ) -> AutoChartRenderedMeasureSemantics {
+            AutoChartDataPreparation.preparedData(
+                snapshot: snapshot,
+                specification: AutoChartSpecification(
+                    family: .bar,
+                    encoding: .init(x: category.id, y: measure.id),
+                    aggregation: aggregation),
+                profiles: profiles
+            ).measureSemantics
+        }
+
+        #expect(semantics(for: .none).kind == .value)
+        #expect(semantics(for: .none).columnID == measure.id)
+        #expect(semantics(for: .mean).kind == .aggregated(.mean))
+        #expect(semantics(for: .mean).columnID == measure.id)
+        #expect(semantics(for: .countDistinct).kind == .aggregated(.countDistinct))
+        #expect(semantics(for: .countDistinct).columnID == measure.id)
+        #expect(semantics(for: .count).kind == .aggregated(.count))
+        #expect(semantics(for: .count).columnID == nil)
+    }
+
+    @Test func emptyMeasureGroupsDoNotFabricateStatisticalZeros() {
+        let input = table(columns: [category], rows: [[.text("A")], [.text("B")]])
+        let snapshot = AutoChartSnapshot(input)
+        let profiles = AutoChartProfiler.profileIndex(snapshot)
+
+        for aggregation in [
+            AutoChartAggregation.mean,
+            .minimum,
+            .maximum,
+        ] {
+            let prepared = AutoChartDataPreparation.preparedData(
+                snapshot: snapshot,
+                specification: AutoChartSpecification(
+                    family: .bar,
+                    encoding: .init(x: category.id),
+                    aggregation: aggregation),
+                profiles: profiles)
+            #expect(prepared.data.isEmpty)
+        }
     }
 
     @Test func preparationOwnsRenderedMeasureSemanticsAcrossFamilies() throws {

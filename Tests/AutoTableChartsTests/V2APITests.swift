@@ -894,7 +894,7 @@ private struct CountingChartRowsTable: AutoChartTable {
     }
 
     @MainActor
-    @Test func preparedMeasureSemanticsDriveRenderingSurfaces() async throws {
+    @Test func renderedMeasureFormattingCoversPreparedFamilies() async throws {
         let histogramDataset = try AutoChartDataset<Int>(
             columns: [v2Measure],
             rows: [[.double(1)], [.double(2)]])
@@ -988,8 +988,8 @@ private struct CountingChartRowsTable: AutoChartTable {
         let kpiView = AutoChartView(
             preparedChart: kpi,
             formatters: formatter)
-        #expect(kpiView.renderedKPIValue == .double(42))
-        #expect(kpiView.renderedKPITitle == "Revenue")
+        #expect(kpi.core.data.first?.ySourceValue == .double(42))
+        #expect(kpi.core.presentation.yTitle == "Revenue")
         #expect(
             kpiView.formattedKPIValue(.double(42))
                 == "kpi:value:\(kpiMeasure.id.rawValue)")
