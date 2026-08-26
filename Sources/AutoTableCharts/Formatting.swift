@@ -18,6 +18,14 @@ public enum AutoChartFormattingPurpose: Hashable, Sendable {
     case normalizedFraction(AutoChartAggregation)
 }
 
+extension AutoChartFormattingPurpose {
+    /// The presentation purpose for a measure produced by the preparation plan.
+    /// `.none` represents an untransformed source value rather than an aggregate.
+    static func renderedMeasure(_ aggregation: AutoChartAggregation) -> Self {
+        aggregation == .none ? .value : .aggregatedMeasure(aggregation)
+    }
+}
+
 /// Complete presentation-time context for a chart value.
 public struct AutoChartFormattingRequest: Hashable, Sendable {
     /// The source column, when the value has column lineage.
@@ -46,9 +54,9 @@ public struct AutoChartFormattingRequest: Hashable, Sendable {
 public struct AutoChartFormatters: Sendable {
     /// A compatibility formatter for source values.
     ///
-    /// Count and normalized-fraction requests receive a `nil` column because
-    /// this callback cannot distinguish them from ordinary source values. Use
-    /// ``RequestFormatter`` when formatting depends on those semantics.
+    /// Count, distinct-count, and normalized-fraction requests receive a `nil`
+    /// column because this callback cannot distinguish them from ordinary source
+    /// values. Use ``RequestFormatter`` when formatting depends on those semantics.
     public typealias ValueFormatter = @Sendable (
         AutoChartColumn?, AutoChartValue, AutoChartFormattingContext, Locale, TimeZone
     ) -> String?
@@ -271,17 +279,12 @@ extension AutoChartSelection {
         if let measure {
             let column = measure.columnID.flatMap { columnIndex[$0] }
             func formatted(_ value: AutoChartValue, column: AutoChartColumn?) -> String {
-                if measure.aggregation == .none {
-                    return formatters.format(
+                formatters.format(
+                    AutoChartFormattingRequest(
                         column: column,
                         value: value,
-                        context: .selectionSummary)
-                }
-                return formatters.format(
-                    column: column,
-                    aggregation: measure.aggregation,
-                    value: value,
-                    context: .selectionSummary)
+                        context: .selectionSummary,
+                        purpose: .renderedMeasure(measure.aggregation)))
             }
             func formattedMeasure(_ value: AutoChartValue) -> String {
                 formatted(value, column: column)
