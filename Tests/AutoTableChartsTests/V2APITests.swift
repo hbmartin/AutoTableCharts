@@ -47,7 +47,7 @@ private actor OneShotPreparationGate {
         var timeoutTask: Task<Void, Never>
     }
 
-    private static let timeout: Duration = .seconds(30)
+    private let timeout: Duration
     private var armed = false
     private var blocked = false
     private var releaseToken: UUID?
@@ -55,6 +55,10 @@ private actor OneShotPreparationGate {
     private var releaseTimeoutTask: Task<Void, Never>?
     private var enteredWaiters: [UUID: EnteredWaiter] = [:]
     private var cancelledWaitAttemptCount = 0
+
+    init(timeout: Duration = .seconds(30)) {
+        self.timeout = timeout
+    }
 
     func arm() {
         armed = true
@@ -82,7 +86,7 @@ private actor OneShotPreparationGate {
                 releaseContinuation = continuation
                 releaseTimeoutTask = Task {
                     do {
-                        try await Task.sleep(for: Self.timeout)
+                        try await Task.sleep(for: timeout)
                     } catch {
                         return
                     }
@@ -119,7 +123,7 @@ private actor OneShotPreparationGate {
                 }
                 let timeoutTask = Task {
                     do {
-                        try await Task.sleep(for: Self.timeout)
+                        try await Task.sleep(for: timeout)
                     } catch {
                         return
                     }
@@ -155,6 +159,7 @@ private actor OneShotPreparationGate {
         guard let waiter = enteredWaiters.removeValue(forKey: token) else {
             return
         }
+        armed = false
         waiter.continuation.resume(
             throwing: PreparationGateError.timedOutWaitingForPreparation)
     }
@@ -1020,6 +1025,17 @@ private struct CountingChartRowsTable: AutoChartTable {
 }
 
 @Suite struct V2AnalyzerLifecycleTests {
+    @Test func preparationGateDisarmsAfterEntryWaitTimesOut() async {
+        let gate = OneShotPreparationGate(timeout: .milliseconds(10))
+        await gate.arm()
+
+        await #expect(throws: PreparationGateError.self) {
+            try await gate.waitUntilBlocked()
+        }
+        #expect(!(await gate.isArmed))
+        #expect(await gate.activeTimeoutTaskCount == 0)
+    }
+
     @Test func preparationGatePreservesArmForAlreadyCancelledPreparation() async throws {
         let gate = OneShotPreparationGate()
         await gate.arm()

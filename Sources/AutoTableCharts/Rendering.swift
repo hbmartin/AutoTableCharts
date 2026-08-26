@@ -472,11 +472,13 @@ enum AutoChartDataPreparation {
             rangeStartColumnID = nil
             rangeEndColumnID = nil
         }
-        let valueSemantics = AutoChartRenderedMeasureSemantics(
-            columnID: specification.encoding.y,
-            rangeStartColumnID: rangeStartColumnID,
-            rangeEndColumnID: rangeEndColumnID,
-            kind: .value)
+        func valueSemantics() -> AutoChartRenderedMeasureSemantics {
+            AutoChartRenderedMeasureSemantics(
+                columnID: specification.encoding.y,
+                rangeStartColumnID: rangeStartColumnID,
+                rangeEndColumnID: rangeEndColumnID,
+                kind: .value)
+        }
         func aggregatedSemantics(
             _ aggregation: AutoChartAggregation
         ) -> AutoChartRenderedMeasureSemantics {
@@ -496,9 +498,9 @@ enum AutoChartDataPreparation {
                 operation: .heatmap,
                 measureSemantics: aggregatedSemantics(.count))
         case .boxPlot:
-            return Plan(operation: .boxPlot, measureSemantics: valueSemantics)
+            return Plan(operation: .boxPlot, measureSemantics: valueSemantics())
         case .kpi:
-            return Plan(operation: .raw, measureSemantics: valueSemantics)
+            return Plan(operation: .raw, measureSemantics: valueSemantics())
         case .donut:
             // Donuts always group categories. Preserve the historical fallback
             // that treats an invalid `.none` specification as a sum, but expose
@@ -511,7 +513,7 @@ enum AutoChartDataPreparation {
         case .bar, .rankedDot, .groupedBar, .stackedBar, .normalizedBar,
             .line, .pointLine, .area, .scatter, .bubble, .range, .faceted:
             if specification.aggregation == .none {
-                return Plan(operation: .raw, measureSemantics: valueSemantics)
+                return Plan(operation: .raw, measureSemantics: valueSemantics())
             }
             return Plan(
                 operation: .grouped(specification.aggregation),
@@ -2230,12 +2232,12 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         let valueDescription: String? = {
             if specification.family == .range, let start = datum.startDate {
                 let startText = formatters.format(
-                    column: resolvedColumn(specification.encoding.start),
+                    column: resolvedColumn(renderedMeasureSemantics.rangeStartColumnID),
                     value: .date(start),
                     context: .markAccessibility)
                 guard let end = datum.endDate, end != start else { return "Date: \(startText)" }
                 let endText = formatters.format(
-                    column: resolvedColumn(specification.encoding.end),
+                    column: resolvedColumn(renderedMeasureSemantics.rangeEndColumnID),
                     value: .date(end),
                     context: .markAccessibility)
                 return "From \(startText) to \(endText)"
