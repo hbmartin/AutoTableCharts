@@ -3423,6 +3423,55 @@ private let date = AutoChartColumn(
                 == "Distinct count of \(AutoChartProfiler.displayName(distinctMeasure))")
     }
 
+    @Test func structuralAndDistributionFamiliesShareRenderedMeasureSemantics() {
+        let heatmapY = AutoChartColumn(
+            id: "heatmap-y", name: "Region",
+            hints: .init(semanticType: .nominal, role: .dimension))
+        let heatmapInput = table(
+            columns: [category, heatmapY],
+            rows: [[.text("A"), .text("West")]])
+        let heatmapSnapshot = AutoChartSnapshot(heatmapInput)
+        let heatmapProfiles = AutoChartProfiler.profileIndex(heatmapSnapshot)
+        let invalidHeatmap = AutoChartSpecification(
+            family: .heatmap,
+            encoding: .init(x: category.id, y: heatmapY.id),
+            aggregation: .sum)
+        let heatmapData = AutoChartDataPreparation.data(
+            snapshot: heatmapSnapshot,
+            specification: invalidHeatmap,
+            profiles: heatmapProfiles)
+        let heatmapPresentation = AutoChartRenderPresentation(
+            snapshot: heatmapSnapshot,
+            specification: invalidHeatmap,
+            profiles: heatmapProfiles,
+            data: heatmapData)
+        let heatmapSelection = AutoChartSelectionPreparation.semanticValues(
+            for: heatmapData,
+            specification: invalidHeatmap)
+
+        #expect(heatmapPresentation.yTitle == AutoChartProfiler.displayName(heatmapY))
+        #expect(heatmapSelection.measure?.aggregation == .count)
+        #expect(heatmapSelection.measure?.columnID == nil)
+
+        let invalidBoxPlot = AutoChartSpecification(
+            family: .boxPlot,
+            encoding: .init(x: category.id, y: measure.id),
+            aggregation: .count)
+        let distribution = AutoChartDatum(
+            id: "box", sourceRowIDs: [0], xIdentity: "A", xLabel: "A",
+            lower: 1, quartile1: 2, median: 3, quartile3: 4, upper: 5)
+        let boxSelection = AutoChartSelectionPreparation.semanticValues(
+            for: [distribution],
+            specification: invalidBoxPlot)
+
+        #expect(boxSelection.measure?.aggregation == AutoChartAggregation.none)
+        #expect(boxSelection.measure?.columnID == measure.id)
+        #expect(
+            boxSelection.measure?.value
+                == .distribution(
+                    lower: 1, quartile1: 2, median: 3, quartile3: 4, upper: 5))
+    }
+
     @Test func selectionDimensionsPreserveTypedSourceValuesInsteadOfLabels() {
         let heatmapY = AutoChartColumnID(rawValue: "heatmap-y")
         let series = AutoChartColumnID(rawValue: "series")

@@ -202,6 +202,8 @@ enum AutoChartSelectionPreparation {
         for matches: [AutoChartDatum],
         specification: AutoChartSpecification
     ) -> SemanticValues {
+        let renderedAggregation = AutoChartRenderCore.renderedAggregation(
+            for: specification)
         var dimensions: [AutoChartSelectedDimension] = []
         var rangeDimensions: [AutoChartSelectedRangeDimension] = []
 
@@ -258,7 +260,7 @@ enum AutoChartSelectionPreparation {
         let markValue: AutoChartMarkValue? = {
             if let value = aggregatedNumericValue(
                 for: matches,
-                aggregation: specification.aggregation)
+                aggregation: renderedAggregation)
             {
                 return .scalar(.double(value))
             }
@@ -270,9 +272,9 @@ enum AutoChartSelectionPreparation {
         }()
         let measure = markValue.map {
             AutoChartSelectedMeasure(
-                columnID: specification.aggregation.preservesMeasureLineage
+                columnID: renderedAggregation.preservesMeasureLineage
                     ? specification.encoding.y : nil,
-                aggregation: specification.aggregation,
+                aggregation: renderedAggregation,
                 value: $0)
         }
         return SemanticValues(
@@ -1012,7 +1014,7 @@ struct AutoChartRenderPresentation: Sendable {
             .map(AutoChartProfiler.displayName) ?? "Category"
         let sourceYTitle = specification.encoding.y.flatMap { snapshot.column($0) }
             .map(AutoChartProfiler.displayName)
-        yTitle = switch specification.aggregation {
+        yTitle = switch AutoChartRenderCore.renderedAggregation(for: specification) {
         case .count where ![.histogram, .heatmap].contains(specification.family):
             "Count"
         case .countDistinct:
@@ -1080,6 +1082,22 @@ struct AutoChartRenderCore: Sendable {
 
     var snapshot: AutoChartSnapshot { table.snapshot }
     var fingerprint: Int { table.fingerprint }
+
+    /// The aggregation represented by prepared marks, including chart families
+    /// whose marks have structural semantics independent of the specification.
+    static func renderedAggregation(
+        for specification: AutoChartSpecification
+    ) -> AutoChartAggregation {
+        switch specification.family {
+        case .histogram, .heatmap:
+            .count
+        case .boxPlot:
+            .none
+        case .kpi, .bar, .rankedDot, .groupedBar, .stackedBar, .normalizedBar,
+            .line, .pointLine, .area, .scatter, .bubble, .donut, .range, .faceted:
+            specification.aggregation
+        }
+    }
 
     static func prepare(
         snapshot: AutoChartSnapshot,
@@ -1294,18 +1312,8 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         id.flatMap { preparedChart.core.table.profiles[$0]?.column }
     }
 
-    /// The aggregation represented by rendered measure values. Histograms and
-    /// heatmaps always render structural row counts, regardless of an invalid
-    /// caller-provided aggregation that validation will reject.
     private var renderedMeasureAggregation: AutoChartAggregation {
-        switch specification.family {
-        case .histogram, .heatmap:
-            .count
-        case .kpi, .bar, .rankedDot, .groupedBar, .stackedBar, .normalizedBar,
-            .line, .pointLine, .area, .scatter, .bubble, .boxPlot, .donut,
-            .range, .faceted:
-            specification.aggregation
-        }
+        AutoChartRenderCore.renderedAggregation(for: specification)
     }
 
     /// The source measure for raw and normalized values. Structural row counts
@@ -2158,7 +2166,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         formatters.format(
             column: resolvedColumn(specification.encoding.y),
             value: value,
-            context: specification.family == .kpi ? .kpi : .detail)
+            context: .kpi)
     }
 
     @AxisContentBuilder
@@ -2205,6 +2213,8 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         _ number: Double,
         for surface: AutoChartMeasureFormattingSurface
     ) -> String {
+        // Internal seam used to verify that every rendered measure surface
+        // applies the same aggregation, lineage, and normalization semantics.
         let context: AutoChartFormattingContext
         let normalizedFraction: Bool
         switch surface {
