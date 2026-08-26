@@ -202,8 +202,18 @@ enum AutoChartSelectionPreparation {
         for matches: [AutoChartDatum],
         specification: AutoChartSpecification
     ) -> SemanticValues {
-        let renderedAggregation = AutoChartRenderCore.renderedAggregation(
-            for: specification)
+        semanticValues(
+            for: matches,
+            specification: specification,
+            measureSemantics: AutoChartDataPreparation.measureSemantics(
+                for: specification))
+    }
+
+    static func semanticValues(
+        for matches: [AutoChartDatum],
+        specification: AutoChartSpecification,
+        measureSemantics: AutoChartRenderedMeasureSemantics
+    ) -> SemanticValues {
         var dimensions: [AutoChartSelectedDimension] = []
         var rangeDimensions: [AutoChartSelectedRangeDimension] = []
 
@@ -260,7 +270,7 @@ enum AutoChartSelectionPreparation {
         let markValue: AutoChartMarkValue? = {
             if let value = aggregatedNumericValue(
                 for: matches,
-                aggregation: renderedAggregation)
+                aggregation: measureSemantics.aggregation)
             {
                 return .scalar(.double(value))
             }
@@ -271,10 +281,20 @@ enum AutoChartSelectionPreparation {
             return value
         }()
         let measure = markValue.map {
-            AutoChartSelectedMeasure(
-                columnID: renderedAggregation.preservesMeasureLineage
-                    ? specification.encoding.y : nil,
-                aggregation: renderedAggregation,
+            let rangeStartColumnID: AutoChartColumnID?
+            let rangeEndColumnID: AutoChartColumnID?
+            if case .temporalRange = $0 {
+                rangeStartColumnID = specification.encoding.start
+                rangeEndColumnID = specification.encoding.end
+            } else {
+                rangeStartColumnID = nil
+                rangeEndColumnID = nil
+            }
+            return AutoChartSelectedMeasure(
+                columnID: measureSemantics.columnID,
+                rangeStartColumnID: rangeStartColumnID,
+                rangeEndColumnID: rangeEndColumnID,
+                aggregation: measureSemantics.aggregation,
                 value: $0)
         }
         return SemanticValues(
@@ -321,16 +341,56 @@ enum AutoChartSelectionPreparation {
     }
 }
 
+enum AutoChartRenderedMeasureKind: Hashable, Sendable {
+    case value
+    case aggregated(AutoChartAggregation)
+}
+
+/// Presentation semantics produced by the same plan that prepares chart marks.
+/// Storing these with the prepared core prevents a later specification adapter
+/// from reinterpreting values that have already been grouped or transformed.
+struct AutoChartRenderedMeasureSemantics: Hashable, Sendable {
+    var columnID: AutoChartColumnID?
+    var kind: AutoChartRenderedMeasureKind
+
+    var aggregation: AutoChartAggregation {
+        switch kind {
+        case .value:
+            .none
+        case .aggregated(let aggregation):
+            aggregation
+        }
+    }
+}
+
 enum AutoChartDataPreparation {
+    struct PreparedData: Sendable {
+        var data: [AutoChartDatum]
+        var measureSemantics: AutoChartRenderedMeasureSemantics
+    }
+
+    private enum Operation {
+        case raw
+        case grouped(AutoChartAggregation)
+        case histogram
+        case boxPlot
+        case heatmap
+    }
+
+    private struct Plan {
+        var operation: Operation
+        var measureSemantics: AutoChartRenderedMeasureSemantics
+    }
+
     static func data(
         snapshot: AutoChartSnapshot,
         specification: AutoChartSpecification
     ) -> [AutoChartDatum] {
         let profiles = AutoChartProfiler.profileIndex(snapshot)
-        return data(
+        return preparedData(
             snapshot: snapshot,
             specification: specification,
-            profiles: profiles)
+            profiles: profiles).data
     }
 
     static func data(
@@ -338,38 +398,100 @@ enum AutoChartDataPreparation {
         specification: AutoChartSpecification,
         profiles: [AutoChartColumnID: AutoChartColumnProfile]
     ) -> [AutoChartDatum] {
-        switch specification.family {
-        case .histogram:
-            return histogram(snapshot: snapshot, specification: specification)
-        case .boxPlot:
-            return boxPlot(
-                snapshot: snapshot,
-                specification: specification,
-                profiles: profiles)
-        case .heatmap:
-            return heatmap(
-                snapshot: snapshot,
-                specification: specification,
-                profiles: profiles)
-        case .donut:
-            return grouped(
-                snapshot: snapshot,
-                specification: specification,
-                profiles: profiles)
-        default:
-            if specification.aggregation != .none {
-                return grouped(
-                    snapshot: snapshot,
-                    specification: specification,
-                    profiles: profiles)
-            }
-            return sorted(
+        preparedData(
+            snapshot: snapshot,
+            specification: specification,
+            profiles: profiles).data
+    }
+
+    static func preparedData(
+        snapshot: AutoChartSnapshot,
+        specification: AutoChartSpecification,
+        profiles: [AutoChartColumnID: AutoChartColumnProfile]
+    ) -> PreparedData {
+        let plan = preparationPlan(for: specification)
+        let data = switch plan.operation {
+        case .raw:
+            sorted(
                 raw(
                     snapshot: snapshot,
                     specification: specification,
                     profiles: profiles),
                 specification: specification,
                 profiles: profiles)
+        case .grouped(let aggregation):
+            grouped(
+                snapshot: snapshot,
+                specification: specification,
+                profiles: profiles,
+                aggregation: aggregation)
+        case .histogram:
+            histogram(snapshot: snapshot, specification: specification)
+        case .boxPlot:
+            boxPlot(
+                snapshot: snapshot,
+                specification: specification,
+                profiles: profiles)
+        case .heatmap:
+            heatmap(
+                snapshot: snapshot,
+                specification: specification,
+                profiles: profiles)
+        }
+        return PreparedData(data: data, measureSemantics: plan.measureSemantics)
+    }
+
+    static func measureSemantics(
+        for specification: AutoChartSpecification
+    ) -> AutoChartRenderedMeasureSemantics {
+        preparationPlan(for: specification).measureSemantics
+    }
+
+    private static func preparationPlan(
+        for specification: AutoChartSpecification
+    ) -> Plan {
+        let valueSemantics = AutoChartRenderedMeasureSemantics(
+            columnID: specification.encoding.y,
+            kind: .value)
+        func aggregatedSemantics(
+            _ aggregation: AutoChartAggregation
+        ) -> AutoChartRenderedMeasureSemantics {
+            AutoChartRenderedMeasureSemantics(
+                columnID: aggregation.preservesMeasureLineage
+                    ? specification.encoding.y : nil,
+                kind: .aggregated(aggregation))
+        }
+
+        switch specification.family {
+        case .histogram:
+            return Plan(
+                operation: .histogram,
+                measureSemantics: aggregatedSemantics(.count))
+        case .heatmap:
+            return Plan(
+                operation: .heatmap,
+                measureSemantics: aggregatedSemantics(.count))
+        case .boxPlot:
+            return Plan(operation: .boxPlot, measureSemantics: valueSemantics)
+        case .kpi:
+            return Plan(operation: .raw, measureSemantics: valueSemantics)
+        case .donut:
+            // Donuts always group categories. Preserve the historical fallback
+            // that treats an invalid `.none` specification as a sum, but expose
+            // that effective aggregation to every presentation surface.
+            let aggregation = specification.aggregation == .none
+                ? AutoChartAggregation.sum : specification.aggregation
+            return Plan(
+                operation: .grouped(aggregation),
+                measureSemantics: aggregatedSemantics(aggregation))
+        case .bar, .rankedDot, .groupedBar, .stackedBar, .normalizedBar,
+            .line, .pointLine, .area, .scatter, .bubble, .range, .faceted:
+            if specification.aggregation == .none {
+                return Plan(operation: .raw, measureSemantics: valueSemantics)
+            }
+            return Plan(
+                operation: .grouped(specification.aggregation),
+                measureSemantics: aggregatedSemantics(specification.aggregation))
         }
     }
 
@@ -441,7 +563,8 @@ enum AutoChartDataPreparation {
     private static func grouped(
         snapshot: AutoChartSnapshot,
         specification: AutoChartSpecification,
-        profiles: [AutoChartColumnID: AutoChartColumnProfile]
+        profiles: [AutoChartColumnID: AutoChartColumnProfile],
+        aggregation: AutoChartAggregation
     ) -> [AutoChartDatum] {
         let rawData = raw(
             snapshot: snapshot,
@@ -459,7 +582,6 @@ enum AutoChartDataPreparation {
         }.map { key, indexedGroup -> AutoChartDatum in
             let group = indexedGroup.map { $0.element }
             let values = group.compactMap { $0.yNumber }
-            let aggregation = specification.aggregation
             let result: Double =
                 switch aggregation {
                 case .none, .sum: values.reduce(0, +)
@@ -789,6 +911,22 @@ struct AutoChartRenderPresentation: Sendable {
         profiles: [AutoChartColumnID: AutoChartColumnProfile],
         data: [AutoChartDatum]
     ) {
+        self.init(
+            snapshot: snapshot,
+            specification: specification,
+            profiles: profiles,
+            data: data,
+            measureSemantics: AutoChartDataPreparation.measureSemantics(
+                for: specification))
+    }
+
+    init(
+        snapshot: AutoChartSnapshot,
+        specification: AutoChartSpecification,
+        profiles: [AutoChartColumnID: AutoChartColumnProfile],
+        data: [AutoChartDatum],
+        measureSemantics: AutoChartRenderedMeasureSemantics
+    ) {
         func categoryLabels(
             identity: KeyPath<AutoChartDatum, String?>,
             label: KeyPath<AutoChartDatum, String?>
@@ -1014,7 +1152,7 @@ struct AutoChartRenderPresentation: Sendable {
             .map(AutoChartProfiler.displayName) ?? "Category"
         let sourceYTitle = specification.encoding.y.flatMap { snapshot.column($0) }
             .map(AutoChartProfiler.displayName)
-        yTitle = switch AutoChartRenderCore.renderedAggregation(for: specification) {
+        yTitle = switch measureSemantics.aggregation {
         case .count where ![.histogram, .heatmap].contains(specification.family):
             "Count"
         case .countDistinct:
@@ -1077,27 +1215,12 @@ final class AutoChartPreparedTable: Sendable {
 struct AutoChartRenderCore: Sendable {
     let table: AutoChartPreparedTable
     let data: [AutoChartDatum]
+    let measureSemantics: AutoChartRenderedMeasureSemantics
     let validation: AutoChartValidationResult
     let presentation: AutoChartRenderPresentation
 
     var snapshot: AutoChartSnapshot { table.snapshot }
     var fingerprint: Int { table.fingerprint }
-
-    /// The aggregation represented by prepared marks, including chart families
-    /// whose marks have structural semantics independent of the specification.
-    static func renderedAggregation(
-        for specification: AutoChartSpecification
-    ) -> AutoChartAggregation {
-        switch specification.family {
-        case .histogram, .heatmap:
-            .count
-        case .boxPlot:
-            .none
-        case .kpi, .bar, .rankedDot, .groupedBar, .stackedBar, .normalizedBar,
-            .line, .pointLine, .area, .scatter, .bubble, .donut, .range, .faceted:
-            specification.aggregation
-        }
-    }
 
     static func prepare(
         snapshot: AutoChartSnapshot,
@@ -1107,7 +1230,7 @@ struct AutoChartRenderCore: Sendable {
         recommendation: AutoChartRecommendation
     ) -> AutoChartRenderCore {
         let specification = recommendation.specification
-        let data = AutoChartDataPreparation.data(
+        let preparedData = AutoChartDataPreparation.preparedData(
             snapshot: snapshot,
             specification: specification,
             profiles: profiles)
@@ -1118,17 +1241,19 @@ struct AutoChartRenderCore: Sendable {
             estimatedCost: estimatedStorageCost)
         return AutoChartRenderCore(
             table: table,
-            data: data,
+            data: preparedData.data,
+            measureSemantics: preparedData.measureSemantics,
             validation: AutoChartRecommendationEngine.validate(
                 specification: specification,
                 snapshot: snapshot,
                 profiles: profiles,
-                preparedData: data),
+                preparedData: preparedData.data),
             presentation: AutoChartRenderPresentation(
                 snapshot: snapshot,
                 specification: specification,
                 profiles: profiles,
-                data: data))
+                data: preparedData.data,
+                measureSemantics: preparedData.measureSemantics))
     }
 }
 
@@ -1312,15 +1437,14 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         id.flatMap { preparedChart.core.table.profiles[$0]?.column }
     }
 
-    private var renderedMeasureAggregation: AutoChartAggregation {
-        AutoChartRenderCore.renderedAggregation(for: specification)
+    private var renderedMeasureSemantics: AutoChartRenderedMeasureSemantics {
+        preparedChart.core.measureSemantics
     }
 
-    /// The source measure for raw and normalized values. Structural row counts
-    /// are the only aggregation without source-column lineage.
+    /// The source measure retained by the preparation plan. Structural row
+    /// counts omit it, while raw and measure-derived values keep their lineage.
     private var sourceMeasureColumn: AutoChartColumn? {
-        guard renderedMeasureAggregation.preservesMeasureLineage else { return nil }
-        return resolvedColumn(specification.encoding.y)
+        resolvedColumn(renderedMeasureSemantics.columnID)
     }
 
     @ViewBuilder
@@ -1456,7 +1580,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             snapshot.rows.first?.values[id]
         }
         return VStack(alignment: .leading, spacing: 4) {
-            Text(value.map(formatted) ?? "—")
+            Text(value.map(formattedKPIValue) ?? "—")
                 .font(
                     .system(
                         size: isCompact ? 34 : 52, weight: .bold, design: .rounded
@@ -2162,7 +2286,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         }
     }
 
-    private func formatted(_ value: AutoChartValue) -> String {
+    func formattedKPIValue(_ value: AutoChartValue) -> String {
         formatters.format(
             column: resolvedColumn(specification.encoding.y),
             value: value,
@@ -2171,21 +2295,12 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
 
     @AxisContentBuilder
     private func yNumericAxis() -> some AxisContent {
-        let column = sourceMeasureColumn
-        let aggregation = renderedMeasureAggregation
-        let normalizedFraction = usesNormalizedMeasureAxis
         AxisMarks { value in
             AxisGridLine()
             AxisTick()
             AxisValueLabel {
                 if let number = value.as(Double.self) {
-                    Text(
-                        formatMeasureValue(
-                            number,
-                            column: column,
-                            aggregation: aggregation,
-                            context: .axisTick,
-                            normalizedFraction: normalizedFraction))
+                    Text(formattedMeasureValue(number, for: .axisTick))
                 }
             }
         }
@@ -2213,8 +2328,6 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         _ number: Double,
         for surface: AutoChartMeasureFormattingSurface
     ) -> String {
-        // Internal seam used to verify that every rendered measure surface
-        // applies the same aggregation, lineage, and normalization semantics.
         let context: AutoChartFormattingContext
         let normalizedFraction: Bool
         switch surface {
@@ -2225,33 +2338,26 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             context = .markAccessibility
             normalizedFraction = false
         }
-        return formatMeasureValue(
-            number,
-            column: sourceMeasureColumn,
-            aggregation: renderedMeasureAggregation,
-            context: context,
-            normalizedFraction: normalizedFraction)
-    }
-
-    private func formatMeasureValue(
-        _ number: Double,
-        column: AutoChartColumn?,
-        aggregation: AutoChartAggregation,
-        context: AutoChartFormattingContext,
-        normalizedFraction: Bool
-    ) -> String {
         if normalizedFraction {
             return formatters.formatNormalizedFraction(
                 number,
-                column: column,
-                aggregation: aggregation,
+                column: sourceMeasureColumn,
+                aggregation: renderedMeasureSemantics.aggregation,
                 context: context)
         }
-        return formatters.format(
-            column: column,
-            aggregation: aggregation,
-            value: .double(number),
-            context: context)
+        switch renderedMeasureSemantics.kind {
+        case .value:
+            return formatters.format(
+                column: sourceMeasureColumn,
+                value: .double(number),
+                context: context)
+        case .aggregated(let aggregation):
+            return formatters.format(
+                column: sourceMeasureColumn,
+                aggregation: aggregation,
+                value: .double(number),
+                context: context)
+        }
     }
 
     @AxisContentBuilder
@@ -2614,7 +2720,8 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         }
         let semanticValues = AutoChartSelectionPreparation.semanticValues(
             for: matches,
-            specification: specification)
+            specification: specification,
+            measureSemantics: renderedMeasureSemantics)
         selection = AutoChartSelection(
             sourceRowIDs: preparedChart.rowIDs(for: sourceRowOffsets),
             dimensions: semanticValues.dimensions,

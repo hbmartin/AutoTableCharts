@@ -663,6 +663,26 @@ private struct CountingChartRowsTable: AutoChartTable {
             family: .boxPlot,
             specificationID: boxSpecification.id,
             markID: "box")
+        let numericRange = AutoChartSelection<Int>(
+            sourceRowIDs: [1],
+            measure: .init(
+                columnID: v2Measure.id,
+                aggregation: .none,
+                value: .numericRange(lower: 1, upper: 5)),
+            family: .boxPlot,
+            specificationID: boxSpecification.id,
+            markID: "numeric-range")
+        let scalar = AutoChartSelection<Int>(
+            sourceRowIDs: [1],
+            measure: .init(
+                columnID: v2Measure.id,
+                aggregation: .none,
+                value: .scalar(.double(3))),
+            family: .bar,
+            specificationID: AutoChartSpecification.bar(
+                category: v2Category.id,
+                measure: v2Measure.id).id,
+            markID: "scalar")
 
         #expect(
             temporal.presentation(columns: [], formatters: formatter).valueDescription
@@ -670,6 +690,38 @@ private struct CountingChartRowsTable: AutoChartTable {
         #expect(
             distribution.presentation(columns: [v2Measure], formatters: formatter)
                 .valueDescription == "Median value; range value–value")
+        #expect(
+            numericRange.presentation(columns: [v2Measure], formatters: formatter)
+                .valueDescription == "value–value")
+        #expect(
+            scalar.presentation(columns: [v2Measure], formatters: formatter)
+                .valueDescription == "value")
+
+        let startColumn = AutoChartColumn(
+            id: "start", name: "Start",
+            hints: .init(semanticType: .temporal, role: .intervalStart))
+        let endColumn = AutoChartColumn(
+            id: "end", name: "End",
+            hints: .init(semanticType: .temporal, role: .intervalEnd))
+        let endpointFormatter = AutoChartFormatters { request, _, _ in
+            request.column?.id.rawValue ?? "nil"
+        }
+        let temporalWithLineage = AutoChartSelection<Int>(
+            sourceRowIDs: [1],
+            measure: .init(
+                columnID: nil,
+                rangeStartColumnID: startColumn.id,
+                rangeEndColumnID: endColumn.id,
+                aggregation: .none,
+                value: .temporalRange(start: start, end: end)),
+            family: .range,
+            specificationID: rangeSpecification.id,
+            markID: "range-with-lineage")
+        #expect(
+            temporalWithLineage.presentation(
+                columns: [startColumn, endColumn],
+                formatters: endpointFormatter
+            ).valueDescription == "start–end")
     }
 
     @Test func defaultsFormatUnitsAndDatesWithExplicitLocaleAndTimeZone() {
@@ -870,7 +922,7 @@ private struct CountingChartRowsTable: AutoChartTable {
     }
 
     @MainActor
-    @Test func structuralCountsIgnoreInvalidSpecificationAggregation() async throws {
+    @Test func preparedMeasureSemanticsSurviveSpecificationTampering() async throws {
         let histogramDataset = try AutoChartDataset<Int>(
             columns: [v2Measure],
             rows: [[.double(1)], [.double(2)]])
@@ -902,11 +954,58 @@ private struct CountingChartRowsTable: AutoChartTable {
             adapting: heatmap,
             recommendation: invalidHeatmapRecommendation)
 
+        let boxDataset = try AutoChartDataset<Int>(
+            columns: [v2Category, v2Measure],
+            rows: (1...5).map { [.text("A"), .double(Double($0))] })
+        let boxAnalysis = try await AutoChartAnalyzer().analyze(boxDataset)
+        let boxPlot = try await boxAnalysis.prepare(
+            .boxPlot(measure: v2Measure.id, category: v2Category.id))
+        var invalidBoxRecommendation = boxPlot.recommendation
+        invalidBoxRecommendation.specification.aggregation = .count
+        let invalidBoxPlot = AutoChartPreparedChart(
+            adapting: boxPlot,
+            recommendation: invalidBoxRecommendation)
+
+        let donutDataset = try AutoChartDataset<Int>(
+            columns: [v2Category, v2Measure],
+            rows: [
+                [.text("A"), .double(1)],
+                [.text("A"), .double(2)],
+                [.text("B"), .double(4)],
+            ])
+        let donutAnalysis = try await AutoChartAnalyzer().analyze(donutDataset)
+        let donut = try await donutAnalysis.prepare(
+            .donut(
+                category: v2Category.id,
+                measure: v2Measure.id,
+                aggregation: .sum))
+        var invalidDonutRecommendation = donut.recommendation
+        invalidDonutRecommendation.specification.aggregation = .none
+        let invalidDonut = AutoChartPreparedChart(
+            adapting: donut,
+            recommendation: invalidDonutRecommendation)
+
+        let kpiDataset = try AutoChartDataset<Int>(
+            columns: [v2Measure],
+            rows: [[.double(42)]])
+        let kpiAnalysis = try await AutoChartAnalyzer().analyze(kpiDataset)
+        let kpi = try await kpiAnalysis.prepare(.kpi(measure: v2Measure.id))
+        var invalidKPIRecommendation = kpi.recommendation
+        invalidKPIRecommendation.specification.aggregation = .count
+        let invalidKPI = AutoChartPreparedChart(
+            adapting: kpi,
+            recommendation: invalidKPIRecommendation)
+
         let formatter = AutoChartFormatters { request, _, _ in
-            guard case .aggregatedMeasure(let aggregation) = request.purpose else {
+            let column = request.column?.id.rawValue ?? "nil"
+            switch request.purpose {
+            case .value:
+                return "\(request.context.rawValue):value:\(column)"
+            case .aggregatedMeasure(let aggregation):
+                return "\(request.context.rawValue):\(aggregation.rawValue):\(column)"
+            case .normalizedFraction:
                 return nil
             }
-            return "\(request.context.rawValue):\(aggregation.rawValue):\(request.column?.id.rawValue ?? "nil")"
         }
         for prepared in [invalidHistogram, invalidHeatmap] {
             let view = AutoChartView(preparedChart: prepared, formatters: formatter)
@@ -917,6 +1016,30 @@ private struct CountingChartRowsTable: AutoChartTable {
                 view.formattedMeasureValue(2, for: .markAccessibility)
                     == "markAccessibility:count:nil")
         }
+
+        let boxView = AutoChartView(
+            preparedChart: invalidBoxPlot,
+            formatters: formatter)
+        #expect(
+            boxView.formattedMeasureValue(3, for: .axisTick)
+                == "axisTick:value:\(v2Measure.id.rawValue)")
+        #expect(
+            boxView.formattedMeasureValue(3, for: .markAccessibility)
+                == "markAccessibility:value:\(v2Measure.id.rawValue)")
+
+        let donutView = AutoChartView(
+            preparedChart: invalidDonut,
+            formatters: formatter)
+        #expect(
+            donutView.formattedMeasureValue(3, for: .axisTick)
+                == "axisTick:sum:\(v2Measure.id.rawValue)")
+
+        let kpiView = AutoChartView(
+            preparedChart: invalidKPI,
+            formatters: formatter)
+        #expect(
+            kpiView.formattedKPIValue(.double(42))
+                == "kpi:value:\(v2Measure.id.rawValue)")
     }
 
     @Test func previewUsesExactHeightAndIndependentControls() {
