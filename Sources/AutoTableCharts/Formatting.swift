@@ -8,12 +8,40 @@ public enum AutoChartFormattingContext: String, CaseIterable, Hashable, Codable,
     case detail
 }
 
+/// An aggregation that transforms source values into a rendered measure.
+///
+/// Unlike ``AutoChartAggregation``, this type has no `none` case: an
+/// untransformed source value uses ``AutoChartFormattingPurpose/value``.
+public enum AutoChartAppliedAggregation: String, CaseIterable, Hashable, Codable, Sendable {
+    /// Add contributing values.
+    case sum
+    /// Compute the arithmetic mean of contributing values.
+    case mean
+    /// Select the smallest contributing value.
+    case minimum
+    /// Select the largest contributing value.
+    case maximum
+    /// Count contributing rows.
+    case count
+    /// Count distinct contributing values.
+    case countDistinct
+
+    init?(_ aggregation: AutoChartAggregation) {
+        guard aggregation != .none else { return nil }
+        self.init(rawValue: aggregation.rawValue)
+    }
+
+    var usesCountFormatting: Bool {
+        self == .count || self == .countDistinct
+    }
+}
+
 /// The semantic role of a value being formatted for chart presentation.
 public enum AutoChartFormattingPurpose: Hashable, Sendable {
     /// A source value that has not been aggregated by the chart.
     case value
     /// A source measure after applying the associated aggregation.
-    case aggregatedMeasure(AutoChartAggregation)
+    case aggregatedMeasure(AutoChartAppliedAggregation)
     /// A zero-through-one contribution displayed by normalized stacking.
     case normalizedFraction(AutoChartAggregation)
 }
@@ -22,7 +50,8 @@ extension AutoChartFormattingPurpose {
     /// The presentation purpose for a measure produced by the preparation plan.
     /// `.none` represents an untransformed source value rather than an aggregate.
     static func renderedMeasure(_ aggregation: AutoChartAggregation) -> Self {
-        aggregation == .none ? .value : .aggregatedMeasure(aggregation)
+        guard let applied = AutoChartAppliedAggregation(aggregation) else { return .value }
+        return .aggregatedMeasure(applied)
     }
 }
 

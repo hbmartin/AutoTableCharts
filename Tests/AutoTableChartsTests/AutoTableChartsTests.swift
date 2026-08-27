@@ -24,6 +24,34 @@ private func renderedAggregationSemantics(
         kind: .aggregated(aggregation))
 }
 
+private func preparedDatumValues(
+    snapshot: AutoChartSnapshot,
+    specification: AutoChartSpecification,
+    profiles: [AutoChartColumnID: AutoChartColumnProfile]? = nil
+) -> [AutoChartDatum] {
+    AutoChartDataPreparation.preparedData(
+        snapshot: snapshot,
+        specification: specification,
+        profiles: profiles ?? AutoChartProfiler.profileIndex(snapshot)
+    ).data
+}
+
+private func preparedRenderCore<Table: AutoChartTable>(
+    for table: Table,
+    specification: AutoChartSpecification
+) throws -> AutoChartRenderCore {
+    let snapshot = AutoChartSnapshot(table)
+    return try AutoChartRenderCore.prepare(
+        snapshot: snapshot,
+        profiles: AutoChartProfiler.profileIndex(snapshot),
+        contentFingerprint: snapshot.contentFingerprint,
+        estimatedStorageCost: snapshot.estimatedStorageCost,
+        recommendation: AutoChartRecommendation(
+            specification: specification,
+            score: 0,
+            rationale: ["Direct render-core test"]))
+}
+
 #if canImport(Charts) && canImport(SwiftUI)
 import Charts
 import SwiftUI
@@ -1036,7 +1064,7 @@ private let date = AutoChartColumn(
             .chartRecommendations.first { $0.specification.family == .bar }
         #expect(recommendation?.specification.aggregation == .sum)
         let data = recommendation.map {
-            AutoChartDataPreparation.data(
+            preparedDatumValues(
                 snapshot: AutoChartSnapshot(input),
                 specification: $0.specification)
         }
@@ -1106,7 +1134,7 @@ private let date = AutoChartColumn(
         let donut = recommendations.first { $0.specification.family == .donut }
         #expect(donut?.specification.aggregation == .count)
         let data = donut.map {
-            AutoChartDataPreparation.data(
+            preparedDatumValues(
                 snapshot: AutoChartSnapshot(input),
                 specification: $0.specification)
         }
@@ -1442,7 +1470,7 @@ private let date = AutoChartColumn(
                 columnID: columnID,
                 rangeStartColumnID: nil,
                 rangeEndColumnID: nil,
-                formattingPurpose: .aggregatedMeasure(aggregation),
+                formattingPurpose: .renderedMeasure(aggregation),
                 usesNormalizedMeasureAxis: usesNormalizedMeasureAxis)
         }
         let cases: [FamilyCase] = [
@@ -1559,31 +1587,104 @@ private let date = AutoChartColumn(
                 prepared.measureSemantics.formattingPurpose
                     == testCase.formattingPurpose)
             #expect(
-                specification.usesNormalizedMeasureAxis
+                prepared.measureSemantics.usesNormalizedMeasureAxis
                     == testCase.usesNormalizedMeasureAxis)
         }
     }
 
-    @Test func normalizedMeasureAxisRequiresFamilyAndStacking() {
+    @Test func renderCorePreservesValidationWarningsOnSuccess() throws {
+        let input = table(
+            columns: [date, measure],
+            rows: [[.text("2026-01-01"), .double(1)]],
+            truncated: true)
+        let specification = AutoChartSpecification.line(
+            x: date.id,
+            measure: measure.id)
+
+        let core = try preparedRenderCore(for: input, specification: specification)
+        let expected = AutoChartRecommendationEngine.validate(
+            specification: specification,
+            for: input)
+
+        #expect(core.validation == expected)
+        #expect(core.validation.isValid)
+        #expect(core.validation.issues.contains { $0.severity == .warning })
+        #expect(!core.data.isEmpty)
+    }
+
+    @Test func renderCoreRejectsStructuralErrorsBeforePreparation() {
+        let input = table(
+            columns: [category, measure],
+            rows: [[.text("A"), .double(1)], [.text("A"), .double(2)]])
+        let specification = AutoChartSpecification(
+            family: .donut,
+            encoding: .init(x: category.id, y: measure.id))
+
+        do {
+            _ = try preparedRenderCore(for: input, specification: specification)
+            Issue.record("Expected structural validation to reject the specification.")
+        } catch AutoChartPreparationError.invalidSpecification(let validation) {
+            #expect(
+                validation
+                    == AutoChartRecommendationEngine.validate(
+                        specification: specification,
+                        for: input))
+            #expect(validation.issues.contains { $0.messageValue.code == .unsafeAggregation })
+        } catch {
+            Issue.record("Unexpected preparation error: \(error)")
+        }
+    }
+
+    @Test func renderCoreRejectsPreparedNumericOverflow() {
+        let halfExtreme = Double.greatestFiniteMagnitude / 2
+        let input = table(
+            columns: [category, measure],
+            rows: [
+                [.text("A"), .double(halfExtreme)],
+                [.text("A"), .double(halfExtreme)],
+                [.text("A"), .double(halfExtreme)],
+            ])
+        let specification = AutoChartSpecification.bar(
+            category: category.id,
+            measure: measure.id,
+            aggregation: .sum)
+
+        do {
+            _ = try preparedRenderCore(for: input, specification: specification)
+            Issue.record("Expected prepared numeric-domain validation to reject overflow.")
+        } catch AutoChartPreparationError.invalidSpecification(let validation) {
+            #expect(
+                validation.issues.contains {
+                    $0.messageValue.code == .nonFiniteValueOmitted
+                        && $0.message.contains("produces non-finite values")
+                })
+        } catch {
+            Issue.record("Unexpected preparation error: \(error)")
+        }
+    }
+
+    @Test func preparationDerivesNormalizedMeasureAxisFromFamilyAndStacking() {
         let encoding = AutoChartEncoding(x: category.id, y: measure.id)
-        #expect(
-            AutoChartSpecification(
-                family: .normalizedBar,
-                encoding: encoding,
-                stacking: .normalized
-            ).usesNormalizedMeasureAxis)
-        #expect(
-            !AutoChartSpecification(
-                family: .normalizedBar,
-                encoding: encoding,
-                stacking: .standard
-            ).usesNormalizedMeasureAxis)
-        #expect(
-            !AutoChartSpecification(
-                family: .bar,
-                encoding: encoding,
-                stacking: .normalized
-            ).usesNormalizedMeasureAxis)
+        let snapshot = AutoChartSnapshot(
+            table(columns: [category, measure], rows: [[.text("A"), .double(1)]]))
+        let profiles = AutoChartProfiler.profileIndex(snapshot)
+        func usesNormalizedAxis(
+            family: AutoChartFamily,
+            stacking: AutoChartStacking
+        ) -> Bool {
+            AutoChartDataPreparation.preparedData(
+                snapshot: snapshot,
+                specification: AutoChartSpecification(
+                    family: family,
+                    encoding: encoding,
+                    stacking: stacking),
+                profiles: profiles
+            ).measureSemantics.usesNormalizedMeasureAxis
+        }
+
+        #expect(usesNormalizedAxis(family: .normalizedBar, stacking: .normalized))
+        #expect(!usesNormalizedAxis(family: .normalizedBar, stacking: .standard))
+        #expect(!usesNormalizedAxis(family: .bar, stacking: .normalized))
     }
 
     @Test func unaggregatedCategoricalFamiliesRejectDuplicateMarks() {
@@ -1682,7 +1783,7 @@ private let date = AutoChartColumn(
         let specification = AutoChartSpecification(
             family: .line,
             encoding: .init(x: date.id, y: measure.id))
-        let prepared = AutoChartDataPreparation.data(
+        let prepared = preparedDatumValues(
             snapshot: AutoChartSnapshot(input),
             specification: specification)
         let validation = AutoChartRecommendationEngine.validate(specification: specification, for: input)
@@ -1709,7 +1810,7 @@ private let date = AutoChartColumn(
         let specification = AutoChartSpecification(
             family: .line,
             encoding: .init(x: quantitativeDimension.id, y: measure.id))
-        let prepared = AutoChartDataPreparation.data(
+        let prepared = preparedDatumValues(
             snapshot: AutoChartSnapshot(input),
             specification: specification)
         let validation = AutoChartRecommendationEngine.validate(specification: specification, for: input)
@@ -1736,7 +1837,7 @@ private let date = AutoChartColumn(
             family: .bar,
             encoding: .init(x: year.id, y: measure.id))
         let snapshot = AutoChartSnapshot(input)
-        let prepared = AutoChartDataPreparation.data(
+        let prepared = preparedDatumValues(
             snapshot: snapshot,
             specification: specification)
         let validation = AutoChartRecommendationEngine.validate(specification: specification, for: input)
@@ -1770,7 +1871,7 @@ private let date = AutoChartColumn(
             family: .bar,
             encoding: .init(x: ordinal.id, y: measure.id))
         let snapshot = AutoChartSnapshot(input)
-        let prepared = AutoChartDataPreparation.data(
+        let prepared = preparedDatumValues(
             snapshot: snapshot,
             specification: specification)
         let profile = AutoChartProfiler.profiles(snapshot)[0]
@@ -1801,7 +1902,7 @@ private let date = AutoChartColumn(
             family: .bar,
             encoding: .init(x: ordinal.id, y: measure.id))
         let snapshot = AutoChartSnapshot(input)
-        let prepared = AutoChartDataPreparation.data(
+        let prepared = preparedDatumValues(
             snapshot: snapshot,
             specification: specification)
         let profile = AutoChartProfiler.profiles(snapshot)[0]
@@ -1843,7 +1944,7 @@ private let date = AutoChartColumn(
             encoding: AutoChartEncoding(x: measure.id),
             aggregation: .count,
             binCount: 2)
-        let data = AutoChartDataPreparation.data(
+        let data = preparedDatumValues(
             snapshot: AutoChartSnapshot(input), specification: spec)
         #expect(data.reduce(0) { $0 + $1.sourceRowIDs.count } == 3)
     }
@@ -1858,7 +1959,7 @@ private let date = AutoChartColumn(
         let spec = AutoChartSpecification(
             family: .bar,
             encoding: AutoChartEncoding(x: category.id, y: measure.id))
-        let data = AutoChartDataPreparation.data(
+        let data = preparedDatumValues(
             snapshot: AutoChartSnapshot(input), specification: spec)
         #expect(data.count == 1)
         #expect(data.first?.xLabel == "B")
@@ -1876,7 +1977,7 @@ private let date = AutoChartColumn(
             family: .bar,
             encoding: AutoChartEncoding(x: category.id, y: measure.id),
             aggregation: .sum)
-        let data = AutoChartDataPreparation.data(
+        let data = preparedDatumValues(
             snapshot: AutoChartSnapshot(input), specification: spec)
         #expect(data.count == 1)
         #expect(data[0].yNumber == 3)
@@ -1894,7 +1995,7 @@ private let date = AutoChartColumn(
         let specification = AutoChartSpecification(
             family: .boxPlot,
             encoding: .init(x: category.id, y: measure.id))
-        let data = AutoChartDataPreparation.data(
+        let data = preparedDatumValues(
             snapshot: AutoChartSnapshot(input),
             specification: specification)
         #expect(data.first?.sourceRowIDs == [0, 2])
@@ -1914,7 +2015,7 @@ private let date = AutoChartColumn(
             encoding: AutoChartEncoding(x: category.id, y: measure.id),
             aggregation: .sum,
             sort: .source)
-        let data = AutoChartDataPreparation.data(
+        let data = preparedDatumValues(
             snapshot: AutoChartSnapshot(input), specification: specification)
         #expect(data.map(\.xLabel) == ["B", "A"])
         #expect(data.map(\.yNumber) == [4, 2])
@@ -1928,7 +2029,7 @@ private let date = AutoChartColumn(
             encoding: AutoChartEncoding(x: measure.id),
             aggregation: .count,
             binCount: 10)
-        let data = AutoChartDataPreparation.data(
+        let data = preparedDatumValues(
             snapshot: AutoChartSnapshot(input), specification: specification)
         #expect(data.count == 10)
         #expect(data.reduce(0) { $0 + $1.sourceRowIDs.count } == 2)
@@ -1950,7 +2051,7 @@ private let date = AutoChartColumn(
             encoding: AutoChartEncoding(x: date.id, y: measure.id),
             aggregation: .sum)
         #expect(AutoChartRecommendationEngine.validate(specification: specification, for: input).isValid)
-        let data = AutoChartDataPreparation.data(
+        let data = preparedDatumValues(
             snapshot: AutoChartSnapshot(input), specification: specification)
         #expect(data.count == 3)
         #expect(data.compactMap(\.xDate) == dates.sorted())
@@ -1972,7 +2073,7 @@ private let date = AutoChartColumn(
             encoding: .init(x: ordinal.id, y: measure.id),
             sort: .source)
         #expect(AutoChartRecommendationEngine.validate(specification: specification, for: input).isValid)
-        let data = AutoChartDataPreparation.data(
+        let data = preparedDatumValues(
             snapshot: AutoChartSnapshot(input),
             specification: specification)
         #expect(data.compactMap(\.xLabel) == ["2", "1"])
@@ -2103,7 +2204,7 @@ private let date = AutoChartColumn(
             family: .boxPlot,
             encoding: AutoChartEncoding(x: category.id, y: measure.id))
         #expect(!AutoChartRecommendationEngine.validate(specification: specification, for: input).isValid)
-        let data = AutoChartDataPreparation.data(
+        let data = preparedDatumValues(
             snapshot: AutoChartSnapshot(input), specification: specification)
         #expect(Set(data.compactMap(\.xLabel)) == ["Missing value", "All"])
         #expect(data.allSatisfy { $0.sourceRowIDs.count == 1 })
@@ -2125,7 +2226,7 @@ private let date = AutoChartColumn(
             !AutoChartRecommendationEngine.validate(
                 specification: faceted, for: facetedInput
             ).isValid)
-        let facetData = AutoChartDataPreparation.data(
+        let facetData = preparedDatumValues(
             snapshot: AutoChartSnapshot(facetedInput), specification: faceted)
         #expect(facetData[0].facetIdentity == nil)
         #expect(facetData[1].facetIdentity != nil)
@@ -2291,7 +2392,7 @@ private let date = AutoChartColumn(
         let validation = AutoChartRecommendationEngine.validate(
             specification: recommendation.specification,
             for: input)
-        let prepared = AutoChartDataPreparation.data(
+        let prepared = preparedDatumValues(
             snapshot: AutoChartSnapshot(input),
             specification: recommendation.specification)
 
@@ -2329,7 +2430,7 @@ private let date = AutoChartColumn(
         let positionValidation = AutoChartRecommendationEngine.validate(
             specification: specification,
             for: positionsInput)
-        let prepared = AutoChartDataPreparation.data(
+        let prepared = preparedDatumValues(
             snapshot: AutoChartSnapshot(positionsInput),
             specification: specification)
 
@@ -2481,7 +2582,7 @@ private let date = AutoChartColumn(
         let specification = AutoChartSpecification(
             family: .bar,
             encoding: .init(x: nominalNumber.id, y: measure.id))
-        let prepared = AutoChartDataPreparation.data(
+        let prepared = preparedDatumValues(
             snapshot: AutoChartSnapshot(input),
             specification: specification)
 
@@ -2550,7 +2651,7 @@ private let date = AutoChartColumn(
             encoding: .init(x: category.id, start: date.id, end: end.id),
             orientation: .horizontal)
         let validation = AutoChartRecommendationEngine.validate(specification: specification, for: input)
-        let prepared = AutoChartDataPreparation.data(
+        let prepared = preparedDatumValues(
             snapshot: AutoChartSnapshot(input),
             specification: specification)
 
@@ -2649,27 +2750,6 @@ private let date = AutoChartColumn(
             })
         #expect(validation.issues.contains { $0.messageValue.code == .duplicateMark })
         #expect(!validation.issues.contains { $0.messageValue.code == .nonFiniteValueOmitted })
-    }
-
-    @Test func invalidDonutAggregationProducesTypedPreparationFailure() {
-        let input = table(
-            columns: [category, measure],
-            rows: [
-                [.text("A"), .double(1)],
-                [.text("A"), .double(2)],
-            ])
-        let snapshot = AutoChartSnapshot(input)
-        let prepared = AutoChartDataPreparation.preparedData(
-            snapshot: snapshot,
-            specification: AutoChartSpecification(
-                family: .donut,
-                encoding: .init(x: category.id, y: measure.id)),
-            profiles: AutoChartProfiler.profileIndex(snapshot))
-
-        #expect(prepared.data.isEmpty)
-        #expect(prepared.measureSemantics.kind == .value)
-        #expect(prepared.measureSemantics.columnID == measure.id)
-        #expect(prepared.failure == .aggregationRequired(.donut))
     }
 
     @Test func donutSectorTotalMustRemainFinite() {
@@ -2876,7 +2956,7 @@ private let date = AutoChartColumn(
             facetBaseFamily: .bar)
         let snapshot = AutoChartSnapshot(input)
         let profiles = AutoChartProfiler.profileIndex(snapshot)
-        let prepared = AutoChartDataPreparation.data(
+        let prepared = preparedDatumValues(
             snapshot: snapshot,
             specification: specification,
             profiles: profiles)
@@ -3084,7 +3164,7 @@ private let date = AutoChartColumn(
                 [.double(2), .double(1)],
             ])
         func prepared(_ sort: AutoChartSort) -> [AutoChartDatum] {
-            AutoChartDataPreparation.data(
+            preparedDatumValues(
                 snapshot: AutoChartSnapshot(input),
                 specification: AutoChartSpecification(
                     family: .bar,
@@ -3108,7 +3188,7 @@ private let date = AutoChartColumn(
                 [.text("Alpha"), .double(5)],
             ])
         func prepared(_ sort: AutoChartSort) -> [String?] {
-            AutoChartDataPreparation.data(
+            preparedDatumValues(
                 snapshot: AutoChartSnapshot(input),
                 specification: AutoChartSpecification(
                     family: .bar,
@@ -3268,7 +3348,7 @@ private let date = AutoChartColumn(
             family: .bar,
             encoding: .init(x: mixed.id, y: measure.id))
         let snapshot = AutoChartSnapshot(input)
-        let prepared = AutoChartDataPreparation.data(
+        let prepared = preparedDatumValues(
             snapshot: snapshot,
             specification: specification)
 
@@ -3370,7 +3450,7 @@ private let date = AutoChartColumn(
             encoding: .init(x: x.id, y: y.id),
             aggregation: .count)
 
-        let typed = AutoChartDataPreparation.data(
+        let typed = preparedDatumValues(
             snapshot: AutoChartSnapshot(
                 table(
                     columns: [x, y],
@@ -3381,7 +3461,7 @@ private let date = AutoChartColumn(
         #expect(Set(typed.compactMap(\.xIdentity)).count == 2)
         #expect(Set(typed.map(\.id)).count == 2)
 
-        let hyphenated = AutoChartDataPreparation.data(
+        let hyphenated = preparedDatumValues(
             snapshot: AutoChartSnapshot(
                 table(
                     columns: [x, y],
@@ -3701,7 +3781,7 @@ private let date = AutoChartColumn(
             ).presentation(columns: [category, measure]).valueDescription == "2")
     }
 
-    @Test func distinctCountAxisTitleNamesTheCountedColumn() {
+    @Test func distinctCountAxisTitleIsTypedAndLocalizable() {
         let distinctMeasure = AutoChartColumn(
             id: "distinct-measure",
             name: "customer_id",
@@ -3739,6 +3819,16 @@ private let date = AutoChartColumn(
         #expect(
             presentation.yTitle
                 == "Distinct count of \(AutoChartProfiler.displayName(distinctMeasure))")
+        #expect(presentation.yTitleMessage?.category == .interface)
+        #expect(presentation.yTitleMessage?.code == .distinctCountTitle)
+        #expect(
+            presentation.yTitleMessage?.arguments["column"]
+                == .string(AutoChartProfiler.displayName(distinctMeasure)))
+        #expect(
+            presentation.resolvedYTitle(
+                using: AutoChartTextResolver { message in
+                    message.code == .distinctCountTitle ? "Localized distinct count" : nil
+                }) == "Localized distinct count")
     }
 
     @Test func preparationDerivesValueAndAggregationLineage() {
@@ -3821,7 +3911,6 @@ private let date = AutoChartColumn(
 
         #expect(heatmapPresentation.yTitle == AutoChartProfiler.displayName(heatmapY))
         #expect(heatmapPrepared.measureSemantics.kind == .aggregated(.count))
-        #expect(heatmapPrepared.failure == nil)
         #expect(heatmapSelection.measure?.aggregation == .count)
         #expect(heatmapSelection.measure?.columnID == nil)
 
@@ -3844,7 +3933,6 @@ private let date = AutoChartColumn(
 
         #expect(boxPrepared.data.count == 1)
         #expect(boxPrepared.measureSemantics.kind == .value)
-        #expect(boxPrepared.failure == nil)
         #expect(boxSelection.measure?.aggregation == AutoChartAggregation.none)
         #expect(boxSelection.measure?.columnID == measure.id)
         #expect(
@@ -3877,7 +3965,6 @@ private let date = AutoChartColumn(
 
         #expect(donutA.yNumber == 3)
         #expect(donutPrepared.measureSemantics.kind == .aggregated(.sum))
-        #expect(donutPrepared.failure == nil)
         #expect(donutSelection.measure?.aggregation == .sum)
         #expect(donutSelection.measure?.value == .scalar(.double(3)))
 
@@ -3894,7 +3981,6 @@ private let date = AutoChartColumn(
         #expect(kpiPrepared.data.first?.yNumber == 42)
         #expect(kpiPrepared.measureSemantics.kind == .value)
         #expect(kpiPrepared.measureSemantics.columnID == measure.id)
-        #expect(kpiPrepared.failure == nil)
     }
 
     @Test func selectionDimensionsPreserveTypedSourceValuesInsteadOfLabels() {
@@ -3969,7 +4055,7 @@ private let date = AutoChartColumn(
         let specification = AutoChartSpecification(
             family: .boxPlot,
             encoding: .init(x: mixed.id, y: measure.id))
-        let data = AutoChartDataPreparation.data(
+        let data = preparedDatumValues(
             snapshot: AutoChartSnapshot(input),
             specification: specification)
         #expect(data.compactMap(\.xLabel) == ["1", "1"])

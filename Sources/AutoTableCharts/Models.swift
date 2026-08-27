@@ -1358,6 +1358,7 @@ public struct AutoChartMessage: Hashable, Codable, Sendable {
         public static let markAccessibilityDate = Self(rawValue: "markAccessibilityDate")
         public static let markAccessibilityRange = Self(rawValue: "markAccessibilityRange")
         public static let kpiAccessibility = Self(rawValue: "kpiAccessibility")
+        public static let distinctCountTitle = Self(rawValue: "distinctCountTitle")
 
         public init(from decoder: any Decoder) throws {
             self.init(rawValue: try decoder.singleValueContainer().decode(String.self))
@@ -1382,7 +1383,7 @@ public struct AutoChartMessage: Hashable, Codable, Sendable {
         var stringValue: String
         var intValue: Int?
 
-        init?(stringValue: String) {
+        init(stringValue: String) {
             self.stringValue = stringValue
             intValue = nil
         }
@@ -1390,6 +1391,71 @@ public struct AutoChartMessage: Hashable, Codable, Sendable {
         init?(intValue: Int) {
             stringValue = String(intValue)
             self.intValue = intValue
+        }
+    }
+
+    private struct ArgumentPayload<Value: Decodable>: Decodable {
+        var value: Value
+
+        private enum CodingKeys: String, CodingKey {
+            case value = "_0"
+        }
+
+        init(from decoder: any Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            value = try container.decode(Value.self, forKey: .value)
+        }
+    }
+
+    /// Decodes the synthesized representation one case at a time so genuinely
+    /// unknown cases can be ignored without also swallowing corruption in a
+    /// representation this package understands.
+    private struct ForwardCompatibleArgument: Decodable {
+        var value: AutoChartMessageArgument?
+
+        init(from decoder: any Decoder) throws {
+            let container = try decoder.container(keyedBy: ArgumentCodingKey.self)
+            guard container.allKeys.count == 1, let key = container.allKeys.first else {
+                throw DecodingError.dataCorrupted(
+                    .init(
+                        codingPath: decoder.codingPath,
+                        debugDescription: "A message argument must contain exactly one case."))
+            }
+            switch key.stringValue {
+            case "string":
+                value = .string(
+                    try container.decode(
+                        ArgumentPayload<String>.self, forKey: key
+                    ).value)
+            case "integer":
+                value = .integer(
+                    try container.decode(
+                        ArgumentPayload<Int>.self, forKey: key
+                    ).value)
+            case "number":
+                value = .number(
+                    try container.decode(
+                        ArgumentPayload<Double>.self, forKey: key
+                    ).value)
+            case "column":
+                value = .column(
+                    try container.decode(
+                        ArgumentPayload<AutoChartColumnID>.self, forKey: key
+                    ).value)
+            case "family":
+                let rawValue = try container.decode(
+                    ArgumentPayload<String>.self, forKey: key
+                ).value
+                value = AutoChartFamily(rawValue: rawValue).map(AutoChartMessageArgument.family)
+            case "aggregation":
+                let rawValue = try container.decode(
+                    ArgumentPayload<String>.self, forKey: key
+                ).value
+                value = AutoChartAggregation(rawValue: rawValue).map(
+                    AutoChartMessageArgument.aggregation)
+            default:
+                value = nil
+            }
         }
     }
 
@@ -1404,9 +1470,9 @@ public struct AutoChartMessage: Hashable, Codable, Sendable {
             let container = try decoder.container(keyedBy: ArgumentCodingKey.self)
             values = [:]
             for key in container.allKeys {
-                if let value = try? container.decode(
-                    AutoChartMessageArgument.self, forKey: key)
-                {
+                if let value = try container.decode(
+                    ForwardCompatibleArgument.self, forKey: key
+                ).value {
                     values[key.stringValue] = value
                 }
             }
@@ -1415,7 +1481,7 @@ public struct AutoChartMessage: Hashable, Codable, Sendable {
         func encode(to encoder: any Encoder) throws {
             var container = encoder.container(keyedBy: ArgumentCodingKey.self)
             for (name, value) in values {
-                guard let key = ArgumentCodingKey(stringValue: name) else { continue }
+                let key = ArgumentCodingKey(stringValue: name)
                 try container.encode(value, forKey: key)
             }
         }
