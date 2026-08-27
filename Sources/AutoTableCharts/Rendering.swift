@@ -932,11 +932,7 @@ private func resolvedDisambiguatedCategoryLabels(
     for (label, identities) in groups {
         guard identities.count > 1 else { continue }
         let kinds = identities.map(AutoChartCategoryDisambiguationKind.init(identity:))
-        let kindCounts = kinds.reduce(
-            into: [AutoChartCategoryDisambiguationKind: Int]()
-        ) { counts, kind in
-            counts[kind, default: 0] += 1
-        }
+        let kindCounts = Dictionary(grouping: kinds, by: \.self).mapValues(\.count)
         var kindIndexes: [AutoChartCategoryDisambiguationKind: Int] = [:]
         for (identity, kind) in zip(identities, kinds) {
             kindIndexes[kind, default: 0] += 1
@@ -979,6 +975,40 @@ func disambiguatedCategoryValue(
     return labels[identity] ?? label ?? identity
 }
 
+/// The presentation semantics of a prepared facet category.
+///
+/// A source label can survive when its value has no renderable identity, but
+/// every such datum belongs to the single missing facet panel. Keeping that
+/// rule here aligns panel captions, ordering, generated-text resolution, and
+/// mark accessibility without discarding the retained source label.
+struct AutoChartFacetCategory: Sendable {
+    let identity: String?
+    let label: String?
+
+    init(identity: String?, label: String?) {
+        self.identity = identity
+        self.label = label
+    }
+
+    init(_ datum: AutoChartDatum) {
+        self.init(identity: datum.facetIdentity, label: datum.facet)
+    }
+
+    var usesMissingDisplayValue: Bool { identity == nil }
+
+    func displayValue(
+        labels: [String: String],
+        fallback: String
+    ) -> String {
+        guard let identity else { return fallback }
+        return disambiguatedCategoryValue(
+            identity: identity,
+            label: label,
+            labels: labels,
+            fallback: fallback)
+    }
+}
+
 struct AutoChartFacetPanel: Sendable {
     let key: String?
     let data: [AutoChartDatum]
@@ -986,22 +1016,19 @@ struct AutoChartFacetPanel: Sendable {
 }
 
 func orderedFacetPanels(
-    in facets: [String?: [AutoChartDatum]],
+    in data: [AutoChartDatum],
     labels: [String: String],
     fallback: String
 ) -> [AutoChartFacetPanel] {
-    facets.map { key, data in
-        let displayValue = key.map { identity in
-            disambiguatedCategoryValue(
-                identity: identity,
-                label: data.first?.facet,
-                labels: labels,
-                fallback: fallback)
-        } ?? fallback
+    let facets = Dictionary(grouping: data, by: \.facetIdentity)
+    return facets.map { key, data in
+        let category = AutoChartFacetCategory(
+            identity: key,
+            label: data.first?.facet)
         return AutoChartFacetPanel(
             key: key,
             data: data,
-            displayValue: displayValue)
+            displayValue: category.displayValue(labels: labels, fallback: fallback))
     }.sorted { left, right in
         if left.displayValue != right.displayValue {
             return left.displayValue < right.displayValue
@@ -1535,6 +1562,8 @@ struct AutoChartResolvedPresentation: Sendable {
                 }
             }
             if presentation.usesYIdentityLabels {
+                // Heatmap preparation admits only categories with both a Y
+                // identity and label, so there is no missing Y value to resolve.
                 if let identity = datum.yIdentity, let label = datum.yLabel {
                     yPairs.append((identity, label))
                 }
@@ -1547,9 +1576,10 @@ struct AutoChartResolvedPresentation: Sendable {
                 }
             }
             if presentation.usesFacetIdentityLabels {
-                if let identity = datum.facetIdentity, let label = datum.facet {
+                let category = AutoChartFacetCategory(datum)
+                if let identity = category.identity, let label = category.label {
                     facetPairs.append((identity, label))
-                } else if datum.facetIdentity == nil, datum.facet == nil {
+                } else if category.usesMissingDisplayValue {
                     needsMissingFacet = true
                 }
             }
@@ -2541,9 +2571,8 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     }
 
     private var facetedChart: some View {
-        let facets = Dictionary(grouping: data) { $0.facetIdentity }
         let facetPanels = orderedFacetPanels(
-            in: facets,
+            in: data,
             labels: facetDisplayLabels,
             fallback: resolvedPresentation.missingFacet)
         return Group {
@@ -2715,9 +2744,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     }
 
     private func facetValue(for datum: AutoChartDatum) -> String {
-        disambiguatedCategoryValue(
-            identity: datum.facetIdentity,
-            label: datum.facet,
+        AutoChartFacetCategory(datum).displayValue(
             labels: facetDisplayLabels,
             fallback: resolvedPresentation.missingFacet)
     }

@@ -1456,7 +1456,11 @@ private struct CountingChartRowsTable: AutoChartTable {
     @Test func preparationGateRejectedRearmReleasesBlockedPreparation() async throws {
         let gate = OneShotPreparationGate()
         try #require(await gate.arm())
-        let preparation = Task { await gate.waitWhenArmed() }
+        let preparationCompleted = DispatchSemaphore(value: 0)
+        let preparation = Task {
+            defer { preparationCompleted.signal() }
+            await gate.waitWhenArmed()
+        }
 
         try await gate.waitUntilBlocked()
         var rearmResult: Bool?
@@ -1464,7 +1468,9 @@ private struct CountingChartRowsTable: AutoChartTable {
             rearmResult = await gate.arm()
         }
         #expect(rearmResult == false)
-        if rearmResult != false {
+        let releasedPromptly = await receivesSignalPromptly(preparationCompleted)
+        #expect(releasedPromptly)
+        if !releasedPromptly {
             await gate.resume()
         }
         await preparation.value

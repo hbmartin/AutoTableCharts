@@ -4059,29 +4059,55 @@ private let date = AutoChartColumn(
         #expect(resolved.sharedXCategoryDomain == ["Zulu", "Alpha"])
         #expect(
             orderedFacetPanels(
-                in: Dictionary(grouping: data, by: \.facetIdentity),
+                in: data,
                 labels: resolved.facetDisplayLabels,
                 fallback: resolved.missingFacet)
                 .map(\.key)
                 == ["text:1:1", "integer:1"])
     }
 
-    @Test func nilFacetPanelUsesMissingLabelInsteadOfAnArbitraryMemberLabel() {
+    @Test func nilFacetIdentityUsesLocalizedMissingLabelAcrossPresentationSurfaces() {
+        let facet = AutoChartColumn(
+            id: "facet", name: "Facet",
+            hints: .init(semanticType: .nominal, role: .dimension))
+        let specification = AutoChartSpecification(
+            family: .faceted,
+            encoding: .init(x: category.id, y: measure.id, facet: facet.id),
+            facetBaseFamily: .bar)
+        let snapshot = AutoChartSnapshot(
+            table(columns: [category, measure, facet], rows: []))
         let data = [
             AutoChartDatum(
                 id: "unrenderable-facet", sourceRowIDs: [],
                 xIdentity: "text:1:A", xLabel: "A", yNumber: 1,
                 facet: "Raw invalid label")
         ]
+        let presentation = AutoChartRenderPresentation(
+            snapshot: snapshot,
+            specification: specification,
+            profiles: AutoChartProfiler.profileIndex(snapshot),
+            data: data,
+            measureSemantics: renderedValueSemantics(columnID: measure.id))
+        let resolved = presentation.resolvedPresentation(
+            data: data,
+            using: AutoChartTextResolver { message in
+                message.code == .missingFacetLabel ? "Localized missing facet" : nil
+            })
 
         let panels = orderedFacetPanels(
-            in: Dictionary(grouping: data, by: \.facetIdentity),
-            labels: [:],
-            fallback: "Localized missing facet")
+            in: data,
+            labels: resolved.facetDisplayLabels,
+            fallback: resolved.missingFacet)
 
+        #expect(resolved.missingFacet == "Localized missing facet")
         #expect(panels.count == 1)
         #expect(panels.first?.key == nil)
         #expect(panels.first?.displayValue == "Localized missing facet")
+        #expect(
+            AutoChartFacetCategory(data[0]).displayValue(
+                labels: resolved.facetDisplayLabels,
+                fallback: resolved.missingFacet)
+                == "Localized missing facet")
     }
 
     @Test func missingFacetDefaultTextRemainsFacetSpecific() {
