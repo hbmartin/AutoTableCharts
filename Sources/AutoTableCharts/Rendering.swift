@@ -406,7 +406,7 @@ struct AutoChartRenderedMeasureSemantics: Hashable, Sendable {
         rangeStartColumnID: AutoChartColumnID? = nil,
         rangeEndColumnID: AutoChartColumnID? = nil,
         kind: AutoChartRenderedMeasureKind,
-        usesNormalizedMeasureAxis: Bool = false
+        usesNormalizedMeasureAxis: Bool
     ) {
         if case .aggregated(.none) = kind {
             preconditionFailure("Prepared aggregated measures require an aggregation.")
@@ -969,10 +969,15 @@ struct AutoChartRenderPresentation: Sendable {
     var sharedXCategoryDomain: [String]
     var facetBaseFamily: AutoChartFamily?
     var xTitle: String
+    var xTitleMessage: AutoChartMessage?
     var yTitle: String
     var yTitleMessage: AutoChartMessage?
     var seriesTitle: String
+    var seriesTitleMessage: AutoChartMessage?
     var facetTitle: String
+    var facetTitleMessage: AutoChartMessage?
+    var countTitleMessage: AutoChartMessage
+    var medianTitleMessage: AutoChartMessage
     var xSemanticType: AutoChartSemanticType?
     var xDisplayLabels: [String: String]
     var yDisplayLabels: [String: String]
@@ -1211,15 +1216,29 @@ struct AutoChartRenderPresentation: Sendable {
             numberZoomValueCount = 0
             numberZoomSpan = 1
         }
-        xTitle =
-            specification.encoding.x.flatMap { snapshot.column($0) }
-            .map(AutoChartProfiler.displayName) ?? "Category"
+        if let sourceXTitle = specification.encoding.x.flatMap({ snapshot.column($0) })
+            .map(AutoChartProfiler.displayName)
+        {
+            xTitle = sourceXTitle
+            xTitleMessage = nil
+        } else {
+            xTitle = "Category"
+            xTitleMessage = AutoChartMessage(
+                category: .interface,
+                code: .categoryTitle,
+                defaultText: xTitle)
+        }
         let sourceYTitle = specification.encoding.y.flatMap { snapshot.column($0) }
             .map(AutoChartProfiler.displayName)
         let resolvedYTitle: (text: String, message: AutoChartMessage?) =
             switch measureSemantics.aggregation {
         case .count where ![.histogram, .heatmap].contains(specification.family):
-            ("Count", nil)
+            (
+                "Count",
+                AutoChartMessage(
+                    category: .interface,
+                    code: .countTitle,
+                    defaultText: "Count"))
         case .countDistinct:
             {
                 let text = sourceYTitle.map { "Distinct count of \($0)" }
@@ -1233,21 +1252,82 @@ struct AutoChartRenderPresentation: Sendable {
                         defaultText: text))
             }()
         case .none, .sum, .mean, .minimum, .maximum, .count:
-            (sourceYTitle ?? "Value", nil)
+            if let sourceYTitle {
+                (sourceYTitle, nil)
+            } else {
+                (
+                    "Value",
+                    AutoChartMessage(
+                        category: .interface,
+                        code: .valueTitle,
+                        defaultText: "Value"))
+            }
         }
         yTitle = resolvedYTitle.text
         yTitleMessage = resolvedYTitle.message
-        seriesTitle =
-            specification.encoding.series.flatMap { snapshot.column($0) }
-            .map(AutoChartProfiler.displayName) ?? "Series"
-        facetTitle =
-            specification.encoding.facet.flatMap { snapshot.column($0) }
-            .map(AutoChartProfiler.displayName) ?? "Facet"
+        if let sourceSeriesTitle = specification.encoding.series
+            .flatMap({ snapshot.column($0) }).map(AutoChartProfiler.displayName)
+        {
+            seriesTitle = sourceSeriesTitle
+            seriesTitleMessage = nil
+        } else {
+            seriesTitle = "Series"
+            seriesTitleMessage = AutoChartMessage(
+                category: .interface,
+                code: .seriesTitle,
+                defaultText: seriesTitle)
+        }
+        if let sourceFacetTitle = specification.encoding.facet
+            .flatMap({ snapshot.column($0) }).map(AutoChartProfiler.displayName)
+        {
+            facetTitle = sourceFacetTitle
+            facetTitleMessage = nil
+        } else {
+            facetTitle = "Facet"
+            facetTitleMessage = AutoChartMessage(
+                category: .interface,
+                code: .facetTitle,
+                defaultText: facetTitle)
+        }
+        countTitleMessage = AutoChartMessage(
+            category: .interface,
+            code: .countTitle,
+            defaultText: "Count")
+        medianTitleMessage = AutoChartMessage(
+            category: .interface,
+            code: .medianTitle,
+            defaultText: "Median")
     }
 
     func resolvedYTitle(using textResolver: AutoChartTextResolver) -> String {
         yTitleMessage.map(textResolver.callAsFunction) ?? yTitle
     }
+
+    func resolvedTitles(using textResolver: AutoChartTextResolver) -> AutoChartResolvedTitles {
+        let count = textResolver(countTitleMessage)
+        let resolvedYTitle =
+            if yTitleMessage?.code == .countTitle {
+                count
+            } else {
+                yTitleMessage.map(textResolver.callAsFunction) ?? yTitle
+            }
+        return AutoChartResolvedTitles(
+            x: xTitleMessage.map(textResolver.callAsFunction) ?? xTitle,
+            y: resolvedYTitle,
+            series: seriesTitleMessage.map(textResolver.callAsFunction) ?? seriesTitle,
+            facet: facetTitleMessage.map(textResolver.callAsFunction) ?? facetTitle,
+            count: count,
+            median: textResolver(medianTitleMessage))
+    }
+}
+
+struct AutoChartResolvedTitles: Sendable {
+    var x: String
+    var y: String
+    var series: String
+    var facet: String
+    var count: String
+    var median: String
 }
 
 private enum AutoChartZoomSource: Equatable {
@@ -1501,6 +1581,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     private let presentation: AutoChartPresentation
     private let formatters: AutoChartFormatters
     private let textResolver: AutoChartTextResolver
+    private let resolvedTitles: AutoChartResolvedTitles?
     @Binding private var selection: AutoChartSelection<RowID>?
 
     @State private var selectedCategory: String?
@@ -1518,6 +1599,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         textResolver: AutoChartTextResolver = .default
     ) {
         content = .chart(preparedChart)
+        resolvedTitles = preparedChart.core.presentation.resolvedTitles(using: textResolver)
         self._selection = selection
         self.presentation = presentation
         self.formatters = formatters
@@ -1533,8 +1615,10 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     ) {
         if let primary = analysis.primaryChart {
             content = .chart(primary)
+            resolvedTitles = primary.core.presentation.resolvedTitles(using: textResolver)
         } else if case .tableFallback(let fallback) = analysis.outcome {
             content = .fallback(fallback)
+            resolvedTitles = nil
         } else {
             content = .fallback(
                 AutoChartFallback(
@@ -1542,6 +1626,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
                         category: .fallback,
                         code: .noSafeChart,
                         defaultText: "No prepared chart is available.")))
+            resolvedTitles = nil
         }
         self._selection = selection
         self.presentation = presentation
@@ -1565,10 +1650,12 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     private var sharedXCategoryDomain: [String] { renderPresentation.sharedXCategoryDomain }
     private var facetBaseFamily: AutoChartFamily? { renderPresentation.facetBaseFamily }
     private var snapshotFingerprint: Int { preparedChart.core.fingerprint }
-    private var xTitle: String { renderPresentation.xTitle }
-    private var yTitle: String { renderPresentation.resolvedYTitle(using: textResolver) }
-    private var seriesTitle: String { renderPresentation.seriesTitle }
-    private var facetTitle: String { renderPresentation.facetTitle }
+    private var xTitle: String { resolvedTitles?.x ?? renderPresentation.xTitle }
+    private var yTitle: String { resolvedTitles?.y ?? renderPresentation.yTitle }
+    private var seriesTitle: String { resolvedTitles?.series ?? renderPresentation.seriesTitle }
+    private var facetTitle: String { resolvedTitles?.facet ?? renderPresentation.facetTitle }
+    private var countTitle: String { resolvedTitles?.count ?? "Count" }
+    private var medianTitle: String { resolvedTitles?.median ?? "Median" }
     private var xSemanticType: AutoChartSemanticType? { renderPresentation.xSemanticType }
     private var xDisplayLabels: [String: String] { renderPresentation.xDisplayLabels }
     private var yDisplayLabels: [String: String] { renderPresentation.yDisplayLabels }
@@ -1860,12 +1947,12 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             BarMark(
                 xStart: .value(xTitle, datum.lower ?? 0),
                 xEnd: .value(xTitle, datum.upper ?? 0),
-                y: .value("Count", datum.yNumber ?? 0)
+                y: .value(countTitle, datum.yNumber ?? 0)
             )
             .accessibilityLabel(markAccessibilityLabel(for: datum))
         }
         .chartXAxisLabel(xTitle)
-        .chartYAxisLabel("Count")
+        .chartYAxisLabel(countTitle)
         .chartXAxis { numericAxis(columnID: specification.encoding.x) }
         .chartYAxis { yNumericAxis() }
         return selectableNumberX(numberZoom(chart))
@@ -1885,7 +1972,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
                 width: .fixed(28))
             PointMark(
                 x: .value(xTitle, datum.xIdentity ?? "all"),
-                y: .value("Median", datum.median ?? 0)
+                y: .value(medianTitle, datum.median ?? 0)
             )
             .symbol(.square)
             .accessibilityLabel(markAccessibilityLabel(for: datum))
@@ -1915,7 +2002,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
                 x: .value(xTitle, datum.xIdentity ?? ""),
                 y: .value(yTitle, datum.yIdentity ?? "")
             )
-            .foregroundStyle(by: .value("Count", datum.yNumber ?? 0))
+            .foregroundStyle(by: .value(countTitle, datum.yNumber ?? 0))
             .accessibilityLabel(heatmapAccessibilityLabel(for: datum))
         }
         .chartXAxisLabel(xTitle)

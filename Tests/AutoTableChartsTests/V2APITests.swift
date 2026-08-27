@@ -60,12 +60,16 @@ private actor OneShotPreparationGate {
         self.timeout = timeout
     }
 
-    func arm() {
-        precondition(
-            !blocked && releaseToken == nil && releaseContinuation == nil
-                && releaseTimeoutTask == nil,
-            "The one-shot preparation gate cannot be re-armed while blocked.")
+    @discardableResult
+    func arm() -> Bool {
+        guard !blocked && releaseToken == nil && releaseContinuation == nil
+            && releaseTimeoutTask == nil
+        else {
+            Issue.record("The one-shot preparation gate cannot be re-armed while blocked.")
+            return false
+        }
         armed = true
+        return true
     }
 
     func waitWhenArmed() async {
@@ -86,10 +90,13 @@ private actor OneShotPreparationGate {
                     continuation.resume()
                     return
                 }
-                precondition(
-                    releaseToken == nil && releaseContinuation == nil
-                        && releaseTimeoutTask == nil,
-                    "A preparation release is already pending.")
+                guard releaseToken == nil && releaseContinuation == nil
+                    && releaseTimeoutTask == nil
+                else {
+                    Issue.record("A preparation release is already pending.")
+                    continuation.resume()
+                    return
+                }
                 releaseToken = token
                 releaseContinuation = continuation
                 releaseTimeoutTask = Task {
@@ -586,6 +593,14 @@ private struct CountingChartRowsTable: AutoChartTable {
         }
     }
 
+    @Test func appliedAggregationsBridgeEveryTransformExhaustively() throws {
+        #expect(AutoChartAppliedAggregation(.none) == nil)
+        for aggregation in AutoChartAggregation.allCases where aggregation != .none {
+            let applied = try #require(AutoChartAppliedAggregation(aggregation))
+            #expect(applied.aggregation == aggregation)
+        }
+    }
+
     @Test func semanticFormatterOverridesReceiveAggregationAndNormalization() {
         let formatter = AutoChartFormatters { request, _, _ in
             let column = request.column?.id.rawValue ?? "nil"
@@ -620,6 +635,12 @@ private struct CountingChartRowsTable: AutoChartTable {
                 aggregation: .sum,
                 context: .axisTick)
                 == "normalized:sum:\(v2Measure.id.rawValue)")
+        #expect(
+            formatter.formatNormalizedFraction(
+                0.42,
+                column: v2Measure,
+                context: .axisTick)
+                == "normalized:none:\(v2Measure.id.rawValue)")
     }
 
     @Test func distinctCountFormattingPreservesLineageWhileDefaultsRemainUnitless() {
@@ -875,6 +896,14 @@ private struct CountingChartRowsTable: AutoChartTable {
         var arguments = try #require(object["arguments"] as? [String: Any])
         arguments["future"] = ["future": ["_0": "payload"]]
         arguments["future-family"] = ["family": ["_0": "future-family"]]
+        arguments["future-scalar"] = 42
+        arguments["future-array"] = ["payload"]
+        arguments["future-null"] = NSNull()
+        arguments["future-empty-object"] = [String: Any]()
+        arguments["future-multi-case"] = [
+            "first-future-case": ["_0": "first"],
+            "second-future-case": ["_0": "second"],
+        ]
         object["arguments"] = arguments
 
         let decoded = try JSONDecoder().decode(
@@ -883,6 +912,21 @@ private struct CountingChartRowsTable: AutoChartTable {
 
         #expect(decoded.arguments == ["known": .string("Known")])
         #expect(decoded.defaultText == "Future message")
+    }
+
+    @Test func messageArgumentCodingRoundTripsEveryKnownCase() throws {
+        let values: [AutoChartMessageArgument] = [
+            .string("Text"),
+            .integer(42),
+            .number(4.25),
+            .column("measure"),
+            .family(.bar),
+            .aggregation(.countDistinct),
+        ]
+        for value in values {
+            let encoded = try JSONEncoder().encode(value)
+            #expect(try JSONDecoder().decode(AutoChartMessageArgument.self, from: encoded) == value)
+        }
     }
 
     @Test func messagesRejectMalformedKnownArgumentRepresentations() throws {
@@ -901,6 +945,16 @@ private struct CountingChartRowsTable: AutoChartTable {
 
         #expect(throws: DecodingError.self) {
             try JSONDecoder().decode(AutoChartMessage.self, from: encoded)
+        }
+
+        arguments["known"] = [
+            "string": ["_0": "Known"],
+            "future": ["_0": "payload"],
+        ]
+        object["arguments"] = arguments
+        let multipleCases = try JSONSerialization.data(withJSONObject: object)
+        #expect(throws: DecodingError.self) {
+            try JSONDecoder().decode(AutoChartMessage.self, from: multipleCases)
         }
     }
 
@@ -1148,7 +1202,7 @@ private struct CountingChartRowsTable: AutoChartTable {
 @Suite struct V2AnalyzerLifecycleTests {
     @Test func preparationGateDisarmsAfterEntryWaitTimesOut() async {
         let gate = OneShotPreparationGate(timeout: .milliseconds(10))
-        await gate.arm()
+        guard await gate.arm() else { return }
 
         await #expect(throws: PreparationGateError.self) {
             try await gate.waitUntilBlocked()
@@ -1161,7 +1215,7 @@ private struct CountingChartRowsTable: AutoChartTable {
         let gate = OneShotPreparationGate(timeout: .seconds(30))
         let peerStarted = DispatchSemaphore(value: 0)
         let peerFinished = DispatchGroup()
-        await gate.arm()
+        guard await gate.arm() else { return }
         let peers = (0..<31).map { _ in
             peerFinished.enter()
             return Task {
@@ -1241,7 +1295,7 @@ private struct CountingChartRowsTable: AutoChartTable {
     @Test func preparationGateCancelsSomeWaitersAndReleasesTheRest() async throws {
         let gate = OneShotPreparationGate(timeout: .seconds(30))
         let waiterStarted = DispatchSemaphore(value: 0)
-        await gate.arm()
+        guard await gate.arm() else { return }
         let waiters = (0..<32).map { _ in
             Task {
                 try await gate.waitUntilBlocked(onWaiting: { waiterStarted.signal() })
@@ -1280,7 +1334,7 @@ private struct CountingChartRowsTable: AutoChartTable {
 
     @Test func preparationGatePreservesArmForAlreadyCancelledPreparation() async throws {
         let gate = OneShotPreparationGate()
-        await gate.arm()
+        guard await gate.arm() else { return }
         let (stream, continuation) = AsyncStream<Void>.makeStream()
         let cancelledPreparation = Task {
             for await _ in stream {}
@@ -1312,7 +1366,7 @@ private struct CountingChartRowsTable: AutoChartTable {
 
     @Test func preparationGateFailsWaiterAndPreservesArmAfterCancelledAttempt() async throws {
         let gate = OneShotPreparationGate()
-        await gate.arm()
+        guard await gate.arm() else { return }
         let waiterStarted = DispatchSemaphore(value: 0)
         let waiterCompleted = DispatchSemaphore(value: 0)
         let waiter = Task {
@@ -1365,7 +1419,7 @@ private struct CountingChartRowsTable: AutoChartTable {
 
     @Test func preparationGateCancelsTimeoutTaskAfterRelease() async throws {
         let gate = OneShotPreparationGate()
-        await gate.arm()
+        guard await gate.arm() else { return }
         let preparation = Task { await gate.waitWhenArmed() }
 
         try await gate.waitUntilBlocked()
@@ -1683,7 +1737,7 @@ private struct CountingChartRowsTable: AutoChartTable {
             counter: counter)
         let analyzer = AutoChartAnalyzer(
             testHooks: .chartPreparation { await gate.waitWhenArmed() })
-        await gate.arm()
+        guard await gate.arm() else { return }
         let task = Task { try await analyzer.analyze(table) }
 
         try await gate.waitUntilBlocked()
@@ -1739,7 +1793,7 @@ private struct CountingChartRowsTable: AutoChartTable {
             chartDataKey: .init(identity: "cancel-before-materialization", revision: "1"))
         let analyzer = AutoChartAnalyzer(
             testHooks: .keyedMaterialization { await gate.waitWhenArmed() })
-        await gate.arm()
+        guard await gate.arm() else { return }
         let completed = DispatchSemaphore(value: 0)
         let pending = Task {
             defer { completed.signal() }
@@ -1809,7 +1863,7 @@ private struct CountingChartRowsTable: AutoChartTable {
             counter: ChartRowsReadCounter())
         let analyzer = AutoChartAnalyzer(
             testHooks: .chartPreparation { await gate.waitWhenArmed() })
-        await gate.arm()
+        guard await gate.arm() else { return }
         let pending = Task { try await analyzer.analyze(table) }
 
         try await gate.waitUntilBlocked()
@@ -1860,7 +1914,7 @@ private struct CountingChartRowsTable: AutoChartTable {
         let analysis = try await analyzer.analyze(dataset)
         let specification = AutoChartSpecification.histogram(value: v2Measure.id)
 
-        await gate.arm()
+        guard await gate.arm() else { return }
         let pending = Task { try await analysis.prepare(specification) }
         try await gate.waitUntilBlocked()
         await analyzer.removeAll()
@@ -1909,7 +1963,7 @@ private struct CountingChartRowsTable: AutoChartTable {
             encoding: .init(x: v2Category.id, y: v2Measure.id),
             aggregation: .sum)
         let missesBefore = await analyzer.cacheStatistics.preparedCharts.misses
-        await gate.arm()
+        guard await gate.arm() else { return }
         let completed = DispatchSemaphore(value: 0)
         let pending = Task {
             defer { completed.signal() }
@@ -1943,7 +1997,7 @@ private struct CountingChartRowsTable: AutoChartTable {
             family: .donut,
             encoding: .init(x: v2Category.id, y: v2Measure.id),
             aggregation: .sum)
-        await gate.arm()
+        guard await gate.arm() else { return }
         let completed = DispatchSemaphore(value: 0)
         let pending = Task {
             defer { completed.signal() }

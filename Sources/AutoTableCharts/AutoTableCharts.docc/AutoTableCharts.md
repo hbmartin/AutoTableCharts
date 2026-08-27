@@ -64,6 +64,7 @@ analyzer is trimmed or cleared.
 - ``AutoChartFormatters``
 - ``AutoChartFormattingRequest``
 - ``AutoChartFormattingPurpose``
+- ``AutoChartAppliedAggregation``
 - ``AutoChartSelection``
 - ``AutoChartTextResolver``
 

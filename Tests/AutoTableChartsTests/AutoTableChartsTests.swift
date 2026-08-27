@@ -12,7 +12,8 @@ private func renderedValueSemantics(
         columnID: columnID,
         rangeStartColumnID: rangeStartColumnID,
         rangeEndColumnID: rangeEndColumnID,
-        kind: .value)
+        kind: .value,
+        usesNormalizedMeasureAxis: false)
 }
 
 private func renderedAggregationSemantics(
@@ -21,7 +22,8 @@ private func renderedAggregationSemantics(
 ) -> AutoChartRenderedMeasureSemantics {
     AutoChartRenderedMeasureSemantics(
         columnID: columnID,
-        kind: .aggregated(aggregation))
+        kind: .aggregated(aggregation),
+        usesNormalizedMeasureAxis: false)
 }
 
 private func preparedDatumValues(
@@ -3829,6 +3831,55 @@ private let date = AutoChartColumn(
                 using: AutoChartTextResolver { message in
                     message.code == .distinctCountTitle ? "Localized distinct count" : nil
                 }) == "Localized distinct count")
+    }
+
+    @Test func generatedChartTitlesAreTypedAndLocalizable() {
+        let emptySnapshot = AutoChartSnapshot(
+            table(columns: [], rows: []))
+        let fallbackPresentation = AutoChartRenderPresentation(
+            snapshot: emptySnapshot,
+            specification: AutoChartSpecification(
+                family: .bar,
+                encoding: .init()),
+            profiles: [:],
+            data: [],
+            measureSemantics: renderedValueSemantics(columnID: nil))
+
+        #expect(fallbackPresentation.xTitleMessage?.code == .categoryTitle)
+        #expect(fallbackPresentation.yTitleMessage?.code == .valueTitle)
+        #expect(fallbackPresentation.seriesTitleMessage?.code == .seriesTitle)
+        #expect(fallbackPresentation.facetTitleMessage?.code == .facetTitle)
+        #expect(fallbackPresentation.countTitleMessage.code == .countTitle)
+        #expect(fallbackPresentation.medianTitleMessage.code == .medianTitle)
+
+        let resolved = fallbackPresentation.resolvedTitles(
+            using: AutoChartTextResolver { "localized:\($0.code.rawValue)" })
+        #expect(resolved.x == "localized:categoryTitle")
+        #expect(resolved.y == "localized:valueTitle")
+        #expect(resolved.series == "localized:seriesTitle")
+        #expect(resolved.facet == "localized:facetTitle")
+        #expect(resolved.count == "localized:countTitle")
+        #expect(resolved.median == "localized:medianTitle")
+
+        let countInput = table(
+            columns: [category, measure],
+            rows: [[.text("A"), .double(1)]])
+        let countSnapshot = AutoChartSnapshot(countInput)
+        let countPresentation = AutoChartRenderPresentation(
+            snapshot: countSnapshot,
+            specification: AutoChartSpecification(
+                family: .bar,
+                encoding: .init(x: category.id, y: measure.id),
+                aggregation: .count),
+            profiles: AutoChartProfiler.profileIndex(countSnapshot),
+            data: [],
+            measureSemantics: renderedAggregationSemantics(.count, columnID: nil))
+        #expect(countPresentation.yTitleMessage?.code == .countTitle)
+        #expect(
+            countPresentation.resolvedYTitle(
+                using: AutoChartTextResolver { message in
+                    message.code == .countTitle ? "Localized count" : nil
+                }) == "Localized count")
     }
 
     @Test func preparationDerivesValueAndAggregationLineage() {
