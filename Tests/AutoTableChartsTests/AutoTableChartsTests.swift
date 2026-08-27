@@ -3479,9 +3479,9 @@ private let date = AutoChartColumn(
             (identity: "text:1:1", label: "1"),
         ])
         let integer = disambiguatedCategoryValue(
-            identity: "integer:1", label: "1", labels: labels)
+            identity: "integer:1", label: "1", labels: labels, fallback: "Missing")
         let text = disambiguatedCategoryValue(
-            identity: "text:1:1", label: "1", labels: labels)
+            identity: "text:1:1", label: "1", labels: labels, fallback: "Missing")
         #expect(integer == "1 (Integer)")
         #expect(text == "1 (Text)")
         #expect(integer != text)
@@ -3882,7 +3882,6 @@ private let date = AutoChartColumn(
 
         let recorder = Recorder()
         let resolved = fallbackPresentation.resolvedPresentation(
-            specification: fallbackSpecification,
             data: [],
             using: AutoChartTextResolver { message in
                 recorder.codes.append(message.code)
@@ -3917,7 +3916,6 @@ private let date = AutoChartColumn(
             arguments: ["scope": .string("rows")],
             defaultText: "Row count")
         let resolvedCount = countPresentation.resolvedPresentation(
-            specification: countSpecification,
             data: [],
             using: AutoChartTextResolver { message in
                 guard message.arguments["scope"] == .string("rows"),
@@ -3944,7 +3942,6 @@ private let date = AutoChartColumn(
                 rangeStartColumnID: "start",
                 rangeEndColumnID: "end"))
         let resolvedRange = rangePresentation.resolvedPresentation(
-            specification: rangeSpecification,
             data: [],
             using: resolver)
         #expect(resolvedRange.rangeStart == "localized:rangeStartTitle")
@@ -3970,7 +3967,6 @@ private let date = AutoChartColumn(
             data: boxData,
             measureSemantics: renderedValueSemantics(columnID: measure.id))
         let resolvedBox = boxPresentation.resolvedPresentation(
-            specification: boxSpecification,
             data: boxData,
             using: resolver)
         #expect(resolvedBox.xDisplayLabels["missing"] == "localized:missingValueLabel")
@@ -3985,7 +3981,6 @@ private let date = AutoChartColumn(
             data: [boxData[0]],
             measureSemantics: renderedValueSemantics(columnID: measure.id))
         let resolvedUngroupedBox = ungroupedBoxPresentation.resolvedPresentation(
-            specification: ungroupedBoxSpecification,
             data: [boxData[0]],
             using: resolver)
         #expect(resolvedUngroupedBox.xDisplayLabels["all"] == "localized:allValuesLabel")
@@ -4020,11 +4015,82 @@ private let date = AutoChartColumn(
             data: missingDimensionData,
             measureSemantics: renderedValueSemantics(columnID: measure.id))
         let resolvedFaceted = facetedPresentation.resolvedPresentation(
-            specification: facetedSpecification,
             data: missingDimensionData,
             using: resolver)
         #expect(resolvedFaceted.missingSeries == "localized:missingSeriesLabel")
         #expect(resolvedFaceted.missingFacet == "localized:missingFacetLabel")
+    }
+
+    @Test func localizedFacetedDomainsAndPanelOrderUseResolvedCategoryValues() {
+        let facet = AutoChartColumn(
+            id: "facet", name: "Facet",
+            hints: .init(semanticType: .nominal, role: .dimension))
+        let specification = AutoChartSpecification(
+            family: .faceted,
+            encoding: .init(x: category.id, y: measure.id, facet: facet.id),
+            facetBaseFamily: .bar)
+        let snapshot = AutoChartSnapshot(
+            table(columns: [category, measure, facet], rows: []))
+        let data = [
+            AutoChartDatum(
+                id: "integer", sourceRowIDs: [],
+                xIdentity: "integer:1", xLabel: "1", yNumber: 1,
+                facetIdentity: "integer:1", facet: "1"),
+            AutoChartDatum(
+                id: "text", sourceRowIDs: [],
+                xIdentity: "text:1:1", xLabel: "1", yNumber: 2,
+                facetIdentity: "text:1:1", facet: "1"),
+        ]
+        let presentation = AutoChartRenderPresentation(
+            snapshot: snapshot,
+            specification: specification,
+            profiles: AutoChartProfiler.profileIndex(snapshot),
+            data: data,
+            measureSemantics: renderedValueSemantics(columnID: measure.id))
+        let resolved = presentation.resolvedPresentation(
+            data: data,
+            using: AutoChartTextResolver { message in
+                guard message.code == .categoryDisambiguation,
+                    case .string(let kind) = message.arguments["kind"]
+                else { return nil }
+                return kind == "integer" ? "Zulu" : "Alpha"
+            })
+
+        #expect(resolved.sharedXCategoryDomain == ["Zulu", "Alpha"])
+        #expect(
+            orderedFacetKeys(
+                in: Dictionary(grouping: data, by: \.facetIdentity),
+                labels: resolved.facetDisplayLabels,
+                fallback: resolved.missingFacet)
+                == ["text:1:1", "integer:1"])
+    }
+
+    @Test func missingFacetDefaultTextRemainsFacetSpecific() {
+        let facet = AutoChartColumn(
+            id: "facet", name: "Facet",
+            hints: .init(semanticType: .nominal, role: .dimension))
+        let specification = AutoChartSpecification(
+            family: .faceted,
+            encoding: .init(x: category.id, y: measure.id, facet: facet.id),
+            facetBaseFamily: .bar)
+        let snapshot = AutoChartSnapshot(
+            table(columns: [category, measure, facet], rows: []))
+        let data = [
+            AutoChartDatum(
+                id: "missing-facet", sourceRowIDs: [],
+                xIdentity: "text:1:A", xLabel: "A", yNumber: 1)
+        ]
+        let presentation = AutoChartRenderPresentation(
+            snapshot: snapshot,
+            specification: specification,
+            profiles: AutoChartProfiler.profileIndex(snapshot),
+            data: data,
+            measureSemantics: renderedValueSemantics(columnID: measure.id))
+        let resolved = presentation.resolvedPresentation(
+            data: data,
+            using: .default)
+
+        #expect(resolved.missingFacet == "Missing facet")
     }
 
     @Test func preparationDerivesValueAndAggregationLineage() {

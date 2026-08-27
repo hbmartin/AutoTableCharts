@@ -64,6 +64,7 @@ private actor OneShotPreparationGate {
         guard !blocked && releaseToken == nil && releaseContinuation == nil
             && releaseTimeoutTask == nil
         else {
+            Issue.record("The one-shot preparation gate cannot be re-armed while blocked.")
             releaseAfterInvariantFailure()
             return false
         }
@@ -942,6 +943,15 @@ private struct CountingChartRowsTable: AutoChartTable {
         }
     }
 
+    @Test func directMessageArgumentsRejectMixedKnownAndUnknownCases() {
+        let mixed = Data(
+            #"{"string":{"_0":"Known"},"future":{"_0":"payload"}}"#.utf8)
+
+        #expect(throws: DecodingError.self) {
+            try JSONDecoder().decode(AutoChartMessageArgument.self, from: mixed)
+        }
+    }
+
     @Test func messagesRejectMalformedKnownArgumentRepresentations() throws {
         let original = AutoChartMessage(
             category: .diagnostic,
@@ -1449,7 +1459,9 @@ private struct CountingChartRowsTable: AutoChartTable {
         let preparation = Task { await gate.waitWhenArmed() }
 
         try await gate.waitUntilBlocked()
-        #expect(!(await gate.arm()))
+        await withKnownIssue("Re-arming reports the gate invariant violation.") {
+            #expect(!(await gate.arm()))
+        }
         await preparation.value
 
         #expect(await gate.activeTimeoutTaskCount == 0)
