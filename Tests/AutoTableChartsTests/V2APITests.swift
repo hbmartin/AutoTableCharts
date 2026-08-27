@@ -61,6 +61,10 @@ private actor OneShotPreparationGate {
     }
 
     func arm() {
+        precondition(
+            !blocked && releaseToken == nil && releaseContinuation == nil
+                && releaseTimeoutTask == nil,
+            "The one-shot preparation gate cannot be re-armed while blocked.")
         armed = true
     }
 
@@ -82,6 +86,10 @@ private actor OneShotPreparationGate {
                     continuation.resume()
                     return
                 }
+                precondition(
+                    releaseToken == nil && releaseContinuation == nil
+                        && releaseTimeoutTask == nil,
+                    "A preparation release is already pending.")
                 releaseToken = token
                 releaseContinuation = continuation
                 releaseTimeoutTask = Task {
@@ -875,6 +883,25 @@ private struct CountingChartRowsTable: AutoChartTable {
 
         #expect(decoded.arguments == ["known": .string("Known")])
         #expect(decoded.defaultText == "Future message")
+    }
+
+    @Test func messagesRejectMalformedKnownArgumentRepresentations() throws {
+        let original = AutoChartMessage(
+            category: .diagnostic,
+            code: .validationFailed,
+            arguments: ["known": .string("Known")],
+            defaultText: "Malformed message")
+        var object = try #require(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(original))
+                as? [String: Any])
+        var arguments = try #require(object["arguments"] as? [String: Any])
+        arguments["known"] = ["string": ["_0": 42]]
+        object["arguments"] = arguments
+        let encoded = try JSONSerialization.data(withJSONObject: object)
+
+        #expect(throws: DecodingError.self) {
+            try JSONDecoder().decode(AutoChartMessage.self, from: encoded)
+        }
     }
 
     #if canImport(Charts) && canImport(SwiftUI)

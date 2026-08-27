@@ -399,12 +399,14 @@ struct AutoChartRenderedMeasureSemantics: Hashable, Sendable {
     let rangeStartColumnID: AutoChartColumnID?
     let rangeEndColumnID: AutoChartColumnID?
     let kind: AutoChartRenderedMeasureKind
+    let usesNormalizedMeasureAxis: Bool
 
     init(
         columnID: AutoChartColumnID?,
         rangeStartColumnID: AutoChartColumnID? = nil,
         rangeEndColumnID: AutoChartColumnID? = nil,
-        kind: AutoChartRenderedMeasureKind
+        kind: AutoChartRenderedMeasureKind,
+        usesNormalizedMeasureAxis: Bool = false
     ) {
         if case .aggregated(.none) = kind {
             preconditionFailure("Prepared aggregated measures require an aggregation.")
@@ -419,6 +421,7 @@ struct AutoChartRenderedMeasureSemantics: Hashable, Sendable {
         self.rangeStartColumnID = rangeStartColumnID
         self.rangeEndColumnID = rangeEndColumnID
         self.kind = kind
+        self.usesNormalizedMeasureAxis = usesNormalizedMeasureAxis
     }
 
     var aggregation: AutoChartAggregation {
@@ -435,38 +438,13 @@ struct AutoChartRenderedMeasureSemantics: Hashable, Sendable {
     }
 }
 
-extension AutoChartSpecification {
-    /// Percent-axis semantics apply only to validated normalized bar marks.
-    var usesNormalizedMeasureAxis: Bool {
-        family == .normalizedBar && stacking == .normalized
-    }
-}
-
 enum AutoChartDataPreparation {
     struct PreparedData: Sendable {
-        enum Failure: Equatable, Sendable {
-            case aggregationRequired(AutoChartFamily)
-
-            var diagnostic: AutoChartDiagnostic {
-                switch self {
-                case .aggregationRequired(let family):
-                    AutoChartDiagnostic(
-                        severity: .error,
-                        code: .unsafeAggregation,
-                        message:
-                            "\(family.displayName) requires an explicit aggregation before data preparation.",
-                        family: family)
-                }
-            }
-        }
-
         var data: [AutoChartDatum]
         var measureSemantics: AutoChartRenderedMeasureSemantics
-        var failure: Failure?
     }
 
     private enum Operation {
-        case invalid
         case raw
         case grouped(AutoChartAggregation)
         case histogram
@@ -477,29 +455,6 @@ enum AutoChartDataPreparation {
     private struct Plan {
         var operation: Operation
         var measureSemantics: AutoChartRenderedMeasureSemantics
-        var failure: PreparedData.Failure? = nil
-    }
-
-    static func data(
-        snapshot: AutoChartSnapshot,
-        specification: AutoChartSpecification
-    ) -> [AutoChartDatum] {
-        let profiles = AutoChartProfiler.profileIndex(snapshot)
-        return preparedData(
-            snapshot: snapshot,
-            specification: specification,
-            profiles: profiles).data
-    }
-
-    static func data(
-        snapshot: AutoChartSnapshot,
-        specification: AutoChartSpecification,
-        profiles: [AutoChartColumnID: AutoChartColumnProfile]
-    ) -> [AutoChartDatum] {
-        preparedData(
-            snapshot: snapshot,
-            specification: specification,
-            profiles: profiles).data
     }
 
     static func preparedData(
@@ -509,8 +464,6 @@ enum AutoChartDataPreparation {
     ) -> PreparedData {
         let plan = preparationPlan(for: specification)
         let data = switch plan.operation {
-        case .invalid:
-            [AutoChartDatum]()
         case .raw:
             sorted(
                 raw(
@@ -538,10 +491,7 @@ enum AutoChartDataPreparation {
                 specification: specification,
                 profiles: profiles)
         }
-        return PreparedData(
-            data: data,
-            measureSemantics: plan.measureSemantics,
-            failure: plan.failure)
+        return PreparedData(data: data, measureSemantics: plan.measureSemantics)
     }
 
     private static func preparationPlan(
@@ -559,12 +509,16 @@ enum AutoChartDataPreparation {
             rangeStartColumnID = nil
             rangeEndColumnID = nil
         }
+        let usesNormalizedMeasureAxis =
+            specification.family == .normalizedBar
+            && specification.stacking == .normalized
         func valueSemantics() -> AutoChartRenderedMeasureSemantics {
             AutoChartRenderedMeasureSemantics(
                 columnID: specification.encoding.y,
                 rangeStartColumnID: rangeStartColumnID,
                 rangeEndColumnID: rangeEndColumnID,
-                kind: .value)
+                kind: .value,
+                usesNormalizedMeasureAxis: usesNormalizedMeasureAxis)
         }
         func aggregatedSemantics(
             _ aggregation: AutoChartAggregation
@@ -572,7 +526,8 @@ enum AutoChartDataPreparation {
             AutoChartRenderedMeasureSemantics(
                 columnID: aggregation.preservesMeasureLineage
                     ? specification.encoding.y : nil,
-                kind: .aggregated(aggregation))
+                kind: .aggregated(aggregation),
+                usesNormalizedMeasureAxis: usesNormalizedMeasureAxis)
         }
 
         switch specification.family {
@@ -589,12 +544,9 @@ enum AutoChartDataPreparation {
         case .kpi:
             return Plan(operation: .raw, measureSemantics: valueSemantics())
         case .donut:
-            guard specification.aggregation != .none else {
-                return Plan(
-                    operation: .invalid,
-                    measureSemantics: valueSemantics(),
-                    failure: .aggregationRequired(.donut))
-            }
+            precondition(
+                specification.aggregation != .none,
+                "Donut preparation requires structural validation and an aggregation.")
             return Plan(
                 operation: .grouped(specification.aggregation),
                 measureSemantics: aggregatedSemantics(specification.aggregation))
@@ -1018,6 +970,7 @@ struct AutoChartRenderPresentation: Sendable {
     var facetBaseFamily: AutoChartFamily?
     var xTitle: String
     var yTitle: String
+    var yTitleMessage: AutoChartMessage?
     var seriesTitle: String
     var facetTitle: String
     var xSemanticType: AutoChartSemanticType?
@@ -1263,20 +1216,37 @@ struct AutoChartRenderPresentation: Sendable {
             .map(AutoChartProfiler.displayName) ?? "Category"
         let sourceYTitle = specification.encoding.y.flatMap { snapshot.column($0) }
             .map(AutoChartProfiler.displayName)
-        yTitle = switch measureSemantics.aggregation {
+        let resolvedYTitle: (text: String, message: AutoChartMessage?) =
+            switch measureSemantics.aggregation {
         case .count where ![.histogram, .heatmap].contains(specification.family):
-            "Count"
+            ("Count", nil)
         case .countDistinct:
-            sourceYTitle.map { "Distinct count of \($0)" } ?? "Distinct count"
+            {
+                let text = sourceYTitle.map { "Distinct count of \($0)" }
+                    ?? "Distinct count"
+                return (
+                    text,
+                    AutoChartMessage(
+                        category: .interface,
+                        code: .distinctCountTitle,
+                        arguments: sourceYTitle.map { ["column": .string($0)] } ?? [:],
+                        defaultText: text))
+            }()
         case .none, .sum, .mean, .minimum, .maximum, .count:
-            sourceYTitle ?? "Value"
+            (sourceYTitle ?? "Value", nil)
         }
+        yTitle = resolvedYTitle.text
+        yTitleMessage = resolvedYTitle.message
         seriesTitle =
             specification.encoding.series.flatMap { snapshot.column($0) }
             .map(AutoChartProfiler.displayName) ?? "Series"
         facetTitle =
             specification.encoding.facet.flatMap { snapshot.column($0) }
             .map(AutoChartProfiler.displayName) ?? "Facet"
+    }
+
+    func resolvedYTitle(using textResolver: AutoChartTextResolver) -> String {
+        yTitleMessage.map(textResolver.callAsFunction) ?? yTitle
     }
 }
 
@@ -1353,10 +1323,6 @@ struct AutoChartRenderCore: Sendable {
             snapshot: snapshot,
             specification: specification,
             profiles: profiles)
-        if let failure = preparedData.failure {
-            throw AutoChartPreparationError.invalidSpecification(
-                AutoChartValidationResult(issues: [failure.diagnostic]))
-        }
         let validation = AutoChartRecommendationEngine.validatePreparedNumericDomain(
             structuralValidation: structuralValidation,
             specification: specification,
@@ -1500,7 +1466,7 @@ struct AutoChartKPIContent: View {
             assertionFailure("Prepared KPI charts require one source measure value.")
             resolvedValueText = AutoChartValue.unrepresentableValuePlaceholder
         }
-        let resolvedTitle = core.presentation.yTitle
+        let resolvedTitle = core.presentation.resolvedYTitle(using: textResolver)
         valueText = resolvedValueText
         title = resolvedTitle
         isCompact = typography == .compact
@@ -1600,7 +1566,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     private var facetBaseFamily: AutoChartFamily? { renderPresentation.facetBaseFamily }
     private var snapshotFingerprint: Int { preparedChart.core.fingerprint }
     private var xTitle: String { renderPresentation.xTitle }
-    private var yTitle: String { renderPresentation.yTitle }
+    private var yTitle: String { renderPresentation.resolvedYTitle(using: textResolver) }
     private var seriesTitle: String { renderPresentation.seriesTitle }
     private var facetTitle: String { renderPresentation.facetTitle }
     private var xSemanticType: AutoChartSemanticType? { renderPresentation.xSemanticType }
@@ -2481,7 +2447,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         switch surface {
         case .axisTick:
             context = .axisTick
-            normalizedFraction = specification.usesNormalizedMeasureAxis
+            normalizedFraction = renderedMeasureSemantics.usesNormalizedMeasureAxis
         case .markAccessibility:
             context = .markAccessibility
             normalizedFraction = false

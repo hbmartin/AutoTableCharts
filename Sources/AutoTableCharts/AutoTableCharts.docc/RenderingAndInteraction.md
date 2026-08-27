@@ -58,9 +58,8 @@ complete semantic purpose. Use the request override whenever formatting depends
 on count, distinct-count, or normalized-fraction semantics.
 
 > Important: Raw measure values are delivered to request overrides with purpose
-> `.value`. Overrides that previously handled raw measures as
-> `.aggregatedMeasure(.none)` must handle `.value` instead; aggregated-measure
-> requests are now reserved for values transformed by an aggregation.
+> `.value`. Aggregated-measure requests carry an ``AutoChartAppliedAggregation``
+> and are reserved for values transformed by an aggregation.
 
 ``AutoChartTextResolver`` can override diagnostics, rationale, fallback,
 accessibility, and built-in controls using stable typed messages. Return `nil`

@@ -70,6 +70,12 @@ enum AutoChartRecommendationEngine {
         func cachedPreparedValidation(
             _ specification: AutoChartSpecification
         ) -> AutoChartValidationResult {
+            guard requiresPreparedNumericDomainValidation(
+                specification: specification,
+                profiles: profileIndex)
+            else {
+                return cachedStructuralValidation(specification)
+            }
             if let cached = preparedValidationResults[specification] { return cached }
             let result = validatePreparedNumericDomain(
                 structuralValidation: cachedStructuralValidation(specification),
@@ -1282,15 +1288,10 @@ enum AutoChartRecommendationEngine {
         if let preparedData {
             data = preparedData
         } else {
-            let preparation = AutoChartDataPreparation.preparedData(
+            data = AutoChartDataPreparation.preparedData(
                 snapshot: snapshot,
                 specification: specification,
-                profiles: profiles)
-            if let failure = preparation.failure {
-                return AutoChartValidationResult(
-                    issues: structuralValidation.issues + [failure.diagnostic])
-            }
-            data = preparation.data
+                profiles: profiles).data
         }
         return AutoChartValidationResult(
             issues: structuralValidation.issues
