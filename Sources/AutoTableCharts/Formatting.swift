@@ -26,13 +26,34 @@ public enum AutoChartAppliedAggregation: String, CaseIterable, Hashable, Codable
     /// Count distinct contributing values.
     case countDistinct
 
-    init?(_ aggregation: AutoChartAggregation) {
-        guard aggregation != .none else { return nil }
-        self.init(rawValue: aggregation.rawValue)
+    /// Creates an applied aggregation from a general aggregation, returning
+    /// `nil` only for the untransformed `.none` case.
+    public init?(_ aggregation: AutoChartAggregation) {
+        switch aggregation {
+        case .none: return nil
+        case .sum: self = .sum
+        case .mean: self = .mean
+        case .minimum: self = .minimum
+        case .maximum: self = .maximum
+        case .count: self = .count
+        case .countDistinct: self = .countDistinct
+        }
+    }
+
+    /// The corresponding general aggregation.
+    public var aggregation: AutoChartAggregation {
+        switch self {
+        case .sum: .sum
+        case .mean: .mean
+        case .minimum: .minimum
+        case .maximum: .maximum
+        case .count: .count
+        case .countDistinct: .countDistinct
+        }
     }
 
     var usesCountFormatting: Bool {
-        self == .count || self == .countDistinct
+        aggregation.usesCountFormatting
     }
 }
 
@@ -50,7 +71,10 @@ extension AutoChartFormattingPurpose {
     /// The presentation purpose for a measure produced by the preparation plan.
     /// `.none` represents an untransformed source value rather than an aggregate.
     static func renderedMeasure(_ aggregation: AutoChartAggregation) -> Self {
-        guard let applied = AutoChartAppliedAggregation(aggregation) else { return .value }
+        guard aggregation != .none else { return .value }
+        guard let applied = AutoChartAppliedAggregation(aggregation) else {
+            preconditionFailure("Every non-none aggregation must have an applied representation.")
+        }
         return .aggregatedMeasure(applied)
     }
 }

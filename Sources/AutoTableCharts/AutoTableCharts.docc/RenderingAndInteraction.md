@@ -59,11 +59,16 @@ on count, distinct-count, or normalized-fraction semantics.
 
 > Important: Raw measure values are delivered to request overrides with purpose
 > `.value`. Aggregated-measure requests carry an ``AutoChartAppliedAggregation``
-> and are reserved for values transformed by an aggregation.
+> and are reserved for values transformed by an aggregation. Applied
+> aggregations convert explicitly to and from ``AutoChartAggregation``. A
+> normalized fraction may still carry `.none` when normalized stacking operates
+> on unaggregated source marks.
 
 ``AutoChartTextResolver`` can override diagnostics, rationale, fallback,
-accessibility, and built-in controls using stable typed messages. Return `nil`
-to use the package English fallback.
+accessibility, built-in controls, and generated chart labels using stable typed
+messages. Generated category, value, count, distinct-count, median, series, and
+facet titles each have a stable message code. Source-column display names remain
+host-provided text. Return `nil` to use the package English fallback.
 
 ### Link semantic selection
 
