@@ -1603,6 +1603,49 @@ public struct AutoChartMessage: Hashable, Codable, Sendable {
     }
 }
 
+/// Internal source of the stable `kind` values documented by
+/// `AutoChartMessage.Code.categoryDisambiguation`; keep additions in this enum and
+/// that public resolver contract synchronized.
+enum AutoChartCategoryDisambiguationKind: String, Sendable {
+    case boolean
+    case integer
+    case number
+    case exactNumber = "exact-number"
+    case double
+    case decimal
+    case text
+    case date
+    case value
+
+    init(identity: String) {
+        self = switch identity.split(separator: ":", maxSplits: 1).first {
+        case "boolean": .boolean
+        case "integer": .integer
+        case "number": .number
+        case "exact-number": .exactNumber
+        case "double": .double
+        case "decimal": .decimal
+        case "text": .text
+        case "date": .date
+        default: .value
+        }
+    }
+
+    var defaultText: String {
+        switch self {
+        case .boolean: "Boolean"
+        case .integer: "Integer"
+        case .number: "Number"
+        case .exactNumber: "Exact Number"
+        case .double: "Double"
+        case .decimal: "Decimal"
+        case .text: "Text"
+        case .date: "Date"
+        case .value: "Value"
+        }
+    }
+}
+
 /// Host override for package-authored text. Return `nil` to use `defaultText`.
 public struct AutoChartTextResolver: Sendable {
     private let resolveValue: @Sendable (AutoChartMessage) -> String?
