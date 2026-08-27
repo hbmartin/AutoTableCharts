@@ -3487,6 +3487,30 @@ private let date = AutoChartColumn(
         #expect(integer != text)
     }
 
+    @Test func typedIdentityQualifiersAreLocalizable() {
+        final class Recorder: @unchecked Sendable {
+            var messages: [AutoChartMessage] = []
+        }
+        let recorder = Recorder()
+        let labels = disambiguatedCategoryLabels(
+            [
+                (identity: "integer:1", label: "1"),
+                (identity: "text:1:1", label: "1"),
+            ],
+            textResolver: AutoChartTextResolver { message in
+                recorder.messages.append(message)
+                guard case .string(let label) = message.arguments["label"],
+                    case .string(let kind) = message.arguments["kind"]
+                else { return nil }
+                return "\(label) [\(kind)]"
+            })
+
+        #expect(labels["integer:1"] == "1 [integer]")
+        #expect(labels["text:1:1"] == "1 [text]")
+        #expect(recorder.messages.allSatisfy { $0.code == .categoryDisambiguation })
+        #expect(recorder.messages.allSatisfy { $0.arguments["index"] == nil })
+    }
+
     @Test func exactAndFallbackNumericIdentitiesHaveMeaningfulQualifiers() {
         let labels = disambiguatedCategoryLabels([
             (identity: "exact-number:3:1e0", label: "1"),
@@ -3834,13 +3858,17 @@ private let date = AutoChartColumn(
     }
 
     @Test func generatedChartTitlesAreTypedAndLocalizable() {
+        final class Recorder: @unchecked Sendable {
+            var codes: [AutoChartMessage.Code] = []
+        }
         let emptySnapshot = AutoChartSnapshot(
             table(columns: [], rows: []))
+        let fallbackSpecification = AutoChartSpecification(
+            family: .bar,
+            encoding: .init())
         let fallbackPresentation = AutoChartRenderPresentation(
             snapshot: emptySnapshot,
-            specification: AutoChartSpecification(
-                family: .bar,
-                encoding: .init()),
+            specification: fallbackSpecification,
             profiles: [:],
             data: [],
             measureSemantics: renderedValueSemantics(columnID: nil))
@@ -3849,37 +3877,154 @@ private let date = AutoChartColumn(
         #expect(fallbackPresentation.yTitleMessage?.code == .valueTitle)
         #expect(fallbackPresentation.seriesTitleMessage?.code == .seriesTitle)
         #expect(fallbackPresentation.facetTitleMessage?.code == .facetTitle)
-        #expect(fallbackPresentation.countTitleMessage.code == .countTitle)
-        #expect(fallbackPresentation.medianTitleMessage.code == .medianTitle)
+        #expect(AutoChartRenderPresentation.countTitleMessage.code == .countTitle)
+        #expect(AutoChartRenderPresentation.medianTitleMessage.code == .medianTitle)
 
-        let resolved = fallbackPresentation.resolvedTitles(
-            using: AutoChartTextResolver { "localized:\($0.code.rawValue)" })
+        let recorder = Recorder()
+        let resolved = fallbackPresentation.resolvedPresentation(
+            specification: fallbackSpecification,
+            data: [],
+            using: AutoChartTextResolver { message in
+                recorder.codes.append(message.code)
+                return "localized:\(message.code.rawValue)"
+            })
         #expect(resolved.x == "localized:categoryTitle")
         #expect(resolved.y == "localized:valueTitle")
-        #expect(resolved.series == "localized:seriesTitle")
-        #expect(resolved.facet == "localized:facetTitle")
-        #expect(resolved.count == "localized:countTitle")
-        #expect(resolved.median == "localized:medianTitle")
+        #expect(resolved.series == "Series")
+        #expect(resolved.facet == "Facet")
+        #expect(resolved.count == "Count")
+        #expect(resolved.median == "Median")
+        #expect(recorder.codes == [.categoryTitle, .valueTitle])
 
         let countInput = table(
             columns: [category, measure],
             rows: [[.text("A"), .double(1)]])
         let countSnapshot = AutoChartSnapshot(countInput)
-        let countPresentation = AutoChartRenderPresentation(
+        let countSpecification = AutoChartSpecification(
+            family: .bar,
+            encoding: .init(x: category.id, y: measure.id),
+            aggregation: .count)
+        var countPresentation = AutoChartRenderPresentation(
             snapshot: countSnapshot,
-            specification: AutoChartSpecification(
-                family: .bar,
-                encoding: .init(x: category.id, y: measure.id),
-                aggregation: .count),
+            specification: countSpecification,
             profiles: AutoChartProfiler.profileIndex(countSnapshot),
             data: [],
             measureSemantics: renderedAggregationSemantics(.count, columnID: nil))
-        #expect(countPresentation.yTitleMessage?.code == .countTitle)
-        #expect(
-            countPresentation.resolvedYTitle(
-                using: AutoChartTextResolver { message in
-                    message.code == .countTitle ? "Localized count" : nil
-                }) == "Localized count")
+        countPresentation.yTitle = "Row count"
+        countPresentation.yTitleMessage = AutoChartMessage(
+            category: .interface,
+            code: .countTitle,
+            arguments: ["scope": .string("rows")],
+            defaultText: "Row count")
+        let resolvedCount = countPresentation.resolvedPresentation(
+            specification: countSpecification,
+            data: [],
+            using: AutoChartTextResolver { message in
+                guard message.arguments["scope"] == .string("rows"),
+                    message.defaultText == "Row count"
+                else { return nil }
+                return "Localized row count"
+            })
+        #expect(resolvedCount.y == "Localized row count")
+    }
+
+    @Test func generatedRangeAndMissingLabelsAreTypedAndLocalizable() {
+        let resolver = AutoChartTextResolver { "localized:\($0.code.rawValue)" }
+        let emptySnapshot = AutoChartSnapshot(table(columns: [], rows: []))
+        let rangeSpecification = AutoChartSpecification(
+            family: .range,
+            encoding: .init(x: "category", start: "start", end: "end"))
+        let rangePresentation = AutoChartRenderPresentation(
+            snapshot: emptySnapshot,
+            specification: rangeSpecification,
+            profiles: [:],
+            data: [],
+            measureSemantics: renderedValueSemantics(
+                columnID: nil,
+                rangeStartColumnID: "start",
+                rangeEndColumnID: "end"))
+        let resolvedRange = rangePresentation.resolvedPresentation(
+            specification: rangeSpecification,
+            data: [],
+            using: resolver)
+        #expect(resolvedRange.rangeStart == "localized:rangeStartTitle")
+        #expect(resolvedRange.rangeEnd == "localized:rangeEndTitle")
+        #expect(resolvedRange.date == "localized:dateTitle")
+
+        let boxData = [
+            AutoChartDatum(
+                id: "all", sourceRowIDs: [], xIdentity: "all", xLabel: "All"),
+            AutoChartDatum(
+                id: "missing", sourceRowIDs: [], xIdentity: "missing",
+                xSourceValue: .null, xLabel: "Missing value"),
+        ]
+        let boxSpecification = AutoChartSpecification(
+            family: .boxPlot,
+            encoding: .init(x: category.id, y: measure.id))
+        let boxSnapshot = AutoChartSnapshot(
+            table(columns: [category, measure], rows: []))
+        let boxPresentation = AutoChartRenderPresentation(
+            snapshot: boxSnapshot,
+            specification: boxSpecification,
+            profiles: AutoChartProfiler.profileIndex(boxSnapshot),
+            data: boxData,
+            measureSemantics: renderedValueSemantics(columnID: measure.id))
+        let resolvedBox = boxPresentation.resolvedPresentation(
+            specification: boxSpecification,
+            data: boxData,
+            using: resolver)
+        #expect(resolvedBox.xDisplayLabels["missing"] == "localized:missingValueLabel")
+
+        let ungroupedBoxSpecification = AutoChartSpecification(
+            family: .boxPlot,
+            encoding: .init(y: measure.id))
+        let ungroupedBoxPresentation = AutoChartRenderPresentation(
+            snapshot: boxSnapshot,
+            specification: ungroupedBoxSpecification,
+            profiles: AutoChartProfiler.profileIndex(boxSnapshot),
+            data: [boxData[0]],
+            measureSemantics: renderedValueSemantics(columnID: measure.id))
+        let resolvedUngroupedBox = ungroupedBoxPresentation.resolvedPresentation(
+            specification: ungroupedBoxSpecification,
+            data: [boxData[0]],
+            using: resolver)
+        #expect(resolvedUngroupedBox.xDisplayLabels["all"] == "localized:allValuesLabel")
+
+        let series = AutoChartColumn(
+            id: "series", name: "Series",
+            hints: .init(semanticType: .nominal, role: .dimension))
+        let facet = AutoChartColumn(
+            id: "facet", name: "Facet",
+            hints: .init(semanticType: .nominal, role: .dimension))
+        let facetedSpecification = AutoChartSpecification(
+            family: .faceted,
+            encoding: .init(
+                x: category.id,
+                y: measure.id,
+                series: series.id,
+                facet: facet.id))
+        let facetedSnapshot = AutoChartSnapshot(
+            table(columns: [category, measure, series, facet], rows: []))
+        let missingDimensionData = [
+            AutoChartDatum(
+                id: "missing-dimensions",
+                sourceRowIDs: [],
+                xIdentity: "text:1:A",
+                xLabel: "A",
+                yNumber: 1)
+        ]
+        let facetedPresentation = AutoChartRenderPresentation(
+            snapshot: facetedSnapshot,
+            specification: facetedSpecification,
+            profiles: AutoChartProfiler.profileIndex(facetedSnapshot),
+            data: missingDimensionData,
+            measureSemantics: renderedValueSemantics(columnID: measure.id))
+        let resolvedFaceted = facetedPresentation.resolvedPresentation(
+            specification: facetedSpecification,
+            data: missingDimensionData,
+            using: resolver)
+        #expect(resolvedFaceted.missingSeries == "localized:missingSeriesLabel")
+        #expect(resolvedFaceted.missingFacet == "localized:missingFacetLabel")
     }
 
     @Test func preparationDerivesValueAndAggregationLineage() {

@@ -1297,39 +1297,42 @@ public enum AutoChartMessageArgument: Hashable, Codable, Sendable {
         }
     }
 
-    fileprivate static func decodeKnownCase(
+    fileprivate static func decodeKnownCase<Key: CodingKey>(
         _ key: CaseCodingKey,
-        from container: KeyedDecodingContainer<CaseCodingKey>
+        forKey codingKey: Key,
+        from container: KeyedDecodingContainer<Key>
     ) throws -> Self? {
         switch key {
         case .string:
-            .string(try container.decode(Payload<String>.self, forKey: key).value)
+            .string(try container.decode(Payload<String>.self, forKey: codingKey).value)
         case .integer:
-            .integer(try container.decode(Payload<Int>.self, forKey: key).value)
+            .integer(try container.decode(Payload<Int>.self, forKey: codingKey).value)
         case .number:
-            .number(try container.decode(Payload<Double>.self, forKey: key).value)
+            .number(try container.decode(Payload<Double>.self, forKey: codingKey).value)
         case .column:
-            .column(try container.decode(Payload<AutoChartColumnID>.self, forKey: key).value)
+            .column(
+                try container.decode(Payload<AutoChartColumnID>.self, forKey: codingKey).value)
         case .family:
             try AutoChartFamily(
-                rawValue: container.decode(Payload<String>.self, forKey: key).value
+                rawValue: container.decode(Payload<String>.self, forKey: codingKey).value
             ).map(Self.family)
         case .aggregation:
             try AutoChartAggregation(
-                rawValue: container.decode(Payload<String>.self, forKey: key).value
+                rawValue: container.decode(Payload<String>.self, forKey: codingKey).value
             ).map(Self.aggregation)
         }
     }
 
     public init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CaseCodingKey.self)
-        guard container.allKeys.count == 1, let key = container.allKeys.first else {
+        let keys = container.allKeys
+        guard keys.count == 1, let key = keys.first else {
             throw DecodingError.dataCorrupted(
                 .init(
                     codingPath: decoder.codingPath,
                     debugDescription: "A message argument must contain exactly one known case."))
         }
-        guard let value = try Self.decodeKnownCase(key, from: container) else {
+        guard let value = try Self.decodeKnownCase(key, forKey: key, from: container) else {
             throw DecodingError.dataCorrupted(
                 .init(
                     codingPath: decoder.codingPath,
@@ -1436,6 +1439,14 @@ public struct AutoChartMessage: Hashable, Codable, Sendable {
         public static let medianTitle = Self(rawValue: "medianTitle")
         public static let seriesTitle = Self(rawValue: "seriesTitle")
         public static let facetTitle = Self(rawValue: "facetTitle")
+        public static let rangeStartTitle = Self(rawValue: "rangeStartTitle")
+        public static let rangeEndTitle = Self(rawValue: "rangeEndTitle")
+        public static let dateTitle = Self(rawValue: "dateTitle")
+        public static let allValuesLabel = Self(rawValue: "allValuesLabel")
+        public static let missingValueLabel = Self(rawValue: "missingValueLabel")
+        public static let missingSeriesLabel = Self(rawValue: "missingSeriesLabel")
+        public static let missingFacetLabel = Self(rawValue: "missingFacetLabel")
+        public static let categoryDisambiguation = Self(rawValue: "categoryDisambiguation")
 
         public init(from decoder: any Decoder) throws {
             self.init(rawValue: try decoder.singleValueContainer().decode(String.self))
@@ -1492,11 +1503,13 @@ public struct AutoChartMessage: Hashable, Codable, Sendable {
                     throw error
                 }
             }
-            let knownKeys = container.allKeys.compactMap {
-                AutoChartMessageArgument.CaseCodingKey(rawValue: $0.stringValue)
-            }
-            guard container.allKeys.count == 1, let key = container.allKeys.first else {
-                guard knownKeys.isEmpty else {
+            let keys = container.allKeys
+            guard keys.count == 1, let key = keys.first else {
+                guard
+                    !keys.contains(where: {
+                        AutoChartMessageArgument.CaseCodingKey(rawValue: $0.stringValue) != nil
+                    })
+                else {
                     throw DecodingError.dataCorrupted(
                         .init(
                             codingPath: decoder.codingPath,
@@ -1513,11 +1526,10 @@ public struct AutoChartMessage: Hashable, Codable, Sendable {
                 value = nil
                 return
             }
-            let knownContainer = try decoder.container(
-                keyedBy: AutoChartMessageArgument.CaseCodingKey.self)
             value = try AutoChartMessageArgument.decodeKnownCase(
                 caseKey,
-                from: knownContainer)
+                forKey: key,
+                from: container)
         }
     }
 

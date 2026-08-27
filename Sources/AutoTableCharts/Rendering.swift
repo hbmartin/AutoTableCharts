@@ -903,6 +903,20 @@ enum AutoChartDataPreparation {
 func disambiguatedCategoryLabels(
     _ pairs: [(identity: String, label: String)]
 ) -> [String: String] {
+    resolvedDisambiguatedCategoryLabels(pairs, textResolver: nil)
+}
+
+func disambiguatedCategoryLabels(
+    _ pairs: [(identity: String, label: String)],
+    textResolver: AutoChartTextResolver
+) -> [String: String] {
+    resolvedDisambiguatedCategoryLabels(pairs, textResolver: textResolver)
+}
+
+private func resolvedDisambiguatedCategoryLabels(
+    _ pairs: [(identity: String, label: String)],
+    textResolver: AutoChartTextResolver?
+) -> [String: String] {
     let groups = Dictionary(grouping: pairs, by: \.label)
         .map { label, pairs in
             (label: label, identities: Array(Set(pairs.map(\.identity))).sorted())
@@ -917,27 +931,39 @@ func disambiguatedCategoryLabels(
     var usedLabels = Set(labels.values)
     for (label, identities) in groups {
         guard identities.count > 1 else { continue }
-        let kinds = identities.map { identity -> String in
+        let kinds = identities.map { identity -> (rawValue: String, defaultText: String) in
             switch identity.split(separator: ":", maxSplits: 1).first {
-            case "boolean": "Boolean"
-            case "integer": "Integer"
-            case "number": "Number"
-            case "exact-number": "Exact Number"
-            case "double": "Double"
-            case "decimal": "Decimal"
-            case "text": "Text"
-            case "date": "Date"
-            default: "Value"
+            case "boolean": ("boolean", "Boolean")
+            case "integer": ("integer", "Integer")
+            case "number": ("number", "Number")
+            case "exact-number": ("exact-number", "Exact Number")
+            case "double": ("double", "Double")
+            case "decimal": ("decimal", "Decimal")
+            case "text": ("text", "Text")
+            case "date": ("date", "Date")
+            default: ("value", "Value")
             }
         }
-        let kindCounts = Dictionary(grouping: kinds, by: { $0 }).mapValues(\.count)
+        let kindCounts = Dictionary(grouping: kinds, by: \.rawValue).mapValues(\.count)
         var kindIndexes: [String: Int] = [:]
         for (identity, kind) in zip(identities, kinds) {
-            kindIndexes[kind, default: 0] += 1
-            let qualifier =
-                kindCounts[kind, default: 0] == 1
-                ? kind : "\(kind) \(kindIndexes[kind, default: 0])"
-            let base = "\(label) (\(qualifier))"
+            kindIndexes[kind.rawValue, default: 0] += 1
+            let index =
+                kindCounts[kind.rawValue, default: 0] == 1
+                ? nil : kindIndexes[kind.rawValue, default: 0]
+            let qualifier = index.map { "\(kind.defaultText) \($0)" } ?? kind.defaultText
+            let defaultText = "\(label) (\(qualifier))"
+            var arguments: [String: AutoChartMessageArgument] = [
+                "label": .string(label),
+                "kind": .string(kind.rawValue),
+            ]
+            if let index { arguments["index"] = .integer(index) }
+            let base = textResolver?(
+                AutoChartMessage(
+                    category: .interface,
+                    code: .categoryDisambiguation,
+                    arguments: arguments,
+                    defaultText: defaultText)) ?? defaultText
             var candidate = base
             var suffix = 2
             while usedLabels.contains(candidate) {
@@ -962,6 +988,33 @@ func disambiguatedCategoryValue(
 }
 
 struct AutoChartRenderPresentation: Sendable {
+    static let categoryTitleMessage = AutoChartMessage(
+        category: .interface, code: .categoryTitle, defaultText: "Category")
+    static let valueTitleMessage = AutoChartMessage(
+        category: .interface, code: .valueTitle, defaultText: "Value")
+    static let countTitleMessage = AutoChartMessage(
+        category: .interface, code: .countTitle, defaultText: "Count")
+    static let medianTitleMessage = AutoChartMessage(
+        category: .interface, code: .medianTitle, defaultText: "Median")
+    static let defaultSeriesTitleMessage = AutoChartMessage(
+        category: .interface, code: .seriesTitle, defaultText: "Series")
+    static let defaultFacetTitleMessage = AutoChartMessage(
+        category: .interface, code: .facetTitle, defaultText: "Facet")
+    static let rangeStartTitleMessage = AutoChartMessage(
+        category: .interface, code: .rangeStartTitle, defaultText: "Start")
+    static let rangeEndTitleMessage = AutoChartMessage(
+        category: .interface, code: .rangeEndTitle, defaultText: "End")
+    static let dateTitleMessage = AutoChartMessage(
+        category: .interface, code: .dateTitle, defaultText: "Date")
+    static let allValuesLabelMessage = AutoChartMessage(
+        category: .interface, code: .allValuesLabel, defaultText: "All")
+    static let missingValueLabelMessage = AutoChartMessage(
+        category: .interface, code: .missingValueLabel, defaultText: "Missing value")
+    static let missingSeriesLabelMessage = AutoChartMessage(
+        category: .interface, code: .missingSeriesLabel, defaultText: "Missing series")
+    static let missingFacetLabelMessage = AutoChartMessage(
+        category: .interface, code: .missingFacetLabel, defaultText: "Missing facet")
+
     var sizeBounds: (minimum: Double, maximum: Double)?
     var sharedYDomain: ClosedRange<Double>?
     var sharedXDateDomain: ClosedRange<Date>?
@@ -976,8 +1029,6 @@ struct AutoChartRenderPresentation: Sendable {
     var seriesTitleMessage: AutoChartMessage?
     var facetTitle: String
     var facetTitleMessage: AutoChartMessage?
-    var countTitleMessage: AutoChartMessage
-    var medianTitleMessage: AutoChartMessage
     var xSemanticType: AutoChartSemanticType?
     var xDisplayLabels: [String: String]
     var yDisplayLabels: [String: String]
@@ -1223,10 +1274,7 @@ struct AutoChartRenderPresentation: Sendable {
             xTitleMessage = nil
         } else {
             xTitle = "Category"
-            xTitleMessage = AutoChartMessage(
-                category: .interface,
-                code: .categoryTitle,
-                defaultText: xTitle)
+            xTitleMessage = Self.categoryTitleMessage
         }
         let sourceYTitle = specification.encoding.y.flatMap { snapshot.column($0) }
             .map(AutoChartProfiler.displayName)
@@ -1235,10 +1283,7 @@ struct AutoChartRenderPresentation: Sendable {
         case .count where ![.histogram, .heatmap].contains(specification.family):
             (
                 "Count",
-                AutoChartMessage(
-                    category: .interface,
-                    code: .countTitle,
-                    defaultText: "Count"))
+                Self.countTitleMessage)
         case .countDistinct:
             {
                 let text = sourceYTitle.map { "Distinct count of \($0)" }
@@ -1257,10 +1302,7 @@ struct AutoChartRenderPresentation: Sendable {
             } else {
                 (
                     "Value",
-                    AutoChartMessage(
-                        category: .interface,
-                        code: .valueTitle,
-                        defaultText: "Value"))
+                    Self.valueTitleMessage)
             }
         }
         yTitle = resolvedYTitle.text
@@ -1272,10 +1314,7 @@ struct AutoChartRenderPresentation: Sendable {
             seriesTitleMessage = nil
         } else {
             seriesTitle = "Series"
-            seriesTitleMessage = AutoChartMessage(
-                category: .interface,
-                code: .seriesTitle,
-                defaultText: seriesTitle)
+            seriesTitleMessage = Self.defaultSeriesTitleMessage
         }
         if let sourceFacetTitle = specification.encoding.facet
             .flatMap({ snapshot.column($0) }).map(AutoChartProfiler.displayName)
@@ -1284,50 +1323,199 @@ struct AutoChartRenderPresentation: Sendable {
             facetTitleMessage = nil
         } else {
             facetTitle = "Facet"
-            facetTitleMessage = AutoChartMessage(
-                category: .interface,
-                code: .facetTitle,
-                defaultText: facetTitle)
+            facetTitleMessage = Self.defaultFacetTitleMessage
         }
-        countTitleMessage = AutoChartMessage(
-            category: .interface,
-            code: .countTitle,
-            defaultText: "Count")
-        medianTitleMessage = AutoChartMessage(
-            category: .interface,
-            code: .medianTitle,
-            defaultText: "Median")
     }
 
     func resolvedYTitle(using textResolver: AutoChartTextResolver) -> String {
         yTitleMessage.map(textResolver.callAsFunction) ?? yTitle
     }
 
-    func resolvedTitles(using textResolver: AutoChartTextResolver) -> AutoChartResolvedTitles {
-        let count = textResolver(countTitleMessage)
-        let resolvedYTitle =
-            if yTitleMessage?.code == .countTitle {
-                count
-            } else {
-                yTitleMessage.map(textResolver.callAsFunction) ?? yTitle
-            }
-        return AutoChartResolvedTitles(
-            x: xTitleMessage.map(textResolver.callAsFunction) ?? xTitle,
-            y: resolvedYTitle,
-            series: seriesTitleMessage.map(textResolver.callAsFunction) ?? seriesTitle,
-            facet: facetTitleMessage.map(textResolver.callAsFunction) ?? facetTitle,
-            count: count,
-            median: textResolver(medianTitleMessage))
+    func resolvedPresentation(
+        specification: AutoChartSpecification,
+        data: [AutoChartDatum],
+        using textResolver: AutoChartTextResolver
+    ) -> AutoChartResolvedPresentation {
+        AutoChartResolvedPresentation(
+            presentation: self,
+            specification: specification,
+            data: data,
+            textResolver: textResolver)
     }
 }
 
-struct AutoChartResolvedTitles: Sendable {
+struct AutoChartResolvedPresentation: Sendable {
     var x: String
     var y: String
     var series: String
     var facet: String
     var count: String
     var median: String
+    var rangeStart: String
+    var rangeEnd: String
+    var date: String
+    var value: String
+    var missingValue: String
+    var missingSeries: String
+    var missingFacet: String
+    var xDisplayLabels: [String: String]
+    var yDisplayLabels: [String: String]
+    var seriesDisplayLabels: [String: String]
+    var facetDisplayLabels: [String: String]
+    var sharedXCategoryDomain: [String]
+
+    init(
+        presentation: AutoChartRenderPresentation,
+        specification: AutoChartSpecification,
+        data: [AutoChartDatum],
+        textResolver: AutoChartTextResolver
+    ) {
+        func resolve(_ message: AutoChartMessage?, fallback: String) -> String {
+            message.map(textResolver.callAsFunction) ?? fallback
+        }
+        func containsNull(_ keyPath: KeyPath<AutoChartDatum, AutoChartValue?>) -> Bool {
+            data.contains { datum in
+                guard let value = datum[keyPath: keyPath] else { return false }
+                if case .null = value { return true }
+                return false
+            }
+        }
+
+        var resolvedX = presentation.xTitle
+        var resolvedY = presentation.yTitle
+        var resolvedSeries = presentation.seriesTitle
+        var resolvedFacet = presentation.facetTitle
+        var resolvedCount = AutoChartRenderPresentation.countTitleMessage.defaultText
+        var resolvedMedian = AutoChartRenderPresentation.medianTitleMessage.defaultText
+        var resolvedRangeStart = AutoChartRenderPresentation.rangeStartTitleMessage.defaultText
+        var resolvedRangeEnd = AutoChartRenderPresentation.rangeEndTitleMessage.defaultText
+        var resolvedDate = AutoChartRenderPresentation.dateTitleMessage.defaultText
+        var resolvedValue = AutoChartRenderPresentation.valueTitleMessage.defaultText
+        var resolvedAllValues = AutoChartRenderPresentation.allValuesLabelMessage.defaultText
+        var resolvedMissingValue = AutoChartRenderPresentation.missingValueLabelMessage.defaultText
+        var resolvedMissingSeries = AutoChartRenderPresentation.missingSeriesLabelMessage.defaultText
+        var resolvedMissingFacet = AutoChartRenderPresentation.missingFacetLabelMessage.defaultText
+
+        if specification.family != .kpi {
+            resolvedX = resolve(presentation.xTitleMessage, fallback: presentation.xTitle)
+        }
+        if ![.kpi, .histogram, .range].contains(specification.family) {
+            resolvedY = presentation.resolvedYTitle(using: textResolver)
+        }
+        if [.histogram, .heatmap].contains(specification.family) {
+            resolvedCount = textResolver(AutoChartRenderPresentation.countTitleMessage)
+        }
+        if specification.family == .boxPlot {
+            resolvedMedian = textResolver(AutoChartRenderPresentation.medianTitleMessage)
+            if specification.encoding.x == nil {
+                resolvedAllValues = textResolver(AutoChartRenderPresentation.allValuesLabelMessage)
+            }
+        }
+        if specification.family == .range {
+            resolvedRangeStart = textResolver(
+                AutoChartRenderPresentation.rangeStartTitleMessage)
+            resolvedRangeEnd = textResolver(AutoChartRenderPresentation.rangeEndTitleMessage)
+            resolvedDate = textResolver(AutoChartRenderPresentation.dateTitleMessage)
+        }
+        if specification.family == .histogram, data.contains(where: { $0.xLabel == nil }) {
+            resolvedValue = textResolver(AutoChartRenderPresentation.valueTitleMessage)
+        }
+        if specification.encoding.series != nil {
+            resolvedSeries = resolve(
+                presentation.seriesTitleMessage,
+                fallback: presentation.seriesTitle)
+            if data.contains(where: { $0.seriesIdentity == nil }) {
+                resolvedMissingSeries = textResolver(
+                    AutoChartRenderPresentation.missingSeriesLabelMessage)
+            }
+        }
+        if specification.encoding.facet != nil {
+            resolvedFacet = resolve(
+                presentation.facetTitleMessage,
+                fallback: presentation.facetTitle)
+            if data.contains(where: { $0.facetIdentity == nil }) {
+                resolvedMissingFacet = textResolver(
+                    AutoChartRenderPresentation.missingFacetLabelMessage)
+            }
+        }
+        if containsNull(\.xSourceValue) {
+            resolvedMissingValue = textResolver(
+                AutoChartRenderPresentation.missingValueLabelMessage)
+        }
+
+        func categoryLabels(
+            identity: KeyPath<AutoChartDatum, String?>,
+            label: (AutoChartDatum) -> String?
+        ) -> [String: String] {
+            disambiguatedCategoryLabels(
+                data.compactMap { datum -> (identity: String, label: String)? in
+                    guard let identity = datum[keyPath: identity], let label = label(datum)
+                    else { return nil }
+                    return (identity, label)
+                },
+                textResolver: textResolver)
+        }
+
+        let resolvedXDisplayLabels =
+            presentation.xDisplayLabels.isEmpty
+            ? [:]
+            : categoryLabels(identity: \.xIdentity) { datum in
+                if specification.family == .boxPlot, specification.encoding.x == nil,
+                    datum.xIdentity == "all"
+                {
+                    return resolvedAllValues
+                }
+                if let value = datum.xSourceValue, case .null = value {
+                    return resolvedMissingValue
+                }
+                return datum.xLabel
+            }
+        let resolvedYDisplayLabels =
+            presentation.yDisplayLabels.isEmpty
+            ? [:] : categoryLabels(identity: \.yIdentity, label: { $0.yLabel })
+        let resolvedSeriesDisplayLabels =
+            presentation.seriesDisplayLabels.isEmpty
+            ? [:] : categoryLabels(identity: \.seriesIdentity, label: { $0.series })
+        let resolvedFacetDisplayLabels =
+            presentation.facetDisplayLabels.isEmpty
+            ? [:] : categoryLabels(identity: \.facetIdentity, label: { $0.facet })
+
+        let resolvedSharedXCategoryDomain: [String]
+        if specification.family == .faceted,
+            !presentation.sharedXCategoryDomain.isEmpty
+        {
+            var seen: Set<String> = []
+            resolvedSharedXCategoryDomain = data.compactMap { datum in
+                let category = disambiguatedCategoryValue(
+                    identity: datum.xIdentity,
+                    label: datum.xLabel,
+                    labels: resolvedXDisplayLabels,
+                    fallback: resolvedMissingValue)
+                return seen.insert(category).inserted ? category : nil
+            }
+        } else {
+            resolvedSharedXCategoryDomain = presentation.sharedXCategoryDomain
+        }
+
+        x = resolvedX
+        y = resolvedY
+        series = resolvedSeries
+        facet = resolvedFacet
+        count = resolvedCount
+        median = resolvedMedian
+        rangeStart = resolvedRangeStart
+        rangeEnd = resolvedRangeEnd
+        date = resolvedDate
+        value = resolvedValue
+        missingValue = resolvedMissingValue
+        missingSeries = resolvedMissingSeries
+        missingFacet = resolvedMissingFacet
+        xDisplayLabels = resolvedXDisplayLabels
+        yDisplayLabels = resolvedYDisplayLabels
+        seriesDisplayLabels = resolvedSeriesDisplayLabels
+        facetDisplayLabels = resolvedFacetDisplayLabels
+        sharedXCategoryDomain = resolvedSharedXCategoryDomain
+    }
 }
 
 private enum AutoChartZoomSource: Equatable {
@@ -1515,7 +1703,7 @@ public struct AutoChartPresentation: Hashable, Sendable {
 }
 
 private enum AutoChartViewContent<RowID: Hashable & Sendable>: Sendable {
-    case chart(AutoChartPreparedChart<RowID>)
+    case chart(AutoChartPreparedChart<RowID>, AutoChartResolvedPresentation)
     case fallback(AutoChartFallback)
 }
 
@@ -1581,7 +1769,6 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     private let presentation: AutoChartPresentation
     private let formatters: AutoChartFormatters
     private let textResolver: AutoChartTextResolver
-    private let resolvedTitles: AutoChartResolvedTitles?
     @Binding private var selection: AutoChartSelection<RowID>?
 
     @State private var selectedCategory: String?
@@ -1598,8 +1785,12 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         formatters: AutoChartFormatters = .init(),
         textResolver: AutoChartTextResolver = .default
     ) {
-        content = .chart(preparedChart)
-        resolvedTitles = preparedChart.core.presentation.resolvedTitles(using: textResolver)
+        content = .chart(
+            preparedChart,
+            preparedChart.core.presentation.resolvedPresentation(
+                specification: preparedChart.recommendation.specification,
+                data: preparedChart.core.data,
+                using: textResolver))
         self._selection = selection
         self.presentation = presentation
         self.formatters = formatters
@@ -1614,11 +1805,14 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         textResolver: AutoChartTextResolver = .default
     ) {
         if let primary = analysis.primaryChart {
-            content = .chart(primary)
-            resolvedTitles = primary.core.presentation.resolvedTitles(using: textResolver)
+            content = .chart(
+                primary,
+                primary.core.presentation.resolvedPresentation(
+                    specification: primary.recommendation.specification,
+                    data: primary.core.data,
+                    using: textResolver))
         } else if case .tableFallback(let fallback) = analysis.outcome {
             content = .fallback(fallback)
-            resolvedTitles = nil
         } else {
             content = .fallback(
                 AutoChartFallback(
@@ -1626,7 +1820,6 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
                         category: .fallback,
                         code: .noSafeChart,
                         defaultText: "No prepared chart is available.")))
-            resolvedTitles = nil
         }
         self._selection = selection
         self.presentation = presentation
@@ -1635,8 +1828,16 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     }
 
     private var preparedChart: AutoChartPreparedChart<RowID> {
-        guard case .chart(let chart) = content else { preconditionFailure("No chart content") }
+        guard case .chart(let chart, _) = content else {
+            preconditionFailure("No chart content")
+        }
         return chart
+    }
+    private var resolvedPresentation: AutoChartResolvedPresentation {
+        guard case .chart(_, let presentation) = content else {
+            preconditionFailure("No chart presentation")
+        }
+        return presentation
     }
     private var snapshot: AutoChartSnapshot { preparedChart.core.snapshot }
     private var recommendation: AutoChartRecommendation { preparedChart.recommendation }
@@ -1647,20 +1848,23 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     private var sharedYDomain: ClosedRange<Double>? { renderPresentation.sharedYDomain }
     private var sharedXDateDomain: ClosedRange<Date>? { renderPresentation.sharedXDateDomain }
     private var sharedXNumberDomain: ClosedRange<Double>? { renderPresentation.sharedXNumberDomain }
-    private var sharedXCategoryDomain: [String] { renderPresentation.sharedXCategoryDomain }
+    private var sharedXCategoryDomain: [String] { resolvedPresentation.sharedXCategoryDomain }
     private var facetBaseFamily: AutoChartFamily? { renderPresentation.facetBaseFamily }
     private var snapshotFingerprint: Int { preparedChart.core.fingerprint }
-    private var xTitle: String { resolvedTitles?.x ?? renderPresentation.xTitle }
-    private var yTitle: String { resolvedTitles?.y ?? renderPresentation.yTitle }
-    private var seriesTitle: String { resolvedTitles?.series ?? renderPresentation.seriesTitle }
-    private var facetTitle: String { resolvedTitles?.facet ?? renderPresentation.facetTitle }
-    private var countTitle: String { resolvedTitles?.count ?? "Count" }
-    private var medianTitle: String { resolvedTitles?.median ?? "Median" }
+    private var xTitle: String { resolvedPresentation.x }
+    private var yTitle: String { resolvedPresentation.y }
+    private var seriesTitle: String { resolvedPresentation.series }
+    private var facetTitle: String { resolvedPresentation.facet }
+    private var countTitle: String { resolvedPresentation.count }
+    private var medianTitle: String { resolvedPresentation.median }
+    private var rangeStartTitle: String { resolvedPresentation.rangeStart }
+    private var rangeEndTitle: String { resolvedPresentation.rangeEnd }
+    private var dateTitle: String { resolvedPresentation.date }
     private var xSemanticType: AutoChartSemanticType? { renderPresentation.xSemanticType }
-    private var xDisplayLabels: [String: String] { renderPresentation.xDisplayLabels }
-    private var yDisplayLabels: [String: String] { renderPresentation.yDisplayLabels }
-    private var seriesDisplayLabels: [String: String] { renderPresentation.seriesDisplayLabels }
-    private var facetDisplayLabels: [String: String] { renderPresentation.facetDisplayLabels }
+    private var xDisplayLabels: [String: String] { resolvedPresentation.xDisplayLabels }
+    private var yDisplayLabels: [String: String] { resolvedPresentation.yDisplayLabels }
+    private var seriesDisplayLabels: [String: String] { resolvedPresentation.seriesDisplayLabels }
+    private var facetDisplayLabels: [String: String] { resolvedPresentation.facetDisplayLabels }
     private var uniqueXCount: Int { renderPresentation.uniqueXCount }
     private var timeZoomValueCount: Int { renderPresentation.timeZoomValueCount }
     private var timeZoomSpan: TimeInterval { renderPresentation.timeZoomSpan }
@@ -1690,7 +1894,10 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         case .fallback(let fallback):
             VStack(alignment: .leading, spacing: 10) {
                 ContentUnavailableView(
-                    "Chart unavailable",
+                    textResolver(.init(
+                        category: .interface,
+                        code: .chartUnavailable,
+                        defaultText: "Chart unavailable")),
                     systemImage: "tablecells",
                     description: Text(textResolver(fallback.message)))
                 if presentation.chrome.contains(.diagnostics) {
@@ -2055,21 +2262,21 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     private var rangeChart: some View {
         let chart = Chart(data) { datum in
             BarMark(
-                xStart: .value("Start", datum.startDate ?? .distantPast),
-                xEnd: .value("End", datum.endDate ?? .distantPast),
+                xStart: .value(rangeStartTitle, datum.startDate ?? .distantPast),
+                xEnd: .value(rangeEndTitle, datum.endDate ?? .distantPast),
                 y: .value(xTitle, xCategoryValue(for: datum))
             )
             .accessibilityLabel(markAccessibilityLabel(for: datum))
             if datum.startDate == datum.endDate {
                 PointMark(
-                    x: .value("Date", datum.startDate ?? .distantPast),
+                    x: .value(dateTitle, datum.startDate ?? .distantPast),
                     y: .value(xTitle, xCategoryValue(for: datum))
                 )
                 .symbol(.diamond)
                 .accessibilityLabel(markAccessibilityLabel(for: datum))
             }
         }
-        .chartXAxisLabel("Date")
+        .chartXAxisLabel(dateTitle)
         .chartYAxisLabel(xTitle)
         .chartXAxis { temporalAxis(columnID: specification.encoding.start) }
         .environment(\.timeZone, formatters.timeZone)
@@ -2296,7 +2503,9 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
                 ForEach(facetKeys, id: \.self) { facetKey in
                     let facetData = facets[facetKey] ?? []
                     VStack(alignment: .leading, spacing: 4) {
-                        Text(facetKey.flatMap { facetDisplayLabels[$0] } ?? "Missing value")
+                        Text(
+                            facetKey.flatMap { facetDisplayLabels[$0] }
+                                ?? resolvedPresentation.missingFacet)
                             .font(.caption.weight(.semibold))
                         if facetBaseFamily == .line, xSemanticType == .temporal {
                             let chart = Chart(facetData) { datum in
@@ -2393,7 +2602,8 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         disambiguatedCategoryValue(
             identity: datum.xIdentity,
             label: datum.xLabel,
-            labels: xDisplayLabels)
+            labels: xDisplayLabels,
+            fallback: resolvedPresentation.missingValue)
     }
 
     private func seriesValue(for datum: AutoChartDatum) -> String {
@@ -2402,7 +2612,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             identity: datum.seriesIdentity,
             label: datum.series,
             labels: seriesDisplayLabels,
-            fallback: "Missing series")
+            fallback: resolvedPresentation.missingSeries)
     }
 
     private func facetValue(for datum: AutoChartDatum) -> String {
@@ -2410,14 +2620,14 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             identity: datum.facetIdentity,
             label: datum.facet,
             labels: facetDisplayLabels,
-            fallback: "Missing facet")
+            fallback: resolvedPresentation.missingFacet)
     }
 
     private func markAccessibilityLabel(for datum: AutoChartDatum) -> String {
         let xColumn = resolvedColumn(specification.encoding.x)
         let name: String
         if specification.family == .histogram {
-            name = datum.xLabel ?? "Value"
+            name = datum.xLabel ?? resolvedPresentation.value
         } else if [
             .bar, .groupedBar, .stackedBar, .normalizedBar, .rankedDot,
             .boxPlot, .donut, .range,
