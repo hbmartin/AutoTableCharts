@@ -1419,15 +1419,12 @@ public actor AutoChartAnalyzer {
             try Task.checkCancellation()
             await preparationHook?()
             try Task.checkCancellation()
-            let core = AutoChartRenderCore.prepare(
+            let core = try AutoChartRenderCore.prepare(
                 snapshot: source.snapshot,
                 profiles: source.profiles,
                 contentFingerprint: source.contentFingerprint,
                 estimatedStorageCost: source.estimatedStorageCost,
                 recommendation: recommendation)
-            guard core.validation.isValid else {
-                throw AutoChartPreparationError.invalidSpecification(core.validation)
-            }
             try Task.checkCancellation()
             let prepared = AutoChartPreparedChart(
                 source: source,

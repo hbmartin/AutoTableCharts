@@ -77,16 +77,12 @@ enum AutoChartRecommendationEngine {
                 return cachedStructuralValidation(specification)
             }
             if let cached = preparedValidationResults[specification] { return cached }
-            let data = AutoChartDataPreparation.data(
-                snapshot: snapshot,
-                specification: specification,
-                profiles: profileIndex)
-            let result = validate(
+            let result = validatePreparedNumericDomain(
+                structuralValidation: cachedStructuralValidation(specification),
                 specification: specification,
                 snapshot: snapshot,
                 profiles: profileIndex,
-                memo: validationMemo,
-                preparedData: data)
+                preparedData: nil)
             preparedValidationResults[specification] = result
             return result
         }
@@ -908,24 +904,6 @@ enum AutoChartRecommendationEngine {
                         ))
                 }
         }
-        if validatesPreparedNumericDomain,
-            requiresPreparedNumericDomainValidation(
-                specification: specification,
-                profiles: profiles),
-            let y = specification.encoding.y,
-            profiles[y]?.hasFiniteNumericSpan == true
-        {
-            let data = preparedData
-                ?? AutoChartDataPreparation.data(
-                    snapshot: snapshot,
-                    specification: specification,
-                    profiles: profiles)
-            issues.append(
-                contentsOf: preparedNumericDomainIssues(
-                    specification: specification,
-                    data: data,
-                    y: y))
-        }
         let expectedAggregation: AutoChartAggregation? =
             switch specification.family {
             case .histogram, .heatmap:
@@ -1122,7 +1100,14 @@ enum AutoChartRecommendationEngine {
                     code: .invalidTemporalRange,
                     message: "Range starts must not occur after their ends."))
         }
-        return AutoChartValidationResult(issues: issues)
+        let structuralValidation = AutoChartValidationResult(issues: issues)
+        guard validatesPreparedNumericDomain else { return structuralValidation }
+        return validatePreparedNumericDomain(
+            structuralValidation: structuralValidation,
+            specification: specification,
+            snapshot: snapshot,
+            profiles: profiles,
+            preparedData: preparedData)
     }
 
     private static func candidate(
@@ -1279,6 +1264,37 @@ enum AutoChartRecommendationEngine {
         }
         return specification.aggregation != .none
             && ![.histogram, .heatmap].contains(specification.family)
+    }
+
+    /// Adds validation that depends on prepared marks only after structural
+    /// validation has established that preparation is safe.
+    static func validatePreparedNumericDomain(
+        structuralValidation: AutoChartValidationResult,
+        specification: AutoChartSpecification,
+        snapshot: AutoChartSnapshot,
+        profiles: [AutoChartColumnID: AutoChartColumnProfile],
+        preparedData: [AutoChartDatum]?
+    ) -> AutoChartValidationResult {
+        guard structuralValidation.isValid,
+            requiresPreparedNumericDomainValidation(
+                specification: specification,
+                profiles: profiles),
+            let y = specification.encoding.y,
+            profiles[y]?.hasFiniteNumericSpan == true
+        else {
+            return structuralValidation
+        }
+        let data = preparedData
+            ?? AutoChartDataPreparation.data(
+                snapshot: snapshot,
+                specification: specification,
+                profiles: profiles)
+        return AutoChartValidationResult(
+            issues: structuralValidation.issues
+                + preparedNumericDomainIssues(
+                    specification: specification,
+                    data: data,
+                    y: y))
     }
 
     private struct PreparedStackKey: Hashable {

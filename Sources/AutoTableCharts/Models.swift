@@ -1288,39 +1288,79 @@ public enum AutoChartMessageArgument: Hashable, Codable, Sendable {
 
 /// A stable, localizable package message.
 public struct AutoChartMessage: Hashable, Codable, Sendable {
-    public enum Category: String, Hashable, Codable, Sendable {
-        case diagnostic, rationale, fallback, accessibility, interface
+    /// A stable, extensible message category.
+    ///
+    /// Unknown raw values are retained when decoding so messages authored by a
+    /// newer package version remain available to older clients.
+    public struct Category: RawRepresentable, Hashable, Codable, Sendable {
+        public var rawValue: String
+
+        public init(rawValue: String) {
+            self.rawValue = rawValue
+        }
+
+        public static let diagnostic = Self(rawValue: "diagnostic")
+        public static let rationale = Self(rawValue: "rationale")
+        public static let fallback = Self(rawValue: "fallback")
+        public static let accessibility = Self(rawValue: "accessibility")
+        public static let interface = Self(rawValue: "interface")
+
+        public init(from decoder: any Decoder) throws {
+            self.init(rawValue: try decoder.singleValueContainer().decode(String.self))
+        }
+
+        public func encode(to encoder: any Encoder) throws {
+            var container = encoder.singleValueContainer()
+            try container.encode(rawValue)
+        }
     }
 
-    /// A stable message identifier.
+    /// A stable, extensible message identifier.
     ///
-    /// New package-authored messages may add cases. Use `@unknown default` when
-    /// switching over codes outside this package so source remains forward-compatible.
-    public enum Code: String, Hashable, Codable, Sendable {
-        case recommendationRationale
-        case incompleteResult
-        case noChartableRows
-        case noSafeChart
-        case invalidInput
-        case validationFailed
-        case nonFiniteValueOmitted
-        case missingValue
-        case unsafeAggregation
-        case nonAdditiveSourceSummation
-        case duplicateMark
-        case invalidTemporalRange
-        case chartUnavailable
-        case clearSelection
-        case resetZoom
-        case selectionSummary
-        case selectionValue
-        case selectionRange
-        case selectionDistribution
-        case selectionRowCount
-        case candidateLimit
-        case markAccessibility
-        case markAccessibilityDate
-        case markAccessibilityRange
+    /// New package-authored messages may add identifiers. Switch over the known
+    /// static values with a `default` branch. Unknown raw values survive Codable
+    /// round trips instead of invalidating the containing message.
+    public struct Code: RawRepresentable, Hashable, Codable, Sendable {
+        public var rawValue: String
+
+        public init(rawValue: String) {
+            self.rawValue = rawValue
+        }
+
+        public static let recommendationRationale = Self(rawValue: "recommendationRationale")
+        public static let incompleteResult = Self(rawValue: "incompleteResult")
+        public static let noChartableRows = Self(rawValue: "noChartableRows")
+        public static let noSafeChart = Self(rawValue: "noSafeChart")
+        public static let invalidInput = Self(rawValue: "invalidInput")
+        public static let validationFailed = Self(rawValue: "validationFailed")
+        public static let nonFiniteValueOmitted = Self(rawValue: "nonFiniteValueOmitted")
+        public static let missingValue = Self(rawValue: "missingValue")
+        public static let unsafeAggregation = Self(rawValue: "unsafeAggregation")
+        public static let nonAdditiveSourceSummation = Self(
+            rawValue: "nonAdditiveSourceSummation")
+        public static let duplicateMark = Self(rawValue: "duplicateMark")
+        public static let invalidTemporalRange = Self(rawValue: "invalidTemporalRange")
+        public static let chartUnavailable = Self(rawValue: "chartUnavailable")
+        public static let clearSelection = Self(rawValue: "clearSelection")
+        public static let resetZoom = Self(rawValue: "resetZoom")
+        public static let selectionSummary = Self(rawValue: "selectionSummary")
+        public static let selectionValue = Self(rawValue: "selectionValue")
+        public static let selectionRange = Self(rawValue: "selectionRange")
+        public static let selectionDistribution = Self(rawValue: "selectionDistribution")
+        public static let selectionRowCount = Self(rawValue: "selectionRowCount")
+        public static let candidateLimit = Self(rawValue: "candidateLimit")
+        public static let markAccessibility = Self(rawValue: "markAccessibility")
+        public static let markAccessibilityDate = Self(rawValue: "markAccessibilityDate")
+        public static let markAccessibilityRange = Self(rawValue: "markAccessibilityRange")
+
+        public init(from decoder: any Decoder) throws {
+            self.init(rawValue: try decoder.singleValueContainer().decode(String.self))
+        }
+
+        public func encode(to encoder: any Encoder) throws {
+            var container = encoder.singleValueContainer()
+            try container.encode(rawValue)
+        }
     }
 
     public var category: Category
