@@ -60,12 +60,11 @@ private actor OneShotPreparationGate {
         self.timeout = timeout
     }
 
-    @discardableResult
     func arm() -> Bool {
         guard !blocked && releaseToken == nil && releaseContinuation == nil
             && releaseTimeoutTask == nil
         else {
-            Issue.record("The one-shot preparation gate cannot be re-armed while blocked.")
+            releaseAfterInvariantFailure()
             return false
         }
         armed = true
@@ -94,6 +93,7 @@ private actor OneShotPreparationGate {
                     && releaseTimeoutTask == nil
                 else {
                     Issue.record("A preparation release is already pending.")
+                    releaseAfterInvariantFailure()
                     continuation.resume()
                     return
                 }
@@ -169,6 +169,18 @@ private actor OneShotPreparationGate {
         releaseTimeoutTask = nil
         let continuation = releaseContinuation
         releaseContinuation = nil
+        continuation?.resume()
+    }
+
+    private func releaseAfterInvariantFailure() {
+        armed = false
+        blocked = false
+        releaseToken = nil
+        releaseTimeoutTask?.cancel()
+        releaseTimeoutTask = nil
+        let continuation = releaseContinuation
+        releaseContinuation = nil
+        cancelEnteredWaiters()
         continuation?.resume()
     }
 
@@ -598,6 +610,7 @@ private struct CountingChartRowsTable: AutoChartTable {
         for aggregation in AutoChartAggregation.allCases where aggregation != .none {
             let applied = try #require(AutoChartAppliedAggregation(aggregation))
             #expect(applied.aggregation == aggregation)
+            #expect(applied.rawValue == aggregation.rawValue)
         }
     }
 
@@ -1200,9 +1213,9 @@ private struct CountingChartRowsTable: AutoChartTable {
 }
 
 @Suite struct V2AnalyzerLifecycleTests {
-    @Test func preparationGateDisarmsAfterEntryWaitTimesOut() async {
+    @Test func preparationGateDisarmsAfterEntryWaitTimesOut() async throws {
         let gate = OneShotPreparationGate(timeout: .milliseconds(10))
-        guard await gate.arm() else { return }
+        try #require(await gate.arm())
 
         await #expect(throws: PreparationGateError.self) {
             try await gate.waitUntilBlocked()
@@ -1211,11 +1224,11 @@ private struct CountingChartRowsTable: AutoChartTable {
         #expect(await gate.activeTimeoutTaskCount == 0)
     }
 
-    @Test func preparationGateTimesOutEveryConcurrentEntryWaiter() async {
+    @Test func preparationGateTimesOutEveryConcurrentEntryWaiter() async throws {
         let gate = OneShotPreparationGate(timeout: .seconds(30))
         let peerStarted = DispatchSemaphore(value: 0)
         let peerFinished = DispatchGroup()
-        guard await gate.arm() else { return }
+        try #require(await gate.arm())
         let peers = (0..<31).map { _ in
             peerFinished.enter()
             return Task {
@@ -1295,7 +1308,7 @@ private struct CountingChartRowsTable: AutoChartTable {
     @Test func preparationGateCancelsSomeWaitersAndReleasesTheRest() async throws {
         let gate = OneShotPreparationGate(timeout: .seconds(30))
         let waiterStarted = DispatchSemaphore(value: 0)
-        guard await gate.arm() else { return }
+        try #require(await gate.arm())
         let waiters = (0..<32).map { _ in
             Task {
                 try await gate.waitUntilBlocked(onWaiting: { waiterStarted.signal() })
@@ -1334,7 +1347,7 @@ private struct CountingChartRowsTable: AutoChartTable {
 
     @Test func preparationGatePreservesArmForAlreadyCancelledPreparation() async throws {
         let gate = OneShotPreparationGate()
-        guard await gate.arm() else { return }
+        try #require(await gate.arm())
         let (stream, continuation) = AsyncStream<Void>.makeStream()
         let cancelledPreparation = Task {
             for await _ in stream {}
@@ -1366,7 +1379,7 @@ private struct CountingChartRowsTable: AutoChartTable {
 
     @Test func preparationGateFailsWaiterAndPreservesArmAfterCancelledAttempt() async throws {
         let gate = OneShotPreparationGate()
-        guard await gate.arm() else { return }
+        try #require(await gate.arm())
         let waiterStarted = DispatchSemaphore(value: 0)
         let waiterCompleted = DispatchSemaphore(value: 0)
         let waiter = Task {
@@ -1419,12 +1432,24 @@ private struct CountingChartRowsTable: AutoChartTable {
 
     @Test func preparationGateCancelsTimeoutTaskAfterRelease() async throws {
         let gate = OneShotPreparationGate()
-        guard await gate.arm() else { return }
+        try #require(await gate.arm())
         let preparation = Task { await gate.waitWhenArmed() }
 
         try await gate.waitUntilBlocked()
         #expect(await gate.activeTimeoutTaskCount == 1)
         await gate.resume()
+        await preparation.value
+
+        #expect(await gate.activeTimeoutTaskCount == 0)
+    }
+
+    @Test func preparationGateRejectedRearmReleasesBlockedPreparation() async throws {
+        let gate = OneShotPreparationGate()
+        try #require(await gate.arm())
+        let preparation = Task { await gate.waitWhenArmed() }
+
+        try await gate.waitUntilBlocked()
+        #expect(!(await gate.arm()))
         await preparation.value
 
         #expect(await gate.activeTimeoutTaskCount == 0)
@@ -1737,7 +1762,7 @@ private struct CountingChartRowsTable: AutoChartTable {
             counter: counter)
         let analyzer = AutoChartAnalyzer(
             testHooks: .chartPreparation { await gate.waitWhenArmed() })
-        guard await gate.arm() else { return }
+        try #require(await gate.arm())
         let task = Task { try await analyzer.analyze(table) }
 
         try await gate.waitUntilBlocked()
@@ -1793,7 +1818,7 @@ private struct CountingChartRowsTable: AutoChartTable {
             chartDataKey: .init(identity: "cancel-before-materialization", revision: "1"))
         let analyzer = AutoChartAnalyzer(
             testHooks: .keyedMaterialization { await gate.waitWhenArmed() })
-        guard await gate.arm() else { return }
+        try #require(await gate.arm())
         let completed = DispatchSemaphore(value: 0)
         let pending = Task {
             defer { completed.signal() }
@@ -1863,7 +1888,7 @@ private struct CountingChartRowsTable: AutoChartTable {
             counter: ChartRowsReadCounter())
         let analyzer = AutoChartAnalyzer(
             testHooks: .chartPreparation { await gate.waitWhenArmed() })
-        guard await gate.arm() else { return }
+        try #require(await gate.arm())
         let pending = Task { try await analyzer.analyze(table) }
 
         try await gate.waitUntilBlocked()
@@ -1914,7 +1939,7 @@ private struct CountingChartRowsTable: AutoChartTable {
         let analysis = try await analyzer.analyze(dataset)
         let specification = AutoChartSpecification.histogram(value: v2Measure.id)
 
-        guard await gate.arm() else { return }
+        try #require(await gate.arm())
         let pending = Task { try await analysis.prepare(specification) }
         try await gate.waitUntilBlocked()
         await analyzer.removeAll()
@@ -1963,7 +1988,7 @@ private struct CountingChartRowsTable: AutoChartTable {
             encoding: .init(x: v2Category.id, y: v2Measure.id),
             aggregation: .sum)
         let missesBefore = await analyzer.cacheStatistics.preparedCharts.misses
-        guard await gate.arm() else { return }
+        try #require(await gate.arm())
         let completed = DispatchSemaphore(value: 0)
         let pending = Task {
             defer { completed.signal() }
@@ -1997,7 +2022,7 @@ private struct CountingChartRowsTable: AutoChartTable {
             family: .donut,
             encoding: .init(x: v2Category.id, y: v2Measure.id),
             aggregation: .sum)
-        guard await gate.arm() else { return }
+        try #require(await gate.arm())
         let completed = DispatchSemaphore(value: 0)
         let pending = Task {
             defer { completed.signal() }

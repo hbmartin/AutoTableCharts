@@ -66,9 +66,11 @@ on count, distinct-count, or normalized-fraction semantics.
 
 ``AutoChartTextResolver`` can override diagnostics, rationale, fallback,
 accessibility, built-in controls, and generated chart labels using stable typed
-messages. Generated category, value, count, distinct-count, median, series, and
-facet titles each have a stable message code. Source-column display names remain
-host-provided text. Return `nil` to use the package English fallback.
+messages. Generated category, value, count, distinct-count, median, series,
+facet, date, and range titles each have a stable message code. Synthetic all-
+values and missing-value labels and typed category disambiguation labels are
+localizable as well. Source-column display names remain host-provided text.
+Return `nil` to use the package English fallback.
 
 ### Link semantic selection
 
