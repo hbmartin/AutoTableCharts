@@ -28,17 +28,24 @@ private func renderedAggregationSemantics(
 import Charts
 import SwiftUI
 
-private func preparedCore<Table: AutoChartTable>(
+private func preparedPresentation<Table: AutoChartTable>(
     for table: Table,
     recommendation: AutoChartRecommendation
-) -> AutoChartRenderCore {
+) -> (data: [AutoChartDatum], presentation: AutoChartRenderPresentation) {
     let snapshot = AutoChartSnapshot(table)
-    return AutoChartRenderCore.prepare(
+    let profiles = AutoChartProfiler.profileIndex(snapshot)
+    let prepared = AutoChartDataPreparation.preparedData(
         snapshot: snapshot,
-        profiles: AutoChartProfiler.profileIndex(snapshot),
-        contentFingerprint: snapshot.contentFingerprint,
-        estimatedStorageCost: snapshot.estimatedStorageCost,
-        recommendation: recommendation)
+        specification: recommendation.specification,
+        profiles: profiles)
+    return (
+        prepared.data,
+        AutoChartRenderPresentation(
+            snapshot: snapshot,
+            specification: recommendation.specification,
+            profiles: profiles,
+            data: prepared.data,
+            measureSemantics: prepared.measureSemantics))
 }
 #endif
 
@@ -1527,16 +1534,6 @@ private let date = AutoChartColumn(
             let isKPI = specification.family == .kpi
             let snapshot = isKPI ? kpiSnapshot : inputSnapshot
             let profiles = isKPI ? kpiProfiles : inputProfiles
-            let structuralValidation = AutoChartRecommendationEngine.validate(
-                specification: specification,
-                snapshot: snapshot,
-                profiles: profiles,
-                validatesPreparedNumericDomain: false)
-            #expect(
-                structuralValidation.isValid,
-                "\(specification.family) should validate before preparation")
-            guard structuralValidation.isValid else { continue }
-
             let prepared = AutoChartDataPreparation.preparedData(
                 snapshot: snapshot,
                 specification: specification,
@@ -2629,7 +2626,7 @@ private let date = AutoChartColumn(
         }
     }
 
-    @Test func donutPreparationIsCheckedEvenWhenAggregationIsNone() {
+    @Test func invalidDonutAggregationIsRejectedBeforePreparedDomainValidation() {
         let halfExtreme = Double.greatestFiniteMagnitude / 2
         let input = table(
             columns: [category, measure],
@@ -2648,9 +2645,10 @@ private let date = AutoChartColumn(
         #expect(!validation.isValid)
         #expect(
             validation.issues.contains {
-                $0.message
-                    == "Aggregation of quantitative field measure produces non-finite values."
+                $0.messageValue.code == .unsafeAggregation
             })
+        #expect(validation.issues.contains { $0.messageValue.code == .duplicateMark })
+        #expect(!validation.issues.contains { $0.messageValue.code == .nonFiniteValueOmitted })
     }
 
     @Test func donutSectorTotalMustRemainFinite() {
@@ -2893,19 +2891,14 @@ private let date = AutoChartColumn(
             family: .faceted,
             encoding: .init(x: date.id, y: measure.id, facet: facet.id),
             facetBaseFamily: .line)
-        let prepared = AutoChartDataPreparation.data(
-            snapshot: AutoChartSnapshot(input),
-            specification: specification)
-
-        #expect(prepared.count == 1)
-        let core = preparedCore(
+        let prepared = preparedPresentation(
             for: input,
             recommendation: AutoChartRecommendation(
                 specification: specification,
                 score: 0,
                 rationale: ["Non-finite date test"]))
-        #expect(core.data.count == 1)
-        let domain = core.presentation.sharedXDateDomain
+        #expect(prepared.data.count == 1)
+        let domain = prepared.presentation.sharedXDateDomain
         #expect(domain?.lowerBound.timeIntervalSinceReferenceDate.isFinite == true)
         #expect(domain?.upperBound.timeIntervalSinceReferenceDate.isFinite == true)
     }
@@ -2968,13 +2961,13 @@ private let date = AutoChartColumn(
 
     @Test func extremeQuantitativeFacetSpanIsRejectedAndHasNoDomain() {
         let fixture = extremeNumericFacetFixture()
-        let core = preparedCore(
+        let prepared = preparedPresentation(
             for: fixture.input,
             recommendation: AutoChartRecommendation(
                 specification: fixture.specification,
                 score: 0,
                 rationale: ["Finite-domain test"]))
-        let domain = core.presentation.sharedXNumberDomain
+        let domain = prepared.presentation.sharedXNumberDomain
         #expect(domain == nil)
         #expect(
             AutoChartRecommendationEngine.validate(
@@ -2988,13 +2981,13 @@ private let date = AutoChartColumn(
 
     @Test func oneSidedExtremeQuantitativeFacetDomainRemainsFinite() {
         let fixture = extremeNumericFacetFixture(oneSided: true)
-        let core = preparedCore(
+        let prepared = preparedPresentation(
             for: fixture.input,
             recommendation: AutoChartRecommendation(
                 specification: fixture.specification,
                 score: 0,
                 rationale: ["Finite unpadded-domain test"]))
-        let domain = core.presentation.sharedXNumberDomain
+        let domain = prepared.presentation.sharedXNumberDomain
         #expect(domain != nil)
         #expect(domain.map { ($0.upperBound - $0.lowerBound).isFinite } == true)
         #expect(
@@ -3009,27 +3002,27 @@ private let date = AutoChartColumn(
         let scatter = AutoChartSpecification(
             family: .scatter,
             encoding: .init(x: fixture.quantitativeX.id, y: measure.id))
-        let core = preparedCore(
+        let prepared = preparedPresentation(
             for: fixture.input,
             recommendation: AutoChartRecommendation(
                 specification: scatter,
                 score: 0,
                 rationale: ["Finite-zoom test"]))
-        let zoomCount = core.presentation.numberZoomValueCount
-        let zoomSpan = core.presentation.numberZoomSpan
+        let zoomCount = prepared.presentation.numberZoomValueCount
+        let zoomSpan = prepared.presentation.numberZoomSpan
         #expect(zoomCount == 0)
         #expect(zoomSpan.isFinite)
     }
 
     @Test func extremeTemporalFacetSpanIsRejectedAndHasNoDomain() {
         let fixture = extremeTemporalFacetFixture()
-        let core = preparedCore(
+        let prepared = preparedPresentation(
             for: fixture.input,
             recommendation: AutoChartRecommendation(
                 specification: fixture.specification,
                 score: 0,
                 rationale: ["Finite date-domain test"]))
-        let domain = core.presentation.sharedXDateDomain
+        let domain = prepared.presentation.sharedXDateDomain
         #expect(domain == nil)
         #expect(
             AutoChartRecommendationEngine.validate(
@@ -3045,14 +3038,14 @@ private let date = AutoChartColumn(
         let line = AutoChartSpecification(
             family: .line,
             encoding: .init(x: date.id, y: measure.id))
-        let core = preparedCore(
+        let prepared = preparedPresentation(
             for: fixture.input,
             recommendation: AutoChartRecommendation(
                 specification: line,
                 score: 0,
                 rationale: ["Finite date-zoom test"]))
-        let timeZoomCount = core.presentation.timeZoomValueCount
-        let timeZoomSpan = core.presentation.timeZoomSpan
+        let timeZoomCount = prepared.presentation.timeZoomValueCount
+        let timeZoomSpan = prepared.presentation.timeZoomSpan
         #expect(timeZoomCount == 0)
         #expect(timeZoomSpan.isFinite)
     }
@@ -3786,23 +3779,23 @@ private let date = AutoChartColumn(
             rows: [[.text("A"), .text("West")]])
         let heatmapSnapshot = AutoChartSnapshot(heatmapInput)
         let heatmapProfiles = AutoChartProfiler.profileIndex(heatmapSnapshot)
-        let invalidHeatmap = AutoChartSpecification(
+        let heatmap = AutoChartSpecification(
             family: .heatmap,
             encoding: .init(x: category.id, y: heatmapY.id),
-            aggregation: .sum)
+            aggregation: .count)
         let heatmapPrepared = AutoChartDataPreparation.preparedData(
             snapshot: heatmapSnapshot,
-            specification: invalidHeatmap,
+            specification: heatmap,
             profiles: heatmapProfiles)
         let heatmapPresentation = AutoChartRenderPresentation(
             snapshot: heatmapSnapshot,
-            specification: invalidHeatmap,
+            specification: heatmap,
             profiles: heatmapProfiles,
             data: heatmapPrepared.data,
             measureSemantics: heatmapPrepared.measureSemantics)
         let heatmapSelection = AutoChartSelectionPreparation.semanticValues(
             for: heatmapPrepared.data,
-            specification: invalidHeatmap,
+            specification: heatmap,
             measureSemantics: heatmapPrepared.measureSemantics)
 
         #expect(heatmapPresentation.yTitle == AutoChartProfiler.displayName(heatmapY))
@@ -3815,17 +3808,16 @@ private let date = AutoChartColumn(
             rows: (1...5).map { [.text("A"), .double(Double($0))] })
         let boxSnapshot = AutoChartSnapshot(boxInput)
         let boxProfiles = AutoChartProfiler.profileIndex(boxSnapshot)
-        let invalidBoxPlot = AutoChartSpecification(
+        let boxPlot = AutoChartSpecification(
             family: .boxPlot,
-            encoding: .init(x: category.id, y: measure.id),
-            aggregation: .count)
+            encoding: .init(x: category.id, y: measure.id))
         let boxPrepared = AutoChartDataPreparation.preparedData(
             snapshot: boxSnapshot,
-            specification: invalidBoxPlot,
+            specification: boxPlot,
             profiles: boxProfiles)
         let boxSelection = AutoChartSelectionPreparation.semanticValues(
             for: boxPrepared.data,
-            specification: invalidBoxPlot,
+            specification: boxPlot,
             measureSemantics: boxPrepared.measureSemantics)
 
         #expect(boxPrepared.data.count == 1)
@@ -3845,19 +3837,19 @@ private let date = AutoChartColumn(
                 [.text("B"), .double(4)],
             ])
         let donutSnapshot = AutoChartSnapshot(donutInput)
-        let invalidDonut = AutoChartSpecification(
+        let donut = AutoChartSpecification(
             family: .donut,
             encoding: .init(x: category.id, y: measure.id),
-            aggregation: .none)
+            aggregation: .sum)
         let donutPrepared = AutoChartDataPreparation.preparedData(
             snapshot: donutSnapshot,
-            specification: invalidDonut,
+            specification: donut,
             profiles: AutoChartProfiler.profileIndex(donutSnapshot))
         let donutA = try #require(
             donutPrepared.data.first { $0.xLabel == "A" })
         let donutSelection = AutoChartSelectionPreparation.semanticValues(
             for: [donutA],
-            specification: invalidDonut,
+            specification: donut,
             measureSemantics: donutPrepared.measureSemantics)
 
         #expect(donutA.yNumber == 3)
@@ -3867,13 +3859,12 @@ private let date = AutoChartColumn(
 
         let kpiInput = table(columns: [measure], rows: [[.double(42)]])
         let kpiSnapshot = AutoChartSnapshot(kpiInput)
-        let invalidKPI = AutoChartSpecification(
+        let kpi = AutoChartSpecification(
             family: .kpi,
-            encoding: .init(y: measure.id),
-            aggregation: .count)
+            encoding: .init(y: measure.id))
         let kpiPrepared = AutoChartDataPreparation.preparedData(
             snapshot: kpiSnapshot,
-            specification: invalidKPI,
+            specification: kpi,
             profiles: AutoChartProfiler.profileIndex(kpiSnapshot))
 
         #expect(kpiPrepared.data.first?.yNumber == 42)

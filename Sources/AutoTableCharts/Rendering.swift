@@ -549,14 +549,9 @@ enum AutoChartDataPreparation {
         case .kpi:
             return Plan(operation: .raw, measureSemantics: valueSemantics())
         case .donut:
-            // Donuts always group categories. Preserve the historical fallback
-            // that treats an invalid `.none` specification as a sum, but expose
-            // that effective aggregation to every presentation surface.
-            let aggregation = specification.aggregation == .none
-                ? AutoChartAggregation.sum : specification.aggregation
             return Plan(
-                operation: .grouped(aggregation),
-                measureSemantics: aggregatedSemantics(aggregation))
+                operation: .grouped(specification.aggregation),
+                measureSemantics: aggregatedSemantics(specification.aggregation))
         case .bar, .rankedDot, .groupedBar, .stackedBar, .normalizedBar,
             .line, .pointLine, .area, .scatter, .bubble, .range, .faceted:
             if specification.aggregation == .none {
@@ -1300,12 +1295,29 @@ struct AutoChartRenderCore: Sendable {
         contentFingerprint: Int,
         estimatedStorageCost: Int,
         recommendation: AutoChartRecommendation
-    ) -> AutoChartRenderCore {
+    ) throws -> AutoChartRenderCore {
         let specification = recommendation.specification
+        let structuralValidation = AutoChartRecommendationEngine.validate(
+            specification: specification,
+            snapshot: snapshot,
+            profiles: profiles,
+            validatesPreparedNumericDomain: false)
+        guard structuralValidation.isValid else {
+            throw AutoChartPreparationError.invalidSpecification(structuralValidation)
+        }
         let preparedData = AutoChartDataPreparation.preparedData(
             snapshot: snapshot,
             specification: specification,
             profiles: profiles)
+        let validation = AutoChartRecommendationEngine.validatePreparedNumericDomain(
+            structuralValidation: structuralValidation,
+            specification: specification,
+            snapshot: snapshot,
+            profiles: profiles,
+            preparedData: preparedData.data)
+        guard validation.isValid else {
+            throw AutoChartPreparationError.invalidSpecification(validation)
+        }
         let table = AutoChartPreparedTable(
             snapshot: snapshot,
             profiles: profiles,
@@ -1315,11 +1327,7 @@ struct AutoChartRenderCore: Sendable {
             table: table,
             data: preparedData.data,
             measureSemantics: preparedData.measureSemantics,
-            validation: AutoChartRecommendationEngine.validate(
-                specification: specification,
-                snapshot: snapshot,
-                profiles: profiles,
-                preparedData: preparedData.data),
+            validation: validation,
             presentation: AutoChartRenderPresentation(
                 snapshot: snapshot,
                 specification: specification,
@@ -1421,26 +1429,37 @@ struct AutoChartKPIContent: View {
     let valueText: String
     let title: String
     let isCompact: Bool
+    let accessibilityText: String
 
     init<RowID: Hashable & Sendable>(
         preparedChart: AutoChartPreparedChart<RowID>,
         typography: AutoChartTypography,
-        formatters: AutoChartFormatters
+        formatters: AutoChartFormatters,
+        textResolver: AutoChartTextResolver = .default
     ) {
         let core = preparedChart.core
         let semantics = core.measureSemantics
         let column = semantics.columnID.flatMap { core.table.profiles[$0]?.column }
-        guard let value = core.data.first?.ySourceValue else {
-            preconditionFailure("Prepared KPI charts require one source measure value.")
+        let resolvedValueText: String
+        if let value = core.data.first?.ySourceValue {
+            resolvedValueText = formatters.format(
+                AutoChartFormattingRequest(
+                    column: column,
+                    value: value,
+                    context: .kpi,
+                    purpose: semantics.formattingPurpose))
+        } else {
+            assertionFailure("Prepared KPI charts require one source measure value.")
+            resolvedValueText = AutoChartValue.unrepresentableValuePlaceholder
         }
-        valueText = formatters.format(
-            AutoChartFormattingRequest(
-                column: column,
-                value: value,
-                context: .kpi,
-                purpose: semantics.formattingPurpose))
-        title = core.presentation.yTitle
+        let resolvedTitle = core.presentation.yTitle
+        valueText = resolvedValueText
+        title = resolvedTitle
         isCompact = typography == .compact
+        accessibilityText = AutoChartAccessibility.markLabel(
+            name: resolvedTitle,
+            valueDescription: resolvedValueText,
+            textResolver: textResolver)
     }
 
     var body: some View {
@@ -1457,6 +1476,8 @@ struct AutoChartKPIContent: View {
                 .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(accessibilityText)
     }
 }
 
@@ -1694,7 +1715,8 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         AutoChartKPIContent(
             preparedChart: preparedChart,
             typography: presentation.typography,
-            formatters: formatters)
+            formatters: formatters,
+            textResolver: textResolver)
     }
 
     @ViewBuilder

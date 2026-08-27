@@ -227,6 +227,15 @@ private func receivesSignalsPromptly(
     }
 }
 
+private func finishesPromptly(_ group: DispatchGroup) async -> Bool {
+    await withCheckedContinuation { continuation in
+        DispatchQueue.global().async {
+            continuation.resume(
+                returning: group.wait(timeout: .now() + 5) == .success)
+        }
+    }
+}
+
 private final class ChartRowsReadCounter: @unchecked Sendable {
     private let lock = NSLock()
     private var value = 0
@@ -830,6 +839,20 @@ private struct CountingChartRowsTable: AutoChartTable {
         #expect(duplicatePresentation.valueDescription == "First")
     }
 
+    @Test func messageIdentifiersRetainUnknownCodableValues() throws {
+        let encoded = Data(
+            #"{"arguments":{},"category":"future-category","code":"future-code","defaultText":"Future"}"#
+                .utf8)
+        let message = try JSONDecoder().decode(AutoChartMessage.self, from: encoded)
+
+        #expect(message.category.rawValue == "future-category")
+        #expect(message.code.rawValue == "future-code")
+        #expect(
+            try JSONDecoder().decode(
+                AutoChartMessage.self,
+                from: JSONEncoder().encode(message)) == message)
+    }
+
     #if canImport(Charts) && canImport(SwiftUI)
     @MainActor
     @Test func distinctCountRenderingSurfacesResolveLineageWithoutApplyingUnits() async throws {
@@ -981,7 +1004,8 @@ private struct CountingChartRowsTable: AutoChartTable {
             switch request.purpose {
             case .value:
                 if request.context == .kpi {
-                    let value = request.value == .double(42) ? "42" : "unexpected"
+                    let value = request.value == .double(42)
+                        ? "42" : "unexpected \(String(reflecting: request.value))"
                     return "\(request.context.rawValue):value:\(column):\(value)"
                 }
                 return "\(request.context.rawValue):value:\(column)"
@@ -1026,6 +1050,23 @@ private struct CountingChartRowsTable: AutoChartTable {
         #expect(kpiContent.valueText == "kpi:value:\(kpiMeasure.id.rawValue):42")
         #expect(kpiContent.title == "Revenue")
         #expect(!kpiContent.isCompact)
+        #expect(
+            kpiContent.accessibilityText
+                == "Revenue, kpi:value:\(kpiMeasure.id.rawValue):42")
+        let localizedKPIContent = AutoChartKPIContent(
+            preparedChart: kpi,
+            typography: .standard,
+            formatters: formatter,
+            textResolver: AutoChartTextResolver { message in
+                guard message.category == .accessibility,
+                    message.code == .markAccessibility,
+                    message.arguments["name"] == .string("Revenue"),
+                    message.arguments["value"]
+                        == .string("kpi:value:\(kpiMeasure.id.rawValue):42")
+                else { return nil }
+                return "Localized KPI"
+            })
+        #expect(localizedKPIContent.accessibilityText == "Localized KPI")
     }
 
     @Test func previewUsesExactHeightAndIndependentControls() {
@@ -1067,27 +1108,39 @@ private struct CountingChartRowsTable: AutoChartTable {
     @Test func preparationGateTimesOutEveryConcurrentEntryWaiter() async {
         let gate = OneShotPreparationGate(timeout: .seconds(30))
         let peerStarted = DispatchSemaphore(value: 0)
-        let peerFinished = DispatchSemaphore(value: 0)
+        let peerFinished = DispatchGroup()
         await gate.arm()
         let peers = (0..<31).map { _ in
-            Task {
-                defer { peerFinished.signal() }
+            peerFinished.enter()
+            return Task {
+                defer { peerFinished.leave() }
                 try await gate.waitUntilBlocked(onWaiting: { peerStarted.signal() })
             }
+        }
+        func drain<Success: Sendable, Failure: Error>(
+            _ tasks: [Task<Success, Failure>],
+            completion: DispatchGroup,
+            name: String
+        ) async {
+            tasks.forEach { $0.cancel() }
+            let didFinish = await finishesPromptly(completion)
+            #expect(didFinish, "Cancelled \(name) should finish promptly")
+            guard didFinish else { return }
+            for task in tasks { _ = await task.result }
         }
 
         let peersStarted = await receivesSignalsPromptly(peerStarted, count: peers.count)
         #expect(peersStarted)
         guard peersStarted else {
-            peers.forEach { $0.cancel() }
-            _ = await receivesSignalsPromptly(peerFinished, count: peers.count)
+            await drain(peers, completion: peerFinished, name: "peer waiters")
             return
         }
 
         let triggerStarted = DispatchSemaphore(value: 0)
-        let triggerFinished = DispatchSemaphore(value: 0)
+        let triggerFinished = DispatchGroup()
+        triggerFinished.enter()
         let trigger = Task {
-            defer { triggerFinished.signal() }
+            defer { triggerFinished.leave() }
             try await gate.waitUntilBlocked(
                 timeout: .milliseconds(100),
                 onWaiting: { triggerStarted.signal() })
@@ -1095,30 +1148,33 @@ private struct CountingChartRowsTable: AutoChartTable {
         let triggerDidStart = await receivesSignalPromptly(triggerStarted)
         #expect(triggerDidStart)
         guard triggerDidStart else {
-            trigger.cancel()
-            peers.forEach { $0.cancel() }
-            _ = await receivesSignalPromptly(triggerFinished)
-            _ = await receivesSignalsPromptly(peerFinished, count: peers.count)
+            await drain([trigger], completion: triggerFinished, name: "trigger")
+            await drain(peers, completion: peerFinished, name: "peer waiters")
             return
         }
 
-        let triggerDidFinish = await receivesSignalPromptly(triggerFinished)
+        let triggerDidFinish = await finishesPromptly(triggerFinished)
         #expect(triggerDidFinish)
         guard triggerDidFinish else {
-            trigger.cancel()
-            peers.forEach { $0.cancel() }
-            _ = await receivesSignalPromptly(triggerFinished)
-            _ = await receivesSignalsPromptly(peerFinished, count: peers.count)
+            await drain([trigger], completion: triggerFinished, name: "trigger")
+            await drain(peers, completion: peerFinished, name: "peer waiters")
             return
         }
         await #expect(throws: PreparationGateError.self) {
             try await trigger.value
         }
 
-        let peersDidFinish = await receivesSignalsPromptly(peerFinished, count: peers.count)
+        let activeTimeoutTaskCount = await gate.activeTimeoutTaskCount
+        #expect(activeTimeoutTaskCount == 0)
+        guard activeTimeoutTaskCount == 0 else {
+            await drain(peers, completion: peerFinished, name: "peer waiters")
+            return
+        }
+
+        let peersDidFinish = await finishesPromptly(peerFinished)
         #expect(peersDidFinish)
         guard peersDidFinish else {
-            peers.forEach { $0.cancel() }
+            await drain(peers, completion: peerFinished, name: "peer waiters")
             return
         }
         for peer in peers {
@@ -1128,7 +1184,6 @@ private struct CountingChartRowsTable: AutoChartTable {
         }
 
         #expect(!(await gate.isArmed))
-        #expect(await gate.activeTimeoutTaskCount == 0)
     }
 
     @Test func preparationGateCancelsSomeWaitersAndReleasesTheRest() async throws {
