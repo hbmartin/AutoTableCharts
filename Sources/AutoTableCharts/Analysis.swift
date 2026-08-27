@@ -189,19 +189,16 @@ public struct AutoChartPreparedChart<RowID: Hashable & Sendable>: Sendable {
 
     let sourceRowIDs: [RowID]
     let core: AutoChartRenderCore
-    let specificationID: AutoChartSpecificationID
 
     init(
         source: AutoChartPreparedSource<RowID>,
         recommendation: AutoChartRecommendation,
-        specificationID: AutoChartSpecificationID,
         core: AutoChartRenderCore
     ) {
         self.recommendation = recommendation
         self.validation = core.validation
         self.sourceRowIDs = source.rowIDs
         self.core = core
-        self.specificationID = specificationID
         self.marks = core.data.map { datum in
             AutoChartPreparedMark(
                 identity: datum.id,
@@ -219,14 +216,13 @@ public struct AutoChartPreparedChart<RowID: Hashable & Sendable>: Sendable {
         // Cache sharing may replace recommendation metadata and titles, but the
         // prepared marks and presentation belong to one structural specification.
         precondition(
-            cached.specificationID == recommendation.specification.id,
+            cached.recommendation.specification.id == recommendation.specification.id,
             "Prepared charts can only adapt to the same structural specification.")
         self.recommendation = recommendation
         self.validation = cached.validation
         self.marks = cached.marks
         self.sourceRowIDs = cached.sourceRowIDs
         self.core = cached.core
-        self.specificationID = cached.specificationID
     }
 
     func rowIDs(for offsets: Set<Int>) -> Set<RowID> {
@@ -1427,7 +1423,6 @@ public actor AutoChartAnalyzer {
             let prepared = AutoChartPreparedChart(
                 source: source,
                 recommendation: recommendation,
-                specificationID: key.specificationID,
                 core: core)
             try Task.checkCancellation()
             let stored = await self.storePreparedChart(

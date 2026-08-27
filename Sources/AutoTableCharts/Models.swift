@@ -1289,6 +1289,21 @@ public enum AutoChartMessageArgument: Hashable, Codable, Sendable {
         case string, integer, number, column, family, aggregation
     }
 
+    fileprivate struct AnyCaseCodingKey: CodingKey {
+        var stringValue: String
+        var intValue: Int?
+
+        init(stringValue: String) {
+            self.stringValue = stringValue
+            intValue = nil
+        }
+
+        init?(intValue: Int) {
+            stringValue = String(intValue)
+            self.intValue = intValue
+        }
+    }
+
     private struct Payload<Value: Codable>: Codable {
         var value: Value
 
@@ -1324,7 +1339,7 @@ public enum AutoChartMessageArgument: Hashable, Codable, Sendable {
     }
 
     public init(from decoder: any Decoder) throws {
-        let container = try decoder.container(keyedBy: CaseCodingKey.self)
+        let container = try decoder.container(keyedBy: AnyCaseCodingKey.self)
         let keys = container.allKeys
         guard keys.count == 1, let key = keys.first else {
             throw DecodingError.dataCorrupted(
@@ -1332,7 +1347,9 @@ public enum AutoChartMessageArgument: Hashable, Codable, Sendable {
                     codingPath: decoder.codingPath,
                     debugDescription: "A message argument must contain exactly one known case."))
         }
-        guard let value = try Self.decodeKnownCase(key, forKey: key, from: container) else {
+        guard let caseKey = CaseCodingKey(rawValue: key.stringValue),
+            let value = try Self.decodeKnownCase(caseKey, forKey: key, from: container)
+        else {
             throw DecodingError.dataCorrupted(
                 .init(
                     codingPath: decoder.codingPath,
@@ -1446,6 +1463,14 @@ public struct AutoChartMessage: Hashable, Codable, Sendable {
         public static let missingValueLabel = Self(rawValue: "missingValueLabel")
         public static let missingSeriesLabel = Self(rawValue: "missingSeriesLabel")
         public static let missingFacetLabel = Self(rawValue: "missingFacetLabel")
+
+        /// Disambiguates categories whose typed source values share one display label.
+        ///
+        /// Resolver arguments include `label` and a stable `kind` string. Known kind
+        /// values mirror the source identity prefixes: `boolean`, `integer`, `number`,
+        /// `exact-number`, `double`, `decimal`, `text`, and `date`; `value` is the
+        /// forward-compatible catch-all. A repeated kind also includes an integer
+        /// `index` argument.
         public static let categoryDisambiguation = Self(rawValue: "categoryDisambiguation")
 
         public init(from decoder: any Decoder) throws {
@@ -1467,20 +1492,7 @@ public struct AutoChartMessage: Hashable, Codable, Sendable {
         case category, code, arguments, defaultText
     }
 
-    private struct ArgumentCodingKey: CodingKey {
-        var stringValue: String
-        var intValue: Int?
-
-        init(stringValue: String) {
-            self.stringValue = stringValue
-            intValue = nil
-        }
-
-        init?(intValue: Int) {
-            stringValue = String(intValue)
-            self.intValue = intValue
-        }
-    }
+    private typealias ArgumentCodingKey = AutoChartMessageArgument.AnyCaseCodingKey
 
     /// Decodes the stable enum representation one case at a time so genuinely
     /// unknown shapes and cases can be ignored without also swallowing
