@@ -913,46 +913,6 @@ func disambiguatedCategoryLabels(
     resolvedDisambiguatedCategoryLabels(pairs, textResolver: textResolver)
 }
 
-private enum AutoChartCategoryDisambiguationKind: String, Sendable {
-    case boolean
-    case integer
-    case number
-    case exactNumber = "exact-number"
-    case double
-    case decimal
-    case text
-    case date
-    case value
-
-    init(identity: String) {
-        self = switch identity.split(separator: ":", maxSplits: 1).first {
-        case "boolean": .boolean
-        case "integer": .integer
-        case "number": .number
-        case "exact-number": .exactNumber
-        case "double": .double
-        case "decimal": .decimal
-        case "text": .text
-        case "date": .date
-        default: .value
-        }
-    }
-
-    var defaultText: String {
-        switch self {
-        case .boolean: "Boolean"
-        case .integer: "Integer"
-        case .number: "Number"
-        case .exactNumber: "Exact Number"
-        case .double: "Double"
-        case .decimal: "Decimal"
-        case .text: "Text"
-        case .date: "Date"
-        case .value: "Value"
-        }
-    }
-}
-
 private func resolvedDisambiguatedCategoryLabels(
     _ pairs: [(identity: String, label: String)],
     textResolver: AutoChartTextResolver?
@@ -972,13 +932,17 @@ private func resolvedDisambiguatedCategoryLabels(
     for (label, identities) in groups {
         guard identities.count > 1 else { continue }
         let kinds = identities.map(AutoChartCategoryDisambiguationKind.init(identity:))
-        let kindCounts = Dictionary(grouping: kinds, by: \.self).mapValues(\.count)
-        var kindIndexes: [String: Int] = [:]
+        let kindCounts = kinds.reduce(
+            into: [AutoChartCategoryDisambiguationKind: Int]()
+        ) { counts, kind in
+            counts[kind, default: 0] += 1
+        }
+        var kindIndexes: [AutoChartCategoryDisambiguationKind: Int] = [:]
         for (identity, kind) in zip(identities, kinds) {
-            kindIndexes[kind.rawValue, default: 0] += 1
+            kindIndexes[kind, default: 0] += 1
             let index =
                 kindCounts[kind, default: 0] == 1
-                ? nil : kindIndexes[kind.rawValue, default: 0]
+                ? nil : kindIndexes[kind, default: 0]
             let qualifier = index.map { "\(kind.defaultText) \($0)" } ?? kind.defaultText
             let defaultText = "\(label) (\(qualifier))"
             var arguments: [String: AutoChartMessageArgument] = [
@@ -1015,24 +979,34 @@ func disambiguatedCategoryValue(
     return labels[identity] ?? label ?? identity
 }
 
-func orderedFacetKeys(
+struct AutoChartFacetPanel: Sendable {
+    let key: String?
+    let data: [AutoChartDatum]
+    let displayValue: String
+}
+
+func orderedFacetPanels(
     in facets: [String?: [AutoChartDatum]],
     labels: [String: String],
     fallback: String
-) -> [String?] {
-    func displayValue(for key: String?) -> String {
-        guard let datum = facets[key]?.first else { return fallback }
-        return disambiguatedCategoryValue(
-            identity: datum.facetIdentity,
-            label: datum.facet,
-            labels: labels,
-            fallback: fallback)
-    }
-    return facets.keys.sorted { leftKey, rightKey in
-        let left = displayValue(for: leftKey)
-        let right = displayValue(for: rightKey)
-        if left != right { return left < right }
-        return (leftKey ?? "") < (rightKey ?? "")
+) -> [AutoChartFacetPanel] {
+    facets.map { key, data in
+        let displayValue = key.map { identity in
+            disambiguatedCategoryValue(
+                identity: identity,
+                label: data.first?.facet,
+                labels: labels,
+                fallback: fallback)
+        } ?? fallback
+        return AutoChartFacetPanel(
+            key: key,
+            data: data,
+            displayValue: displayValue)
+    }.sorted { left, right in
+        if left.displayValue != right.displayValue {
+            return left.displayValue < right.displayValue
+        }
+        return (left.key ?? "") < (right.key ?? "")
     }
 }
 
@@ -1530,10 +1504,9 @@ struct AutoChartResolvedPresentation: Sendable {
             var override: LabelOverride?
         }
         var xCandidates: [LabelCandidate] = []
-        var yCandidates: [LabelCandidate] = []
+        var yPairs: [(identity: String, label: String)] = []
         var seriesPairs: [(identity: String, label: String)] = []
         var facetPairs: [(identity: String, label: String)] = []
-        var sharedXDomainInputs: [(identity: String?, label: String?)] = []
         var needsMissingValue = false
         var needsMissingSeries = false
         var needsMissingFacet = false
@@ -1563,18 +1536,7 @@ struct AutoChartResolvedPresentation: Sendable {
             }
             if presentation.usesYIdentityLabels {
                 if let identity = datum.yIdentity, let label = datum.yLabel {
-                    let labelOverride: LabelOverride? =
-                        isNull(datum.ySourceValue) ? .missingValue : nil
-                    if case .some(.missingValue) = labelOverride {
-                        needsMissingValue = true
-                    }
-                    yCandidates.append(
-                        LabelCandidate(
-                            identity: identity,
-                            label: label,
-                            override: labelOverride))
-                } else if datum.yIdentity == nil, datum.yLabel == nil {
-                    needsMissingValue = true
+                    yPairs.append((identity, label))
                 }
             }
             if presentation.usesSeriesIdentityLabels {
@@ -1590,9 +1552,6 @@ struct AutoChartResolvedPresentation: Sendable {
                 } else if datum.facetIdentity == nil, datum.facet == nil {
                     needsMissingFacet = true
                 }
-            }
-            if presentation.usesSharedXCategoryDomain {
-                sharedXDomainInputs.append((datum.xIdentity, datum.xLabel))
             }
         }
 
@@ -1620,14 +1579,6 @@ struct AutoChartResolvedPresentation: Sendable {
             }
             return (identity: candidate.identity, label: label)
         }
-        let yPairs = yCandidates.map { candidate in
-            let label = switch candidate.override {
-            case .missingValue: resolvedMissingValue
-            case .allValues, nil: candidate.label
-            }
-            return (identity: candidate.identity, label: label)
-        }
-
         let resolvedXDisplayLabels =
             presentation.usesXIdentityLabels
             ? disambiguatedCategoryLabels(xPairs, textResolver: textResolver) : [:]
@@ -1644,10 +1595,10 @@ struct AutoChartResolvedPresentation: Sendable {
         let resolvedSharedXCategoryDomain: [String] = {
             guard presentation.usesSharedXCategoryDomain else { return [] }
             var seen: Set<String> = []
-            return sharedXDomainInputs.compactMap { input in
+            return data.compactMap { datum in
                 let category = disambiguatedCategoryValue(
-                    identity: input.identity,
-                    label: input.label,
+                    identity: datum.xIdentity,
+                    label: datum.xLabel,
                     labels: resolvedXDisplayLabels,
                     fallback: resolvedMissingValue)
                 return seen.insert(category).inserted ? category : nil
@@ -2591,7 +2542,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
 
     private var facetedChart: some View {
         let facets = Dictionary(grouping: data) { $0.facetIdentity }
-        let facetKeys = orderedFacetKeys(
+        let facetPanels = orderedFacetPanels(
             in: facets,
             labels: facetDisplayLabels,
             fallback: resolvedPresentation.missingFacet)
@@ -2599,15 +2550,14 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             if let plotHeight = presentation.plotHeight {
                 GeometryReader { geometry in
                     facetGrid(
-                        facets: facets,
-                        facetKeys: facetKeys,
+                        panels: facetPanels,
                         tileHeight: facetTileHeight(
                             totalHeight: plotHeight,
                             availableWidth: geometry.size.width,
-                            panelCount: facetKeys.count))
+                            panelCount: facetPanels.count))
                 }
             } else {
-                facetGrid(facets: facets, facetKeys: facetKeys, tileHeight: 180)
+                facetGrid(panels: facetPanels, tileHeight: 180)
             }
         }
     }
@@ -2634,8 +2584,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     }
 
     private func facetGrid(
-        facets: [String?: [AutoChartDatum]],
-        facetKeys: [String?],
+        panels: [AutoChartFacetPanel],
         tileHeight: CGFloat
     ) -> some View {
         let yDomain = sharedYDomain ?? 0...1
@@ -2652,12 +2601,10 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
                 ],
                 spacing: AutoChartFacetLayout.spacing
             ) {
-                ForEach(facetKeys, id: \.self) { facetKey in
-                    let facetData = facets[facetKey] ?? []
+                ForEach(panels, id: \.key) { panel in
+                    let facetData = panel.data
                     VStack(alignment: .leading, spacing: 4) {
-                        Text(
-                            facetData.first.map(facetValue(for:))
-                                ?? resolvedPresentation.missingFacet)
+                        Text(panel.displayValue)
                             .font(.caption.weight(.semibold))
                         if facetBaseFamily == .line, xSemanticType == .temporal {
                             let chart = Chart(facetData) { datum in

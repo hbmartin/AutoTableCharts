@@ -4058,11 +4058,30 @@ private let date = AutoChartColumn(
 
         #expect(resolved.sharedXCategoryDomain == ["Zulu", "Alpha"])
         #expect(
-            orderedFacetKeys(
+            orderedFacetPanels(
                 in: Dictionary(grouping: data, by: \.facetIdentity),
                 labels: resolved.facetDisplayLabels,
                 fallback: resolved.missingFacet)
+                .map(\.key)
                 == ["text:1:1", "integer:1"])
+    }
+
+    @Test func nilFacetPanelUsesMissingLabelInsteadOfAnArbitraryMemberLabel() {
+        let data = [
+            AutoChartDatum(
+                id: "unrenderable-facet", sourceRowIDs: [],
+                xIdentity: "text:1:A", xLabel: "A", yNumber: 1,
+                facet: "Raw invalid label")
+        ]
+
+        let panels = orderedFacetPanels(
+            in: Dictionary(grouping: data, by: \.facetIdentity),
+            labels: [:],
+            fallback: "Localized missing facet")
+
+        #expect(panels.count == 1)
+        #expect(panels.first?.key == nil)
+        #expect(panels.first?.displayValue == "Localized missing facet")
     }
 
     @Test func missingFacetDefaultTextRemainsFacetSpecific() {

@@ -1459,8 +1459,13 @@ private struct CountingChartRowsTable: AutoChartTable {
         let preparation = Task { await gate.waitWhenArmed() }
 
         try await gate.waitUntilBlocked()
+        var rearmResult: Bool?
         await withKnownIssue("Re-arming reports the gate invariant violation.") {
-            #expect(!(await gate.arm()))
+            rearmResult = await gate.arm()
+        }
+        #expect(rearmResult == false)
+        if rearmResult != false {
+            await gate.resume()
         }
         await preparation.value
 
