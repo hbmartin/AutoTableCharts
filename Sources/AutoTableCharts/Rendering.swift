@@ -1425,42 +1425,22 @@ struct AutoChartKPIContent: View {
     init<RowID: Hashable & Sendable>(
         preparedChart: AutoChartPreparedChart<RowID>,
         typography: AutoChartTypography,
-        formatters: AutoChartFormatters,
-        textResolver: AutoChartTextResolver = .default
+        formatters: AutoChartFormatters
     ) {
         let core = preparedChart.core
         let semantics = core.measureSemantics
         let column = semantics.columnID.flatMap { core.table.profiles[$0]?.column }
-        valueText = Self.resolvedValueText(
-            value: core.data.first?.ySourceValue,
-            column: column,
-            purpose: semantics.formattingPurpose,
-            formatters: formatters,
-            textResolver: textResolver)
-        title = core.presentation.yTitle
-        isCompact = typography == .compact
-    }
-
-    static func resolvedValueText(
-        value: AutoChartValue?,
-        column: AutoChartColumn?,
-        purpose: AutoChartFormattingPurpose,
-        formatters: AutoChartFormatters,
-        textResolver: AutoChartTextResolver
-    ) -> String {
-        guard let value else {
-            return textResolver(
-                AutoChartMessage(
-                    category: .interface,
-                    code: .missingValue,
-                    defaultText: AutoChartValue.unrepresentableValuePlaceholder))
+        guard let value = core.data.first?.ySourceValue else {
+            preconditionFailure("Prepared KPI charts require one source measure value.")
         }
-        return formatters.format(
+        valueText = formatters.format(
             AutoChartFormattingRequest(
                 column: column,
                 value: value,
                 context: .kpi,
-                purpose: purpose))
+                purpose: semantics.formattingPurpose))
+        title = core.presentation.yTitle
+        isCompact = typography == .compact
     }
 
     var body: some View {
@@ -1714,8 +1694,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         AutoChartKPIContent(
             preparedChart: preparedChart,
             typography: presentation.typography,
-            formatters: formatters,
-            textResolver: textResolver)
+            formatters: formatters)
     }
 
     @ViewBuilder
