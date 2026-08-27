@@ -9,3 +9,5 @@ DerivedData/
 
 # Local authoring inputs; published DocC cites original sources directly.
 /research/
+reviews_triage/
+triage_decisions.db

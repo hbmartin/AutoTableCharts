@@ -1292,6 +1292,10 @@ public struct AutoChartMessage: Hashable, Codable, Sendable {
         case diagnostic, rationale, fallback, accessibility, interface
     }
 
+    /// A stable message identifier.
+    ///
+    /// New package-authored messages may add cases. Use `@unknown default` when
+    /// switching over codes outside this package so source remains forward-compatible.
     public enum Code: String, Hashable, Codable, Sendable {
         case recommendationRationale
         case incompleteResult

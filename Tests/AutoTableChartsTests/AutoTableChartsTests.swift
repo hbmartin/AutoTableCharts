@@ -1527,6 +1527,16 @@ private let date = AutoChartColumn(
             let isKPI = specification.family == .kpi
             let snapshot = isKPI ? kpiSnapshot : inputSnapshot
             let profiles = isKPI ? kpiProfiles : inputProfiles
+            let structuralValidation = AutoChartRecommendationEngine.validate(
+                specification: specification,
+                snapshot: snapshot,
+                profiles: profiles,
+                validatesPreparedNumericDomain: false)
+            #expect(
+                structuralValidation.isValid,
+                "\(specification.family) should validate before preparation")
+            guard structuralValidation.isValid else { continue }
+
             let prepared = AutoChartDataPreparation.preparedData(
                 snapshot: snapshot,
                 specification: specification,
@@ -1579,7 +1589,7 @@ private let date = AutoChartColumn(
             ).usesNormalizedMeasureAxis)
     }
 
-    @Test func unaggregatedBarFamiliesRejectDuplicateMarks() {
+    @Test func unaggregatedCategoricalFamiliesRejectDuplicateMarks() {
         let series = AutoChartColumn(
             id: "series", name: "Series",
             hints: .init(semanticType: .nominal, role: .series))
@@ -1595,6 +1605,7 @@ private let date = AutoChartColumn(
         let specifications = [
             AutoChartSpecification(family: .bar, encoding: xy),
             AutoChartSpecification(family: .rankedDot, encoding: xy),
+            AutoChartSpecification(family: .donut, encoding: xy),
             AutoChartSpecification(family: .groupedBar, encoding: grouped),
             AutoChartSpecification(
                 family: .stackedBar, encoding: grouped, stacking: .standard),
