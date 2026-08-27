@@ -2651,6 +2651,27 @@ private let date = AutoChartColumn(
         #expect(!validation.issues.contains { $0.messageValue.code == .nonFiniteValueOmitted })
     }
 
+    @Test func invalidDonutAggregationProducesTypedPreparationFailure() {
+        let input = table(
+            columns: [category, measure],
+            rows: [
+                [.text("A"), .double(1)],
+                [.text("A"), .double(2)],
+            ])
+        let snapshot = AutoChartSnapshot(input)
+        let prepared = AutoChartDataPreparation.preparedData(
+            snapshot: snapshot,
+            specification: AutoChartSpecification(
+                family: .donut,
+                encoding: .init(x: category.id, y: measure.id)),
+            profiles: AutoChartProfiler.profileIndex(snapshot))
+
+        #expect(prepared.data.isEmpty)
+        #expect(prepared.measureSemantics.kind == .value)
+        #expect(prepared.measureSemantics.columnID == measure.id)
+        #expect(prepared.failure == .aggregationRequired(.donut))
+    }
+
     @Test func donutSectorTotalMustRemainFinite() {
         let halfExtreme = Double.greatestFiniteMagnitude / 2
         let input = table(
@@ -3770,7 +3791,7 @@ private let date = AutoChartColumn(
         }
     }
 
-    @Test func preparationOwnsRenderedMeasureSemanticsAcrossFamilies() throws {
+    @Test func preparedSemanticsDrivePresentationAndSelectionAcrossFamilies() throws {
         let heatmapY = AutoChartColumn(
             id: "heatmap-y", name: "Region",
             hints: .init(semanticType: .nominal, role: .dimension))
@@ -3800,6 +3821,7 @@ private let date = AutoChartColumn(
 
         #expect(heatmapPresentation.yTitle == AutoChartProfiler.displayName(heatmapY))
         #expect(heatmapPrepared.measureSemantics.kind == .aggregated(.count))
+        #expect(heatmapPrepared.failure == nil)
         #expect(heatmapSelection.measure?.aggregation == .count)
         #expect(heatmapSelection.measure?.columnID == nil)
 
@@ -3822,6 +3844,7 @@ private let date = AutoChartColumn(
 
         #expect(boxPrepared.data.count == 1)
         #expect(boxPrepared.measureSemantics.kind == .value)
+        #expect(boxPrepared.failure == nil)
         #expect(boxSelection.measure?.aggregation == AutoChartAggregation.none)
         #expect(boxSelection.measure?.columnID == measure.id)
         #expect(
@@ -3854,6 +3877,7 @@ private let date = AutoChartColumn(
 
         #expect(donutA.yNumber == 3)
         #expect(donutPrepared.measureSemantics.kind == .aggregated(.sum))
+        #expect(donutPrepared.failure == nil)
         #expect(donutSelection.measure?.aggregation == .sum)
         #expect(donutSelection.measure?.value == .scalar(.double(3)))
 
@@ -3870,6 +3894,7 @@ private let date = AutoChartColumn(
         #expect(kpiPrepared.data.first?.yNumber == 42)
         #expect(kpiPrepared.measureSemantics.kind == .value)
         #expect(kpiPrepared.measureSemantics.columnID == measure.id)
+        #expect(kpiPrepared.failure == nil)
     }
 
     @Test func selectionDimensionsPreserveTypedSourceValuesInsteadOfLabels() {

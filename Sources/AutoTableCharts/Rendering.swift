@@ -62,6 +62,22 @@ enum AutoChartAccessibility {
             textResolver: textResolver)
     }
 
+    static func kpiLabel(
+        title: String,
+        valueDescription: String,
+        textResolver: AutoChartTextResolver
+    ) -> String {
+        textResolver(
+            AutoChartMessage(
+                category: .accessibility,
+                code: .kpiAccessibility,
+                arguments: [
+                    "title": .string(title),
+                    "value": .string(valueDescription),
+                ],
+                defaultText: "\(title), \(valueDescription)"))
+    }
+
     static func heatmapLabel(
         category: String,
         secondaryCategory: String,
@@ -428,11 +444,29 @@ extension AutoChartSpecification {
 
 enum AutoChartDataPreparation {
     struct PreparedData: Sendable {
+        enum Failure: Equatable, Sendable {
+            case aggregationRequired(AutoChartFamily)
+
+            var diagnostic: AutoChartDiagnostic {
+                switch self {
+                case .aggregationRequired(let family):
+                    AutoChartDiagnostic(
+                        severity: .error,
+                        code: .unsafeAggregation,
+                        message:
+                            "\(family.displayName) requires an explicit aggregation before data preparation.",
+                        family: family)
+                }
+            }
+        }
+
         var data: [AutoChartDatum]
         var measureSemantics: AutoChartRenderedMeasureSemantics
+        var failure: Failure?
     }
 
     private enum Operation {
+        case invalid
         case raw
         case grouped(AutoChartAggregation)
         case histogram
@@ -443,6 +477,7 @@ enum AutoChartDataPreparation {
     private struct Plan {
         var operation: Operation
         var measureSemantics: AutoChartRenderedMeasureSemantics
+        var failure: PreparedData.Failure? = nil
     }
 
     static func data(
@@ -474,6 +509,8 @@ enum AutoChartDataPreparation {
     ) -> PreparedData {
         let plan = preparationPlan(for: specification)
         let data = switch plan.operation {
+        case .invalid:
+            [AutoChartDatum]()
         case .raw:
             sorted(
                 raw(
@@ -501,7 +538,10 @@ enum AutoChartDataPreparation {
                 specification: specification,
                 profiles: profiles)
         }
-        return PreparedData(data: data, measureSemantics: plan.measureSemantics)
+        return PreparedData(
+            data: data,
+            measureSemantics: plan.measureSemantics,
+            failure: plan.failure)
     }
 
     private static func preparationPlan(
@@ -549,6 +589,12 @@ enum AutoChartDataPreparation {
         case .kpi:
             return Plan(operation: .raw, measureSemantics: valueSemantics())
         case .donut:
+            guard specification.aggregation != .none else {
+                return Plan(
+                    operation: .invalid,
+                    measureSemantics: valueSemantics(),
+                    failure: .aggregationRequired(.donut))
+            }
             return Plan(
                 operation: .grouped(specification.aggregation),
                 measureSemantics: aggregatedSemantics(specification.aggregation))
@@ -634,9 +680,7 @@ enum AutoChartDataPreparation {
         profiles: [AutoChartColumnID: AutoChartColumnProfile],
         aggregation: AutoChartAggregation
     ) -> [AutoChartDatum] {
-        precondition(
-            aggregation != .none,
-            "Grouped preparation requires an effective aggregation.")
+        guard aggregation != .none else { return [] }
         let rawData = raw(
             snapshot: snapshot,
             specification: specification,
@@ -656,7 +700,7 @@ enum AutoChartDataPreparation {
             let result: Double
             switch aggregation {
             case .none:
-                preconditionFailure("Grouped preparation requires an effective aggregation.")
+                return nil
             case .sum:
                 result = values.reduce(0, +)
             case .mean:
@@ -1309,6 +1353,10 @@ struct AutoChartRenderCore: Sendable {
             snapshot: snapshot,
             specification: specification,
             profiles: profiles)
+        if let failure = preparedData.failure {
+            throw AutoChartPreparationError.invalidSpecification(
+                AutoChartValidationResult(issues: [failure.diagnostic]))
+        }
         let validation = AutoChartRecommendationEngine.validatePreparedNumericDomain(
             structuralValidation: structuralValidation,
             specification: specification,
@@ -1435,7 +1483,7 @@ struct AutoChartKPIContent: View {
         preparedChart: AutoChartPreparedChart<RowID>,
         typography: AutoChartTypography,
         formatters: AutoChartFormatters,
-        textResolver: AutoChartTextResolver = .default
+        textResolver: AutoChartTextResolver
     ) {
         let core = preparedChart.core
         let semantics = core.measureSemantics
@@ -1456,8 +1504,8 @@ struct AutoChartKPIContent: View {
         valueText = resolvedValueText
         title = resolvedTitle
         isCompact = typography == .compact
-        accessibilityText = AutoChartAccessibility.markLabel(
-            name: resolvedTitle,
+        accessibilityText = AutoChartAccessibility.kpiLabel(
+            title: resolvedTitle,
             valueDescription: resolvedValueText,
             textResolver: textResolver)
     }
