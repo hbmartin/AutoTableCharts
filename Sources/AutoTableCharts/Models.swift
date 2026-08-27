@@ -1315,6 +1315,8 @@ public struct AutoChartMessage: Hashable, Codable, Sendable {
         case selectionRowCount
         case candidateLimit
         case markAccessibility
+        case markAccessibilityDate
+        case markAccessibilityRange
     }
 
     public var category: Category

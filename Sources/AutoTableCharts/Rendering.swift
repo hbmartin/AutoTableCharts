@@ -81,19 +81,40 @@ enum AutoChartAccessibility {
         for datum: AutoChartDatum,
         measureSemantics: AutoChartRenderedMeasureSemantics,
         profiles: [AutoChartColumnID: AutoChartColumnProfile],
-        formatters: AutoChartFormatters
+        formatters: AutoChartFormatters,
+        textResolver: AutoChartTextResolver = .default
     ) -> String? {
         guard let start = datum.startDate else { return nil }
+        let rangeColumns = AutoChartFormattingLineage.rangeColumns(
+            columnID: measureSemantics.columnID,
+            startColumnID: measureSemantics.rangeStartColumnID,
+            endColumnID: measureSemantics.rangeEndColumnID,
+            resolve: { profiles[$0]?.column })
         let startText = formatters.format(
-            column: measureSemantics.rangeStartColumnID.flatMap { profiles[$0]?.column },
+            column: rangeColumns.start,
             value: .date(start),
             context: .markAccessibility)
-        guard let end = datum.endDate, end != start else { return "Date: \(startText)" }
+        guard let end = datum.endDate, end != start else {
+            return textResolver(
+                AutoChartMessage(
+                    category: .accessibility,
+                    code: .markAccessibilityDate,
+                    arguments: ["date": .string(startText)],
+                    defaultText: "Date: \(startText)"))
+        }
         let endText = formatters.format(
-            column: measureSemantics.rangeEndColumnID.flatMap { profiles[$0]?.column },
+            column: rangeColumns.end,
             value: .date(end),
             context: .markAccessibility)
-        return "From \(startText) to \(endText)"
+        return textResolver(
+            AutoChartMessage(
+                category: .accessibility,
+                code: .markAccessibilityRange,
+                arguments: [
+                    "start": .string(startText),
+                    "end": .string(endText),
+                ],
+                defaultText: "From \(startText) to \(endText)"))
     }
 
     private static func label(
@@ -1396,29 +1417,50 @@ private enum AutoChartViewContent<RowID: Hashable & Sendable>: Sendable {
     case fallback(AutoChartFallback)
 }
 
-struct AutoChartKPIContent<RowID: Hashable & Sendable>: View {
+struct AutoChartKPIContent: View {
     let valueText: String
     let title: String
     let isCompact: Bool
 
-    init(
+    init<RowID: Hashable & Sendable>(
         preparedChart: AutoChartPreparedChart<RowID>,
         typography: AutoChartTypography,
-        formatters: AutoChartFormatters
+        formatters: AutoChartFormatters,
+        textResolver: AutoChartTextResolver = .default
     ) {
         let core = preparedChart.core
         let semantics = core.measureSemantics
         let column = semantics.columnID.flatMap { core.table.profiles[$0]?.column }
-        valueText = core.data.first?.ySourceValue.map {
-            formatters.format(
-                AutoChartFormattingRequest(
-                    column: column,
-                    value: $0,
-                    context: .kpi,
-                    purpose: semantics.formattingPurpose))
-        } ?? "—"
+        valueText = Self.resolvedValueText(
+            value: core.data.first?.ySourceValue,
+            column: column,
+            purpose: semantics.formattingPurpose,
+            formatters: formatters,
+            textResolver: textResolver)
         title = core.presentation.yTitle
         isCompact = typography == .compact
+    }
+
+    static func resolvedValueText(
+        value: AutoChartValue?,
+        column: AutoChartColumn?,
+        purpose: AutoChartFormattingPurpose,
+        formatters: AutoChartFormatters,
+        textResolver: AutoChartTextResolver
+    ) -> String {
+        guard let value else {
+            return textResolver(
+                AutoChartMessage(
+                    category: .interface,
+                    code: .missingValue,
+                    defaultText: AutoChartValue.unrepresentableValuePlaceholder))
+        }
+        return formatters.format(
+            AutoChartFormattingRequest(
+                column: column,
+                value: value,
+                context: .kpi,
+                purpose: purpose))
     }
 
     var body: some View {
@@ -1672,7 +1714,8 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         AutoChartKPIContent(
             preparedChart: preparedChart,
             typography: presentation.typography,
-            formatters: formatters)
+            formatters: formatters,
+            textResolver: textResolver)
     }
 
     @ViewBuilder
@@ -2293,7 +2336,8 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
                     for: datum,
                     measureSemantics: renderedMeasureSemantics,
                     profiles: preparedChart.core.table.profiles,
-                    formatters: formatters)
+                    formatters: formatters,
+                    textResolver: textResolver)
             {
                 return description
             }

@@ -245,6 +245,20 @@ public struct AutoChartFormatters: Sendable {
     }
 }
 
+enum AutoChartFormattingLineage {
+    static func rangeColumns(
+        columnID: AutoChartColumnID?,
+        startColumnID: AutoChartColumnID?,
+        endColumnID: AutoChartColumnID?,
+        resolve: (AutoChartColumnID) -> AutoChartColumn?
+    ) -> (start: AutoChartColumn?, end: AutoChartColumn?) {
+        let fallback = columnID.flatMap(resolve)
+        return (
+            startColumnID.flatMap(resolve) ?? fallback,
+            endColumnID.flatMap(resolve) ?? fallback)
+    }
+}
+
 extension AutoChartSelection {
     public func presentation(
         columns: [AutoChartColumn],
@@ -309,12 +323,13 @@ extension AutoChartSelection {
                     arguments: ["lower": .string(lower), "upper": .string(upper)],
                     defaultText: "\(lower)–\(upper)")
             case .temporalRange(let start, let end):
-                let startColumn = measure.rangeStartColumnID.flatMap { columnIndex[$0] }
-                    ?? column
-                let endColumn = measure.rangeEndColumnID.flatMap { columnIndex[$0] }
-                    ?? column
-                let start = formatted(.date(start), column: startColumn)
-                let end = formatted(.date(end), column: endColumn)
+                let rangeColumns = AutoChartFormattingLineage.rangeColumns(
+                    columnID: measure.columnID,
+                    startColumnID: measure.rangeStartColumnID,
+                    endColumnID: measure.rangeEndColumnID,
+                    resolve: { columnIndex[$0] })
+                let start = formatted(.date(start), column: rangeColumns.start)
+                let end = formatted(.date(end), column: rangeColumns.end)
                 valueMessage = AutoChartMessage(
                     category: .interface,
                     code: .selectionRange,

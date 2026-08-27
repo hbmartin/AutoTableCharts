@@ -1399,6 +1399,11 @@ private let date = AutoChartColumn(
                     .double(15), .double(9), .double(80),
                 ],
             ])
+        let inputSnapshot = AutoChartSnapshot(input)
+        let inputProfiles = AutoChartProfiler.profileIndex(inputSnapshot)
+        let kpiSnapshot = AutoChartSnapshot(
+            table(columns: [measure], rows: [[.double(20)]]))
+        let kpiProfiles = AutoChartProfiler.profileIndex(kpiSnapshot)
         let xy = AutoChartEncoding(x: category.id, y: measure.id)
         let grouped = AutoChartEncoding(
             x: category.id, y: measure.id, series: series.id)
@@ -1406,7 +1411,8 @@ private let date = AutoChartColumn(
             _ specification: AutoChartSpecification,
             columnID: AutoChartColumnID?,
             rangeStartColumnID: AutoChartColumnID? = nil,
-            rangeEndColumnID: AutoChartColumnID? = nil
+            rangeEndColumnID: AutoChartColumnID? = nil,
+            usesNormalizedMeasureAxis: Bool = false
         ) -> FamilyCase {
             FamilyCase(
                 specification: specification,
@@ -1415,7 +1421,7 @@ private let date = AutoChartColumn(
                 rangeStartColumnID: rangeStartColumnID,
                 rangeEndColumnID: rangeEndColumnID,
                 formattingPurpose: .value,
-                usesNormalizedMeasureAxis: false)
+                usesNormalizedMeasureAxis: usesNormalizedMeasureAxis)
         }
         func aggregateCase(
             _ specification: AutoChartSpecification,
@@ -1453,6 +1459,16 @@ private let date = AutoChartColumn(
                     family: .normalizedBar, encoding: grouped,
                     aggregation: .sum, stacking: .normalized),
                 aggregation: .sum, columnID: measure.id,
+                usesNormalizedMeasureAxis: true),
+            valueCase(.init(family: .bar, encoding: xy), columnID: measure.id),
+            valueCase(.init(family: .rankedDot, encoding: xy), columnID: measure.id),
+            valueCase(.init(family: .groupedBar, encoding: grouped), columnID: measure.id),
+            valueCase(
+                .init(family: .stackedBar, encoding: grouped, stacking: .standard),
+                columnID: measure.id),
+            valueCase(
+                .init(family: .normalizedBar, encoding: grouped, stacking: .normalized),
+                columnID: measure.id,
                 usesNormalizedMeasureAxis: true),
             valueCase(
                 .init(family: .line, encoding: .init(x: date.id, y: measure.id)),
@@ -1508,20 +1524,21 @@ private let date = AutoChartColumn(
         #expect(Set(cases.map(\.specification.family)) == Set(AutoChartFamily.allCases))
         for testCase in cases {
             let specification = testCase.specification
-            let validationInput =
-                specification.family == .kpi
-                ? table(columns: [measure], rows: [[.double(20)]])
-                : input
-            #expect(
-                AutoChartRecommendationEngine.validate(
-                    specification: specification, for: validationInput
-                ).isValid,
-                "\(specification.family) should validate")
-            let snapshot = AutoChartSnapshot(validationInput)
+            let isKPI = specification.family == .kpi
+            let snapshot = isKPI ? kpiSnapshot : inputSnapshot
+            let profiles = isKPI ? kpiProfiles : inputProfiles
             let prepared = AutoChartDataPreparation.preparedData(
                 snapshot: snapshot,
                 specification: specification,
-                profiles: AutoChartProfiler.profileIndex(snapshot))
+                profiles: profiles)
+            #expect(
+                AutoChartRecommendationEngine.validate(
+                    specification: specification,
+                    snapshot: snapshot,
+                    profiles: profiles,
+                    preparedData: prepared.data
+                ).isValid,
+                "\(specification.family) should validate")
             #expect(!prepared.data.isEmpty, "\(specification.family) should prepare data")
             #expect(prepared.measureSemantics.kind == testCase.kind)
             #expect(prepared.measureSemantics.columnID == testCase.columnID)
@@ -1537,6 +1554,61 @@ private let date = AutoChartColumn(
             #expect(
                 specification.usesNormalizedMeasureAxis
                     == testCase.usesNormalizedMeasureAxis)
+        }
+    }
+
+    @Test func normalizedMeasureAxisRequiresFamilyAndStacking() {
+        let encoding = AutoChartEncoding(x: category.id, y: measure.id)
+        #expect(
+            AutoChartSpecification(
+                family: .normalizedBar,
+                encoding: encoding,
+                stacking: .normalized
+            ).usesNormalizedMeasureAxis)
+        #expect(
+            !AutoChartSpecification(
+                family: .normalizedBar,
+                encoding: encoding,
+                stacking: .standard
+            ).usesNormalizedMeasureAxis)
+        #expect(
+            !AutoChartSpecification(
+                family: .bar,
+                encoding: encoding,
+                stacking: .normalized
+            ).usesNormalizedMeasureAxis)
+    }
+
+    @Test func unaggregatedBarFamiliesRejectDuplicateMarks() {
+        let series = AutoChartColumn(
+            id: "series", name: "Series",
+            hints: .init(semanticType: .nominal, role: .series))
+        let input = table(
+            columns: [category, series, measure],
+            rows: [
+                [.text("A"), .text("One"), .double(1)],
+                [.text("A"), .text("One"), .double(2)],
+            ])
+        let xy = AutoChartEncoding(x: category.id, y: measure.id)
+        let grouped = AutoChartEncoding(
+            x: category.id, y: measure.id, series: series.id)
+        let specifications = [
+            AutoChartSpecification(family: .bar, encoding: xy),
+            AutoChartSpecification(family: .rankedDot, encoding: xy),
+            AutoChartSpecification(family: .groupedBar, encoding: grouped),
+            AutoChartSpecification(
+                family: .stackedBar, encoding: grouped, stacking: .standard),
+            AutoChartSpecification(
+                family: .normalizedBar, encoding: grouped, stacking: .normalized),
+        ]
+
+        for specification in specifications {
+            #expect(
+                AutoChartRecommendationEngine.validate(
+                    specification: specification,
+                    for: input
+                ).issues.contains(where: { $0.messageValue.code == .duplicateMark }),
+                "\(specification.family) should reject duplicate marks")
         }
     }
 
@@ -3477,12 +3549,48 @@ private let date = AutoChartColumn(
             request.column?.id.rawValue ?? "nil"
         }
         let datum = try #require(prepared.data.first)
+        var collapsedDatum = datum
+        collapsedDatum.endDate = start
         #expect(
             AutoChartAccessibility.rangeValueDescription(
                 for: datum,
                 measureSemantics: prepared.measureSemantics,
                 profiles: profiles,
                 formatters: formatter) == "From start to end")
+        #expect(
+            AutoChartAccessibility.rangeValueDescription(
+                for: collapsedDatum,
+                measureSemantics: prepared.measureSemantics,
+                profiles: profiles,
+                formatters: formatter) == "Date: start")
+        let accessibilityResolver = AutoChartTextResolver { message in
+            switch message.code {
+            case .markAccessibilityRange:
+                guard message.arguments["start"] == .string("start"),
+                    message.arguments["end"] == .string("end")
+                else { return nil }
+                return "Localized range"
+            case .markAccessibilityDate:
+                guard message.arguments["date"] == .string("start") else { return nil }
+                return "Localized date"
+            default:
+                return nil
+            }
+        }
+        #expect(
+            AutoChartAccessibility.rangeValueDescription(
+                for: datum,
+                measureSemantics: prepared.measureSemantics,
+                profiles: profiles,
+                formatters: formatter,
+                textResolver: accessibilityResolver) == "Localized range")
+        #expect(
+            AutoChartAccessibility.rangeValueDescription(
+                for: collapsedDatum,
+                measureSemantics: prepared.measureSemantics,
+                profiles: profiles,
+                formatters: formatter,
+                textResolver: accessibilityResolver) == "Localized date")
         #expect(
             selection.presentation(
                 columns: [category, startColumn, endColumn],
