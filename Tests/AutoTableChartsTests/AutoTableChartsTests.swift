@@ -4066,32 +4066,56 @@ private let date = AutoChartColumn(
                 == ["text:1:1", "integer:1"])
     }
 
-    @Test func nilFacetIdentityUsesLocalizedMissingLabelAcrossPresentationSurfaces() {
+    @Test func preparedNilDimensionIdentitiesUseLocalizedMissingLabelsAcrossSurfaces() throws {
+        let series = AutoChartColumn(
+            id: "series", name: "Series",
+            hints: .init(semanticType: .nominal, role: .dimension))
         let facet = AutoChartColumn(
             id: "facet", name: "Facet",
             hints: .init(semanticType: .nominal, role: .dimension))
         let specification = AutoChartSpecification(
             family: .faceted,
-            encoding: .init(x: category.id, y: measure.id, facet: facet.id),
+            encoding: .init(
+                x: category.id,
+                y: measure.id,
+                series: series.id,
+                facet: facet.id),
             facetBaseFamily: .bar)
+        let invalidDate = Date(timeIntervalSinceReferenceDate: .nan)
         let snapshot = AutoChartSnapshot(
-            table(columns: [category, measure, facet], rows: []))
-        let data = [
-            AutoChartDatum(
-                id: "unrenderable-facet", sourceRowIDs: [],
-                xIdentity: "text:1:A", xLabel: "A", yNumber: 1,
-                facet: "Raw invalid label")
-        ]
+            table(
+                columns: [category, measure, series, facet],
+                rows: [
+                    [.text("A"), .double(1), .date(invalidDate), .date(invalidDate)],
+                    [
+                        .text("B"), .double(2), .text("Localized missing series"),
+                        .text("Localized missing facet"),
+                    ],
+                ]))
+        let profiles = AutoChartProfiler.profileIndex(snapshot)
+        let prepared = AutoChartDataPreparation.preparedData(
+            snapshot: snapshot,
+            specification: specification,
+            profiles: profiles)
+        let data = prepared.data
+        let missing = try #require(data.first { $0.facetIdentity == nil })
+        #expect(missing.seriesIdentity == nil)
+        #expect(missing.series != nil)
+        #expect(missing.facet != nil)
         let presentation = AutoChartRenderPresentation(
             snapshot: snapshot,
             specification: specification,
-            profiles: AutoChartProfiler.profileIndex(snapshot),
+            profiles: profiles,
             data: data,
-            measureSemantics: renderedValueSemantics(columnID: measure.id))
+            measureSemantics: prepared.measureSemantics)
         let resolved = presentation.resolvedPresentation(
             data: data,
             using: AutoChartTextResolver { message in
-                message.code == .missingFacetLabel ? "Localized missing facet" : nil
+                switch message.code {
+                case .missingSeriesLabel: "Localized missing series"
+                case .missingFacetLabel: "Localized missing facet"
+                default: nil
+                }
             })
 
         let panels = orderedFacetPanels(
@@ -4099,12 +4123,27 @@ private let date = AutoChartColumn(
             labels: resolved.facetDisplayLabels,
             fallback: resolved.missingFacet)
 
+        #expect(resolved.missingSeries == "Localized missing series")
         #expect(resolved.missingFacet == "Localized missing facet")
-        #expect(panels.count == 1)
-        #expect(panels.first?.key == nil)
-        #expect(panels.first?.displayValue == "Localized missing facet")
+        #expect(panels.count == 2)
+        #expect(Set(panels.map(\.displayValue)).count == 2)
+        #expect(panels.first { $0.key == nil }?.displayValue == "Localized missing facet")
+        #expect(resolved.seriesDisplayLabels.count == 1)
         #expect(
-            AutoChartFacetCategory(data[0]).displayValue(
+            resolved.seriesDisplayLabels.values.allSatisfy {
+                $0 != "Localized missing series"
+            })
+        #expect(
+            disambiguatedCategoryValue(
+                identity: missing.seriesIdentity,
+                label: missing.series,
+                labels: resolved.seriesDisplayLabels,
+                fallback: resolved.missingSeries)
+                == "Localized missing series")
+        #expect(
+            disambiguatedCategoryValue(
+                identity: missing.facetIdentity,
+                label: missing.facet,
                 labels: resolved.facetDisplayLabels,
                 fallback: resolved.missingFacet)
                 == "Localized missing facet")
@@ -4367,6 +4406,58 @@ private let date = AutoChartColumn(
             specification: specification)
         #expect(data.compactMap(\.xLabel) == ["1", "1"])
         #expect(data.compactMap(\.xIdentity) == ["integer:1", "text:1:1"])
+    }
+
+    @Test func boxPlotUsesOneMissingGroupWithoutCollidingWithARealLabel() throws {
+        let mixed = AutoChartColumn(
+            id: "mixed", name: "mixed",
+            hints: AutoChartColumnHints(semanticType: .nominal))
+        let input = table(
+            columns: [mixed, measure],
+            rows: [
+                [.double(.nan), .double(1)],
+                [.double(.infinity), .double(2)],
+                [.text("Missing value"), .double(3)],
+            ])
+        let snapshot = AutoChartSnapshot(input)
+        let specification = AutoChartSpecification(
+            family: .boxPlot,
+            encoding: .init(x: mixed.id, y: measure.id))
+        let profiles = AutoChartProfiler.profileIndex(snapshot)
+        let prepared = AutoChartDataPreparation.preparedData(
+            snapshot: snapshot,
+            specification: specification,
+            profiles: profiles)
+        let data = prepared.data
+        let missing = try #require(data.first { $0.xIdentity == nil })
+        let real = try #require(data.first { $0.xIdentity != nil })
+
+        #expect(data.count == 2)
+        #expect(Set(data.map(\.id)).count == data.count)
+        #expect(missing.sourceRowIDs.count == 2)
+        #expect(missing.xLabel == "Missing value")
+        #expect(real.xLabel == "Missing value")
+
+        let presentation = AutoChartRenderPresentation(
+            snapshot: snapshot,
+            specification: specification,
+            profiles: profiles,
+            data: data,
+            measureSemantics: prepared.measureSemantics)
+        let resolved = presentation.resolvedPresentation(data: data, using: .default)
+        let missingDisplayValue = disambiguatedCategoryValue(
+            identity: missing.xIdentity,
+            label: missing.xLabel,
+            labels: resolved.xDisplayLabels,
+            fallback: resolved.missingValue)
+        let realDisplayValue = disambiguatedCategoryValue(
+            identity: real.xIdentity,
+            label: real.xLabel,
+            labels: resolved.xDisplayLabels,
+            fallback: resolved.missingValue)
+
+        #expect(missingDisplayValue == "Missing value")
+        #expect(realDisplayValue != missingDisplayValue)
     }
 
 }

@@ -743,7 +743,7 @@ enum AutoChartDataPreparation {
         guard let y = specification.encoding.y else { return [] }
         let x = specification.encoding.x
         struct BoxGroupKey: Hashable {
-            var identity: String
+            var identity: String?
             var label: String
         }
         let semanticType = x.flatMap { profiles[$0]?.semanticType }
@@ -752,10 +752,13 @@ enum AutoChartDataPreparation {
                 return BoxGroupKey(identity: "all", label: "All")
             }
             let value = row.values[x]
+            let identity = AutoChartProfiler.identityString(
+                value, semanticType: semanticType)
             return BoxGroupKey(
-                identity: AutoChartProfiler.identityString(
-                    value, semanticType: semanticType) ?? "missing",
-                label: value?.categoryString() ?? "Missing value")
+                identity: identity,
+                label:
+                    identity == nil
+                    ? "Missing value" : value?.categoryString() ?? "Missing value")
         }
         return grouped.compactMap { key, rows in
             let contributingValues = rows.compactMap { row -> (Double, Int)? in
@@ -774,7 +777,7 @@ enum AutoChartDataPreparation {
                 return sortedValues[lower] * (1 - fraction) + sortedValues[upper] * fraction
             }
             return AutoChartDatum(
-                id: "box-\(key.identity)",
+                id: "box-\(key.identity ?? "missing")",
                 sourceRowIDs: Set(contributingValues.map(\.1)),
                 xIdentity: key.identity,
                 xSourceValue: x.flatMap { rows.first?.values[$0] },
@@ -901,20 +904,25 @@ enum AutoChartDataPreparation {
 }
 
 func disambiguatedCategoryLabels(
-    _ pairs: [(identity: String, label: String)]
+    _ pairs: [(identity: String, label: String)],
+    reserving reservedLabels: Set<String> = []
 ) -> [String: String] {
-    resolvedDisambiguatedCategoryLabels(pairs, textResolver: nil)
+    resolvedDisambiguatedCategoryLabels(
+        pairs, reserving: reservedLabels, textResolver: nil)
 }
 
 func disambiguatedCategoryLabels(
     _ pairs: [(identity: String, label: String)],
+    reserving reservedLabels: Set<String> = [],
     textResolver: AutoChartTextResolver
 ) -> [String: String] {
-    resolvedDisambiguatedCategoryLabels(pairs, textResolver: textResolver)
+    resolvedDisambiguatedCategoryLabels(
+        pairs, reserving: reservedLabels, textResolver: textResolver)
 }
 
 private func resolvedDisambiguatedCategoryLabels(
     _ pairs: [(identity: String, label: String)],
+    reserving reservedLabels: Set<String>,
     textResolver: AutoChartTextResolver?
 ) -> [String: String] {
     let groups = Dictionary(grouping: pairs, by: \.label)
@@ -923,18 +931,26 @@ private func resolvedDisambiguatedCategoryLabels(
         }
         .sorted { $0.label < $1.label }
     var labels: [String: String] = [:]
+    var usedLabels = reservedLabels
     for (label, identities) in groups {
-        if identities.count == 1, let identity = identities.first {
+        if identities.count == 1, let identity = identities.first,
+            usedLabels.insert(label).inserted
+        {
             labels[identity] = label
         }
     }
-    var usedLabels = Set(labels.values)
     for (label, identities) in groups {
-        guard identities.count > 1 else { continue }
-        let kinds = identities.map(AutoChartCategoryDisambiguationKind.init(identity:))
-        let kindCounts = Dictionary(grouping: kinds, by: \.self).mapValues(\.count)
+        let unresolvedIdentities = identities.filter { labels[$0] == nil }
+        guard !unresolvedIdentities.isEmpty else { continue }
+        let kinds = unresolvedIdentities.map(
+            AutoChartCategoryDisambiguationKind.init(identity:))
+        let kindCounts = kinds.reduce(
+            into: [AutoChartCategoryDisambiguationKind: Int]()
+        ) { counts, kind in
+            counts[kind, default: 0] += 1
+        }
         var kindIndexes: [AutoChartCategoryDisambiguationKind: Int] = [:]
-        for (identity, kind) in zip(identities, kinds) {
+        for (identity, kind) in zip(unresolvedIdentities, kinds) {
             kindIndexes[kind, default: 0] += 1
             let index =
                 kindCounts[kind, default: 0] == 1
@@ -965,48 +981,16 @@ private func resolvedDisambiguatedCategoryLabels(
     return labels
 }
 
+/// A missing identity always uses the channel's resolved missing value, even
+/// when preparation retained a source label for diagnostics or selection.
 func disambiguatedCategoryValue(
     identity: String?,
     label: String?,
     labels: [String: String],
     fallback: String
 ) -> String {
-    guard let identity else { return label ?? fallback }
+    guard let identity else { return fallback }
     return labels[identity] ?? label ?? identity
-}
-
-/// The presentation semantics of a prepared facet category.
-///
-/// A source label can survive when its value has no renderable identity, but
-/// every such datum belongs to the single missing facet panel. Keeping that
-/// rule here aligns panel captions, ordering, generated-text resolution, and
-/// mark accessibility without discarding the retained source label.
-struct AutoChartFacetCategory: Sendable {
-    let identity: String?
-    let label: String?
-
-    init(identity: String?, label: String?) {
-        self.identity = identity
-        self.label = label
-    }
-
-    init(_ datum: AutoChartDatum) {
-        self.init(identity: datum.facetIdentity, label: datum.facet)
-    }
-
-    var usesMissingDisplayValue: Bool { identity == nil }
-
-    func displayValue(
-        labels: [String: String],
-        fallback: String
-    ) -> String {
-        guard let identity else { return fallback }
-        return disambiguatedCategoryValue(
-            identity: identity,
-            label: label,
-            labels: labels,
-            fallback: fallback)
-    }
 }
 
 struct AutoChartFacetPanel: Sendable {
@@ -1021,14 +1005,15 @@ func orderedFacetPanels(
     fallback: String
 ) -> [AutoChartFacetPanel] {
     let facets = Dictionary(grouping: data, by: \.facetIdentity)
-    return facets.map { key, data in
-        let category = AutoChartFacetCategory(
-            identity: key,
-            label: data.first?.facet)
-        return AutoChartFacetPanel(
+    return facets.map { key, panelData in
+        AutoChartFacetPanel(
             key: key,
-            data: data,
-            displayValue: category.displayValue(labels: labels, fallback: fallback))
+            data: panelData,
+            displayValue: disambiguatedCategoryValue(
+                identity: key,
+                label: panelData.first?.facet,
+                labels: labels,
+                fallback: fallback))
     }.sorted { left, right in
         if left.displayValue != right.displayValue {
             return left.displayValue < right.displayValue
@@ -1537,6 +1522,9 @@ struct AutoChartResolvedPresentation: Sendable {
         var needsMissingValue = false
         var needsMissingSeries = false
         var needsMissingFacet = false
+        var hasUnidentifiedXCategory = false
+        var hasUnidentifiedSeries = false
+        var hasUnidentifiedFacet = false
 
         for datum in data {
             if presentation.usesXIdentityLabels {
@@ -1557,8 +1545,9 @@ struct AutoChartResolvedPresentation: Sendable {
                             identity: identity,
                             label: label,
                             override: labelOverride))
-                } else if datum.xIdentity == nil, datum.xLabel == nil {
+                } else if datum.xIdentity == nil {
                     needsMissingValue = true
+                    hasUnidentifiedXCategory = true
                 }
             }
             if presentation.usesYIdentityLabels {
@@ -1571,16 +1560,17 @@ struct AutoChartResolvedPresentation: Sendable {
             if presentation.usesSeriesIdentityLabels {
                 if let identity = datum.seriesIdentity, let label = datum.series {
                     seriesPairs.append((identity, label))
-                } else if datum.seriesIdentity == nil, datum.series == nil {
+                } else if datum.seriesIdentity == nil {
                     needsMissingSeries = true
+                    hasUnidentifiedSeries = true
                 }
             }
             if presentation.usesFacetIdentityLabels {
-                let category = AutoChartFacetCategory(datum)
-                if let identity = category.identity, let label = category.label {
+                if let identity = datum.facetIdentity, let label = datum.facet {
                     facetPairs.append((identity, label))
-                } else if category.usesMissingDisplayValue {
+                } else if datum.facetIdentity == nil {
                     needsMissingFacet = true
+                    hasUnidentifiedFacet = true
                 }
             }
         }
@@ -1611,16 +1601,25 @@ struct AutoChartResolvedPresentation: Sendable {
         }
         let resolvedXDisplayLabels =
             presentation.usesXIdentityLabels
-            ? disambiguatedCategoryLabels(xPairs, textResolver: textResolver) : [:]
+            ? disambiguatedCategoryLabels(
+                xPairs,
+                reserving: hasUnidentifiedXCategory ? [resolvedMissingValue] : [],
+                textResolver: textResolver) : [:]
         let resolvedYDisplayLabels =
             presentation.usesYIdentityLabels
             ? disambiguatedCategoryLabels(yPairs, textResolver: textResolver) : [:]
         let resolvedSeriesDisplayLabels =
             presentation.usesSeriesIdentityLabels
-            ? disambiguatedCategoryLabels(seriesPairs, textResolver: textResolver) : [:]
+            ? disambiguatedCategoryLabels(
+                seriesPairs,
+                reserving: hasUnidentifiedSeries ? [resolvedMissingSeries] : [],
+                textResolver: textResolver) : [:]
         let resolvedFacetDisplayLabels =
             presentation.usesFacetIdentityLabels
-            ? disambiguatedCategoryLabels(facetPairs, textResolver: textResolver) : [:]
+            ? disambiguatedCategoryLabels(
+                facetPairs,
+                reserving: hasUnidentifiedFacet ? [resolvedMissingFacet] : [],
+                textResolver: textResolver) : [:]
 
         let resolvedSharedXCategoryDomain: [String] = {
             guard presentation.usesSharedXCategoryDomain else { return [] }
@@ -2744,7 +2743,9 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     }
 
     private func facetValue(for datum: AutoChartDatum) -> String {
-        AutoChartFacetCategory(datum).displayValue(
+        disambiguatedCategoryValue(
+            identity: datum.facetIdentity,
+            label: datum.facet,
             labels: facetDisplayLabels,
             fallback: resolvedPresentation.missingFacet)
     }
