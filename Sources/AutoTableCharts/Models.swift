@@ -1287,13 +1287,18 @@ public enum AutoChartMessageArgument: Hashable, Codable, Sendable {
 }
 
 /// A stable, localizable package message.
+///
+/// Category and code identifiers retain unknown raw values. Argument values
+/// whose representation is unknown to this package are ignored during decoding
+/// so `defaultText` and every understood argument remain available to older
+/// clients.
 public struct AutoChartMessage: Hashable, Codable, Sendable {
     /// A stable, extensible message category.
     ///
     /// Unknown raw values are retained when decoding so messages authored by a
     /// newer package version remain available to older clients.
     public struct Category: RawRepresentable, Hashable, Codable, Sendable {
-        public var rawValue: String
+        public let rawValue: String
 
         public init(rawValue: String) {
             self.rawValue = rawValue
@@ -1321,7 +1326,7 @@ public struct AutoChartMessage: Hashable, Codable, Sendable {
     /// static values with a `default` branch. Unknown raw values survive Codable
     /// round trips instead of invalidating the containing message.
     public struct Code: RawRepresentable, Hashable, Codable, Sendable {
-        public var rawValue: String
+        public let rawValue: String
 
         public init(rawValue: String) {
             self.rawValue = rawValue
@@ -1352,6 +1357,7 @@ public struct AutoChartMessage: Hashable, Codable, Sendable {
         public static let markAccessibility = Self(rawValue: "markAccessibility")
         public static let markAccessibilityDate = Self(rawValue: "markAccessibilityDate")
         public static let markAccessibilityRange = Self(rawValue: "markAccessibilityRange")
+        public static let kpiAccessibility = Self(rawValue: "kpiAccessibility")
 
         public init(from decoder: any Decoder) throws {
             self.init(rawValue: try decoder.singleValueContainer().decode(String.self))
@@ -1368,6 +1374,53 @@ public struct AutoChartMessage: Hashable, Codable, Sendable {
     public var arguments: [String: AutoChartMessageArgument]
     public var defaultText: String
 
+    private enum CodingKeys: String, CodingKey {
+        case category, code, arguments, defaultText
+    }
+
+    private struct ArgumentCodingKey: CodingKey {
+        var stringValue: String
+        var intValue: Int?
+
+        init?(stringValue: String) {
+            self.stringValue = stringValue
+            intValue = nil
+        }
+
+        init?(intValue: Int) {
+            stringValue = String(intValue)
+            self.intValue = intValue
+        }
+    }
+
+    private struct LossyArguments: Codable {
+        var values: [String: AutoChartMessageArgument]
+
+        init(_ values: [String: AutoChartMessageArgument] = [:]) {
+            self.values = values
+        }
+
+        init(from decoder: any Decoder) throws {
+            let container = try decoder.container(keyedBy: ArgumentCodingKey.self)
+            values = [:]
+            for key in container.allKeys {
+                if let value = try? container.decode(
+                    AutoChartMessageArgument.self, forKey: key)
+                {
+                    values[key.stringValue] = value
+                }
+            }
+        }
+
+        func encode(to encoder: any Encoder) throws {
+            var container = encoder.container(keyedBy: ArgumentCodingKey.self)
+            for (name, value) in values {
+                guard let key = ArgumentCodingKey(stringValue: name) else { continue }
+                try container.encode(value, forKey: key)
+            }
+        }
+    }
+
     public init(
         category: Category,
         code: Code,
@@ -1378,6 +1431,23 @@ public struct AutoChartMessage: Hashable, Codable, Sendable {
         self.code = code
         self.arguments = arguments
         self.defaultText = defaultText
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        category = try container.decode(Category.self, forKey: .category)
+        code = try container.decode(Code.self, forKey: .code)
+        arguments = try container.decodeIfPresent(LossyArguments.self, forKey: .arguments)?
+            .values ?? [:]
+        defaultText = try container.decode(String.self, forKey: .defaultText)
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(category, forKey: .category)
+        try container.encode(code, forKey: .code)
+        try container.encode(LossyArguments(arguments), forKey: .arguments)
+        try container.encode(defaultText, forKey: .defaultText)
     }
 }
 

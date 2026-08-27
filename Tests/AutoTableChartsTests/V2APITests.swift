@@ -199,12 +199,19 @@ private actor InvocationCounter {
     }
 }
 
-private func receivesSignalPromptly(_ semaphore: DispatchSemaphore) async -> Bool {
+private func blockingWaitFinishesPromptly(
+    _ wait: @escaping @Sendable (DispatchTime) -> Bool
+) async -> Bool {
     await withCheckedContinuation { continuation in
         DispatchQueue.global().async {
-            continuation.resume(
-                returning: semaphore.wait(timeout: .now() + 5) == .success)
+            continuation.resume(returning: wait(.now() + 5))
         }
+    }
+}
+
+private func receivesSignalPromptly(_ semaphore: DispatchSemaphore) async -> Bool {
+    await blockingWaitFinishesPromptly { deadline in
+        semaphore.wait(timeout: deadline) == .success
     }
 }
 
@@ -213,26 +220,19 @@ private func receivesSignalsPromptly(
     count: Int
 ) async -> Bool {
     guard count > 0 else { return true }
-    return await withCheckedContinuation { continuation in
-        DispatchQueue.global().async {
-            let deadline = DispatchTime.now() + 5
-            for _ in 0..<count {
-                guard semaphore.wait(timeout: deadline) == .success else {
-                    continuation.resume(returning: false)
-                    return
-                }
+    return await blockingWaitFinishesPromptly { deadline in
+        for _ in 0..<count {
+            guard semaphore.wait(timeout: deadline) == .success else {
+                return false
             }
-            continuation.resume(returning: true)
         }
+        return true
     }
 }
 
 private func finishesPromptly(_ group: DispatchGroup) async -> Bool {
-    await withCheckedContinuation { continuation in
-        DispatchQueue.global().async {
-            continuation.resume(
-                returning: group.wait(timeout: .now() + 5) == .success)
-        }
+    await blockingWaitFinishesPromptly { deadline in
+        group.wait(timeout: deadline) == .success
     }
 }
 
@@ -847,10 +847,34 @@ private struct CountingChartRowsTable: AutoChartTable {
 
         #expect(message.category.rawValue == "future-category")
         #expect(message.code.rawValue == "future-code")
-        #expect(
-            try JSONDecoder().decode(
-                AutoChartMessage.self,
-                from: JSONEncoder().encode(message)) == message)
+        let reencoded = try JSONEncoder().encode(message)
+        let object = try #require(
+            JSONSerialization.jsonObject(with: reencoded) as? [String: Any])
+        #expect(object["category"] as? String == "future-category")
+        #expect(object["code"] as? String == "future-code")
+        #expect(try JSONDecoder().decode(AutoChartMessage.self, from: reencoded) == message)
+    }
+
+    @Test func messagesIgnoreUnknownArgumentRepresentationsWithoutLosingKnownValues() throws {
+        let original = AutoChartMessage(
+            category: .diagnostic,
+            code: .validationFailed,
+            arguments: ["known": .string("Known")],
+            defaultText: "Future message")
+        var object = try #require(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(original))
+                as? [String: Any])
+        var arguments = try #require(object["arguments"] as? [String: Any])
+        arguments["future"] = ["future": ["_0": "payload"]]
+        arguments["future-family"] = ["family": ["_0": "future-family"]]
+        object["arguments"] = arguments
+
+        let decoded = try JSONDecoder().decode(
+            AutoChartMessage.self,
+            from: JSONSerialization.data(withJSONObject: object))
+
+        #expect(decoded.arguments == ["known": .string("Known")])
+        #expect(decoded.defaultText == "Future message")
     }
 
     #if canImport(Charts) && canImport(SwiftUI)
@@ -1046,7 +1070,8 @@ private struct CountingChartRowsTable: AutoChartTable {
         let kpiContent = AutoChartKPIContent(
             preparedChart: kpi,
             typography: .standard,
-            formatters: formatter)
+            formatters: formatter,
+            textResolver: .default)
         #expect(kpiContent.valueText == "kpi:value:\(kpiMeasure.id.rawValue):42")
         #expect(kpiContent.title == "Revenue")
         #expect(!kpiContent.isCompact)
@@ -1059,8 +1084,8 @@ private struct CountingChartRowsTable: AutoChartTable {
             formatters: formatter,
             textResolver: AutoChartTextResolver { message in
                 guard message.category == .accessibility,
-                    message.code == .markAccessibility,
-                    message.arguments["name"] == .string("Revenue"),
+                    message.code == .kpiAccessibility,
+                    message.arguments["title"] == .string("Revenue"),
                     message.arguments["value"]
                         == .string("kpi:value:\(kpiMeasure.id.rawValue):42")
                 else { return nil }
