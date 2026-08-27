@@ -3474,10 +3474,12 @@ private let date = AutoChartColumn(
     }
 
     @Test func typedIdentityDisplayLabelsRemainVisuallyDistinct() {
-        let labels = disambiguatedCategoryLabels([
-            (identity: "integer:1", label: "1"),
-            (identity: "text:1:1", label: "1"),
-        ])
+        let labels = disambiguatedCategoryLabels(
+            [
+                (identity: "integer:1", label: "1"),
+                (identity: "text:1:1", label: "1"),
+            ],
+            textResolver: .default)
         let integer = disambiguatedCategoryValue(
             identity: "integer:1", label: "1", labels: labels, fallback: "Missing")
         let text = disambiguatedCategoryValue(
@@ -3512,24 +3514,45 @@ private let date = AutoChartColumn(
     }
 
     @Test func exactAndFallbackNumericIdentitiesHaveMeaningfulQualifiers() {
-        let labels = disambiguatedCategoryLabels([
-            (identity: "exact-number:3:1e0", label: "1"),
-            (identity: "double:4607182418800017408", label: "1"),
-        ])
+        let labels = disambiguatedCategoryLabels(
+            [
+                (identity: "exact-number:3:1e0", label: "1"),
+                (identity: "double:4607182418800017408", label: "1"),
+            ],
+            textResolver: .default)
 
         #expect(labels["exact-number:3:1e0"] == "1 (Exact Number)")
         #expect(labels["double:4607182418800017408"] == "1 (Double)")
     }
 
     @Test func disambiguatedLabelsDoNotCollideWithExistingLabels() {
-        let labels = disambiguatedCategoryLabels([
-            (identity: "integer:1", label: "1"),
-            (identity: "text:1:1", label: "1"),
-            (identity: "text:11:qualified", label: "1 (Integer)"),
-            (identity: "text:13:qualified-2", label: "1 (Integer) 2"),
-        ])
+        let labels = disambiguatedCategoryLabels(
+            [
+                (identity: "integer:1", label: "1"),
+                (identity: "text:1:1", label: "1"),
+                (identity: "text:11:qualified", label: "1 (Integer)"),
+                (identity: "text:13:qualified-2", label: "1 (Integer) 2"),
+            ],
+            textResolver: .default)
         #expect(labels["text:11:qualified"] == "1 (Integer)")
         #expect(labels["text:13:qualified-2"] == "1 (Integer) 2")
+        #expect(Set(labels.values).count == labels.count)
+    }
+
+    @Test func localizedDisambiguationCannotClaimAnotherSourceLabelGroup() {
+        let labels = disambiguatedCategoryLabels(
+            [
+                (identity: "integer:1", label: "A"),
+                (identity: "text:1:1", label: "A"),
+                (identity: "boolean:1", label: "B"),
+                (identity: "text:1:B", label: "B"),
+            ],
+            textResolver: AutoChartTextResolver { message in
+                message.arguments["label"] == .string("A") ? "B" : nil
+            })
+
+        #expect(!labels.values.contains("A"))
+        #expect(!labels.values.contains("B"))
         #expect(Set(labels.values).count == labels.count)
     }
 
@@ -3952,8 +3975,8 @@ private let date = AutoChartColumn(
             AutoChartDatum(
                 id: "all", sourceRowIDs: [], xIdentity: "all", xLabel: "All"),
             AutoChartDatum(
-                id: "missing", sourceRowIDs: [], xIdentity: "missing",
-                xSourceValue: .null, xLabel: "Missing value"),
+                id: "missing", sourceRowIDs: [], xSourceValue: .null,
+                xLabel: "Missing value"),
         ]
         let boxSpecification = AutoChartSpecification(
             family: .boxPlot,
@@ -3969,7 +3992,13 @@ private let date = AutoChartColumn(
         let resolvedBox = boxPresentation.resolvedPresentation(
             data: boxData,
             using: resolver)
-        #expect(resolvedBox.xDisplayLabels["missing"] == "localized:missingValueLabel")
+        #expect(
+            disambiguatedCategoryValue(
+                identity: boxData[1].xIdentity,
+                label: boxData[1].xLabel,
+                labels: resolvedBox.xDisplayLabels,
+                fallback: resolvedBox.missingValue)
+                == "localized:missingValueLabel")
 
         let ungroupedBoxSpecification = AutoChartSpecification(
             family: .boxPlot,
@@ -4415,9 +4444,11 @@ private let date = AutoChartColumn(
         let input = table(
             columns: [mixed, measure],
             rows: [
-                [.double(.nan), .double(1)],
-                [.double(.infinity), .double(2)],
-                [.text("Missing value"), .double(3)],
+                [.null, .double(1)],
+                [.double(.nan), .double(2)],
+                [.double(.infinity), .double(3)],
+                [.binary(Data([0x01])), .double(4)],
+                [.text("Missing value"), .double(5)],
             ])
         let snapshot = AutoChartSnapshot(input)
         let specification = AutoChartSpecification(
@@ -4434,9 +4465,16 @@ private let date = AutoChartColumn(
 
         #expect(data.count == 2)
         #expect(Set(data.map(\.id)).count == data.count)
-        #expect(missing.sourceRowIDs.count == 2)
+        #expect(missing.sourceRowIDs.count == 4)
+        #expect(missing.xSourceValue == nil)
         #expect(missing.xLabel == "Missing value")
         #expect(real.xLabel == "Missing value")
+
+        let missingSelection = AutoChartSelectionPreparation.semanticValues(
+            for: [missing],
+            specification: specification,
+            measureSemantics: prepared.measureSemantics)
+        #expect(missingSelection.dimensions.isEmpty)
 
         let presentation = AutoChartRenderPresentation(
             snapshot: snapshot,
@@ -4458,6 +4496,59 @@ private let date = AutoChartColumn(
 
         #expect(missingDisplayValue == "Missing value")
         #expect(realDisplayValue != missingDisplayValue)
+    }
+
+    @Test func boxPlotPreservesNullSelectionOnlyForAnAllNullGroup() throws {
+        let mixed = AutoChartColumn(
+            id: "mixed", name: "mixed",
+            hints: AutoChartColumnHints(semanticType: .nominal))
+        let snapshot = AutoChartSnapshot(
+            table(
+                columns: [mixed, measure],
+                rows: [[.null, .double(1)], [.null, .double(2)]]))
+        let specification = AutoChartSpecification(
+            family: .boxPlot,
+            encoding: .init(x: mixed.id, y: measure.id))
+        let prepared = AutoChartDataPreparation.preparedData(
+            snapshot: snapshot,
+            specification: specification,
+            profiles: AutoChartProfiler.profileIndex(snapshot))
+        let missing = try #require(prepared.data.first)
+        let selection = AutoChartSelectionPreparation.semanticValues(
+            for: [missing],
+            specification: specification,
+            measureSemantics: prepared.measureSemantics)
+
+        #expect(missing.xSourceValue == .null)
+        #expect(
+            selection.dimensions
+                == [.init(columnID: mixed.id, value: .null)])
+    }
+
+    @Test func boxPlotOrderingUsesResolvedDisplayValues() {
+        let data = [
+            AutoChartDatum(
+                id: "missing", sourceRowIDs: [0], xLabel: "Missing value",
+                median: 1),
+            AutoChartDatum(
+                id: "real", sourceRowIDs: [1],
+                xIdentity: "text:8:November", xLabel: "November", median: 2),
+        ]
+        let ordered = orderedBoxPlotData(
+            data,
+            labels: ["text:8:November": "November"],
+            fallback: "Zulu")
+        let displayValues = ordered.map {
+            disambiguatedCategoryValue(
+                identity: $0.xIdentity,
+                label: $0.xLabel,
+                labels: ["text:8:November": "November"],
+                fallback: "Zulu")
+        }
+
+        #expect(ordered.map(\.id) == ["real", "missing"])
+        #expect(displayValues == ["November", "Zulu"])
+        #expect(!displayValues.contains("all"))
     }
 
 }
