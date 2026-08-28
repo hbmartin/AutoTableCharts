@@ -403,7 +403,7 @@ public struct AutoChartColumnProfile: Sendable {
 }
 
 enum AutoChartProfiler {
-    private static let posixLocale = Locale(identifier: "en_US_POSIX")
+    static let posixLocale = Locale(identifier: "en_US_POSIX")
 
     static func profiles(_ snapshot: AutoChartSnapshot) -> [AutoChartColumnProfile] {
         snapshot.columns.enumerated().map { columnIndex, column in

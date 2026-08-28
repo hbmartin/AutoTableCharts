@@ -7,6 +7,32 @@ import Foundation
 /// returns a bounded set with diverse chart families. It runs synchronously and
 /// entirely offline.
 enum AutoChartRecommendationEngine {
+    private struct BoxPlotCategorySummary {
+        var categoryCount: Int
+        var includesMissing: Bool
+    }
+
+    /// Summarizes the category groups that box-plot preparation will actually
+    /// emit. Rows without a renderable measure cannot contribute a box and must
+    /// not create a category or a missing-category diagnostic.
+    private static func boxPlotCategorySummary(
+        snapshot: AutoChartSnapshot,
+        categoryID: AutoChartColumnID,
+        categorySemanticType: AutoChartSemanticType,
+        measureID: AutoChartColumnID
+    ) -> BoxPlotCategorySummary {
+        var identities: Set<AutoChartValueIdentity> = []
+        for row in snapshot.rows
+        where row.values[measureID]?.numericValue != nil {
+            identities.insert(
+                AutoChartProfiler.identity(
+                    row.values[categoryID],
+                    semanticType: categorySemanticType))
+        }
+        return BoxPlotCategorySummary(
+            categoryCount: identities.count,
+            includesMissing: identities.contains(.missing))
+    }
 
     static func recommendations<Table: AutoChartTable>(
         for table: Table,
@@ -91,11 +117,6 @@ enum AutoChartRecommendationEngine {
             snapshot.metadata.isTruncated
             ? ["Based on the first returned rows; totals and composition are suppressed."]
             : []
-        func renderedCategoryCount(_ profile: AutoChartColumnProfile) -> Int {
-            profile.renderableDistinctCount
-                + (profile.renderableValueCount < snapshot.rows.count ? 1 : 0)
-        }
-
         if !snapshot.metadata.isTruncated,
             snapshot.rows.count == 1,
             let measure = quantitative.first(where: { $0.nonNullCount > 0 })
@@ -296,9 +317,13 @@ enum AutoChartRecommendationEngine {
                     rationale: ["Quartiles summarize spread and potential outliers."],
                     warnings: warnings))
             if let group = categorical.first(where: {
-                let categoryCount = renderedCategoryCount($0)
-                return categoryCount >= 2
-                    && categoryCount <= min(10, options.maximumCategories)
+                let summary = boxPlotCategorySummary(
+                    snapshot: snapshot,
+                    categoryID: $0.column.id,
+                    categorySemanticType: $0.semanticType,
+                    measureID: measure.column.id)
+                return summary.categoryCount >= 2
+                    && summary.categoryCount <= min(10, options.maximumCategories)
             }) {
                 let groupedBox = candidate(
                     family: .boxPlot, x: group, y: measure, context: context,
@@ -649,13 +674,20 @@ enum AutoChartRecommendationEngine {
             require(specification.encoding.y, .quantitative, "Measure")
             if let x = specification.encoding.x {
                 require(x, .nominal, "Category")
-                if let profile = profiles[x],
-                    profile.renderableValueCount != snapshot.rows.count
+                if let categoryProfile = profiles[x],
+                    let y = specification.encoding.y,
+                    profiles[y] != nil,
+                    boxPlotCategorySummary(
+                        snapshot: snapshot,
+                        categoryID: x,
+                        categorySemanticType: categoryProfile.semanticType,
+                        measureID: y
+                    ).includesMissing
                 {
                     issues.append(
                         .init(
                             severity: .warning,
-                            code: .missingValue,
+                            code: .boxPlotMissingCategoryGroup,
                             message:
                                 "Unrenderable box-plot categories are combined into one missing-value group.",
                             family: .boxPlot,
