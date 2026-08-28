@@ -916,6 +916,43 @@ private let date = AutoChartColumn(
         #expect(families.contains(.boxPlot))
     }
 
+    @Test func groupedBoxPlotCategoryLimitIncludesMissingGroup() {
+        let overLimit = table(
+            columns: [category, measure],
+            rows: [
+                [.text("A"), .double(1)],
+                [.text("B"), .double(2)],
+                [.null, .double(3)],
+            ])
+        let withinLimit = table(
+            columns: [category, measure],
+            rows: [
+                [.text("A"), .double(1)],
+                [.null, .double(2)],
+            ])
+        let options = AutoChartOptions(
+            maximumRecommendations: 12,
+            maximumCategories: 2)
+
+        let overLimitRecommendations = AutoChartRecommendationEngine.recommendations(
+            for: overLimit,
+            options: options)
+        let withinLimitRecommendations = AutoChartRecommendationEngine.recommendations(
+            for: withinLimit,
+            options: options)
+
+        #expect(
+            !overLimitRecommendations.chartRecommendations.contains {
+                $0.specification.family == .boxPlot
+                    && $0.specification.encoding.x == category.id
+            })
+        #expect(
+            withinLimitRecommendations.chartRecommendations.contains {
+                $0.specification.family == .boxPlot
+                    && $0.specification.encoding.x == category.id
+            })
+    }
+
     @Test func categoricalPairOffersHeatmap() {
         let second = AutoChartColumn(
             id: "market", name: "market",
@@ -4090,9 +4127,28 @@ private let date = AutoChartColumn(
             orderedFacetPanels(
                 in: data,
                 labels: resolved.facetDisplayLabels,
-                fallback: resolved.missingFacet)
+                fallback: resolved.missingFacet,
+                locale: Locale(identifier: "en_US"))
                 .map(\.key)
                 == ["text:1:1", "integer:1"])
+    }
+
+    @Test func facetPanelOrderingUsesLocaleAwareCollation() {
+        let data = [
+            AutoChartDatum(
+                id: "z", sourceRowIDs: [0], yNumber: 1,
+                facetIdentity: "text:1:z", facet: "z"),
+            AutoChartDatum(
+                id: "umlaut", sourceRowIDs: [1], yNumber: 2,
+                facetIdentity: "text:2:ä", facet: "ä"),
+        ]
+        let panels = orderedFacetPanels(
+            in: data,
+            labels: ["text:1:z": "z", "text:2:ä": "ä"],
+            fallback: "Missing",
+            locale: Locale(identifier: "de_DE"))
+
+        #expect(panels.map(\.key) == ["text:2:ä", "text:1:z"])
     }
 
     @Test func preparedNilDimensionIdentitiesUseLocalizedMissingLabelsAcrossSurfaces() throws {
@@ -4150,7 +4206,8 @@ private let date = AutoChartColumn(
         let panels = orderedFacetPanels(
             in: data,
             labels: resolved.facetDisplayLabels,
-            fallback: resolved.missingFacet)
+            fallback: resolved.missingFacet,
+            locale: Locale(identifier: "en_US"))
 
         #expect(resolved.missingSeries == "Localized missing series")
         #expect(resolved.missingFacet == "Localized missing facet")
@@ -4453,12 +4510,26 @@ private let date = AutoChartColumn(
             specification: specification,
             profiles: AutoChartProfiler.profileIndex(snapshot))
         let datum = try #require(prepared.data.first)
+        let reversedSnapshot = AutoChartSnapshot(
+            table(
+                columns: [ordinal, measure],
+                rows: [[.double(1_000), .double(3)], [.integer(1_000), .double(1)]]))
+        let reversed = AutoChartDataPreparation.preparedData(
+            snapshot: reversedSnapshot,
+            specification: specification,
+            profiles: AutoChartProfiler.profileIndex(reversedSnapshot))
+        let selection = AutoChartSelectionPreparation.semanticValues(
+            for: [datum],
+            specification: specification,
+            measureSemantics: prepared.measureSemantics)
 
         #expect(prepared.data.count == 1)
         #expect(datum.sourceRowIDs == [0, 1])
         #expect(datum.xIdentity == "exact-number:3:1e3")
         #expect(datum.xSourceValue == nil)
         #expect(datum.xLabel == "1000")
+        #expect(reversed.data.first?.xLabel == datum.xLabel)
+        #expect(selection.dimensions.isEmpty)
         #expect(datum.median == 2)
     }
 
@@ -4492,6 +4563,13 @@ private let date = AutoChartColumn(
         let real = try #require(data.first { $0.xIdentity != nil })
 
         #expect(validation.isValid)
+        #expect(
+            validation.issues.contains {
+                $0.severity == .warning
+                    && $0.messageValue.code == .missingValue
+                    && $0.message
+                        == "Unrenderable box-plot categories are combined into one missing-value group."
+            })
         #expect(data.count == 2)
         #expect(Set(data.map(\.id)).count == data.count)
         #expect(missing.sourceRowIDs.count == 4)
@@ -4591,7 +4669,8 @@ private let date = AutoChartColumn(
         let ordered = orderedBoxPlotData(
             data,
             labels: ["text:8:November": "November"],
-            fallback: "Zulu")
+            fallback: "Zulu",
+            locale: Locale(identifier: "en_US"))
         let displayValues = ordered.map {
             disambiguatedCategoryValue(
                 identity: $0.xIdentity,

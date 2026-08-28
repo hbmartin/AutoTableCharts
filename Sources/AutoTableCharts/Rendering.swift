@@ -158,7 +158,7 @@ enum AutoChartAccessibility {
 /// Matching semantic identities are necessary but not sufficient: selection
 /// exposes an `AutoChartValue`, so it must not choose arbitrarily between raw
 /// representations such as `.integer(1)` and `.double(1)`.
-func identicalSourceValue<Elements: Collection>(
+private func identicalSourceValue<Elements: Collection>(
     in elements: Elements,
     value: (Elements.Element) -> AutoChartValue?,
     identity: (Elements.Element) -> String?
@@ -787,16 +787,32 @@ enum AutoChartDataPreparation {
             var rowID: Int
             var xSourceValue: AutoChartValue?
         }
+        func stableLabel(
+            for identity: AutoChartValueIdentity,
+            in values: [BoxContributingValue]
+        ) -> String? {
+            // Ordinal numeric source types intentionally share an exact semantic
+            // identity. Derive their merged label from that canonical identity so
+            // row order and the process locale cannot choose different labels.
+            if case .exactNumber(let canonical) = identity,
+                let decimal = Decimal(
+                    string: canonical,
+                    locale: Locale(identifier: "en_US_POSIX"))
+            {
+                return NSDecimalNumber(decimal: decimal).stringValue
+            }
+            return values.compactMap { $0.xSourceValue?.categoryString() }.min()
+        }
         let allValuesLabel = AutoChartRenderPresentation.allValuesLabelMessage.defaultText
         let missingValueLabel =
             AutoChartRenderPresentation.missingValueLabelMessage.defaultText
         let semanticType = x.flatMap { profiles[$0]?.semanticType }
-        let grouped = Dictionary(grouping: snapshot.rows) { row -> String? in
-            guard let x else { return "all" }
-            return AutoChartProfiler.identityString(
+        let grouped = Dictionary(grouping: snapshot.rows) { row -> AutoChartValueIdentity? in
+            guard let x else { return nil }
+            return AutoChartProfiler.identity(
                 row.values[x], semanticType: semanticType)
         }
-        return grouped.compactMap { identity, rows in
+        return grouped.compactMap { groupIdentity, rows in
             let contributingValues = rows.compactMap { row -> BoxContributingValue? in
                 guard let measure = row.values[y]?.numericValue else { return nil }
                 return BoxContributingValue(
@@ -806,21 +822,25 @@ enum AutoChartDataPreparation {
             }
             let sortedValues = contributingValues.map(\.measure).sorted()
             guard !sortedValues.isEmpty else { return nil }
+            let identity = x == nil ? "all" : groupIdentity?.stringValue
             let xLabel: String
             if x == nil {
                 xLabel = allValuesLabel
-            } else if identity == nil {
+            } else if groupIdentity == .missing {
                 xLabel = missingValueLabel
             } else {
-                guard let sourceLabel = contributingValues.first?.xSourceValue?.categoryString()
-                else { return nil }
-                xLabel = sourceLabel
+                xLabel = groupIdentity.flatMap {
+                    stableLabel(for: $0, in: contributingValues)
+                } ?? identity ?? missingValueLabel
             }
-            let xSourceValue = x.flatMap { _ in
-                identicalSourceValue(
-                    in: contributingValues,
-                    value: \.xSourceValue,
-                    identity: { _ in identity })
+            let xSourceValue = x.flatMap { _ -> AutoChartValue? in
+                guard let first = contributingValues.first?.xSourceValue,
+                    contributingValues.dropFirst().allSatisfy({
+                        $0.xSourceValue == first
+                    }),
+                    identity != nil || first == .null
+                else { return nil }
+                return first
             }
             func quantile(_ p: Double) -> Double {
                 guard sortedValues.count > 1 else { return sortedValues[0] }
@@ -1036,7 +1056,7 @@ func orderedBoxPlotData(
     _ data: [AutoChartDatum],
     labels: [String: String],
     fallback: String,
-    locale: Locale = .autoupdatingCurrent
+    locale: Locale
 ) -> [AutoChartDatum] {
     data.enumerated().map { offset, datum in
         (
@@ -1065,7 +1085,7 @@ func orderedFacetPanels(
     in data: [AutoChartDatum],
     labels: [String: String],
     fallback: String,
-    locale: Locale = .autoupdatingCurrent
+    locale: Locale
 ) -> [AutoChartFacetPanel] {
     let facets = Dictionary(grouping: data, by: \.facetIdentity)
     return facets.map { key, panelData in
@@ -1931,6 +1951,12 @@ struct AutoChartKPIContent: View {
 
 /// Convenience composition of a prepared plot and optional package chrome.
 public struct AutoChartView<RowID: Hashable & Sendable>: View {
+    private struct PreparedViewState {
+        let content: AutoChartViewContent<RowID>
+        let boxPlotData: [AutoChartDatum]
+        let facetPanels: [AutoChartFacetPanel]
+    }
+
     private let content: AutoChartViewContent<RowID>
     private let presentation: AutoChartPresentation
     private let formatters: AutoChartFormatters
@@ -1946,6 +1972,33 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     @State private var zoomScale = 1.0
     @State private var zoomAnchor = 1.0
 
+    private static func preparedViewState(
+        for preparedChart: AutoChartPreparedChart<RowID>,
+        formatters: AutoChartFormatters,
+        textResolver: AutoChartTextResolver
+    ) -> PreparedViewState {
+        let core = preparedChart.core
+        let resolvedPresentation = core.presentation.resolvedPresentation(
+            data: core.data,
+            using: textResolver)
+        return PreparedViewState(
+            content: .chart(preparedChart, resolvedPresentation),
+            boxPlotData:
+                preparedChart.recommendation.specification.family == .boxPlot
+                ? orderedBoxPlotData(
+                    core.data,
+                    labels: resolvedPresentation.xDisplayLabels,
+                    fallback: resolvedPresentation.missingValue,
+                    locale: formatters.locale) : [],
+            facetPanels:
+                preparedChart.recommendation.specification.family == .faceted
+                ? orderedFacetPanels(
+                    in: core.data,
+                    labels: resolvedPresentation.facetDisplayLabels,
+                    fallback: resolvedPresentation.missingFacet,
+                    locale: formatters.locale) : [])
+    }
+
     public init(
         preparedChart: AutoChartPreparedChart<RowID>,
         selection: Binding<AutoChartSelection<RowID>?> = .constant(nil),
@@ -1953,25 +2006,13 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         formatters: AutoChartFormatters = .init(),
         textResolver: AutoChartTextResolver = .default
     ) {
-        let core = preparedChart.core
-        let resolvedPresentation = core.presentation.resolvedPresentation(
-            data: core.data,
-            using: textResolver)
-        content = .chart(preparedChart, resolvedPresentation)
-        boxPlotData =
-            preparedChart.recommendation.specification.family == .boxPlot
-            ? orderedBoxPlotData(
-                core.data,
-                labels: resolvedPresentation.xDisplayLabels,
-                fallback: resolvedPresentation.missingValue,
-                locale: formatters.locale) : []
-        facetPanels =
-            preparedChart.recommendation.specification.family == .faceted
-            ? orderedFacetPanels(
-                in: core.data,
-                labels: resolvedPresentation.facetDisplayLabels,
-                fallback: resolvedPresentation.missingFacet,
-                locale: formatters.locale) : []
+        let state = Self.preparedViewState(
+            for: preparedChart,
+            formatters: formatters,
+            textResolver: textResolver)
+        content = state.content
+        boxPlotData = state.boxPlotData
+        facetPanels = state.facetPanels
         self._selection = selection
         self.presentation = presentation
         self.formatters = formatters
@@ -1986,25 +2027,13 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         textResolver: AutoChartTextResolver = .default
     ) {
         if let primary = analysis.primaryChart {
-            let core = primary.core
-            let resolvedPresentation = core.presentation.resolvedPresentation(
-                data: core.data,
-                using: textResolver)
-            content = .chart(primary, resolvedPresentation)
-            boxPlotData =
-                primary.recommendation.specification.family == .boxPlot
-                ? orderedBoxPlotData(
-                    core.data,
-                    labels: resolvedPresentation.xDisplayLabels,
-                    fallback: resolvedPresentation.missingValue,
-                    locale: formatters.locale) : []
-            facetPanels =
-                primary.recommendation.specification.family == .faceted
-                ? orderedFacetPanels(
-                    in: core.data,
-                    labels: resolvedPresentation.facetDisplayLabels,
-                    fallback: resolvedPresentation.missingFacet,
-                    locale: formatters.locale) : []
+            let state = Self.preparedViewState(
+                for: primary,
+                formatters: formatters,
+                textResolver: textResolver)
+            content = state.content
+            boxPlotData = state.boxPlotData
+            facetPanels = state.facetPanels
         } else if case .tableFallback(let fallback) = analysis.outcome {
             content = .fallback(fallback)
             boxPlotData = []
