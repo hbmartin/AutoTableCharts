@@ -814,24 +814,31 @@ enum AutoChartDataPreparation {
             for identity: AutoChartValueIdentity,
             sourceValue: AutoChartValue?
         ) -> String {
-            // Preserve the same concise, locale-aware source label used by other
-            // chart families whenever the group represents one exact typed value.
-            if let label = sourceValue?.categoryString() { return label }
-
-            // Ordinal numeric storage types can share one exact identity. Only
-            // those merged groups need a deterministic synthesized label.
-            guard case .exactNumber(let canonical) = identity else {
-                assertionFailure("A nonnumeric box-plot category must retain one source value.")
-                return AutoChartValue.unrepresentableValuePlaceholder
-            }
-            guard let decimal = Decimal(
-                string: canonical,
-                locale: AutoChartProfiler.posixLocale)
-            else {
+            // Numeric labels come from the normalized group identity rather than
+            // source-row order. This keeps merged and unmerged groups on one
+            // convention, preserves nearby values, and normalizes signed zero.
+            switch identity {
+            case .integer(let value):
+                return String(value)
+            case .number(let bits), .double(let bits):
+                return String(Double(bitPattern: bits))
+            case .exactNumber(let canonical):
+                if let decimal = Decimal(
+                    string: canonical,
+                    locale: AutoChartProfiler.posixLocale)
+                {
+                    return NSDecimalNumber(decimal: decimal).stringValue
+                }
                 assertionFailure("An exact numeric identity must contain a canonical decimal.")
-                return AutoChartValue.unrepresentableValuePlaceholder
+            case .decimal(let canonical):
+                return canonical
+            case .missing, .boolean, .text, .date:
+                break
             }
-            return NSDecimalNumber(decimal: decimal).stringValue
+
+            if let label = sourceValue?.categoryString() { return label }
+            assertionFailure("A nonnumeric box-plot category must retain one source value.")
+            return identity.stringValue ?? AutoChartValue.unrepresentableValuePlaceholder
         }
         let allValuesLabel = AutoChartRenderPresentation.allValuesLabelMessage.defaultText
         let missingValueLabel =
