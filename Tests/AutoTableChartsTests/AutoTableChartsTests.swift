@@ -4570,14 +4570,20 @@ private let date = AutoChartColumn(
         #expect(datum.median == 2)
     }
 
-    @Test func boxPlotPreservesUnmergedNumericCategoryDisplayLabels() throws {
+    @Test func boxPlotUsesExactLocaleFreeNumericCategoryLabels() {
         let ordinal = AutoChartColumn(
             id: "ordinal", name: "ordinal",
             hints: AutoChartColumnHints(semanticType: .ordinal))
-        let sourceValue = AutoChartValue.double(1_000.0625)
+        let sourceValues: [AutoChartValue] = [
+            .double(1_000.0624),
+            .double(1_000.0625),
+        ]
         let input = table(
             columns: [ordinal, measure],
-            rows: [[sourceValue, .double(1)], [sourceValue, .double(3)]])
+            rows: [
+                [sourceValues[0], .double(1)],
+                [sourceValues[1], .double(3)],
+            ])
         let snapshot = AutoChartSnapshot(input)
         let prepared = AutoChartDataPreparation.preparedData(
             snapshot: snapshot,
@@ -4585,11 +4591,34 @@ private let date = AutoChartColumn(
                 family: .boxPlot,
                 encoding: .init(x: ordinal.id, y: measure.id)),
             profiles: AutoChartProfiler.profileIndex(snapshot))
-        let datum = try #require(prepared.data.first)
 
-        #expect(prepared.data.count == 1)
-        #expect(datum.xSourceValue == sourceValue)
-        #expect(datum.xLabel == sourceValue.categoryString())
+        #expect(prepared.data.count == 2)
+        #expect(Set(prepared.data.compactMap(\.xSourceValue)) == Set(sourceValues))
+        #expect(Set(prepared.data.compactMap(\.xLabel)) == ["1000.0624", "1000.0625"])
+    }
+
+    @Test func boxPlotUsesOneNumericLabelConventionForMergedAndUnmergedGroups() {
+        let ordinal = AutoChartColumn(
+            id: "ordinal", name: "ordinal",
+            hints: AutoChartColumnHints(semanticType: .ordinal))
+        let input = table(
+            columns: [ordinal, measure],
+            rows: [
+                [.integer(1_000), .double(1)],
+                [.double(1_000), .double(3)],
+                [.double(2_000), .double(2)],
+                [.double(2_000), .double(4)],
+            ])
+        let snapshot = AutoChartSnapshot(input)
+        let prepared = AutoChartDataPreparation.preparedData(
+            snapshot: snapshot,
+            specification: AutoChartSpecification(
+                family: .boxPlot,
+                encoding: .init(x: ordinal.id, y: measure.id)),
+            profiles: AutoChartProfiler.profileIndex(snapshot))
+
+        #expect(prepared.data.count == 2)
+        #expect(Set(prepared.data.compactMap(\.xLabel)) == ["1000", "2000"])
     }
 
     @Test func boxPlotUsesOneMissingGroupWithoutCollidingWithARealLabel() throws {
@@ -4625,7 +4654,7 @@ private let date = AutoChartColumn(
         #expect(
             validation.issues.contains {
                 $0.severity == .warning
-                    && $0.messageValue.code == .boxPlotMissingCategoryGroup
+                    && $0.messageValue.code == .missingValue
                     && $0.message
                         == "Unrenderable box-plot categories are combined into one missing-value group."
             })
@@ -4681,8 +4710,52 @@ private let date = AutoChartColumn(
         #expect(validation.isValid)
         #expect(
             !validation.issues.contains {
-                $0.messageValue.code == .boxPlotMissingCategoryGroup
+                $0.messageValue.code == .missingValue
+                    && $0.message
+                        == "Unrenderable box-plot categories are combined into one missing-value group."
             })
+    }
+
+    @Test func invalidBoxPlotEncodingsDoNotEmitMissingCategoryWarning() {
+        let invalidCategory = AutoChartColumn(
+            id: "invalid-category", name: "invalid-category",
+            hints: AutoChartColumnHints(semanticType: .quantitative))
+        let invalidCategoryInput = table(
+            columns: [invalidCategory, measure],
+            rows: [
+                [.null, .double(1)],
+                [.double(2), .double(3)],
+            ])
+        let invalidCategoryValidation = AutoChartRecommendationEngine.validate(
+            specification: AutoChartSpecification(
+                family: .boxPlot,
+                encoding: .init(x: invalidCategory.id, y: measure.id)),
+            for: invalidCategoryInput)
+
+        let invalidMeasure = AutoChartColumn(
+            id: "invalid-measure", name: "invalid-measure",
+            hints: AutoChartColumnHints(semanticType: .nominal))
+        let invalidMeasureInput = table(
+            columns: [category, invalidMeasure],
+            rows: [
+                [.null, .double(1)],
+                [.text("A"), .double(3)],
+            ])
+        let invalidMeasureValidation = AutoChartRecommendationEngine.validate(
+            specification: AutoChartSpecification(
+                family: .boxPlot,
+                encoding: .init(x: category.id, y: invalidMeasure.id)),
+            for: invalidMeasureInput)
+
+        for validation in [invalidCategoryValidation, invalidMeasureValidation] {
+            #expect(!validation.isValid)
+            #expect(
+                !validation.issues.contains {
+                    $0.messageValue.code == .missingValue
+                        && $0.message
+                            == "Unrenderable box-plot categories are combined into one missing-value group."
+                })
+        }
     }
 
     @Test func missingBoxPlotCategoriesReachPublicPreparation() async throws {
