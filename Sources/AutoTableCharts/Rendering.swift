@@ -789,26 +789,34 @@ enum AutoChartDataPreparation {
         }
         func stableLabel(
             for identity: AutoChartValueIdentity,
-            in values: [BoxContributingValue]
-        ) -> String? {
+            sourceValue: AutoChartValue?
+        ) -> String {
+            // Preserve the source label when one exact typed value represents the
+            // group. Only mixed numeric storage types need a synthesized label.
+            if let label = sourceValue?.categoryString() { return label }
+
             // Ordinal numeric source types intentionally share an exact semantic
             // identity. Derive their merged label from that canonical identity so
             // row order and the process locale cannot choose different labels.
-            if case .exactNumber(let canonical) = identity,
-                let decimal = Decimal(
-                    string: canonical,
-                    locale: Locale(identifier: "en_US_POSIX"))
-            {
-                return NSDecimalNumber(decimal: decimal).stringValue
+            guard case .exactNumber(let canonical) = identity else {
+                assertionFailure("A nonnumeric box-plot category must retain one source value.")
+                return AutoChartValue.unrepresentableValuePlaceholder
             }
-            return values.compactMap { $0.xSourceValue?.categoryString() }.min()
+            guard let decimal = Decimal(
+                string: canonical,
+                locale: AutoChartProfiler.posixLocale)
+            else {
+                assertionFailure("An exact numeric identity must contain a canonical decimal.")
+                return AutoChartValue.unrepresentableValuePlaceholder
+            }
+            return NSDecimalNumber(decimal: decimal).stringValue
         }
         let allValuesLabel = AutoChartRenderPresentation.allValuesLabelMessage.defaultText
         let missingValueLabel =
             AutoChartRenderPresentation.missingValueLabelMessage.defaultText
         let semanticType = x.flatMap { profiles[$0]?.semanticType }
-        let grouped = Dictionary(grouping: snapshot.rows) { row -> AutoChartValueIdentity? in
-            guard let x else { return nil }
+        let grouped = Dictionary(grouping: snapshot.rows) { row -> AutoChartValueIdentity in
+            guard let x else { return .missing }
             return AutoChartProfiler.identity(
                 row.values[x], semanticType: semanticType)
         }
@@ -822,25 +830,22 @@ enum AutoChartDataPreparation {
             }
             let sortedValues = contributingValues.map(\.measure).sorted()
             guard !sortedValues.isEmpty else { return nil }
-            let identity = x == nil ? "all" : groupIdentity?.stringValue
+            let identity = x == nil ? "all" : groupIdentity.stringValue
+            let xSourceValue = x.flatMap { _ in
+                identicalSourceValue(
+                    in: contributingValues,
+                    value: \.xSourceValue,
+                    identity: { _ in identity })
+            }
             let xLabel: String
             if x == nil {
                 xLabel = allValuesLabel
             } else if groupIdentity == .missing {
                 xLabel = missingValueLabel
             } else {
-                xLabel = groupIdentity.flatMap {
-                    stableLabel(for: $0, in: contributingValues)
-                } ?? identity ?? missingValueLabel
-            }
-            let xSourceValue = x.flatMap { _ -> AutoChartValue? in
-                guard let first = contributingValues.first?.xSourceValue,
-                    contributingValues.dropFirst().allSatisfy({
-                        $0.xSourceValue == first
-                    }),
-                    identity != nil || first == .null
-                else { return nil }
-                return first
+                xLabel = stableLabel(
+                    for: groupIdentity,
+                    sourceValue: xSourceValue)
             }
             func quantile(_ p: Double) -> Double {
                 guard sortedValues.count > 1 else { return sortedValues[0] }

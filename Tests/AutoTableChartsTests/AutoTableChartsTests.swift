@@ -953,6 +953,43 @@ private let date = AutoChartColumn(
             })
     }
 
+    @Test func groupedBoxPlotCategoryLimitIgnoresRowsWithoutMeasures() {
+        let withinLimit = table(
+            columns: [category, measure],
+            rows: [
+                [.text("A"), .double(1)],
+                [.text("B"), .double(2)],
+                [.null, .null],
+            ])
+        let oneContributingCategory = table(
+            columns: [category, measure],
+            rows: [
+                [.text("A"), .double(1)],
+                [.null, .null],
+            ])
+        let options = AutoChartOptions(
+            maximumRecommendations: 12,
+            maximumCategories: 2)
+
+        let withinLimitRecommendations = AutoChartRecommendationEngine.recommendations(
+            for: withinLimit,
+            options: options)
+        let oneCategoryRecommendations = AutoChartRecommendationEngine.recommendations(
+            for: oneContributingCategory,
+            options: options)
+
+        #expect(
+            withinLimitRecommendations.chartRecommendations.contains {
+                $0.specification.family == .boxPlot
+                    && $0.specification.encoding.x == category.id
+            })
+        #expect(
+            !oneCategoryRecommendations.chartRecommendations.contains {
+                $0.specification.family == .boxPlot
+                    && $0.specification.encoding.x == category.id
+            })
+    }
+
     @Test func categoricalPairOffersHeatmap() {
         let second = AutoChartColumn(
             id: "market", name: "market",
@@ -4533,6 +4570,28 @@ private let date = AutoChartColumn(
         #expect(datum.median == 2)
     }
 
+    @Test func boxPlotPreservesUnmergedNumericCategoryDisplayLabels() throws {
+        let ordinal = AutoChartColumn(
+            id: "ordinal", name: "ordinal",
+            hints: AutoChartColumnHints(semanticType: .ordinal))
+        let sourceValue = AutoChartValue.double(1_000.0625)
+        let input = table(
+            columns: [ordinal, measure],
+            rows: [[sourceValue, .double(1)], [sourceValue, .double(3)]])
+        let snapshot = AutoChartSnapshot(input)
+        let prepared = AutoChartDataPreparation.preparedData(
+            snapshot: snapshot,
+            specification: AutoChartSpecification(
+                family: .boxPlot,
+                encoding: .init(x: ordinal.id, y: measure.id)),
+            profiles: AutoChartProfiler.profileIndex(snapshot))
+        let datum = try #require(prepared.data.first)
+
+        #expect(prepared.data.count == 1)
+        #expect(datum.xSourceValue == sourceValue)
+        #expect(datum.xLabel == sourceValue.categoryString())
+    }
+
     @Test func boxPlotUsesOneMissingGroupWithoutCollidingWithARealLabel() throws {
         let mixed = AutoChartColumn(
             id: "mixed", name: "mixed",
@@ -4566,7 +4625,7 @@ private let date = AutoChartColumn(
         #expect(
             validation.issues.contains {
                 $0.severity == .warning
-                    && $0.messageValue.code == .missingValue
+                    && $0.messageValue.code == .boxPlotMissingCategoryGroup
                     && $0.message
                         == "Unrenderable box-plot categories are combined into one missing-value group."
             })
@@ -4603,6 +4662,27 @@ private let date = AutoChartColumn(
 
         #expect(missingDisplayValue == "Missing value")
         #expect(realDisplayValue != missingDisplayValue)
+    }
+
+    @Test func boxPlotDoesNotWarnForMissingCategoriesWithoutMeasures() {
+        let input = table(
+            columns: [category, measure],
+            rows: [
+                [.text("A"), .double(1)],
+                [.null, .null],
+            ])
+        let specification = AutoChartSpecification(
+            family: .boxPlot,
+            encoding: .init(x: category.id, y: measure.id))
+        let validation = AutoChartRecommendationEngine.validate(
+            specification: specification,
+            for: input)
+
+        #expect(validation.isValid)
+        #expect(
+            !validation.issues.contains {
+                $0.messageValue.code == .boxPlotMissingCategoryGroup
+            })
     }
 
     @Test func missingBoxPlotCategoriesReachPublicPreparation() async throws {
