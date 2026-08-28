@@ -91,6 +91,10 @@ enum AutoChartRecommendationEngine {
             snapshot.metadata.isTruncated
             ? ["Based on the first returned rows; totals and composition are suppressed."]
             : []
+        func renderedCategoryCount(_ profile: AutoChartColumnProfile) -> Int {
+            profile.renderableDistinctCount
+                + (profile.renderableValueCount < snapshot.rows.count ? 1 : 0)
+        }
 
         if !snapshot.metadata.isTruncated,
             snapshot.rows.count == 1,
@@ -292,7 +296,9 @@ enum AutoChartRecommendationEngine {
                     rationale: ["Quartiles summarize spread and potential outliers."],
                     warnings: warnings))
             if let group = categorical.first(where: {
-                $0.distinctCount >= 2 && $0.distinctCount <= min(10, options.maximumCategories)
+                let categoryCount = renderedCategoryCount($0)
+                return categoryCount >= 2
+                    && categoryCount <= min(10, options.maximumCategories)
             }) {
                 let groupedBox = candidate(
                     family: .boxPlot, x: group, y: measure, context: context,
@@ -641,8 +647,20 @@ enum AutoChartRecommendationEngine {
             }
         case .boxPlot:
             require(specification.encoding.y, .quantitative, "Measure")
-            if specification.encoding.x != nil {
-                require(specification.encoding.x, .nominal, "Category")
+            if let x = specification.encoding.x {
+                require(x, .nominal, "Category")
+                if let profile = profiles[x],
+                    profile.renderableValueCount != snapshot.rows.count
+                {
+                    issues.append(
+                        .init(
+                            severity: .warning,
+                            code: .missingValue,
+                            message:
+                                "Unrenderable box-plot categories are combined into one missing-value group.",
+                            family: .boxPlot,
+                            columnIDs: [x]))
+                }
             }
         case .heatmap:
             require(specification.encoding.x, .nominal, "X category")

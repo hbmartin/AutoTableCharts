@@ -80,6 +80,10 @@ distribution value, separate start/end column lineage for temporal ranges,
 family, specification ID, and mark identity. It contains no preformatted label
 strings.
 
+When one mark combines source categories that share a semantic identity but use
+different exact `AutoChartValue` representations, selection retains all source
+row IDs and omits that ambiguous dimension instead of choosing one source type.
+
 ```swift
 let selectedRows = dataset.chartRows.filter {
     selection.sourceRowIDs.contains($0.chartRowID)
