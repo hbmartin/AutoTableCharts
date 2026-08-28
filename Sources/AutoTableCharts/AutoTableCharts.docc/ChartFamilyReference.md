@@ -21,7 +21,7 @@ a prepared native chart and preserves typed source-row lineage.
 | `scatter` | quantitative/temporal x, quantitative y | Two compatible position fields |
 | `bubble` | scatter fields plus size | Distinct nonnegative size field |
 | `histogram` | quantitative value | Frequency bins over returned rows |
-| `boxPlot` | measure, optional category | Five-number summaries over returned rows |
+| `boxPlot` | measure, optional category | Five-number summaries; missing categories form one localized group |
 | `heatmap` | two categorical dimensions | Complete bounded categorical frequency |
 | `donut` | category, measure | Complete, positive, additive whole |
 | `range` | label, temporal start/end | Complete intervals with start no later than end |

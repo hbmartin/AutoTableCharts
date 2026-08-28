@@ -643,7 +643,6 @@ enum AutoChartRecommendationEngine {
             require(specification.encoding.y, .quantitative, "Measure")
             if specification.encoding.x != nil {
                 require(specification.encoding.x, .nominal, "Category")
-                rejectMissing(specification.encoding.x, "Box-plot categories")
             }
         case .heatmap:
             require(specification.encoding.x, .nominal, "X category")

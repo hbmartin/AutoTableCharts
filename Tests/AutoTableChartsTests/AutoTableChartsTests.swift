@@ -2205,7 +2205,7 @@ private let date = AutoChartColumn(
         let specification = AutoChartSpecification(
             family: .boxPlot,
             encoding: AutoChartEncoding(x: category.id, y: measure.id))
-        #expect(!AutoChartRecommendationEngine.validate(specification: specification, for: input).isValid)
+        #expect(AutoChartRecommendationEngine.validate(specification: specification, for: input).isValid)
         let data = preparedDatumValues(
             snapshot: AutoChartSnapshot(input), specification: specification)
         #expect(Set(data.compactMap(\.xLabel)) == ["Missing value", "All"])
@@ -4437,6 +4437,31 @@ private let date = AutoChartColumn(
         #expect(data.compactMap(\.xIdentity) == ["integer:1", "text:1:1"])
     }
 
+    @Test func boxPlotMergesEquivalentNumericRepresentationsByIdentity() throws {
+        let ordinal = AutoChartColumn(
+            id: "ordinal", name: "ordinal",
+            hints: AutoChartColumnHints(semanticType: .ordinal))
+        let input = table(
+            columns: [ordinal, measure],
+            rows: [[.integer(1_000), .double(1)], [.double(1_000), .double(3)]])
+        let specification = AutoChartSpecification(
+            family: .boxPlot,
+            encoding: .init(x: ordinal.id, y: measure.id))
+        let snapshot = AutoChartSnapshot(input)
+        let prepared = AutoChartDataPreparation.preparedData(
+            snapshot: snapshot,
+            specification: specification,
+            profiles: AutoChartProfiler.profileIndex(snapshot))
+        let datum = try #require(prepared.data.first)
+
+        #expect(prepared.data.count == 1)
+        #expect(datum.sourceRowIDs == [0, 1])
+        #expect(datum.xIdentity == "exact-number:3:1e3")
+        #expect(datum.xSourceValue == nil)
+        #expect(datum.xLabel == "1000")
+        #expect(datum.median == 2)
+    }
+
     @Test func boxPlotUsesOneMissingGroupWithoutCollidingWithARealLabel() throws {
         let mixed = AutoChartColumn(
             id: "mixed", name: "mixed",
@@ -4454,6 +4479,9 @@ private let date = AutoChartColumn(
         let specification = AutoChartSpecification(
             family: .boxPlot,
             encoding: .init(x: mixed.id, y: measure.id))
+        let validation = AutoChartRecommendationEngine.validate(
+            specification: specification,
+            for: input)
         let profiles = AutoChartProfiler.profileIndex(snapshot)
         let prepared = AutoChartDataPreparation.preparedData(
             snapshot: snapshot,
@@ -4463,6 +4491,7 @@ private let date = AutoChartColumn(
         let missing = try #require(data.first { $0.xIdentity == nil })
         let real = try #require(data.first { $0.xIdentity != nil })
 
+        #expect(validation.isValid)
         #expect(data.count == 2)
         #expect(Set(data.map(\.id)).count == data.count)
         #expect(missing.sourceRowIDs.count == 4)
@@ -4496,6 +4525,31 @@ private let date = AutoChartColumn(
 
         #expect(missingDisplayValue == "Missing value")
         #expect(realDisplayValue != missingDisplayValue)
+    }
+
+    @Test func missingBoxPlotCategoriesReachPublicPreparation() async throws {
+        let mixed = AutoChartColumn(
+            id: "mixed", name: "mixed",
+            hints: AutoChartColumnHints(semanticType: .nominal))
+        let input = table(
+            columns: [mixed, measure],
+            rows: [
+                [.null, .double(1)],
+                [.double(.nan), .double(2)],
+                [.text("A"), .double(3)],
+            ])
+        let specification = AutoChartSpecification(
+            family: .boxPlot,
+            encoding: .init(x: mixed.id, y: measure.id))
+        let analysis = try await AutoChartAnalyzer().analyze(input)
+        let prepared = try await analysis.prepare(specification)
+
+        #expect(prepared.validation.isValid)
+        #expect(prepared.marks.count == 2)
+        #expect(Set(prepared.marks.map(\.identity)).count == prepared.marks.count)
+        #expect(
+            prepared.marks.first { $0.identity == "box-missing" }?.sourceRowIDs
+                == ["r0", "r1"])
     }
 
     @Test func boxPlotPreservesNullSelectionOnlyForAnAllNullGroup() throws {
@@ -4549,6 +4603,24 @@ private let date = AutoChartColumn(
         #expect(ordered.map(\.id) == ["real", "missing"])
         #expect(displayValues == ["November", "Zulu"])
         #expect(!displayValues.contains("all"))
+    }
+
+    @Test func boxPlotOrderingUsesLocaleAwareCollation() {
+        let data = [
+            AutoChartDatum(
+                id: "z", sourceRowIDs: [0],
+                xIdentity: "text:1:z", xLabel: "z", median: 1),
+            AutoChartDatum(
+                id: "umlaut", sourceRowIDs: [1],
+                xIdentity: "text:2:ä", xLabel: "ä", median: 2),
+        ]
+        let ordered = orderedBoxPlotData(
+            data,
+            labels: ["text:1:z": "z", "text:2:ä": "ä"],
+            fallback: "Missing",
+            locale: Locale(identifier: "de_DE"))
+
+        #expect(ordered.map(\.id) == ["umlaut", "z"])
     }
 
 }
