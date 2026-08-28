@@ -808,59 +808,51 @@ enum AutoChartDataPreparation {
         struct BoxContributingValue {
             var measure: Double
             var rowID: Int
-            var groupIdentity: AutoChartValueIdentity
             var xSourceValue: AutoChartValue?
         }
         func stableLabel(
             for identity: AutoChartValueIdentity,
             sourceValue: AutoChartValue?
         ) -> String {
-            // Numeric category identities always receive a canonical, locale-free
-            // label. This keeps merged and unmerged source representations on one
-            // convention and does not round distinct Double categories together.
-            switch identity {
-            case .integer(let value):
-                return String(value)
-            case .number(let bits), .double(let bits):
-                return String(Double(bitPattern: bits))
-            case .exactNumber(let canonical):
-                if let decimal = Decimal(
-                    string: canonical,
-                    locale: AutoChartProfiler.posixLocale)
-                {
-                    return NSDecimalNumber(decimal: decimal).stringValue
-                }
-                assertionFailure("An exact numeric identity must contain a canonical decimal.")
-            case .decimal(let canonical):
-                return canonical
-            case .missing, .boolean, .text, .date:
-                break
-            }
-
+            // Preserve the same concise, locale-aware source label used by other
+            // chart families whenever the group represents one exact typed value.
             if let label = sourceValue?.categoryString() { return label }
-            assertionFailure("A nonnumeric box-plot category must retain one source value.")
-            return identity.stringValue ?? AutoChartValue.unrepresentableValuePlaceholder
+
+            // Ordinal numeric storage types can share one exact identity. Only
+            // those merged groups need a deterministic synthesized label.
+            guard case .exactNumber(let canonical) = identity else {
+                assertionFailure("A nonnumeric box-plot category must retain one source value.")
+                return AutoChartValue.unrepresentableValuePlaceholder
+            }
+            guard let decimal = Decimal(
+                string: canonical,
+                locale: AutoChartProfiler.posixLocale)
+            else {
+                assertionFailure("An exact numeric identity must contain a canonical decimal.")
+                return AutoChartValue.unrepresentableValuePlaceholder
+            }
+            return NSDecimalNumber(decimal: decimal).stringValue
         }
         let allValuesLabel = AutoChartRenderPresentation.allValuesLabelMessage.defaultText
         let missingValueLabel =
             AutoChartRenderPresentation.missingValueLabelMessage.defaultText
         let semanticType = x.flatMap { profiles[$0]?.semanticType }
-        let contributingValues = snapshot.rows.compactMap { row -> BoxContributingValue? in
+        var grouped: [AutoChartValueIdentity: [BoxContributingValue]] = [:]
+        for row in snapshot.rows {
             guard let measure = AutoChartBoxPlotGrouping.measure(in: row, columnID: y)
-            else { return nil }
-            return BoxContributingValue(
-                measure: measure,
-                rowID: row.id,
-                groupIdentity: AutoChartBoxPlotGrouping.categoryIdentity(
-                    in: row,
-                    columnID: x,
-                    semanticType: semanticType),
-                xSourceValue: x.flatMap { row.values[$0] })
+            else { continue }
+            let groupIdentity = AutoChartBoxPlotGrouping.categoryIdentity(
+                in: row,
+                columnID: x,
+                semanticType: semanticType)
+            grouped[groupIdentity, default: []].append(
+                BoxContributingValue(
+                    measure: measure,
+                    rowID: row.id,
+                    xSourceValue: x.flatMap { row.values[$0] }))
         }
-        let grouped = Dictionary(grouping: contributingValues, by: \.groupIdentity)
-        return grouped.compactMap { groupIdentity, contributingValues in
+        return grouped.map { groupIdentity, contributingValues in
             let sortedValues = contributingValues.map(\.measure).sorted()
-            guard !sortedValues.isEmpty else { return nil }
             let identity = x == nil ? "all" : groupIdentity.stringValue
             let xSourceValue = x.flatMap { _ -> AutoChartValue? in
                 guard let first = contributingValues.first?.xSourceValue,

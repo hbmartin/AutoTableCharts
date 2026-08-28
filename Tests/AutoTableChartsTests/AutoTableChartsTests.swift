@@ -3410,6 +3410,52 @@ private let date = AutoChartColumn(
             })
     }
 
+    @Test func indexedValidationMemoRejectsDifferentSnapshot() {
+        let firstSnapshot = AutoChartSnapshot(
+            table(
+                columns: [category, measure],
+                rows: [
+                    [.text("A"), .double(1)],
+                    [.text("B"), .double(2)],
+                ]))
+        let secondSnapshot = AutoChartSnapshot(
+            table(
+                columns: [category, measure],
+                rows: [
+                    [.text("A"), .double(1)],
+                    [.null, .double(2)],
+                ]))
+        let specification = AutoChartSpecification(
+            family: .boxPlot,
+            encoding: .init(x: category.id, y: measure.id))
+        let firstProfiles = AutoChartProfiler.profiles(firstSnapshot)
+        let memo = AutoChartRecommendationEngine.AutoChartValidationMemo(
+            snapshot: firstSnapshot,
+            categories: firstProfiles.filter(\.isCategorical),
+            measures: firstProfiles.filter(\.isQuantitative),
+            maximumCategoryCount: 10)
+
+        let first = AutoChartRecommendationEngine.validate(
+            specification: specification,
+            snapshot: firstSnapshot,
+            profiles: AutoChartProfiler.profileIndex(firstProfiles),
+            memo: memo)
+        let second = AutoChartRecommendationEngine.validate(
+            specification: specification,
+            snapshot: secondSnapshot,
+            profiles: AutoChartProfiler.profileIndex(secondSnapshot),
+            memo: memo)
+
+        #expect(
+            !first.issues.contains {
+                $0.messageValue.code == .boxPlotMissingCategoryGroup
+            })
+        #expect(
+            second.issues.contains {
+                $0.messageValue.code == .boxPlotMissingCategoryGroup
+            })
+    }
+
     @Test func signedZeroUsesTheSameIdentityForValidationAndRendering() {
         let mixed = AutoChartColumn(
             id: "mixed", name: "mixed",
@@ -4570,13 +4616,13 @@ private let date = AutoChartColumn(
         #expect(datum.median == 2)
     }
 
-    @Test func boxPlotUsesExactLocaleFreeNumericCategoryLabels() {
+    @Test func boxPlotPreservesFormattedNumericCategoryLabelPairing() {
         let ordinal = AutoChartColumn(
             id: "ordinal", name: "ordinal",
             hints: AutoChartColumnHints(semanticType: .ordinal))
         let sourceValues: [AutoChartValue] = [
             .double(1_000.0624),
-            .double(1_000.0625),
+            .double(2_000.0625),
         ]
         let input = table(
             columns: [ordinal, measure],
@@ -4592,12 +4638,23 @@ private let date = AutoChartColumn(
                 encoding: .init(x: ordinal.id, y: measure.id)),
             profiles: AutoChartProfiler.profileIndex(snapshot))
 
+        let labelsBySourceValue: [AutoChartValue: String] = Dictionary(
+            uniqueKeysWithValues: prepared.data.compactMap { datum in
+                guard let sourceValue = datum.xSourceValue,
+                    let label = datum.xLabel
+                else { return nil }
+                return (sourceValue, label)
+            })
+        let expectedLabelsBySourceValue: [AutoChartValue: String] = Dictionary(
+            uniqueKeysWithValues: sourceValues.compactMap { sourceValue in
+                sourceValue.categoryString().map { (sourceValue, $0) }
+            })
+
         #expect(prepared.data.count == 2)
-        #expect(Set(prepared.data.compactMap(\.xSourceValue)) == Set(sourceValues))
-        #expect(Set(prepared.data.compactMap(\.xLabel)) == ["1000.0624", "1000.0625"])
+        #expect(labelsBySourceValue == expectedLabelsBySourceValue)
     }
 
-    @Test func boxPlotUsesOneNumericLabelConventionForMergedAndUnmergedGroups() {
+    @Test func boxPlotSynthesizesOnlyMergedNumericCategoryLabels() throws {
         let ordinal = AutoChartColumn(
             id: "ordinal", name: "ordinal",
             hints: AutoChartColumnHints(semanticType: .ordinal))
@@ -4617,8 +4674,13 @@ private let date = AutoChartColumn(
                 encoding: .init(x: ordinal.id, y: measure.id)),
             profiles: AutoChartProfiler.profileIndex(snapshot))
 
+        let merged = try #require(prepared.data.first { $0.xSourceValue == nil })
+        let unmerged = try #require(
+            prepared.data.first { $0.xSourceValue == .double(2_000) })
+
         #expect(prepared.data.count == 2)
-        #expect(Set(prepared.data.compactMap(\.xLabel)) == ["1000", "2000"])
+        #expect(merged.xLabel == "1000")
+        #expect(unmerged.xLabel == AutoChartValue.double(2_000).categoryString())
     }
 
     @Test func boxPlotUsesOneMissingGroupWithoutCollidingWithARealLabel() throws {
@@ -4654,7 +4716,7 @@ private let date = AutoChartColumn(
         #expect(
             validation.issues.contains {
                 $0.severity == .warning
-                    && $0.messageValue.code == .missingValue
+                    && $0.messageValue.code == .boxPlotMissingCategoryGroup
                     && $0.message
                         == "Unrenderable box-plot categories are combined into one missing-value group."
             })
@@ -4710,7 +4772,7 @@ private let date = AutoChartColumn(
         #expect(validation.isValid)
         #expect(
             !validation.issues.contains {
-                $0.messageValue.code == .missingValue
+                $0.messageValue.code == .boxPlotMissingCategoryGroup
                     && $0.message
                         == "Unrenderable box-plot categories are combined into one missing-value group."
             })
@@ -4751,7 +4813,7 @@ private let date = AutoChartColumn(
             #expect(!validation.isValid)
             #expect(
                 !validation.issues.contains {
-                    $0.messageValue.code == .missingValue
+                    $0.messageValue.code == .boxPlotMissingCategoryGroup
                         && $0.message
                             == "Unrenderable box-plot categories are combined into one missing-value group."
                 })

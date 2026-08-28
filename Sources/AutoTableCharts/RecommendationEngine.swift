@@ -7,111 +7,91 @@ import Foundation
 /// returns a bounded set with diverse chart families. It runs synchronously and
 /// entirely offline.
 enum AutoChartRecommendationEngine {
-    /// Preindexes which measures contribute to each prepared category group.
-    /// Each row is decoded once per candidate column; recommendation queries then
-    /// inspect category groups instead of rescanning the full snapshot.
-    fileprivate struct BoxPlotCategoryIndex {
-        private final class MeasureMembership {
-            var words: [UInt64]
-
-            init(words: [UInt64]) {
-                self.words = words
-            }
-
-            func formUnion(_ other: [UInt64]) {
-                for index in words.indices {
-                    words[index] |= other[index]
-                }
-            }
-
-            func contains(_ index: Int) -> Bool {
-                words[index / UInt64.bitWidth]
-                    & (UInt64(1) << UInt64(index % UInt64.bitWidth)) != 0
-            }
+    /// Lazily summarizes the category groups that a grouped box plot would emit.
+    /// Only requested category/measure pairs are scanned, and cardinality storage
+    /// stops once the pair is known to exceed the recommendation limit.
+    fileprivate final class BoxPlotCategoryIndex {
+        private struct Request: Hashable {
+            var categoryID: AutoChartColumnID
+            var measureID: AutoChartColumnID
         }
 
-        private let measureIndexes: [AutoChartColumnID: Int]
-        private let memberships:
-            [AutoChartColumnID: [AutoChartValueIdentity: MeasureMembership]]
-        private let categoryCounts: [AutoChartColumnID: [Int]]
+        private struct Summary {
+            var categoryCount: Int
+            var includesMissing: Bool
+        }
+
+        let snapshotIdentity: UUID
+        private let snapshot: AutoChartSnapshot
+        private let categorySemanticTypes: [AutoChartColumnID: AutoChartSemanticType]
+        private let measureIDs: Set<AutoChartColumnID>
+        private let retainedCategoryLimit: Int
+        private var summaries: [Request: Summary] = [:]
 
         init(
             snapshot: AutoChartSnapshot,
             categories: [AutoChartColumnProfile],
-            measures: [AutoChartColumnProfile]
+            measures: [AutoChartColumnProfile],
+            maximumCategoryCount: Int
         ) {
-            measureIndexes = Dictionary(
-                uniqueKeysWithValues: measures.enumerated().map {
-                    ($0.element.column.id, $0.offset)
+            self.snapshot = snapshot
+            snapshotIdentity = snapshot.validationIdentity
+            categorySemanticTypes = Dictionary(
+                uniqueKeysWithValues: categories.map {
+                    ($0.column.id, $0.semanticType)
                 })
-            let wordCount = (measures.count + UInt64.bitWidth - 1) / UInt64.bitWidth
-            var result: [
-                AutoChartColumnID: [AutoChartValueIdentity: MeasureMembership]
-            ] = [:]
-            for row in snapshot.rows {
-                var rowMembership = Array(repeating: UInt64(0), count: wordCount)
-                var contributesToAnyMeasure = false
-                for (index, measure) in measures.enumerated()
-                where AutoChartBoxPlotGrouping.measure(
-                    in: row,
-                    columnID: measure.column.id) != nil
-                {
-                    rowMembership[index / UInt64.bitWidth]
-                        |= UInt64(1) << UInt64(index % UInt64.bitWidth)
-                    contributesToAnyMeasure = true
-                }
-                guard contributesToAnyMeasure else { continue }
+            measureIDs = Set(measures.map(\.column.id))
+            retainedCategoryLimit = maximumCategoryCount + 1
+        }
 
-                for category in categories {
-                    let categoryID = category.column.id
-                    let identity = AutoChartBoxPlotGrouping.categoryIdentity(
-                        in: row,
-                        columnID: categoryID,
-                        semanticType: category.semanticType)
-                    var categoryMemberships = result[categoryID] ?? [:]
-                    if let membership = categoryMemberships[identity] {
-                        membership.formUnion(rowMembership)
-                    } else {
-                        categoryMemberships[identity] = MeasureMembership(words: rowMembership)
-                        result[categoryID] = categoryMemberships
-                    }
+        private func summary(
+            categoryID: AutoChartColumnID,
+            measureID: AutoChartColumnID
+        ) -> Summary? {
+            guard let semanticType = categorySemanticTypes[categoryID],
+                measureIDs.contains(measureID)
+            else { return nil }
+            let request = Request(categoryID: categoryID, measureID: measureID)
+            if let summary = summaries[request] { return summary }
+
+            var identities: Set<AutoChartValueIdentity> = []
+            var includesMissing = false
+            for row in snapshot.rows
+            where AutoChartBoxPlotGrouping.measure(
+                in: row,
+                columnID: measureID) != nil
+            {
+                let identity = AutoChartBoxPlotGrouping.categoryIdentity(
+                    in: row,
+                    columnID: categoryID,
+                    semanticType: semanticType)
+                if identity == .missing { includesMissing = true }
+                if identities.count < retainedCategoryLimit {
+                    identities.insert(identity)
+                }
+                if identities.count == retainedCategoryLimit && includesMissing {
+                    break
                 }
             }
-            memberships = result
-            categoryCounts = result.mapValues { categoryMemberships in
-                var counts = Array(repeating: 0, count: measures.count)
-                for membership in categoryMemberships.values {
-                    for (wordIndex, word) in membership.words.enumerated() {
-                        var remaining = word
-                        while remaining != 0 {
-                            let bitIndex = remaining.trailingZeroBitCount
-                            counts[wordIndex * UInt64.bitWidth + bitIndex] += 1
-                            remaining &= remaining - 1
-                        }
-                    }
-                }
-                return counts
-            }
+            let summary = Summary(
+                categoryCount: identities.count,
+                includesMissing: includesMissing)
+            summaries[request] = summary
+            return summary
         }
 
         func categoryCount(
             categoryID: AutoChartColumnID,
             measureID: AutoChartColumnID
         ) -> Int {
-            guard let measureIndex = measureIndexes[measureID],
-                let counts = categoryCounts[categoryID]
-            else { return 0 }
-            return counts[measureIndex]
+            summary(categoryID: categoryID, measureID: measureID)?.categoryCount ?? 0
         }
 
         func includesMissing(
             categoryID: AutoChartColumnID,
             measureID: AutoChartColumnID
         ) -> Bool? {
-            guard let measureIndex = measureIndexes[measureID],
-                let categoryMemberships = memberships[categoryID]
-            else { return nil }
-            return categoryMemberships[.missing]?.contains(measureIndex) == true
+            summary(categoryID: categoryID, measureID: measureID)?.includesMissing
         }
     }
 
@@ -123,6 +103,7 @@ enum AutoChartRecommendationEngine {
         memo: AutoChartValidationMemo?
     ) -> Bool {
         if let indexed = memo?.boxPlotIncludesMissing(
+            snapshotIdentity: snapshot.validationIdentity,
             categoryID: categoryID,
             measureID: measureID)
         {
@@ -180,12 +161,12 @@ enum AutoChartRecommendationEngine {
                 $0.isCategorical && $0.column.hints.role != .identifier
                     && $0.distinctCount > 0
             }.prefix(options.maximumCandidateColumns))
-        let boxPlotCategoryIndex = BoxPlotCategoryIndex(
+        let maximumGroupedBoxPlotCategories = min(10, options.maximumCategories)
+        let validationMemo = AutoChartValidationMemo(
             snapshot: snapshot,
             categories: categorical,
-            measures: quantitative)
-        let validationMemo = AutoChartValidationMemo(
-            boxPlotCategoryIndex: boxPlotCategoryIndex)
+            measures: quantitative,
+            maximumCategoryCount: maximumGroupedBoxPlotCategories)
         var structuralValidationResults: [AutoChartSpecification: AutoChartValidationResult] = [:]
         func cachedStructuralValidation(
             _ specification: AutoChartSpecification
@@ -425,11 +406,12 @@ enum AutoChartRecommendationEngine {
                     rationale: ["Quartiles summarize spread and potential outliers."],
                     warnings: warnings))
             if let group = categorical.first(where: {
-                let maximum = min(10, options.maximumCategories)
-                let categoryCount = boxPlotCategoryIndex.categoryCount(
+                let categoryCount = validationMemo.boxPlotCategoryCount(
+                    snapshotIdentity: snapshot.validationIdentity,
                     categoryID: $0.column.id,
-                    measureID: measure.column.id)
-                return categoryCount >= 2 && categoryCount <= maximum
+                    measureID: measure.column.id) ?? 0
+                return categoryCount >= 2
+                    && categoryCount <= maximumGroupedBoxPlotCategories
             }) {
                 let groupedBox = candidate(
                     family: .boxPlot, x: group, y: measure, context: context,
@@ -796,7 +778,7 @@ enum AutoChartRecommendationEngine {
                     issues.append(
                         .init(
                             severity: .warning,
-                            code: .missingValue,
+                            code: .boxPlotMissingCategoryGroup,
                             message:
                                 "Unrenderable box-plot categories are combined into one missing-value group.",
                             family: .boxPlot,
@@ -1672,15 +1654,41 @@ enum AutoChartRecommendationEngine {
             boxPlotCategoryIndex = nil
         }
 
-        fileprivate init(boxPlotCategoryIndex: BoxPlotCategoryIndex) {
-            self.boxPlotCategoryIndex = boxPlotCategoryIndex
+        init(
+            snapshot: AutoChartSnapshot,
+            categories: [AutoChartColumnProfile],
+            measures: [AutoChartColumnProfile],
+            maximumCategoryCount: Int
+        ) {
+            boxPlotCategoryIndex = BoxPlotCategoryIndex(
+                snapshot: snapshot,
+                categories: categories,
+                measures: measures,
+                maximumCategoryCount: maximumCategoryCount)
+        }
+
+        fileprivate func boxPlotCategoryCount(
+            snapshotIdentity: UUID,
+            categoryID: AutoChartColumnID,
+            measureID: AutoChartColumnID
+        ) -> Int? {
+            guard boxPlotCategoryIndex?.snapshotIdentity == snapshotIdentity else {
+                return nil
+            }
+            return boxPlotCategoryIndex?.categoryCount(
+                categoryID: categoryID,
+                measureID: measureID)
         }
 
         fileprivate func boxPlotIncludesMissing(
+            snapshotIdentity: UUID,
             categoryID: AutoChartColumnID,
             measureID: AutoChartColumnID
         ) -> Bool? {
-            boxPlotCategoryIndex?.includesMissing(
+            guard boxPlotCategoryIndex?.snapshotIdentity == snapshotIdentity else {
+                return nil
+            }
+            return boxPlotCategoryIndex?.includesMissing(
                 categoryID: categoryID,
                 measureID: measureID)
         }
