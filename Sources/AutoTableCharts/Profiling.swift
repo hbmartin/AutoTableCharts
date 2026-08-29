@@ -949,10 +949,33 @@ enum AutoChartValueIdentity: Hashable, Sendable {
 }
 
 extension AutoChartValue {
+    private static func conciseCategoryNumber(_ value: Double) -> String {
+        let standard = value.formatted(
+            .number.grouping(.never).precision(.fractionLength(0...3)))
+        let needsScientificNotation = standard.count > 24
+            || (value != 0 && abs(value) < 0.001)
+        guard needsScientificNotation, value.isFinite else { return standard }
+        return value.formatted(
+            .number.notation(.scientific).precision(.significantDigits(1...6)))
+    }
+
+    private static func conciseCategoryNumber(_ value: Decimal) -> String {
+        let standard = value.formatted(
+            .number.grouping(.never).precision(.fractionLength(0...3)))
+        let scientificThreshold = Decimal(1) / Decimal(1_000)
+        let needsScientificNotation = standard.count > 24
+            || (value != 0 && abs(value) < scientificThreshold)
+        guard needsScientificNotation else { return standard }
+        return value.formatted(
+            .number.notation(.scientific).precision(.significantDigits(1...6)))
+    }
+
     func categoryString() -> String? {
         switch self {
         case .null, .binary: nil
         case .integer(let value): String(value)
+        case .double(let value): Self.conciseCategoryNumber(value)
+        case .decimal(let value): Self.conciseCategoryNumber(value)
         default: displayString
         }
     }

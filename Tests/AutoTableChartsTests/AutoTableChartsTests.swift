@@ -917,14 +917,41 @@ private let date = AutoChartColumn(
     }
 
     @Test func groupedBoxPlotCategoryLimitIncludesMissingGroup() {
-        let overLimit = table(
+        let input = table(
             columns: [category, measure],
             rows: [
                 [.text("A"), .double(1)],
                 [.text("B"), .double(2)],
                 [.null, .double(3)],
             ])
-        let withinLimit = table(
+        let overLimitOptions = AutoChartOptions(
+            maximumRecommendations: 12,
+            maximumCategories: 2)
+        let withinLimitOptions = AutoChartOptions(
+            maximumRecommendations: 12,
+            maximumCategories: 3)
+
+        let overLimitRecommendations = AutoChartRecommendationEngine.recommendations(
+            for: input,
+            options: overLimitOptions)
+        let withinLimitRecommendations = AutoChartRecommendationEngine.recommendations(
+            for: input,
+            options: withinLimitOptions)
+
+        #expect(
+            !overLimitRecommendations.chartRecommendations.contains {
+                $0.specification.family == .boxPlot
+                    && $0.specification.encoding.x == category.id
+            })
+        #expect(
+            withinLimitRecommendations.chartRecommendations.contains {
+                $0.specification.family == .boxPlot
+                    && $0.specification.encoding.x == category.id
+            })
+    }
+
+    @Test func groupedBoxPlotRequiresTwoRenderableCategories() {
+        let input = table(
             columns: [category, measure],
             rows: [
                 [.text("A"), .double(1)],
@@ -934,20 +961,12 @@ private let date = AutoChartColumn(
             maximumRecommendations: 12,
             maximumCategories: 2)
 
-        let overLimitRecommendations = AutoChartRecommendationEngine.recommendations(
-            for: overLimit,
-            options: options)
-        let withinLimitRecommendations = AutoChartRecommendationEngine.recommendations(
-            for: withinLimit,
+        let recommendations = AutoChartRecommendationEngine.recommendations(
+            for: input,
             options: options)
 
         #expect(
-            !overLimitRecommendations.chartRecommendations.contains {
-                $0.specification.family == .boxPlot
-                    && $0.specification.encoding.x == category.id
-            })
-        #expect(
-            withinLimitRecommendations.chartRecommendations.contains {
+            !recommendations.chartRecommendations.contains {
                 $0.specification.family == .boxPlot
                     && $0.specification.encoding.x == category.id
             })
@@ -2095,6 +2114,43 @@ private let date = AutoChartColumn(
             snapshot: AutoChartSnapshot(input), specification: specification)
         #expect(data.map(\.xLabel) == ["B", "A"])
         #expect(data.map(\.yNumber) == [4, 2])
+    }
+
+    @Test func normalizedNumericCategoryLabelsStayStableAcrossPreparationPaths() {
+        let ordinal = AutoChartColumn(
+            id: "ordinal", name: "ordinal",
+            hints: AutoChartColumnHints(semanticType: .ordinal))
+        let forward = table(
+            columns: [ordinal, measure],
+            rows: [[.integer(1_000), .double(1)], [.double(1_000), .double(3)]])
+        let reversed = table(
+            columns: [ordinal, measure],
+            rows: [[.double(1_000), .double(3)], [.integer(1_000), .double(1)]])
+        func data(
+            _ input: some AutoChartTable,
+            aggregation: AutoChartAggregation
+        ) -> [AutoChartDatum] {
+            preparedDatumValues(
+                snapshot: AutoChartSnapshot(input),
+                specification: AutoChartSpecification(
+                    family: .bar,
+                    encoding: .init(x: ordinal.id, y: measure.id),
+                    aggregation: aggregation))
+        }
+
+        let forwardRaw = data(forward, aggregation: .none)
+        let reversedRaw = data(reversed, aggregation: .none)
+        let forwardGrouped = data(forward, aggregation: .sum)
+        let reversedGrouped = data(reversed, aggregation: .sum)
+
+        #expect(forwardRaw.compactMap(\.xLabel) == ["1000", "1000"])
+        #expect(reversedRaw.compactMap(\.xLabel) == ["1000", "1000"])
+        #expect(forwardGrouped.count == 1)
+        #expect(reversedGrouped.count == 1)
+        #expect(forwardGrouped.first?.xLabel == "1000")
+        #expect(reversedGrouped.first?.xLabel == "1000")
+        #expect(forwardGrouped.first?.yNumber == 4)
+        #expect(reversedGrouped.first?.yNumber == 4)
     }
 
     @Test func histogramHandlesOverflowingFiniteRanges() {
@@ -3475,14 +3531,12 @@ private let date = AutoChartColumn(
 
         #expect(
             !first.issues.contains {
-                $0.messageValue.code == .missingValue
-                    && $0.message
-                        == "Unrenderable box-plot categories are combined into one missing-value group."
+                $0.messageValue.code == .boxPlotMissingCategoryGroup
             })
         #expect(
             second.issues.contains {
                 $0.severity == .warning
-                    && $0.messageValue.code == .missingValue
+                    && $0.messageValue.code == .boxPlotMissingCategoryGroup
                     && $0.message
                         == "Unrenderable box-plot categories are combined into one missing-value group."
                     && $0.family == .boxPlot
@@ -4740,17 +4794,13 @@ private let date = AutoChartColumn(
         #expect(datum.sourceRowIDs == [0, 1])
         #expect(datum.xIdentity == "exact-number:3:1e3")
         #expect(datum.xSourceValue == nil)
-        #expect(
-            datum.xLabel
-                == Decimal(1_000).formatted(
-                    .number.grouping(.automatic)
-                        .precision(.significantDigits(1...38))))
+        #expect(datum.xLabel == "1000")
         #expect(reversed.data.first?.xLabel == datum.xLabel)
         #expect(selection.dimensions.isEmpty)
         #expect(datum.median == 2)
     }
 
-    @Test func boxPlotKeepsNearbyNumericCategoryLabelsDistinctAndPaired() {
+    @Test func boxPlotDisambiguatesNearbyConciseNumericCategoryLabels() {
         let ordinal = AutoChartColumn(
             id: "ordinal", name: "ordinal",
             hints: AutoChartColumnHints(semanticType: .ordinal))
@@ -4765,12 +4815,21 @@ private let date = AutoChartColumn(
                 [sourceValues[1], .double(3)],
             ])
         let snapshot = AutoChartSnapshot(input)
+        let specification = AutoChartSpecification(
+            family: .boxPlot,
+            encoding: .init(x: ordinal.id, y: measure.id))
+        let profiles = AutoChartProfiler.profileIndex(snapshot)
         let prepared = AutoChartDataPreparation.preparedData(
             snapshot: snapshot,
-            specification: AutoChartSpecification(
-                family: .boxPlot,
-                encoding: .init(x: ordinal.id, y: measure.id)),
-            profiles: AutoChartProfiler.profileIndex(snapshot))
+            specification: specification,
+            profiles: profiles)
+        let resolved = AutoChartRenderPresentation(
+            snapshot: snapshot,
+            specification: specification,
+            profiles: profiles,
+            data: prepared.data,
+            measureSemantics: prepared.measureSemantics
+        ).resolvedPresentation(data: prepared.data, using: .default)
 
         let labelPairs: [(sourceValue: AutoChartValue, label: String)] =
             prepared.data.compactMap { datum in
@@ -4782,19 +4841,70 @@ private let date = AutoChartColumn(
 
         #expect(prepared.data.count == 2)
         #expect(labelPairs.count == sourceValues.count)
-        #expect(Set(labelPairs.map(\.label)).count == sourceValues.count)
-        for sourceValue in sourceValues {
-            guard case .double(let number) = sourceValue else {
-                Issue.record("The numeric-label fixture must contain Doubles.")
-                continue
-            }
-            let matches = labelPairs.filter { $0.sourceValue == sourceValue }
-            let expected = number.formatted(
-                .number.grouping(.automatic)
-                    .precision(.significantDigits(1...17)))
-            #expect(matches.count == 1)
-            #expect(matches.first?.label == expected)
-        }
+        #expect(
+            Dictionary(uniqueKeysWithValues: labelPairs.map { ($0.sourceValue, $0.label) })
+                == [
+                    sourceValues[0]: "1000.062",
+                    sourceValues[1]: "1000.062",
+                ])
+        let displayLabelsBySourceValue: [AutoChartValue: String] = Dictionary(
+            uniqueKeysWithValues: prepared.data.compactMap { datum in
+                guard let sourceValue = datum.xSourceValue,
+                    let identity = datum.xIdentity,
+                    let label = resolved.xDisplayLabels[identity]
+                else { return nil }
+                return (sourceValue, label)
+            })
+        #expect(
+            displayLabelsBySourceValue
+                == [
+                    sourceValues[0]: "1000.062 (Double)",
+                    sourceValues[1]: "1000.062 (Exact Number)",
+                ])
+    }
+
+    @Test func boxPlotBoundsExtremeNumericCategoryLabels() {
+        let nominal = AutoChartColumn(
+            id: "nominal", name: "nominal",
+            hints: AutoChartColumnHints(semanticType: .nominal))
+        let input = table(
+            columns: [nominal, measure],
+            rows: [
+                [.double(.greatestFiniteMagnitude), .double(1)],
+                [.double(.leastNonzeroMagnitude), .double(2)],
+            ])
+        let data = preparedDatumValues(
+            snapshot: AutoChartSnapshot(input),
+            specification: AutoChartSpecification(
+                family: .boxPlot,
+                encoding: .init(x: nominal.id, y: measure.id)))
+
+        #expect(Set(data.compactMap(\.xLabel)) == ["1.79769E308", "5E-324"])
+        #expect(data.compactMap(\.xLabel).allSatisfy { $0.count <= 24 })
+    }
+
+    @Test func boxPlotDerivesMergedTemporalLabelWithoutExposingIdentity() throws {
+        let temporal = AutoChartColumn(
+            id: "temporal", name: "temporal",
+            hints: AutoChartColumnHints(semanticType: .temporal))
+        let input = table(
+            columns: [temporal, measure],
+            rows: [
+                [.date(Date(timeIntervalSinceReferenceDate: 0)), .double(1)],
+                [.text("2001-01-01T00:00:00Z"), .double(3)],
+            ])
+        let datum = try #require(
+            preparedDatumValues(
+                snapshot: AutoChartSnapshot(input),
+                specification: AutoChartSpecification(
+                    family: .boxPlot,
+                    encoding: .init(x: temporal.id, y: measure.id)
+                )
+            ).first)
+
+        #expect(datum.xSourceValue == nil)
+        #expect(datum.xLabel != datum.xIdentity)
+        #expect(datum.xLabel?.hasPrefix("date:") == false)
     }
 
     @Test func boxPlotUsesOneNumericLabelConventionForMergedAndUnmergedGroups() throws {
@@ -4822,16 +4932,8 @@ private let date = AutoChartColumn(
             prepared.data.first { $0.xSourceValue == .double(2_000) })
 
         #expect(prepared.data.count == 2)
-        #expect(
-            merged.xLabel
-                == Decimal(1_000).formatted(
-                    .number.grouping(.automatic)
-                        .precision(.significantDigits(1...38))))
-        #expect(
-            unmerged.xLabel
-                == Decimal(2_000).formatted(
-                    .number.grouping(.automatic)
-                        .precision(.significantDigits(1...38))))
+        #expect(merged.xLabel == "1000")
+        #expect(unmerged.xLabel == "2000")
     }
 
     @Test func boxPlotNumericLabelsNormalizeSignedZeroAcrossMembershipAndSemantics() throws {
@@ -4867,10 +4969,6 @@ private let date = AutoChartColumn(
         let forward = try datum([.double(0.0), .double(-0.0)], category: ordinal)
         let reversed = try datum([.double(-0.0), .double(0.0)], category: ordinal)
         let nominalMixed = try datum([.double(-0.0), .double(0.0)], category: nominal)
-        let canonicalZeroLabel = Decimal.zero.formatted(
-            .number.grouping(.automatic)
-                .precision(.significantDigits(1...38)))
-
         #expect(forward.sourceRowIDs == [0, 1])
         #expect(reversed.sourceRowIDs == forward.sourceRowIDs)
         #expect(forward.xSourceValue == nil)
@@ -4878,7 +4976,7 @@ private let date = AutoChartColumn(
         #expect(nominalMixed.xSourceValue == nil)
         #expect(
             [negativeOnly, positiveOnly, forward, reversed, nominalMixed]
-                .allSatisfy { $0.xLabel == canonicalZeroLabel })
+                .allSatisfy { $0.xLabel == "0" })
         #expect(nominalMixed.xLabel != AutoChartValue.unrepresentableValuePlaceholder)
     }
 
@@ -4915,7 +5013,7 @@ private let date = AutoChartColumn(
         #expect(
             validation.issues.contains {
                 $0.severity == .warning
-                    && $0.messageValue.code == .missingValue
+                    && $0.messageValue.code == .boxPlotMissingCategoryGroup
                     && $0.message
                         == "Unrenderable box-plot categories are combined into one missing-value group."
             })
@@ -4971,9 +5069,7 @@ private let date = AutoChartColumn(
         #expect(validation.isValid)
         #expect(
             !validation.issues.contains {
-                $0.messageValue.code == .missingValue
-                    && $0.message
-                        == "Unrenderable box-plot categories are combined into one missing-value group."
+                $0.messageValue.code == .boxPlotMissingCategoryGroup
             })
     }
 
@@ -5012,9 +5108,7 @@ private let date = AutoChartColumn(
             #expect(!validation.isValid)
             #expect(
                 !validation.issues.contains {
-                    $0.messageValue.code == .missingValue
-                        && $0.message
-                            == "Unrenderable box-plot categories are combined into one missing-value group."
+                    $0.messageValue.code == .boxPlotMissingCategoryGroup
                 })
         }
     }

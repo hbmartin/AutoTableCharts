@@ -520,6 +520,46 @@ enum AutoChartDataPreparation {
         var measureSemantics: AutoChartRenderedMeasureSemantics
     }
 
+    /// A deterministic category label derived from the normalized identity.
+    /// Numeric identities use the same concise, ungrouped category formatting
+    /// as raw source values, while identities that merge storage families never
+    /// inherit a label from whichever source row happened to arrive first.
+    private static func categoryLabel(
+        for identity: AutoChartValueIdentity
+    ) -> String? {
+        switch identity {
+        case .missing:
+            return nil
+        case .boolean(let value):
+            return AutoChartValue.boolean(value).categoryString()
+        case .integer(let value):
+            return AutoChartValue.integer(value).categoryString()
+        case .number(let bits), .double(let bits):
+            return AutoChartValue.double(Double(bitPattern: bits)).categoryString()
+        case .exactNumber(let canonical), .decimal(let canonical):
+            guard let value = Decimal(
+                string: canonical,
+                locale: AutoChartProfiler.posixLocale)
+            else { return AutoChartValue.unrepresentableValuePlaceholder }
+            return AutoChartValue.decimal(value).categoryString()
+        case .text(let value):
+            return value
+        case .date(let bits):
+            return AutoChartValue.date(
+                Date(timeIntervalSinceReferenceDate: Double(bitPattern: bits))
+            ).categoryString()
+        }
+    }
+
+    /// Missing identities display through localized presentation fallbacks, but
+    /// retaining a source label here preserves diagnostic and inspection context.
+    private static func preparedCategoryLabel(
+        for identity: AutoChartValueIdentity,
+        sourceValue: AutoChartValue?
+    ) -> String? {
+        identity == .missing ? sourceValue?.categoryString() : categoryLabel(for: identity)
+    }
+
     static func preparedData(
         snapshot: AutoChartSnapshot,
         specification: AutoChartSpecification,
@@ -633,12 +673,23 @@ enum AutoChartDataPreparation {
         return snapshot.rows.enumerated().compactMap { index, row in
             let xValue = encoding.x.flatMap { row.values[$0] }
             let yValue = encoding.y.flatMap { row.values[$0] }
+            let seriesValue = encoding.series.flatMap { row.values[$0] }
+            let facetValue = encoding.facet.flatMap { row.values[$0] }
             let start = encoding.start.flatMap { row.values[$0] }
             let end = encoding.end.flatMap { row.values[$0] }
-            let xIdentity = encoding.x.flatMap { id in
-                AutoChartProfiler.identityString(
+            let xValueIdentity = encoding.x.map { id in
+                AutoChartProfiler.identity(
                     xValue, semanticType: profiles[id]?.semanticType)
             }
+            let seriesValueIdentity = encoding.series.map { id in
+                AutoChartProfiler.identity(
+                    seriesValue, semanticType: profiles[id]?.semanticType)
+            }
+            let facetValueIdentity = encoding.facet.map { id in
+                AutoChartProfiler.identity(
+                    facetValue, semanticType: profiles[id]?.semanticType)
+            }
+            let xIdentity = xValueIdentity?.stringValue
             let startDate = start.flatMap(AutoChartProfiler.dateValue)
             let endDate = end.flatMap(AutoChartProfiler.dateValue)
             if specification.family == .range {
@@ -659,25 +710,25 @@ enum AutoChartDataPreparation {
                 sourceRowIDs: [row.id],
                 xIdentity: xIdentity,
                 xSourceValue: xValue,
-                xLabel: xValue?.categoryString(),
+                xLabel: xValueIdentity.flatMap {
+                    preparedCategoryLabel(for: $0, sourceValue: xValue)
+                },
                 xNumber: xValue?.numericValue,
                 xDate: xValue.flatMap(AutoChartProfiler.dateValue),
                 ySourceValue: yValue,
                 yLabel: yValue?.categoryString(),
                 yNumber: yValue?.numericValue,
-                seriesIdentity: encoding.series.flatMap { id in
-                    AutoChartProfiler.identityString(
-                        row.values[id], semanticType: profiles[id]?.semanticType)
+                seriesIdentity: seriesValueIdentity?.stringValue,
+                seriesSourceValue: seriesValue,
+                series: seriesValueIdentity.flatMap {
+                    preparedCategoryLabel(for: $0, sourceValue: seriesValue)
                 },
-                seriesSourceValue: encoding.series.flatMap { row.values[$0] },
-                series: encoding.series.flatMap { row.values[$0]?.categoryString() },
                 size: encoding.size.flatMap { row.values[$0]?.numericValue },
-                facetIdentity: encoding.facet.flatMap { id in
-                    AutoChartProfiler.identityString(
-                        row.values[id], semanticType: profiles[id]?.semanticType)
+                facetIdentity: facetValueIdentity?.stringValue,
+                facetSourceValue: facetValue,
+                facet: facetValueIdentity.flatMap {
+                    preparedCategoryLabel(for: $0, sourceValue: facetValue)
                 },
-                facetSourceValue: encoding.facet.flatMap { row.values[$0] },
-                facet: encoding.facet.flatMap { row.values[$0]?.categoryString() },
                 startDate: startDate,
                 endDate: endDate)
         }
@@ -810,42 +861,6 @@ enum AutoChartDataPreparation {
             var rowID: Int
             var xSourceValue: AutoChartValue?
         }
-        func stableLabel(
-            for identity: AutoChartValueIdentity,
-            sourceValue: AutoChartValue?
-        ) -> String {
-            // Numeric category labels come from the normalized identity so they
-            // remain stable across source-row order, storage-family merges, and
-            // signed-zero representations. Extra precision prevents distinct
-            // numeric categories from sharing the same base display label.
-            switch identity {
-            case .integer(let value):
-                return Decimal(value).formatted(
-                    .number.grouping(.automatic)
-                        .precision(.significantDigits(1...38)))
-            case .number(let bits), .double(let bits):
-                return Double(bitPattern: bits).formatted(
-                    .number.grouping(.automatic)
-                        .precision(.significantDigits(1...17)))
-            case .exactNumber(let canonical), .decimal(let canonical):
-                guard let decimal = Decimal(
-                    string: canonical,
-                    locale: AutoChartProfiler.posixLocale)
-                else {
-                    assertionFailure("A numeric identity must contain a canonical decimal.")
-                    return canonical
-                }
-                return decimal.formatted(
-                    .number.grouping(.automatic)
-                        .precision(.significantDigits(1...38)))
-            case .missing, .boolean, .text, .date:
-                break
-            }
-
-            if let label = sourceValue?.categoryString() { return label }
-            assertionFailure("A nonnumeric box-plot category must retain one source value.")
-            return identity.stringValue ?? AutoChartValue.unrepresentableValuePlaceholder
-        }
         func hasSameStoredCategoryValue(
             _ candidate: AutoChartValue?,
             as reference: AutoChartValue
@@ -853,8 +868,9 @@ enum AutoChartDataPreparation {
             guard let candidate else { return false }
             switch (candidate, reference) {
             case (.double(let candidate), .double(let reference)):
-                // Value equality intentionally merges signed zero, but retaining
-                // either source would make its label depend on row order.
+                // Value equality intentionally merges signed zero. Do not retain
+                // one representation as the typed selection value when the group
+                // contains both, because that source would depend on row order.
                 return candidate.bitPattern == reference.bitPattern
             default:
                 return candidate == reference
@@ -896,9 +912,8 @@ enum AutoChartDataPreparation {
             } else if groupIdentity == .missing {
                 xLabel = missingValueLabel
             } else {
-                xLabel = stableLabel(
-                    for: groupIdentity,
-                    sourceValue: xSourceValue)
+                xLabel = categoryLabel(for: groupIdentity)
+                    ?? AutoChartValue.unrepresentableValuePlaceholder
             }
             func quantile(_ p: Double) -> Double {
                 guard sortedValues.count > 1 else { return sortedValues[0] }
@@ -941,12 +956,14 @@ enum AutoChartDataPreparation {
         }
         var groups: [Key: [AutoChartSnapshot.Row]] = [:]
         for row in snapshot.rows {
-            guard let xLabel = row.values[x]?.categoryString(),
-                let yLabel = row.values[y]?.categoryString(),
-                let xIdentity = AutoChartProfiler.identityString(
-                    row.values[x], semanticType: profiles[x]?.semanticType),
-                let yIdentity = AutoChartProfiler.identityString(
-                    row.values[y], semanticType: profiles[y]?.semanticType)
+            let xValueIdentity = AutoChartProfiler.identity(
+                row.values[x], semanticType: profiles[x]?.semanticType)
+            let yValueIdentity = AutoChartProfiler.identity(
+                row.values[y], semanticType: profiles[y]?.semanticType)
+            guard let xIdentity = xValueIdentity.stringValue,
+                let yIdentity = yValueIdentity.stringValue,
+                let xLabel = categoryLabel(for: xValueIdentity),
+                let yLabel = categoryLabel(for: yValueIdentity)
             else { continue }
             groups[
                 Key(

@@ -255,28 +255,6 @@ enum AutoChartRecommendationEngine {
         }
     }
 
-    private static func boundedBoxPlotCategoryCount(
-        snapshot: AutoChartSnapshot,
-        categoryID: AutoChartColumnID,
-        categorySemanticType: AutoChartSemanticType,
-        measureID: AutoChartColumnID,
-        maximumCategoryCount: Int
-    ) -> Int {
-        let maximum = max(0, maximumCategoryCount)
-        let retainedCategoryLimit = maximum == Int.max ? Int.max : maximum + 1
-        var identities: Set<AutoChartValueIdentity> = []
-        for row in snapshot.rows
-        where AutoChartBoxPlotGrouping.measure(in: row, columnID: measureID) != nil {
-            identities.insert(
-                AutoChartBoxPlotGrouping.categoryIdentity(
-                    in: row,
-                    columnID: categoryID,
-                    semanticType: categorySemanticType))
-            if identities.count == retainedCategoryLimit { break }
-        }
-        return identities.count
-    }
-
     private static func boxPlotIncludesMissingCategory(
         snapshot: AutoChartSnapshot,
         categoryID: AutoChartColumnID,
@@ -588,17 +566,17 @@ enum AutoChartRecommendationEngine {
                     rationale: ["Quartiles summarize spread and potential outliers."],
                     warnings: warnings))
             if let group = categorical.first(where: {
-                let categoryCount = validationMemo.boundedBoxPlotCategoryCount(
+                guard let categoryCount = validationMemo.boundedBoxPlotCategoryCount(
                     snapshotIdentity: snapshot.validationIdentity,
                     categoryID: $0.column.id,
-                    measureID: measure.column.id)
-                    ?? boundedBoxPlotCategoryCount(
-                        snapshot: snapshot,
+                    measureID: measure.column.id),
+                    let includesMissing = validationMemo.boxPlotIncludesMissing(
+                        snapshotIdentity: snapshot.validationIdentity,
                         categoryID: $0.column.id,
-                        categorySemanticType: $0.semanticType,
-                        measureID: measure.column.id,
-                        maximumCategoryCount: maximumGroupedBoxPlotCategories)
-                return categoryCount >= 2
+                        measureID: measure.column.id)
+                else { return false }
+                let renderableCategoryCount = categoryCount - (includesMissing ? 1 : 0)
+                return renderableCategoryCount >= 2
                     && categoryCount <= maximumGroupedBoxPlotCategories
             }) {
                 let groupedBox = candidate(
@@ -966,7 +944,7 @@ enum AutoChartRecommendationEngine {
                     issues.append(
                         .init(
                             severity: .warning,
-                            code: .missingValue,
+                            code: .boxPlotMissingCategoryGroup,
                             message:
                                 "Unrenderable box-plot categories are combined into one missing-value group.",
                             family: .boxPlot,
