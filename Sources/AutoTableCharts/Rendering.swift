@@ -814,24 +814,37 @@ enum AutoChartDataPreparation {
             for identity: AutoChartValueIdentity,
             sourceValue: AutoChartValue?
         ) -> String {
-            // Match the concise, locale-aware source label used by other chart
-            // families whenever the group represents one exact stored value.
-            if let label = sourceValue?.categoryString() { return label }
+            // Numeric category labels come from the normalized identity so they
+            // remain stable across source-row order, storage-family merges, and
+            // signed-zero representations. Extra precision prevents distinct
+            // numeric categories from sharing the same base display label.
+            switch identity {
+            case .integer(let value):
+                return Decimal(value).formatted(
+                    .number.grouping(.automatic)
+                        .precision(.significantDigits(1...38)))
+            case .number(let bits), .double(let bits):
+                return Double(bitPattern: bits).formatted(
+                    .number.grouping(.automatic)
+                        .precision(.significantDigits(1...17)))
+            case .exactNumber(let canonical), .decimal(let canonical):
+                guard let decimal = Decimal(
+                    string: canonical,
+                    locale: AutoChartProfiler.posixLocale)
+                else {
+                    assertionFailure("A numeric identity must contain a canonical decimal.")
+                    return canonical
+                }
+                return decimal.formatted(
+                    .number.grouping(.automatic)
+                        .precision(.significantDigits(1...38)))
+            case .missing, .boolean, .text, .date:
+                break
+            }
 
-            // Ordinal numeric storage types can share one exact identity. Only
-            // those merged groups need a deterministic synthesized label.
-            guard case .exactNumber(let canonical) = identity else {
-                assertionFailure("A nonnumeric box-plot category must retain one source value.")
-                return AutoChartValue.unrepresentableValuePlaceholder
-            }
-            guard let decimal = Decimal(
-                string: canonical,
-                locale: AutoChartProfiler.posixLocale)
-            else {
-                assertionFailure("An exact numeric identity must contain a canonical decimal.")
-                return AutoChartValue.unrepresentableValuePlaceholder
-            }
-            return NSDecimalNumber(decimal: decimal).stringValue
+            if let label = sourceValue?.categoryString() { return label }
+            assertionFailure("A nonnumeric box-plot category must retain one source value.")
+            return identity.stringValue ?? AutoChartValue.unrepresentableValuePlaceholder
         }
         func hasSameStoredCategoryValue(
             _ candidate: AutoChartValue?,

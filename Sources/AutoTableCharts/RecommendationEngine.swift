@@ -7,10 +7,10 @@ import Foundation
 /// returns a bounded set with diverse chart families. It runs synchronously and
 /// entirely offline.
 enum AutoChartRecommendationEngine {
-    /// Lazily summarizes every candidate category/measure pair in one snapshot pass.
+    /// Summarizes every candidate category/measure pair in one snapshot pass.
     /// Per-pair identity retention stops at one beyond the recommendation limit,
     /// which is enough to distinguish an accepted cardinality from overflow.
-    fileprivate final class BoxPlotCategoryIndex {
+    fileprivate struct BoxPlotCategoryIndex {
         private struct Request: Hashable {
             var categoryID: AutoChartColumnID
             var measureID: AutoChartColumnID
@@ -35,6 +35,57 @@ enum AutoChartRecommendationEngine {
                 }
             }
 
+            func insert(_ index: Int) {
+                words[index / UInt64.bitWidth]
+                    |= UInt64(1) << UInt64(index % UInt64.bitWidth)
+            }
+
+            func remove(_ index: Int) {
+                words[index / UInt64.bitWidth]
+                    &= ~(UInt64(1) << UInt64(index % UInt64.bitWidth))
+            }
+
+            /// Reports whether this active membership intersects a row and
+            /// whether that row can still add to the missing membership.
+            func rowStatus(
+                for rowWords: [UInt64],
+                missingMembership: MeasureMembership
+            ) -> (hasActiveMeasure: Bool, needsMissingInspection: Bool) {
+                precondition(words.count == rowWords.count)
+                precondition(words.count == missingMembership.words.count)
+                var hasActiveMeasure = false
+                var needsMissingInspection = false
+                for wordIndex in words.indices {
+                    hasActiveMeasure = hasActiveMeasure
+                        || rowWords[wordIndex] & words[wordIndex] != 0
+                    needsMissingInspection = needsMissingInspection
+                        || rowWords[wordIndex] & ~missingMembership.words[wordIndex] != 0
+                    if hasActiveMeasure && needsMissingInspection { break }
+                }
+                return (hasActiveMeasure, needsMissingInspection)
+            }
+
+            /// Adds row members that are still eligible and visits each new index.
+            func formUnion(
+                _ rowWords: [UInt64],
+                constrainedTo eligible: MeasureMembership,
+                onInsert: (Int) -> Void
+            ) {
+                precondition(words.count == rowWords.count)
+                precondition(words.count == eligible.words.count)
+                for wordIndex in words.indices {
+                    var newBits = rowWords[wordIndex]
+                        & eligible.words[wordIndex]
+                        & ~words[wordIndex]
+                    words[wordIndex] |= newBits
+                    while newBits != 0 {
+                        let bitIndex = newBits.trailingZeroBitCount
+                        onInsert(wordIndex * UInt64.bitWidth + bitIndex)
+                        newBits &= newBits - 1
+                    }
+                }
+            }
+
             func contains(_ index: Int) -> Bool {
                 words[index / UInt64.bitWidth]
                     & (UInt64(1) << UInt64(index % UInt64.bitWidth)) != 0
@@ -45,7 +96,7 @@ enum AutoChartRecommendationEngine {
             let id: AutoChartColumnID
             let semanticType: AutoChartSemanticType
             var boundedCounts: [Int]
-            var activeMeasureWords: [UInt64]
+            let activeMeasureMembership: MeasureMembership
             var identityMemberships: [AutoChartValueIdentity: MeasureMembership] = [:]
             // Identity memberships stop updating after count saturation; missing
             // membership remains exhaustive for validation warnings.
@@ -59,10 +110,9 @@ enum AutoChartRecommendationEngine {
                 id = profile.column.id
                 semanticType = profile.semanticType
                 boundedCounts = Array(repeating: 0, count: measureCount)
-                activeMeasureWords = Array(repeating: 0, count: wordCount)
+                activeMeasureMembership = MeasureMembership(wordCount: wordCount)
                 for index in 0..<measureCount {
-                    activeMeasureWords[index / UInt64.bitWidth]
-                        |= UInt64(1) << UInt64(index % UInt64.bitWidth)
+                    activeMeasureMembership.insert(index)
                 }
                 missingMembership = MeasureMembership(wordCount: wordCount)
             }
@@ -108,16 +158,12 @@ enum AutoChartRecommendationEngine {
                 for accumulator in accumulators {
                     // Once a measure's count is saturated and its missing flag is
                     // known, later rows cannot change its summary.
-                    var needsIdentity = false
-                    for wordIndex in rowMeasureWords.indices
-                    where rowMeasureWords[wordIndex]
-                        & (accumulator.activeMeasureWords[wordIndex]
-                            | ~accumulator.missingMembership.words[wordIndex]) != 0
-                    {
-                        needsIdentity = true
-                        break
-                    }
-                    guard needsIdentity else { continue }
+                    let rowStatus = accumulator.activeMeasureMembership.rowStatus(
+                        for: rowMeasureWords,
+                        missingMembership: accumulator.missingMembership)
+                    guard rowStatus.hasActiveMeasure
+                        || rowStatus.needsMissingInspection
+                    else { continue }
 
                     let identity = AutoChartBoxPlotGrouping.categoryIdentity(
                         in: row,
@@ -127,15 +173,7 @@ enum AutoChartRecommendationEngine {
                         accumulator.missingMembership.formUnion(rowMeasureWords)
                     }
 
-                    var hasActiveMeasure = false
-                    for wordIndex in rowMeasureWords.indices
-                    where rowMeasureWords[wordIndex]
-                        & accumulator.activeMeasureWords[wordIndex] != 0
-                    {
-                        hasActiveMeasure = true
-                        break
-                    }
-                    guard hasActiveMeasure else { continue }
+                    guard rowStatus.hasActiveMeasure else { continue }
                     let membership: MeasureMembership
                     if let existing = accumulator.identityMemberships[identity] {
                         membership = existing
@@ -144,22 +182,15 @@ enum AutoChartRecommendationEngine {
                         accumulator.identityMemberships[identity] = membership
                     }
 
-                    for wordIndex in rowMeasureWords.indices {
-                        var newBits = rowMeasureWords[wordIndex]
-                            & accumulator.activeMeasureWords[wordIndex]
-                            & ~membership.words[wordIndex]
-                        membership.words[wordIndex] |= newBits
-                        while newBits != 0 {
-                            let bitIndex = newBits.trailingZeroBitCount
-                            let measureIndex = wordIndex * UInt64.bitWidth + bitIndex
-                            accumulator.boundedCounts[measureIndex] += 1
-                            if accumulator.boundedCounts[measureIndex]
-                                == retainedCategoryLimit
-                            {
-                                accumulator.activeMeasureWords[wordIndex]
-                                    &= ~(UInt64(1) << UInt64(bitIndex))
-                            }
-                            newBits &= newBits - 1
+                    membership.formUnion(
+                        rowMeasureWords,
+                        constrainedTo: accumulator.activeMeasureMembership
+                    ) { measureIndex in
+                        accumulator.boundedCounts[measureIndex] += 1
+                        if accumulator.boundedCounts[measureIndex]
+                            == retainedCategoryLimit
+                        {
+                            accumulator.activeMeasureMembership.remove(measureIndex)
                         }
                     }
                 }
@@ -182,15 +213,7 @@ enum AutoChartRecommendationEngine {
         }
 
         let snapshotIdentity: UUID
-        private let snapshot: AutoChartSnapshot
-        private let categories: [AutoChartColumnProfile]
-        private let measures: [AutoChartColumnProfile]
-        private let retainedCategoryLimit: Int
-        private lazy var summaries = Self.makeSummaries(
-            snapshot: snapshot,
-            categories: categories,
-            measures: measures,
-            retainedCategoryLimit: retainedCategoryLimit)
+        private let summaries: [Request: Summary]
 
         init(
             snapshot: AutoChartSnapshot,
@@ -198,12 +221,19 @@ enum AutoChartRecommendationEngine {
             measures: [AutoChartColumnProfile],
             maximumCategoryCount: Int
         ) {
-            self.snapshot = snapshot
             snapshotIdentity = snapshot.validationIdentity
-            self.categories = Self.uniqueProfiles(categories)
-            self.measures = Self.uniqueProfiles(measures)
+            let categoryProfiles = Self.uniqueProfiles(categories)
+            let measureProfiles = Self.uniqueProfiles(measures)
             let maximum = max(0, maximumCategoryCount)
-            retainedCategoryLimit = maximum == Int.max ? Int.max : maximum + 1
+            let retainedCategoryLimit = maximum == Int.max ? Int.max : maximum + 1
+            summaries =
+                categoryProfiles.isEmpty || measureProfiles.isEmpty
+                ? [:]
+                : Self.makeSummaries(
+                    snapshot: snapshot,
+                    categories: categoryProfiles,
+                    measures: measureProfiles,
+                    retainedCategoryLimit: retainedCategoryLimit)
         }
 
         func boundedCategoryCount(
@@ -223,6 +253,28 @@ enum AutoChartRecommendationEngine {
                 Request(categoryID: categoryID, measureID: measureID)
             ]?.includesMissing
         }
+    }
+
+    private static func boundedBoxPlotCategoryCount(
+        snapshot: AutoChartSnapshot,
+        categoryID: AutoChartColumnID,
+        categorySemanticType: AutoChartSemanticType,
+        measureID: AutoChartColumnID,
+        maximumCategoryCount: Int
+    ) -> Int {
+        let maximum = max(0, maximumCategoryCount)
+        let retainedCategoryLimit = maximum == Int.max ? Int.max : maximum + 1
+        var identities: Set<AutoChartValueIdentity> = []
+        for row in snapshot.rows
+        where AutoChartBoxPlotGrouping.measure(in: row, columnID: measureID) != nil {
+            identities.insert(
+                AutoChartBoxPlotGrouping.categoryIdentity(
+                    in: row,
+                    columnID: categoryID,
+                    semanticType: categorySemanticType))
+            if identities.count == retainedCategoryLimit { break }
+        }
+        return identities.count
     }
 
     private static func boxPlotIncludesMissingCategory(
@@ -536,11 +588,16 @@ enum AutoChartRecommendationEngine {
                     rationale: ["Quartiles summarize spread and potential outliers."],
                     warnings: warnings))
             if let group = categorical.first(where: {
-                guard let categoryCount = validationMemo.boundedBoxPlotCategoryCount(
+                let categoryCount = validationMemo.boundedBoxPlotCategoryCount(
                     snapshotIdentity: snapshot.validationIdentity,
                     categoryID: $0.column.id,
                     measureID: measure.column.id)
-                else { return false }
+                    ?? boundedBoxPlotCategoryCount(
+                        snapshot: snapshot,
+                        categoryID: $0.column.id,
+                        categorySemanticType: $0.semanticType,
+                        measureID: measure.column.id,
+                        maximumCategoryCount: maximumGroupedBoxPlotCategories)
                 return categoryCount >= 2
                     && categoryCount <= maximumGroupedBoxPlotCategories
             }) {
@@ -909,7 +966,7 @@ enum AutoChartRecommendationEngine {
                     issues.append(
                         .init(
                             severity: .warning,
-                            code: .boxPlotMissingCategoryGroup,
+                            code: .missingValue,
                             message:
                                 "Unrenderable box-plot categories are combined into one missing-value group.",
                             family: .boxPlot,
