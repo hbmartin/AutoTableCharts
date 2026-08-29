@@ -1431,8 +1431,6 @@ public struct AutoChartMessage: Hashable, Codable, Sendable {
         public static let validationFailed = Self(rawValue: "validationFailed")
         public static let nonFiniteValueOmitted = Self(rawValue: "nonFiniteValueOmitted")
         public static let missingValue = Self(rawValue: "missingValue")
-        public static let boxPlotMissingCategoryGroup = Self(
-            rawValue: "boxPlotMissingCategoryGroup")
         public static let unsafeAggregation = Self(rawValue: "unsafeAggregation")
         public static let nonAdditiveSourceSummation = Self(
             rawValue: "nonAdditiveSourceSummation")
