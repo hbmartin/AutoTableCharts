@@ -14,19 +14,23 @@ struct AutoChartDatum: Identifiable, Sendable {
     var sourceRowIDs: Set<Int>
     var xIdentity: String? = nil
     var xSourceValue: AutoChartValue? = nil
+    var xCategoryValue: AutoChartValue? = nil
     var xLabel: String?
     var xNumber: Double?
     var xDate: Date?
     var yIdentity: String? = nil
     var ySourceValue: AutoChartValue? = nil
+    var yCategoryValue: AutoChartValue? = nil
     var yLabel: String?
     var yNumber: Double?
     var seriesIdentity: String? = nil
     var seriesSourceValue: AutoChartValue? = nil
+    var seriesCategoryValue: AutoChartValue? = nil
     var series: String?
     var size: Double?
     var facetIdentity: String? = nil
     var facetSourceValue: AutoChartValue? = nil
+    var facetCategoryValue: AutoChartValue? = nil
     var facet: String?
     var startDate: Date?
     var endDate: Date?
@@ -167,11 +171,31 @@ private func identicalSourceValue<Elements: Collection>(
     let firstIdentity = identity(first)
     guard let firstValue = value(first),
         elements.dropFirst().allSatisfy({ element in
-            identity(element) == firstIdentity && value(element) == firstValue
+            identity(element) == firstIdentity
+                && hasSameStoredValue(value(element), as: firstValue)
         }),
         firstIdentity != nil || firstValue == .null
     else { return nil }
     return firstValue
+}
+
+/// Value equality intentionally merges signed zero. Selection exposes the
+/// stored value, so representations with different floating-point payloads do
+/// not constitute one exact source value.
+private func hasSameStoredValue(
+    _ candidate: AutoChartValue?,
+    as reference: AutoChartValue
+) -> Bool {
+    guard let candidate else { return false }
+    switch (candidate, reference) {
+    case (.double(let candidate), .double(let reference)):
+        return candidate.bitPattern == reference.bitPattern
+    case (.date(let candidate), .date(let reference)):
+        return candidate.timeIntervalSinceReferenceDate.bitPattern
+            == reference.timeIntervalSinceReferenceDate.bitPattern
+    default:
+        return candidate == reference
+    }
 }
 
 private struct AutoChartCategorySortKey {
@@ -329,11 +353,7 @@ enum AutoChartSelectionPreparation {
             } else {
                 if let value = identicalSourceValue(
                     in: matches,
-                    value: { datum in
-                        datum.xSourceValue
-                            ?? datum.xDate.map(AutoChartValue.date)
-                            ?? datum.xNumber.map(AutoChartValue.double)
-                    },
+                    value: \.xSourceValue,
                     identity: \.xIdentity)
                 {
                     dimensions.append(.init(columnID: x, value: value))
@@ -527,37 +547,17 @@ enum AutoChartDataPreparation {
     private static func categoryLabel(
         for identity: AutoChartValueIdentity
     ) -> String? {
-        switch identity {
-        case .missing:
-            return nil
-        case .boolean(let value):
-            return AutoChartValue.boolean(value).categoryString()
-        case .integer(let value):
-            return AutoChartValue.integer(value).categoryString()
-        case .number(let bits), .double(let bits):
-            return AutoChartValue.double(Double(bitPattern: bits)).categoryString()
-        case .exactNumber(let canonical), .decimal(let canonical):
-            guard let value = Decimal(
-                string: canonical,
-                locale: AutoChartProfiler.posixLocale)
-            else { return AutoChartValue.unrepresentableValuePlaceholder }
-            return AutoChartValue.decimal(value).categoryString()
-        case .text(let value):
-            return value
-        case .date(let bits):
-            return AutoChartValue.date(
-                Date(timeIntervalSinceReferenceDate: Double(bitPattern: bits))
-            ).categoryString()
-        }
+        identity.categoryValue?.categoryString()
     }
 
-    /// Missing identities display through localized presentation fallbacks, but
-    /// retaining a source label here preserves diagnostic and inspection context.
-    private static func preparedCategoryLabel(
-        for identity: AutoChartValueIdentity,
-        sourceValue: AutoChartValue?
-    ) -> String? {
-        identity == .missing ? sourceValue?.categoryString() : categoryLabel(for: identity)
+    private static func nonMissingCategoryLabel(
+        for identity: AutoChartValueIdentity
+    ) -> String {
+        precondition(identity != .missing)
+        guard let label = categoryLabel(for: identity) else {
+            preconditionFailure("A nonmissing category identity must have a display value.")
+        }
+        return label
     }
 
     static func preparedData(
@@ -710,9 +710,8 @@ enum AutoChartDataPreparation {
                 sourceRowIDs: [row.id],
                 xIdentity: xIdentity,
                 xSourceValue: xValue,
-                xLabel: xValueIdentity.flatMap {
-                    preparedCategoryLabel(for: $0, sourceValue: xValue)
-                },
+                xCategoryValue: xValueIdentity?.categoryValue,
+                xLabel: xValueIdentity.flatMap { categoryLabel(for: $0) },
                 xNumber: xValue?.numericValue,
                 xDate: xValue.flatMap(AutoChartProfiler.dateValue),
                 ySourceValue: yValue,
@@ -720,15 +719,13 @@ enum AutoChartDataPreparation {
                 yNumber: yValue?.numericValue,
                 seriesIdentity: seriesValueIdentity?.stringValue,
                 seriesSourceValue: seriesValue,
-                series: seriesValueIdentity.flatMap {
-                    preparedCategoryLabel(for: $0, sourceValue: seriesValue)
-                },
+                seriesCategoryValue: seriesValueIdentity?.categoryValue,
+                series: seriesValueIdentity.flatMap { categoryLabel(for: $0) },
                 size: encoding.size.flatMap { row.values[$0]?.numericValue },
                 facetIdentity: facetValueIdentity?.stringValue,
                 facetSourceValue: facetValue,
-                facet: facetValueIdentity.flatMap {
-                    preparedCategoryLabel(for: $0, sourceValue: facetValue)
-                },
+                facetCategoryValue: facetValueIdentity?.categoryValue,
+                facet: facetValueIdentity.flatMap { categoryLabel(for: $0) },
                 startDate: startDate,
                 endDate: endDate)
         }
@@ -784,22 +781,37 @@ enum AutoChartDataPreparation {
                 result = Double(Set(values).count)
             }
             let first = group[0]
+            let xSourceValue = identicalSourceValue(
+                in: group,
+                value: \.xSourceValue,
+                identity: \.xIdentity)
+            let seriesSourceValue = identicalSourceValue(
+                in: group,
+                value: \.seriesSourceValue,
+                identity: \.seriesIdentity)
+            let facetSourceValue = identicalSourceValue(
+                in: group,
+                value: \.facetSourceValue,
+                identity: \.facetIdentity)
             return AutoChartDatum(
                 id: "group-\(first.id)",
                 sourceRowIDs: group.reduce(into: []) {
                     $0.formUnion($1.sourceRowIDs)
                 },
                 xIdentity: first.xIdentity,
-                xSourceValue: first.xSourceValue,
+                xSourceValue: xSourceValue,
+                xCategoryValue: first.xCategoryValue,
                 xLabel: first.xLabel,
                 xNumber: first.xNumber,
                 xDate: first.xDate,
                 yNumber: result,
                 seriesIdentity: first.seriesIdentity,
-                seriesSourceValue: first.seriesSourceValue,
+                seriesSourceValue: seriesSourceValue,
+                seriesCategoryValue: first.seriesCategoryValue,
                 series: first.series,
                 facetIdentity: first.facetIdentity,
-                facetSourceValue: first.facetSourceValue,
+                facetSourceValue: facetSourceValue,
+                facetCategoryValue: first.facetCategoryValue,
                 facet: first.facet)
         }
         return sorted(aggregated, specification: specification, profiles: profiles)
@@ -861,21 +873,6 @@ enum AutoChartDataPreparation {
             var rowID: Int
             var xSourceValue: AutoChartValue?
         }
-        func hasSameStoredCategoryValue(
-            _ candidate: AutoChartValue?,
-            as reference: AutoChartValue
-        ) -> Bool {
-            guard let candidate else { return false }
-            switch (candidate, reference) {
-            case (.double(let candidate), .double(let reference)):
-                // Value equality intentionally merges signed zero. Do not retain
-                // one representation as the typed selection value when the group
-                // contains both, because that source would depend on row order.
-                return candidate.bitPattern == reference.bitPattern
-            default:
-                return candidate == reference
-            }
-        }
         let allValuesLabel = AutoChartRenderPresentation.allValuesLabelMessage.defaultText
         let missingValueLabel =
             AutoChartRenderPresentation.missingValueLabelMessage.defaultText
@@ -900,7 +897,7 @@ enum AutoChartDataPreparation {
             let xSourceValue = x.flatMap { _ -> AutoChartValue? in
                 guard let first = contributingValues.first?.xSourceValue,
                     contributingValues.dropFirst().allSatisfy({
-                        hasSameStoredCategoryValue($0.xSourceValue, as: first)
+                        hasSameStoredValue($0.xSourceValue, as: first)
                     }),
                     groupIdentity != .missing || first == .null
                 else { return nil }
@@ -912,8 +909,7 @@ enum AutoChartDataPreparation {
             } else if groupIdentity == .missing {
                 xLabel = missingValueLabel
             } else {
-                xLabel = categoryLabel(for: groupIdentity)
-                    ?? AutoChartValue.unrepresentableValuePlaceholder
+                xLabel = nonMissingCategoryLabel(for: groupIdentity)
             }
             func quantile(_ p: Double) -> Double {
                 guard sortedValues.count > 1 else { return sortedValues[0] }
@@ -929,6 +925,7 @@ enum AutoChartDataPreparation {
                 sourceRowIDs: Set(contributingValues.map(\.rowID)),
                 xIdentity: identity,
                 xSourceValue: xSourceValue,
+                xCategoryValue: groupIdentity.categoryValue,
                 xLabel: xLabel,
                 lower: sortedValues.first,
                 quartile1: quantile(0.25),
@@ -949,10 +946,8 @@ enum AutoChartDataPreparation {
             return []
         }
         struct Key: Hashable {
-            var xIdentity: String
-            var yIdentity: String
-            var xLabel: String
-            var yLabel: String
+            var xIdentity: AutoChartValueIdentity
+            var yIdentity: AutoChartValueIdentity
         }
         var groups: [Key: [AutoChartSnapshot.Row]] = [:]
         for row in snapshot.rows {
@@ -960,31 +955,38 @@ enum AutoChartDataPreparation {
                 row.values[x], semanticType: profiles[x]?.semanticType)
             let yValueIdentity = AutoChartProfiler.identity(
                 row.values[y], semanticType: profiles[y]?.semanticType)
-            guard let xIdentity = xValueIdentity.stringValue,
-                let yIdentity = yValueIdentity.stringValue,
-                let xLabel = categoryLabel(for: xValueIdentity),
-                let yLabel = categoryLabel(for: yValueIdentity)
-            else { continue }
+            guard xValueIdentity != .missing, yValueIdentity != .missing else { continue }
             groups[
                 Key(
-                    xIdentity: xIdentity,
-                    yIdentity: yIdentity,
-                    xLabel: xLabel,
-                    yLabel: yLabel),
+                    xIdentity: xValueIdentity,
+                    yIdentity: yValueIdentity),
                 default: []
             ].append(row)
         }
         return groups.map { key, rows in
-            AutoChartDatum(
+            guard let xIdentity = key.xIdentity.stringValue,
+                let yIdentity = key.yIdentity.stringValue
+            else {
+                preconditionFailure("Heatmap groups require two renderable identities.")
+            }
+            return AutoChartDatum(
                 id:
-                    "heat-\(key.xIdentity.utf8.count):\(key.xIdentity)\(key.yIdentity.utf8.count):\(key.yIdentity)",
+                    "heat-\(xIdentity.utf8.count):\(xIdentity)\(yIdentity.utf8.count):\(yIdentity)",
                 sourceRowIDs: Set(rows.map(\.id)),
-                xIdentity: key.xIdentity,
-                xSourceValue: rows.first?.values[x],
-                xLabel: key.xLabel,
-                yIdentity: key.yIdentity,
-                ySourceValue: rows.first?.values[y],
-                yLabel: key.yLabel,
+                xIdentity: xIdentity,
+                xSourceValue: identicalSourceValue(
+                    in: rows,
+                    value: { $0.values[x] },
+                    identity: { _ in xIdentity }),
+                xCategoryValue: key.xIdentity.categoryValue,
+                xLabel: nonMissingCategoryLabel(for: key.xIdentity),
+                yIdentity: yIdentity,
+                ySourceValue: identicalSourceValue(
+                    in: rows,
+                    value: { $0.values[y] },
+                    identity: { _ in yIdentity }),
+                yCategoryValue: key.yIdentity.categoryValue,
+                yLabel: nonMissingCategoryLabel(for: key.yIdentity),
                 yNumber: Double(rows.count))
         }.sorted {
             ($0.xLabel ?? "", $0.yLabel ?? "", $0.xIdentity ?? "", $0.yIdentity ?? "")
@@ -1307,6 +1309,10 @@ struct AutoChartRenderPresentation: Sendable {
     var usesSeriesIdentityLabels: Bool
     var usesFacetIdentityLabels: Bool
     var usesSharedXCategoryDomain: Bool
+    fileprivate var xCategoryColumn: AutoChartColumn?
+    fileprivate var yCategoryColumn: AutoChartColumn?
+    fileprivate var seriesCategoryColumn: AutoChartColumn?
+    fileprivate var facetCategoryColumn: AutoChartColumn?
     fileprivate var generatedTextRequirements: AutoChartGeneratedTextRequirements
     var uniqueXCount: Int
     var timeZoomValueCount: Int
@@ -1451,6 +1457,10 @@ struct AutoChartRenderPresentation: Sendable {
 
         self.facetBaseFamily = facetBaseFamily
         self.xSemanticType = xSemanticType
+        xCategoryColumn = specification.encoding.x.flatMap(snapshot.column)
+        yCategoryColumn = specification.encoding.y.flatMap(snapshot.column)
+        seriesCategoryColumn = specification.encoding.series.flatMap(snapshot.column)
+        facetCategoryColumn = specification.encoding.facet.flatMap(snapshot.column)
         usesXIdentityLabels = xUsesIdentityLabels
         usesYIdentityLabels = specification.family == .heatmap
         usesSeriesIdentityLabels = specification.encoding.series != nil
@@ -1593,12 +1603,14 @@ struct AutoChartRenderPresentation: Sendable {
 
     func resolvedPresentation(
         data: [AutoChartDatum],
-        using textResolver: AutoChartTextResolver
+        using textResolver: AutoChartTextResolver,
+        formatters: AutoChartFormatters = .init()
     ) -> AutoChartResolvedPresentation {
         AutoChartResolvedPresentation(
             presentation: self,
             data: data,
-            textResolver: textResolver)
+            textResolver: textResolver,
+            formatters: formatters)
     }
 }
 
@@ -1624,7 +1636,8 @@ struct AutoChartResolvedPresentation: Sendable {
     init(
         presentation: AutoChartRenderPresentation,
         data: [AutoChartDatum],
-        textResolver: AutoChartTextResolver
+        textResolver: AutoChartTextResolver,
+        formatters: AutoChartFormatters
     ) {
         func resolve(_ message: AutoChartMessage?, fallback: String) -> String {
             message.map(textResolver.callAsFunction) ?? fallback
@@ -1672,9 +1685,26 @@ struct AutoChartResolvedPresentation: Sendable {
         var needsMissingSeries = false
         var needsMissingFacet = false
 
+        func categoryLabel(
+            value: AutoChartValue?,
+            preparedLabel: String?,
+            column: AutoChartColumn?
+        ) -> String? {
+            guard let value else { return preparedLabel }
+            return formatters.formatCategory(
+                column: column,
+                value: value,
+                context: .axisTick)
+        }
+
         for datum in data {
             if presentation.usesXIdentityLabels {
-                if let identity = datum.xIdentity, let label = datum.xLabel {
+                if let identity = datum.xIdentity,
+                    let label = categoryLabel(
+                        value: datum.xCategoryValue,
+                        preparedLabel: datum.xLabel,
+                        column: presentation.xCategoryColumn)
+                {
                     xPairs.append(
                         (
                             identity,
@@ -1688,19 +1718,34 @@ struct AutoChartResolvedPresentation: Sendable {
             if presentation.usesYIdentityLabels {
                 // Heatmap preparation admits only categories with both a Y
                 // identity and label, so there is no missing Y value to resolve.
-                if let identity = datum.yIdentity, let label = datum.yLabel {
+                if let identity = datum.yIdentity,
+                    let label = categoryLabel(
+                        value: datum.yCategoryValue,
+                        preparedLabel: datum.yLabel,
+                        column: presentation.yCategoryColumn)
+                {
                     yPairs.append((identity, label))
                 }
             }
             if presentation.usesSeriesIdentityLabels {
-                if let identity = datum.seriesIdentity, let label = datum.series {
+                if let identity = datum.seriesIdentity,
+                    let label = categoryLabel(
+                        value: datum.seriesCategoryValue,
+                        preparedLabel: datum.series,
+                        column: presentation.seriesCategoryColumn)
+                {
                     seriesPairs.append((identity, label))
                 } else if datum.seriesIdentity == nil {
                     needsMissingSeries = true
                 }
             }
             if presentation.usesFacetIdentityLabels {
-                if let identity = datum.facetIdentity, let label = datum.facet {
+                if let identity = datum.facetIdentity,
+                    let label = categoryLabel(
+                        value: datum.facetCategoryValue,
+                        preparedLabel: datum.facet,
+                        column: presentation.facetCategoryColumn)
+                {
                     facetPairs.append((identity, label))
                 } else if datum.facetIdentity == nil {
                     needsMissingFacet = true
@@ -2055,7 +2100,8 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         let core = preparedChart.core
         let resolvedPresentation = core.presentation.resolvedPresentation(
             data: core.data,
-            using: textResolver)
+            using: textResolver,
+            formatters: formatters)
         return PreparedViewState(
             content: .chart(preparedChart, resolvedPresentation),
             boxPlotData:

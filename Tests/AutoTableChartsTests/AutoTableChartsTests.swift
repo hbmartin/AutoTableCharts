@@ -3,6 +3,10 @@ import Testing
 
 @testable import AutoTableCharts
 
+private let posixCategoryFormatters = AutoChartFormatters(
+    locale: Locale(identifier: "en_US_POSIX"),
+    timeZone: .gmt)
+
 private func renderedValueSemantics(
     columnID: AutoChartColumnID?,
     rangeStartColumnID: AutoChartColumnID? = nil,
@@ -343,6 +347,48 @@ private let date = AutoChartColumn(
             valueDescription: "2")
         #expect(label == "\(accessibleDate), 2")
         #expect(!label.contains("T00:00:00Z"))
+    }
+
+    @Test func categoryStringsPreservePrecisionAndUseExplicitPresentationSettings() throws {
+        let first = AutoChartValue.double(1_000.0624)
+        let second = AutoChartValue.double(1_000.0625)
+        let english = Locale(identifier: "en_US")
+        let german = Locale(identifier: "de_DE")
+
+        #expect(first.categoryString(locale: english) != second.categoryString(locale: english))
+        #expect(first.categoryString(locale: english) != first.categoryString(locale: german))
+        #expect(first.categoryString(locale: german)?.contains(",") == true)
+        let small = 0.000_000_123_456_789_012_345_6
+        #expect(
+            AutoChartValue.double(small).categoryString(locale: english)
+                != AutoChartValue.double(small.nextUp).categoryString(locale: english))
+        let decimalFirst = try #require(
+            Decimal(
+                string: "0.12345678901234567890123456789012345678",
+                locale: Locale(identifier: "en_US_POSIX")))
+        let decimalSecond = try #require(
+            Decimal(
+                string: "0.12345678901234567890123456789012345679",
+                locale: Locale(identifier: "en_US_POSIX")))
+        #expect(
+            AutoChartValue.decimal(decimalFirst).categoryString(locale: english)
+                != AutoChartValue.decimal(decimalSecond).categoryString(locale: english))
+        #expect(
+            AutoChartValue.double(.nan).categoryString(locale: english)
+                == AutoChartValue.unrepresentableValuePlaceholder)
+        #expect(
+            AutoChartValue.decimal(.nan).categoryString(locale: english)
+                == AutoChartValue.unrepresentableValuePlaceholder)
+
+        let date = try Date("2026-01-01T00:30:00Z", strategy: .iso8601)
+        let pacific = try #require(TimeZone(secondsFromGMT: -8 * 3_600))
+        #expect(
+            AutoChartValue.date(date).categoryString(
+                locale: english,
+                timeZone: .gmt)
+                != AutoChartValue.date(date).categoryString(
+                    locale: english,
+                    timeZone: pacific))
     }
 
     @Test func accessibilityLabelsIncludeSeriesContext() {
@@ -3531,12 +3577,12 @@ private let date = AutoChartColumn(
 
         #expect(
             !first.issues.contains {
-                $0.messageValue.code == .boxPlotMissingCategoryGroup
+                $0.messageValue.code == .missingValue
             })
         #expect(
             second.issues.contains {
                 $0.severity == .warning
-                    && $0.messageValue.code == .boxPlotMissingCategoryGroup
+                    && $0.messageValue.code == .missingValue
                     && $0.message
                         == "Unrenderable box-plot categories are combined into one missing-value group."
                     && $0.family == .boxPlot
@@ -4452,8 +4498,8 @@ private let date = AutoChartColumn(
         let data = prepared.data
         let missing = try #require(data.first { $0.facetIdentity == nil })
         #expect(missing.seriesIdentity == nil)
-        #expect(missing.series != nil)
-        #expect(missing.facet != nil)
+        #expect(missing.series == nil)
+        #expect(missing.facet == nil)
         let presentation = AutoChartRenderPresentation(
             snapshot: snapshot,
             specification: specification,
@@ -4682,6 +4728,102 @@ private let date = AutoChartColumn(
         #expect(kpiPrepared.measureSemantics.columnID == measure.id)
     }
 
+    @Test func heatmapMergedIdentitiesDoNotExposeTheFirstStoredSourceValue() throws {
+        let ordinal = AutoChartColumn(
+            id: "ordinal", name: "ordinal",
+            hints: AutoChartColumnHints(semanticType: .ordinal))
+        let secondary = AutoChartColumn(
+            id: "secondary", name: "secondary",
+            hints: AutoChartColumnHints(semanticType: .nominal))
+        let specification = AutoChartSpecification(
+            family: .heatmap,
+            encoding: .init(x: ordinal.id, y: secondary.id),
+            aggregation: .count)
+        func datum(_ xValues: [AutoChartValue]) throws -> AutoChartDatum {
+            let snapshot = AutoChartSnapshot(
+                table(
+                    columns: [ordinal, secondary],
+                    rows: xValues.map { [$0, .text("A")] }))
+            let data = preparedDatumValues(
+                snapshot: snapshot,
+                specification: specification)
+            #expect(data.count == 1)
+            return try #require(data.first)
+        }
+
+        let forward = try datum([.integer(1_000), .double(1_000)])
+        let reversed = try datum([.double(1_000), .integer(1_000)])
+        let selection = AutoChartSelectionPreparation.semanticValues(
+            for: [forward],
+            specification: specification,
+            measureSemantics: renderedAggregationSemantics(.count, columnID: nil))
+
+        #expect(forward.sourceRowIDs == [0, 1])
+        #expect(forward.xIdentity == reversed.xIdentity)
+        #expect(forward.xSourceValue == nil)
+        #expect(reversed.xSourceValue == nil)
+        #expect(forward.ySourceValue == .text("A"))
+        #expect(
+            selection.dimensions
+                == [.init(columnID: secondary.id, value: .text("A"))])
+    }
+
+    @Test func groupedMergedDimensionsUseConsensusSourcesAndStableMissingLabels() throws {
+        let ordinal = AutoChartColumn(
+            id: "ordinal", name: "ordinal",
+            hints: AutoChartColumnHints(semanticType: .ordinal))
+        let series = AutoChartColumn(
+            id: "series", name: "series",
+            hints: AutoChartColumnHints(semanticType: .nominal))
+        let facet = AutoChartColumn(
+            id: "facet", name: "facet",
+            hints: AutoChartColumnHints(semanticType: .ordinal))
+        let specification = AutoChartSpecification(
+            family: .faceted,
+            encoding: .init(
+                x: ordinal.id,
+                y: measure.id,
+                series: series.id,
+                facet: facet.id),
+            aggregation: .sum,
+            facetBaseFamily: .bar)
+        func datum(_ rows: [[AutoChartValue]]) throws -> AutoChartDatum {
+            let snapshot = AutoChartSnapshot(
+                table(
+                    columns: [ordinal, measure, series, facet],
+                    rows: rows))
+            let data = preparedDatumValues(
+                snapshot: snapshot,
+                specification: specification)
+            #expect(data.count == 1)
+            return try #require(data.first)
+        }
+
+        let firstRow: [AutoChartValue] = [
+            .integer(1_000), .double(1), .null, .integer(2_000),
+        ]
+        let secondRow: [AutoChartValue] = [
+            .double(1_000), .double(3), .double(.nan), .double(2_000),
+        ]
+        let forward = try datum([firstRow, secondRow])
+        let reversed = try datum([secondRow, firstRow])
+        let selection = AutoChartSelectionPreparation.semanticValues(
+            for: [forward],
+            specification: specification,
+            measureSemantics: renderedAggregationSemantics(.sum, columnID: measure.id))
+
+        #expect(forward.sourceRowIDs == [0, 1])
+        #expect(forward.xSourceValue == nil)
+        #expect(forward.seriesSourceValue == nil)
+        #expect(forward.facetSourceValue == nil)
+        #expect(forward.series == nil)
+        #expect(reversed.series == nil)
+        #expect(forward.xLabel == reversed.xLabel)
+        #expect(forward.facet == reversed.facet)
+        #expect(selection.dimensions.isEmpty)
+        #expect(forward.yNumber == 4)
+    }
+
     @Test func selectionDimensionsPreserveTypedSourceValuesInsteadOfLabels() {
         let heatmapY = AutoChartColumnID(rawValue: "heatmap-y")
         let series = AutoChartColumnID(rawValue: "series")
@@ -4800,7 +4942,7 @@ private let date = AutoChartColumn(
         #expect(datum.median == 2)
     }
 
-    @Test func boxPlotDisambiguatesNearbyConciseNumericCategoryLabels() {
+    @Test func boxPlotPreservesNearbyNumericCategoryLabelPrecision() {
         let ordinal = AutoChartColumn(
             id: "ordinal", name: "ordinal",
             hints: AutoChartColumnHints(semanticType: .ordinal))
@@ -4823,13 +4965,32 @@ private let date = AutoChartColumn(
             snapshot: snapshot,
             specification: specification,
             profiles: profiles)
-        let resolved = AutoChartRenderPresentation(
+        let presentation = AutoChartRenderPresentation(
             snapshot: snapshot,
             specification: specification,
             profiles: profiles,
             data: prepared.data,
-            measureSemantics: prepared.measureSemantics
-        ).resolvedPresentation(data: prepared.data, using: .default)
+            measureSemantics: prepared.measureSemantics)
+        let resolved = presentation.resolvedPresentation(
+            data: prepared.data,
+            using: .default,
+            formatters: posixCategoryFormatters)
+        let germanFormatters = AutoChartFormatters(
+            locale: Locale(identifier: "de_DE"),
+            timeZone: .gmt)
+        let germanResolved = presentation.resolvedPresentation(
+            data: prepared.data,
+            using: .default,
+            formatters: germanFormatters)
+        let overridden = presentation.resolvedPresentation(
+            data: prepared.data,
+            using: .default,
+            formatters: AutoChartFormatters { request, _, _ in
+                guard request.column?.id == ordinal.id,
+                    request.context == .axisTick
+                else { return nil }
+                return "category:\(request.value.categoryString() ?? "missing")"
+            })
 
         let labelPairs: [(sourceValue: AutoChartValue, label: String)] =
             prepared.data.compactMap { datum in
@@ -4841,12 +5002,14 @@ private let date = AutoChartColumn(
 
         #expect(prepared.data.count == 2)
         #expect(labelPairs.count == sourceValues.count)
+        let expectedLabels = Dictionary(
+            uniqueKeysWithValues: sourceValues.compactMap { sourceValue in
+                sourceValue.categoryString().map { (sourceValue, $0) }
+            })
         #expect(
             Dictionary(uniqueKeysWithValues: labelPairs.map { ($0.sourceValue, $0.label) })
-                == [
-                    sourceValues[0]: "1000.062",
-                    sourceValues[1]: "1000.062",
-                ])
+                == expectedLabels)
+        #expect(Set(labelPairs.map(\.label)).count == sourceValues.count)
         let displayLabelsBySourceValue: [AutoChartValue: String] = Dictionary(
             uniqueKeysWithValues: prepared.data.compactMap { datum in
                 guard let sourceValue = datum.xSourceValue,
@@ -4857,10 +5020,14 @@ private let date = AutoChartColumn(
             })
         #expect(
             displayLabelsBySourceValue
-                == [
-                    sourceValues[0]: "1000.062 (Double)",
-                    sourceValues[1]: "1000.062 (Exact Number)",
-                ])
+                == expectedLabels)
+        #expect(
+            Set(germanResolved.xDisplayLabels.values)
+                == Set(sourceValues.compactMap {
+                    $0.categoryString(locale: germanFormatters.locale)
+                }))
+        #expect(germanResolved.xDisplayLabels.values.allSatisfy { $0.contains(",") })
+        #expect(overridden.xDisplayLabels.values.allSatisfy { $0.hasPrefix("category:") })
     }
 
     @Test func boxPlotBoundsExtremeNumericCategoryLabels() {
@@ -4879,7 +5046,11 @@ private let date = AutoChartColumn(
                 family: .boxPlot,
                 encoding: .init(x: nominal.id, y: measure.id)))
 
-        #expect(Set(data.compactMap(\.xLabel)) == ["1.79769E308", "5E-324"])
+        let expectedLabels = Set(
+            [Double.greatestFiniteMagnitude, Double.leastNonzeroMagnitude].compactMap {
+                AutoChartValue.double($0).categoryString()
+            })
+        #expect(Set(data.compactMap(\.xLabel)) == expectedLabels)
         #expect(data.compactMap(\.xLabel).allSatisfy { $0.count <= 24 })
     }
 
@@ -5013,7 +5184,7 @@ private let date = AutoChartColumn(
         #expect(
             validation.issues.contains {
                 $0.severity == .warning
-                    && $0.messageValue.code == .boxPlotMissingCategoryGroup
+                    && $0.messageValue.code == .missingValue
                     && $0.message
                         == "Unrenderable box-plot categories are combined into one missing-value group."
             })
@@ -5069,7 +5240,7 @@ private let date = AutoChartColumn(
         #expect(validation.isValid)
         #expect(
             !validation.issues.contains {
-                $0.messageValue.code == .boxPlotMissingCategoryGroup
+                $0.messageValue.code == .missingValue
             })
     }
 
@@ -5108,7 +5279,7 @@ private let date = AutoChartColumn(
             #expect(!validation.isValid)
             #expect(
                 !validation.issues.contains {
-                    $0.messageValue.code == .boxPlotMissingCategoryGroup
+                    $0.messageValue.code == .missingValue
                 })
         }
     }

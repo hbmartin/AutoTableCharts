@@ -946,37 +946,131 @@ enum AutoChartValueIdentity: Hashable, Sendable {
             "date:\(value)"
         }
     }
+
+    /// The normalized value represented by a renderable category identity.
+    /// Canonical decimal parsing is an internal invariant; retain the canonical
+    /// digits as text in release builds rather than mislabeling a real category
+    /// with the missing-value placeholder.
+    var categoryValue: AutoChartValue? {
+        switch self {
+        case .missing:
+            return nil
+        case .boolean(let value):
+            return .boolean(value)
+        case .integer(let value):
+            return .integer(value)
+        case .number(let bits), .double(let bits):
+            return .double(Double(bitPattern: bits))
+        case .exactNumber(let canonical), .decimal(let canonical):
+            guard let value = Decimal(
+                string: canonical,
+                locale: AutoChartProfiler.posixLocale)
+            else {
+                assertionFailure("A numeric identity must contain a canonical decimal.")
+                return .text(canonical)
+            }
+            return .decimal(value)
+        case .text(let value):
+            return .text(value)
+        case .date(let bits):
+            return .date(
+                Date(timeIntervalSinceReferenceDate: Double(bitPattern: bits)))
+        }
+    }
 }
 
 extension AutoChartValue {
-    private static func conciseCategoryNumber(_ value: Double) -> String {
-        let standard = value.formatted(
-            .number.grouping(.never).precision(.fractionLength(0...3)))
-        let needsScientificNotation = standard.count > 24
-            || (value != 0 && abs(value) < 0.001)
-        guard needsScientificNotation, value.isFinite else { return standard }
-        return value.formatted(
-            .number.notation(.scientific).precision(.significantDigits(1...6)))
+    private enum CategoryNumberPolicy {
+        static let maximumStandardLength = 24
+        static let scientificCutoff = 0.001
+        static let decimalScientificCutoff = Decimal(1) / Decimal(1_000)
+
+        static func usesScientificNotation(
+            standardLength: Int,
+            isZero: Bool,
+            isBelowCutoff: Bool
+        ) -> Bool {
+            standardLength > maximumStandardLength
+                || (!isZero && isBelowCutoff)
+        }
     }
 
-    private static func conciseCategoryNumber(_ value: Decimal) -> String {
+    private static func conciseCategoryNumber(
+        _ value: Double,
+        locale: Locale
+    ) -> String {
+        guard value.isFinite else { return unrepresentableValuePlaceholder }
         let standard = value.formatted(
-            .number.grouping(.never).precision(.fractionLength(0...3)))
-        let scientificThreshold = Decimal(1) / Decimal(1_000)
-        let needsScientificNotation = standard.count > 24
-            || (value != 0 && abs(value) < scientificThreshold)
+            .number.locale(locale).grouping(.never)
+                .precision(.significantDigits(1...17)))
+        let needsScientificNotation = CategoryNumberPolicy.usesScientificNotation(
+            standardLength: standard.count,
+            isZero: value == 0,
+            isBelowCutoff: abs(value) < CategoryNumberPolicy.scientificCutoff)
         guard needsScientificNotation else { return standard }
         return value.formatted(
-            .number.notation(.scientific).precision(.significantDigits(1...6)))
+            .number.locale(locale).notation(.scientific)
+                .precision(.significantDigits(1...17)))
     }
 
-    func categoryString() -> String? {
+    private static func conciseCategoryNumber(
+        _ value: Decimal,
+        locale: Locale
+    ) -> String {
+        guard !value.isNaN else { return unrepresentableValuePlaceholder }
+        let standard = value.formatted(
+            .number.locale(locale).grouping(.never)
+                .precision(.significantDigits(1...38)))
+        let needsScientificNotation = CategoryNumberPolicy.usesScientificNotation(
+            standardLength: standard.count,
+            isZero: value == 0,
+            isBelowCutoff: abs(value) < CategoryNumberPolicy.decimalScientificCutoff)
+        guard needsScientificNotation else { return standard }
+        return value.formatted(
+            .number.locale(locale).notation(.scientific)
+                .precision(.significantDigits(1...38)))
+    }
+
+    /// A deterministic category label. Presentation code supplies the chart's
+    /// locale and time zone; preparation uses POSIX/GMT defaults so cached data
+    /// does not depend on the process locale.
+    func categoryString(
+        locale: Locale = AutoChartProfiler.posixLocale,
+        timeZone: TimeZone = .gmt
+    ) -> String? {
         switch self {
-        case .null, .binary: nil
-        case .integer(let value): String(value)
-        case .double(let value): Self.conciseCategoryNumber(value)
-        case .decimal(let value): Self.conciseCategoryNumber(value)
-        default: displayString
+        case .null, .binary:
+            return nil
+        case .integer(let value):
+            return String(value)
+        case .double(let value):
+            return Self.conciseCategoryNumber(value, locale: locale)
+        case .decimal(let value):
+            return Self.conciseCategoryNumber(value, locale: locale)
+        case .date(let value):
+            guard value.timeIntervalSinceReferenceDate.isFinite else {
+                return Self.unrepresentableValuePlaceholder
+            }
+            var calendar = Calendar(identifier: .gregorian)
+            calendar.timeZone = timeZone
+            calendar.locale = locale
+            let components = calendar.dateComponents([.hour, .minute, .second], from: value)
+            let time: Date.FormatStyle.TimeStyle =
+                if (components.second ?? 0) != 0 {
+                    .standard
+                } else if (components.hour ?? 0) != 0 || (components.minute ?? 0) != 0 {
+                    .shortened
+                } else {
+                    .omitted
+                }
+            return value.formatted(
+                Date.FormatStyle(
+                    date: .abbreviated,
+                    time: time,
+                    locale: locale,
+                    timeZone: timeZone))
+        default:
+            return displayString
         }
     }
 }
