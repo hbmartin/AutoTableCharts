@@ -814,31 +814,38 @@ enum AutoChartDataPreparation {
             for identity: AutoChartValueIdentity,
             sourceValue: AutoChartValue?
         ) -> String {
-            // Numeric labels come from the normalized group identity rather than
-            // source-row order. This keeps merged and unmerged groups on one
-            // convention, preserves nearby values, and normalizes signed zero.
-            switch identity {
-            case .integer(let value):
-                return String(value)
-            case .number(let bits), .double(let bits):
-                return String(Double(bitPattern: bits))
-            case .exactNumber(let canonical):
-                if let decimal = Decimal(
-                    string: canonical,
-                    locale: AutoChartProfiler.posixLocale)
-                {
-                    return NSDecimalNumber(decimal: decimal).stringValue
-                }
-                assertionFailure("An exact numeric identity must contain a canonical decimal.")
-            case .decimal(let canonical):
-                return canonical
-            case .missing, .boolean, .text, .date:
-                break
-            }
-
+            // Match the concise, locale-aware source label used by other chart
+            // families whenever the group represents one exact stored value.
             if let label = sourceValue?.categoryString() { return label }
-            assertionFailure("A nonnumeric box-plot category must retain one source value.")
-            return identity.stringValue ?? AutoChartValue.unrepresentableValuePlaceholder
+
+            // Ordinal numeric storage types can share one exact identity. Only
+            // those merged groups need a deterministic synthesized label.
+            guard case .exactNumber(let canonical) = identity else {
+                assertionFailure("A nonnumeric box-plot category must retain one source value.")
+                return AutoChartValue.unrepresentableValuePlaceholder
+            }
+            guard let decimal = Decimal(
+                string: canonical,
+                locale: AutoChartProfiler.posixLocale)
+            else {
+                assertionFailure("An exact numeric identity must contain a canonical decimal.")
+                return AutoChartValue.unrepresentableValuePlaceholder
+            }
+            return NSDecimalNumber(decimal: decimal).stringValue
+        }
+        func hasSameStoredCategoryValue(
+            _ candidate: AutoChartValue?,
+            as reference: AutoChartValue
+        ) -> Bool {
+            guard let candidate else { return false }
+            switch (candidate, reference) {
+            case (.double(let candidate), .double(let reference)):
+                // Value equality intentionally merges signed zero, but retaining
+                // either source would make its label depend on row order.
+                return candidate.bitPattern == reference.bitPattern
+            default:
+                return candidate == reference
+            }
         }
         let allValuesLabel = AutoChartRenderPresentation.allValuesLabelMessage.defaultText
         let missingValueLabel =
@@ -864,7 +871,7 @@ enum AutoChartDataPreparation {
             let xSourceValue = x.flatMap { _ -> AutoChartValue? in
                 guard let first = contributingValues.first?.xSourceValue,
                     contributingValues.dropFirst().allSatisfy({
-                        $0.xSourceValue == first
+                        hasSameStoredCategoryValue($0.xSourceValue, as: first)
                     }),
                     groupIdentity != .missing || first == .null
                 else { return nil }
