@@ -3,5 +3,5 @@ public enum AutoTableCharts {
     /// The version of the public recommendation policy. Persisted callers can
     /// use this to invalidate cached specification identifiers after a major
     /// policy change.
-    public static let recommendationPolicyVersion = 10
+    public static let recommendationPolicyVersion = 11
 }
