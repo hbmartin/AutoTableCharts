@@ -948,7 +948,7 @@ enum AutoChartRecommendationEngine {
                     issues.append(
                         .init(
                             severity: .warning,
-                            code: .missingValue,
+                            code: .boxPlotMissingCategoryGroup,
                             message:
                                 "Unrenderable box-plot categories are combined into one missing-value group.",
                             family: .boxPlot,

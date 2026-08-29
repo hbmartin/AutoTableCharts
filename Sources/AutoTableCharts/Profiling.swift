@@ -981,17 +981,17 @@ enum AutoChartValueIdentity: Hashable, Sendable {
 
 extension AutoChartValue {
     private enum CategoryNumberPolicy {
-        static let maximumStandardLength = 24
-        static let scientificCutoff = 0.001
-        static let decimalScientificCutoff = Decimal(1) / Decimal(1_000)
+        static let maximumReadableStandardLength = 24
 
-        static func usesScientificNotation(
-            standardLength: Int,
-            isZero: Bool,
-            isBelowCutoff: Bool
-        ) -> Bool {
-            standardLength > maximumStandardLength
-                || (!isZero && isBelowCutoff)
+        static func concise(
+            standard: String,
+            scientific: @autoclosure () -> String
+        ) -> String {
+            guard standard.count > maximumReadableStandardLength else {
+                return standard
+            }
+            let scientific = scientific()
+            return scientific.count < standard.count ? scientific : standard
         }
     }
 
@@ -1003,14 +1003,11 @@ extension AutoChartValue {
         let standard = value.formatted(
             .number.locale(locale).grouping(.never)
                 .precision(.significantDigits(1...17)))
-        let needsScientificNotation = CategoryNumberPolicy.usesScientificNotation(
-            standardLength: standard.count,
-            isZero: value == 0,
-            isBelowCutoff: abs(value) < CategoryNumberPolicy.scientificCutoff)
-        guard needsScientificNotation else { return standard }
-        return value.formatted(
-            .number.locale(locale).notation(.scientific)
-                .precision(.significantDigits(1...17)))
+        return CategoryNumberPolicy.concise(
+            standard: standard,
+            scientific: value.formatted(
+                .number.locale(locale).notation(.scientific)
+                    .precision(.significantDigits(1...17))))
     }
 
     private static func conciseCategoryNumber(
@@ -1021,14 +1018,11 @@ extension AutoChartValue {
         let standard = value.formatted(
             .number.locale(locale).grouping(.never)
                 .precision(.significantDigits(1...38)))
-        let needsScientificNotation = CategoryNumberPolicy.usesScientificNotation(
-            standardLength: standard.count,
-            isZero: value == 0,
-            isBelowCutoff: abs(value) < CategoryNumberPolicy.decimalScientificCutoff)
-        guard needsScientificNotation else { return standard }
-        return value.formatted(
-            .number.locale(locale).notation(.scientific)
-                .precision(.significantDigits(1...38)))
+        return CategoryNumberPolicy.concise(
+            standard: standard,
+            scientific: value.formatted(
+                .number.locale(locale).notation(.scientific)
+                    .precision(.significantDigits(1...38))))
     }
 
     /// A deterministic category label. Presentation code supplies the chart's
@@ -1036,39 +1030,25 @@ extension AutoChartValue {
     /// does not depend on the process locale.
     func categoryString(
         locale: Locale = AutoChartProfiler.posixLocale,
-        timeZone: TimeZone = .gmt
+        timeZone: TimeZone = .gmt,
+        datePrecision: AutoChartDateLabelPrecision? = nil
     ) -> String? {
         switch self {
         case .null, .binary:
             return nil
         case .integer(let value):
-            return String(value)
+            return value.formatted(
+                .number.locale(locale).grouping(.never))
         case .double(let value):
             return Self.conciseCategoryNumber(value, locale: locale)
         case .decimal(let value):
             return Self.conciseCategoryNumber(value, locale: locale)
         case .date(let value):
-            guard value.timeIntervalSinceReferenceDate.isFinite else {
-                return Self.unrepresentableValuePlaceholder
-            }
-            var calendar = Calendar(identifier: .gregorian)
-            calendar.timeZone = timeZone
-            calendar.locale = locale
-            let components = calendar.dateComponents([.hour, .minute, .second], from: value)
-            let time: Date.FormatStyle.TimeStyle =
-                if (components.second ?? 0) != 0 {
-                    .standard
-                } else if (components.hour ?? 0) != 0 || (components.minute ?? 0) != 0 {
-                    .shortened
-                } else {
-                    .omitted
-                }
-            return value.formatted(
-                Date.FormatStyle(
-                    date: .abbreviated,
-                    time: time,
-                    locale: locale,
-                    timeZone: timeZone))
+            return AutoChartDateFormatting.string(
+                value,
+                locale: locale,
+                timeZone: timeZone,
+                precision: datePrecision)
         default:
             return displayString
         }

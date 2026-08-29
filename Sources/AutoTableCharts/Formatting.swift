@@ -2,10 +2,76 @@ import Foundation
 
 public enum AutoChartFormattingContext: String, CaseIterable, Hashable, Codable, Sendable {
     case axisTick
+    case legend
+    case facetHeader
     case markAccessibility
     case selectionSummary
     case kpi
     case detail
+}
+
+enum AutoChartDateLabelPrecision: Int, Comparable, Sendable {
+    case date = 0
+    case minute = 1
+    case second = 2
+
+    static func < (lhs: Self, rhs: Self) -> Bool {
+        lhs.rawValue < rhs.rawValue
+    }
+}
+
+enum AutoChartDateFormatting {
+    static func precision(
+        for date: Date,
+        locale: Locale,
+        timeZone: TimeZone
+    ) -> AutoChartDateLabelPrecision {
+        let components = calendar(locale: locale, timeZone: timeZone)
+            .dateComponents([.hour, .minute, .second], from: date)
+        if (components.second ?? 0) != 0 {
+            return .second
+        }
+        if (components.hour ?? 0) != 0 || (components.minute ?? 0) != 0 {
+            return .minute
+        }
+        return .date
+    }
+
+    static func string(
+        _ date: Date,
+        locale: Locale,
+        timeZone: TimeZone,
+        precision: AutoChartDateLabelPrecision? = nil
+    ) -> String {
+        guard date.timeIntervalSinceReferenceDate.isFinite else {
+            return AutoChartValue.unrepresentableValuePlaceholder
+        }
+        let calendar = calendar(locale: locale, timeZone: timeZone)
+        let precision = precision
+            ?? self.precision(for: date, locale: locale, timeZone: timeZone)
+        let time: Date.FormatStyle.TimeStyle = switch precision {
+        case .date: .omitted
+        case .minute: .shortened
+        case .second: .standard
+        }
+        return date.formatted(
+            Date.FormatStyle(
+                date: .abbreviated,
+                time: time,
+                locale: locale,
+                calendar: calendar,
+                timeZone: timeZone))
+    }
+
+    private static func calendar(
+        locale: Locale,
+        timeZone: TimeZone
+    ) -> Calendar {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.locale = locale
+        calendar.timeZone = timeZone
+        return calendar
+    }
 }
 
 /// An aggregation that transforms source values into a rendered measure.
@@ -166,7 +232,7 @@ public struct AutoChartFormatters: Sendable {
 
     /// Formats a complete semantic request.
     public func format(_ request: AutoChartFormattingRequest) -> String {
-        if let formatted = override?(request, locale, timeZone) {
+        if let formatted = overridden(request) {
             return formatted
         }
         return defaultFormat(request)
@@ -178,16 +244,20 @@ public struct AutoChartFormatters: Sendable {
     func formatCategory(
         column: AutoChartColumn?,
         value: AutoChartValue,
-        context: AutoChartFormattingContext
+        context: AutoChartFormattingContext,
+        datePrecision: AutoChartDateLabelPrecision? = nil
     ) -> String {
         let request = AutoChartFormattingRequest(
             column: column,
             value: value,
             context: context)
-        if let formatted = override?(request, locale, timeZone) {
+        if let formatted = overridden(request) {
             return formatted
         }
-        return value.categoryString(locale: locale, timeZone: timeZone)
+        return value.categoryString(
+            locale: locale,
+            timeZone: timeZone,
+            datePrecision: datePrecision)
             ?? AutoChartValue.unrepresentableValuePlaceholder
     }
 
@@ -264,38 +334,19 @@ public struct AutoChartFormatters: Sendable {
         }
     }
 
+    private func overridden(_ request: AutoChartFormattingRequest) -> String? {
+        override?(request, locale, timeZone)
+    }
+
     private func defaultFormat(
         column: AutoChartColumn?,
         value: AutoChartValue
     ) -> String {
         if case .date(let date) = value {
-            // Non-finite dates survive validation as a warning, so they reach
-            // ticks, mark labels, and selection summaries. `Date.FormatStyle`
-            // renders NaN as an empty string and infinities as year 5828963;
-            // neither tells the reader the value is unusable.
-            guard date.timeIntervalSinceReferenceDate.isFinite else {
-                return AutoChartValue.unrepresentableValuePlaceholder
-            }
-            // Sub-day values must keep their time component or every tick,
-            // mark, and selection within one day formats identically.
-            var calendar = Calendar(identifier: .gregorian)
-            calendar.timeZone = timeZone
-            calendar.locale = locale
-            let components = calendar.dateComponents([.hour, .minute, .second], from: date)
-            let time: Date.FormatStyle.TimeStyle =
-                if (components.second ?? 0) != 0 {
-                    .standard
-                } else if (components.hour ?? 0) != 0 || (components.minute ?? 0) != 0 {
-                    .shortened
-                } else {
-                    .omitted
-                }
-            return date.formatted(
-                Date.FormatStyle(
-                    date: .abbreviated,
-                    time: time,
-                    locale: locale,
-                    timeZone: timeZone))
+            return AutoChartDateFormatting.string(
+                date,
+                locale: locale,
+                timeZone: timeZone)
         }
         guard let number = value.numericValue else { return value.displayString }
         switch column?.hints.unit {
