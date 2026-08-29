@@ -172,6 +172,25 @@ public struct AutoChartFormatters: Sendable {
         return defaultFormat(request)
     }
 
+    /// Formats one normalized category at presentation time. Host overrides
+    /// receive a value request carrying that normalized category; the default
+    /// keeps enough numeric precision to distinguish categories.
+    func formatCategory(
+        column: AutoChartColumn?,
+        value: AutoChartValue,
+        context: AutoChartFormattingContext
+    ) -> String {
+        let request = AutoChartFormattingRequest(
+            column: column,
+            value: value,
+            context: context)
+        if let formatted = override?(request, locale, timeZone) {
+            return formatted
+        }
+        return value.categoryString(locale: locale, timeZone: timeZone)
+            ?? AutoChartValue.unrepresentableValuePlaceholder
+    }
+
     /// Formats a measure while preserving its source column for request overrides.
     ///
     /// Count and distinct-count results remain unitless under the default

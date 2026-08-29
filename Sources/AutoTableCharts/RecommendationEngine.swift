@@ -574,7 +574,11 @@ enum AutoChartRecommendationEngine {
                         snapshotIdentity: snapshot.validationIdentity,
                         categoryID: $0.column.id,
                         measureID: measure.column.id)
-                else { return false }
+                else {
+                    assertionFailure(
+                        "The box-plot validation index must contain every candidate pair.")
+                    return false
+                }
                 let renderableCategoryCount = categoryCount - (includesMissing ? 1 : 0)
                 return renderableCategoryCount >= 2
                     && categoryCount <= maximumGroupedBoxPlotCategories
@@ -944,7 +948,7 @@ enum AutoChartRecommendationEngine {
                     issues.append(
                         .init(
                             severity: .warning,
-                            code: .boxPlotMissingCategoryGroup,
+                            code: .missingValue,
                             message:
                                 "Unrenderable box-plot categories are combined into one missing-value group.",
                             family: .boxPlot,
