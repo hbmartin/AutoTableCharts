@@ -3475,11 +3475,16 @@ private let date = AutoChartColumn(
 
         #expect(
             !first.issues.contains {
-                $0.messageValue.code == .missingValue
+                $0.messageValue.code == .boxPlotMissingCategoryGroup
             })
         #expect(
             second.issues.contains {
-                $0.messageValue.code == .missingValue
+                $0.severity == .warning
+                    && $0.messageValue.code == .boxPlotMissingCategoryGroup
+                    && $0.message
+                        == "Unrenderable box-plot categories are combined into one missing-value group."
+                    && $0.family == .boxPlot
+                    && $0.columnIDs == [category.id]
             })
     }
 
@@ -4687,13 +4692,13 @@ private let date = AutoChartColumn(
         #expect(datum.median == 2)
     }
 
-    @Test func boxPlotUsesExactLocaleFreeNumericCategoryLabels() {
+    @Test func boxPlotPreservesFormattedNumericCategoryLabelPairing() {
         let ordinal = AutoChartColumn(
             id: "ordinal", name: "ordinal",
             hints: AutoChartColumnHints(semanticType: .ordinal))
         let sourceValues: [AutoChartValue] = [
             .double(1_000.0624),
-            .double(1_000.0625),
+            .double(2_000.0625),
         ]
         let input = table(
             columns: [ordinal, measure],
@@ -4709,12 +4714,23 @@ private let date = AutoChartColumn(
                 encoding: .init(x: ordinal.id, y: measure.id)),
             profiles: AutoChartProfiler.profileIndex(snapshot))
 
+        let labelsBySourceValue: [AutoChartValue: String] = Dictionary(
+            uniqueKeysWithValues: prepared.data.compactMap { datum in
+                guard let sourceValue = datum.xSourceValue,
+                    let label = datum.xLabel
+                else { return nil }
+                return (sourceValue, label)
+            })
+        let expectedLabelsBySourceValue: [AutoChartValue: String] = Dictionary(
+            uniqueKeysWithValues: sourceValues.compactMap { sourceValue in
+                sourceValue.categoryString().map { (sourceValue, $0) }
+            })
+
         #expect(prepared.data.count == 2)
-        #expect(Set(prepared.data.compactMap(\.xSourceValue)) == Set(sourceValues))
-        #expect(Set(prepared.data.compactMap(\.xLabel)) == ["1000.0624", "1000.0625"])
+        #expect(labelsBySourceValue == expectedLabelsBySourceValue)
     }
 
-    @Test func boxPlotUsesOneNumericLabelConventionForMergedAndUnmergedGroups() {
+    @Test func boxPlotDistinguishesMergedAndUnmergedNumericLabelSources() throws {
         let ordinal = AutoChartColumn(
             id: "ordinal", name: "ordinal",
             hints: AutoChartColumnHints(semanticType: .ordinal))
@@ -4734,8 +4750,13 @@ private let date = AutoChartColumn(
                 encoding: .init(x: ordinal.id, y: measure.id)),
             profiles: AutoChartProfiler.profileIndex(snapshot))
 
+        let merged = try #require(prepared.data.first { $0.xSourceValue == nil })
+        let unmerged = try #require(
+            prepared.data.first { $0.xSourceValue == .double(2_000) })
+
         #expect(prepared.data.count == 2)
-        #expect(Set(prepared.data.compactMap(\.xLabel)) == ["1000", "2000"])
+        #expect(merged.xLabel == "1000")
+        #expect(unmerged.xLabel == AutoChartValue.double(2_000).categoryString())
     }
 
     @Test func boxPlotNumericLabelsDoNotDependOnSignedZeroRowOrder() throws {
@@ -4745,7 +4766,7 @@ private let date = AutoChartColumn(
         let specification = AutoChartSpecification(
             family: .boxPlot,
             encoding: .init(x: ordinal.id, y: measure.id))
-        func label(_ categoryValues: [AutoChartValue]) throws -> String {
+        func data(_ categoryValues: [AutoChartValue]) -> [AutoChartDatum] {
             let snapshot = AutoChartSnapshot(
                 table(
                     columns: [ordinal, measure],
@@ -4757,14 +4778,22 @@ private let date = AutoChartColumn(
                 snapshot: snapshot,
                 specification: specification,
                 profiles: AutoChartProfiler.profileIndex(snapshot))
-            return try #require(prepared.data.first?.xLabel)
+            return prepared.data
         }
 
-        let forward = try label([.double(0.0), .double(-0.0)])
-        let reversed = try label([.double(-0.0), .double(0.0)])
+        let forwardData = data([.double(0.0), .double(-0.0)])
+        let reversedData = data([.double(-0.0), .double(0.0)])
+        let forward = try #require(forwardData.first)
+        let reversed = try #require(reversedData.first)
 
-        #expect(forward == "0")
-        #expect(reversed == forward)
+        #expect(forwardData.count == 1)
+        #expect(reversedData.count == 1)
+        #expect(forward.sourceRowIDs == [0, 1])
+        #expect(reversed.sourceRowIDs == forward.sourceRowIDs)
+        #expect(forward.xSourceValue == nil)
+        #expect(reversed.xSourceValue == nil)
+        #expect(forward.xLabel == "0")
+        #expect(reversed.xLabel == forward.xLabel)
     }
 
     @Test func boxPlotUsesOneMissingGroupWithoutCollidingWithARealLabel() throws {
@@ -4800,7 +4829,7 @@ private let date = AutoChartColumn(
         #expect(
             validation.issues.contains {
                 $0.severity == .warning
-                    && $0.messageValue.code == .missingValue
+                    && $0.messageValue.code == .boxPlotMissingCategoryGroup
                     && $0.message
                         == "Unrenderable box-plot categories are combined into one missing-value group."
             })
@@ -4856,7 +4885,7 @@ private let date = AutoChartColumn(
         #expect(validation.isValid)
         #expect(
             !validation.issues.contains {
-                $0.messageValue.code == .missingValue
+                $0.messageValue.code == .boxPlotMissingCategoryGroup
                     && $0.message
                         == "Unrenderable box-plot categories are combined into one missing-value group."
             })
@@ -4897,7 +4926,7 @@ private let date = AutoChartColumn(
             #expect(!validation.isValid)
             #expect(
                 !validation.issues.contains {
-                    $0.messageValue.code == .missingValue
+                    $0.messageValue.code == .boxPlotMissingCategoryGroup
                         && $0.message
                             == "Unrenderable box-plot categories are combined into one missing-value group."
                 })
