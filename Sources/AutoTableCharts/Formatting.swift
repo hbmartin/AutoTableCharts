@@ -252,7 +252,8 @@ public struct AutoChartFormatters: Sendable {
 
     /// Formats one normalized category at presentation time. Host overrides
     /// receive a value request carrying that normalized category; the default
-    /// keeps enough numeric precision to distinguish categories.
+    /// honors unit metadata while retaining enough numeric precision to
+    /// distinguish categories.
     func formatCategory(
         column: AutoChartColumn?,
         value: AutoChartValue,
@@ -267,12 +268,88 @@ public struct AutoChartFormatters: Sendable {
         if let formatted = overridden(request) {
             return formatted
         }
-        return value.categoryString(
+        return formatCategoryDefault(
+            column: column,
+            value: value,
+            datePrecision: datePrecision,
+            calendar: calendar)
+    }
+
+    /// Applies unit metadata without sacrificing the precision used to keep
+    /// neighboring numeric categories distinguishable.
+    func formatCategoryDefault(
+        column: AutoChartColumn?,
+        value: AutoChartValue,
+        datePrecision: AutoChartDateLabelPrecision? = nil,
+        calendar: Calendar? = nil
+    ) -> String {
+        let base = value.categoryString(
             locale: locale,
             timeZone: timeZone,
             datePrecision: datePrecision,
             calendar: calendar)
             ?? AutoChartValue.unrepresentableValuePlaceholder
+        guard value.numericValue != nil else { return base }
+        switch column?.hints.unit {
+        case .currency(let code):
+            return formatCategoryCurrency(value, code: code) ?? base
+        case .percent(let fractional):
+            return formatCategoryPercent(value, fractional: fractional) ?? base
+        case .area(let unit), .duration(let unit), .custom(let unit):
+            return "\(base) \(unit)"
+        case .number, nil:
+            return base
+        }
+    }
+
+    private func formatCategoryCurrency(
+        _ value: AutoChartValue,
+        code: String
+    ) -> String? {
+        switch value {
+        case .integer(let number):
+            return number.formatted(
+                .currency(code: code).locale(locale)
+                    .precision(.significantDigits(1...38)))
+        case .double(let number) where number.isFinite:
+            return number.formatted(
+                .currency(code: code).locale(locale)
+                    .precision(.significantDigits(1...17)))
+        case .decimal(let number) where !number.isNaN:
+            return number.formatted(
+                .currency(code: code).locale(locale)
+                    .precision(.significantDigits(1...38)))
+        default:
+            return nil
+        }
+    }
+
+    private func formatCategoryPercent(
+        _ value: AutoChartValue,
+        fractional: Bool
+    ) -> String? {
+        switch value {
+        case .integer(let number):
+            if fractional {
+                return number.formatted(
+                    .percent.locale(locale).precision(.significantDigits(1...38)))
+            }
+            var scaled = Decimal(number)
+            scaled /= 100
+            return scaled.formatted(
+                .percent.locale(locale).precision(.significantDigits(1...38)))
+        case .double(let number) where number.isFinite:
+            let scaled = fractional ? number : number / 100
+            return scaled.formatted(
+                .percent.locale(locale).precision(.significantDigits(1...17)))
+        case .decimal(let number) where !number.isNaN:
+            var scaled = number
+            if !fractional { scaled /= 100 }
+            return scaled.formatted(
+                .percent.locale(locale).precision(.significantDigits(1...38)))
+        default:
+            return nil
+        }
     }
 
     /// Formats a measure while preserving its source column for request overrides.
@@ -433,7 +510,9 @@ extension AutoChartSelection {
                 context: .selectionSummary)
             return formatters.formatOverride(request)
                 ?? resolvedDimensionLabel(dimension)
-                ?? formatters.formatDefault(request)
+                ?? formatters.formatCategoryDefault(
+                    column: request.column,
+                    value: request.value)
         }
         let rangeLabels = rangeDimensions.map { dimension in
             let column = columnIndex[dimension.columnID]
