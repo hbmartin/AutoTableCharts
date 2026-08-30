@@ -594,6 +594,20 @@ private struct CountingChartRowsTable: AutoChartTable {
 }
 
 @Suite struct V2FormattingAndPresentationTests {
+    @Test func formattingContextRemainsExhaustiveForExistingClients() {
+        func label(_ context: AutoChartFormattingContext) -> String {
+            switch context {
+            case .axisTick: "axis"
+            case .markAccessibility: "accessibility"
+            case .selectionSummary: "selection"
+            case .kpi: "kpi"
+            case .detail: "detail"
+            }
+        }
+
+        #expect(AutoChartFormattingContext.allCases.map(label).count == 5)
+    }
+
     @Test func formatterOverridesReceiveEveryContext() {
         let formatter = AutoChartFormatters(
             locale: Locale(identifier: "en_US"),
@@ -832,6 +846,15 @@ private struct CountingChartRowsTable: AutoChartTable {
                 column: nil,
                 value: .date(Date(timeIntervalSince1970: 0)),
                 context: .axisTick).isEmpty)
+        let buddhistFormatter = AutoChartFormatters(
+            locale: Locale(identifier: "en_US@calendar=buddhist"),
+            timeZone: .gmt)
+        let buddhistDate = buddhistFormatter.format(
+            column: nil,
+            value: .date(Date(timeIntervalSinceReferenceDate: 0)),
+            context: .selectionSummary)
+        #expect(buddhistDate.contains("2544"))
+        #expect(!buddhistDate.contains("2001"))
         #expect(formatter.formatNormalizedFraction(0.25, context: .axisTick).contains("25"))
         #expect(!formatter.formatNormalizedFraction(0.25, context: .axisTick).contains("0.25"))
     }
@@ -2289,5 +2312,17 @@ private struct CountingChartRowsTable: AutoChartTable {
         #expect(second != first)
         #expect(third != second)
         #expect(!first.contains(":"))
+        let nonFinite = Date(timeIntervalSinceReferenceDate: .nan)
+        #expect(
+            AutoChartDateFormatting.precision(
+                for: nonFinite,
+                locale: formatters.locale,
+                timeZone: formatters.timeZone) == .date)
+        #expect(
+            AutoChartDateFormatting.string(
+                nonFinite,
+                locale: formatters.locale,
+                timeZone: formatters.timeZone)
+                == AutoChartValue.unrepresentableValuePlaceholder)
     }
 }
