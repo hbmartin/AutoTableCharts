@@ -190,11 +190,29 @@ private func hasSameStoredValue(
     switch (candidate, reference) {
     case (.double(let candidate), .double(let reference)):
         return candidate.bitPattern == reference.bitPattern
+    case (.decimal(let candidate), .decimal(let reference)):
+        return hasSameStoredDecimalValue(candidate, as: reference)
     case (.date(let candidate), .date(let reference)):
         return candidate.timeIntervalSinceReferenceDate.bitPattern
             == reference.timeIntervalSinceReferenceDate.bitPattern
     default:
         return candidate == reference
+    }
+}
+
+/// `Decimal` equality normalizes equivalent coefficients and exponents, while
+/// selection returns the caller's stored value. Compare the complete Foundation
+/// representation so a merged category cannot select `1` or `1.0` by row order.
+private func hasSameStoredDecimalValue(
+    _ candidate: Decimal,
+    as reference: Decimal
+) -> Bool {
+    var candidate = candidate
+    var reference = reference
+    return withUnsafeBytes(of: &candidate) { candidateBytes in
+        withUnsafeBytes(of: &reference) { referenceBytes in
+            candidateBytes.elementsEqual(referenceBytes)
+        }
     }
 }
 
@@ -715,7 +733,6 @@ enum AutoChartDataPreparation {
                 xNumber: xValue?.numericValue,
                 xDate: xValue.flatMap(AutoChartProfiler.dateValue),
                 ySourceValue: yValue,
-                yLabel: yValue?.categoryString(),
                 yNumber: yValue?.numericValue,
                 seriesIdentity: seriesValueIdentity?.stringValue,
                 seriesSourceValue: seriesValue,
@@ -1184,6 +1201,93 @@ func orderedFacetPanels(
                 displayValue: rhs.element.displayValue,
                 identity: rhs.element.key ?? "",
                 sourceOffset: rhs.offset),
+            locale: locale)
+    }.map(\.element)
+}
+
+/// Applies presentation-time category labels to ordering decisions without
+/// mutating the reusable prepared chart core. Preparation remains deterministic;
+/// the rendered view follows the labels the host actually supplied.
+func orderedPresentedData(
+    _ data: [AutoChartDatum],
+    specification: AutoChartSpecification,
+    xLabels: [String: String],
+    yLabels: [String: String],
+    missingValue: String,
+    locale: Locale
+) -> [AutoChartDatum] {
+    func key(
+        identity: String?,
+        preparedLabel: String?,
+        labels: [String: String],
+        offset: Int
+    ) -> AutoChartCategorySortKey {
+        AutoChartCategorySortKey(
+            displayValue: disambiguatedCategoryValue(
+                identity: identity,
+                label: preparedLabel,
+                labels: labels,
+                fallback: missingValue),
+            identity: identity ?? "",
+            sourceOffset: offset)
+    }
+
+    if specification.family == .heatmap {
+        return data.enumerated().sorted { lhs, rhs in
+            let leftX = key(
+                identity: lhs.element.xIdentity,
+                preparedLabel: lhs.element.xLabel,
+                labels: xLabels,
+                offset: 0)
+            let rightX = key(
+                identity: rhs.element.xIdentity,
+                preparedLabel: rhs.element.xLabel,
+                labels: xLabels,
+                offset: 0)
+            if leftX.displayValue != rightX.displayValue || leftX.identity != rightX.identity {
+                return categoryPrecedes(leftX, rightX, locale: locale)
+            }
+            let leftY = key(
+                identity: lhs.element.yIdentity,
+                preparedLabel: lhs.element.yLabel,
+                labels: yLabels,
+                offset: lhs.offset)
+            let rightY = key(
+                identity: rhs.element.yIdentity,
+                preparedLabel: rhs.element.yLabel,
+                labels: yLabels,
+                offset: rhs.offset)
+            return categoryPrecedes(leftY, rightY, locale: locale)
+        }.map(\.element)
+    }
+
+    let sortsAscending: Bool
+    switch specification.sort {
+    case .source:
+        return data
+    case .ascending:
+        sortsAscending = true
+    case .descending:
+        sortsAscending = false
+    }
+    guard !xLabels.isEmpty else { return data }
+    return data.enumerated().sorted { lhs, rhs in
+        let leftValue = lhs.element.yNumber ?? 0
+        let rightValue = rhs.element.yNumber ?? 0
+        if leftValue != rightValue {
+            return sortsAscending ? leftValue < rightValue : leftValue > rightValue
+        }
+        return categoryPrecedes(
+            key(
+                identity: lhs.element.xIdentity,
+                preparedLabel: lhs.element.xLabel,
+                labels: xLabels,
+                offset: lhs.offset),
+            key(
+                identity: rhs.element.xIdentity,
+                preparedLabel: rhs.element.xLabel,
+                labels: xLabels,
+                offset: rhs.offset),
             locale: locale)
     }.map(\.element)
 }
@@ -1685,73 +1789,101 @@ struct AutoChartResolvedPresentation: Sendable {
         var needsMissingSeries = false
         var needsMissingFacet = false
 
-        func categoryLabel(
-            value: AutoChartValue?,
-            preparedLabel: String?,
-            column: AutoChartColumn?
-        ) -> String? {
-            guard let value else { return preparedLabel }
-            return formatters.formatCategory(
-                column: column,
-                value: value,
-                context: .axisTick)
+        struct CategoryEntry {
+            var identity: String
+            var value: AutoChartValue?
+            var preparedLabel: String?
+        }
+        func resolvedCategoryPairs(
+            enabled: Bool,
+            identity: (AutoChartDatum) -> String?,
+            value: (AutoChartDatum) -> AutoChartValue?,
+            preparedLabel: (AutoChartDatum) -> String?,
+            column: AutoChartColumn?,
+            context: AutoChartFormattingContext
+        ) -> (pairs: [(identity: String, label: String)], needsMissing: Bool) {
+            guard enabled else { return ([], false) }
+            var entries: [CategoryEntry] = []
+            var seen: Set<String> = []
+            var needsMissing = false
+            for datum in data {
+                guard let identity = identity(datum) else {
+                    needsMissing = true
+                    continue
+                }
+                guard seen.insert(identity).inserted else { continue }
+                entries.append(
+                    CategoryEntry(
+                        identity: identity,
+                        value: value(datum),
+                        preparedLabel: preparedLabel(datum)))
+            }
+            let datePrecision = entries.compactMap { entry -> AutoChartDateLabelPrecision? in
+                guard case .date(let date)? = entry.value else { return nil }
+                return AutoChartDateFormatting.precision(
+                    for: date,
+                    locale: formatters.locale,
+                    timeZone: formatters.timeZone)
+            }.max()
+            let pairs = entries.compactMap { entry -> (String, String)? in
+                guard let value = entry.value else {
+                    return entry.preparedLabel.map { (entry.identity, $0) }
+                }
+                return (
+                    entry.identity,
+                    formatters.formatCategory(
+                        column: column,
+                        value: value,
+                        context: context,
+                        datePrecision: datePrecision))
+            }
+            return (pairs, needsMissing)
         }
 
-        for datum in data {
-            if presentation.usesXIdentityLabels {
-                if let identity = datum.xIdentity,
-                    let label = categoryLabel(
-                        value: datum.xCategoryValue,
-                        preparedLabel: datum.xLabel,
-                        column: presentation.xCategoryColumn)
-                {
-                    xPairs.append(
-                        (
-                            identity,
-                            requirements.allValuesLabel != nil && identity == "all"
-                                ? resolvedAllValues : label
-                        ))
-                } else if datum.xIdentity == nil {
-                    needsMissingValue = true
-                }
-            }
-            if presentation.usesYIdentityLabels {
-                // Heatmap preparation admits only categories with both a Y
-                // identity and label, so there is no missing Y value to resolve.
-                if let identity = datum.yIdentity,
-                    let label = categoryLabel(
-                        value: datum.yCategoryValue,
-                        preparedLabel: datum.yLabel,
-                        column: presentation.yCategoryColumn)
-                {
-                    yPairs.append((identity, label))
-                }
-            }
-            if presentation.usesSeriesIdentityLabels {
-                if let identity = datum.seriesIdentity,
-                    let label = categoryLabel(
-                        value: datum.seriesCategoryValue,
-                        preparedLabel: datum.series,
-                        column: presentation.seriesCategoryColumn)
-                {
-                    seriesPairs.append((identity, label))
-                } else if datum.seriesIdentity == nil {
-                    needsMissingSeries = true
-                }
-            }
-            if presentation.usesFacetIdentityLabels {
-                if let identity = datum.facetIdentity,
-                    let label = categoryLabel(
-                        value: datum.facetCategoryValue,
-                        preparedLabel: datum.facet,
-                        column: presentation.facetCategoryColumn)
-                {
-                    facetPairs.append((identity, label))
-                } else if datum.facetIdentity == nil {
-                    needsMissingFacet = true
-                }
-            }
+        let resolvedXPairs = resolvedCategoryPairs(
+            enabled: presentation.usesXIdentityLabels,
+            identity: \AutoChartDatum.xIdentity,
+            value: \AutoChartDatum.xCategoryValue,
+            preparedLabel: \AutoChartDatum.xLabel,
+            column: presentation.xCategoryColumn,
+            context: .axisTick)
+        xPairs = resolvedXPairs.pairs.map { pair in
+            (
+                pair.identity,
+                requirements.allValuesLabel != nil && pair.identity == "all"
+                    ? resolvedAllValues : pair.label
+            )
         }
+        needsMissingValue = resolvedXPairs.needsMissing
+
+        let resolvedYPairs = resolvedCategoryPairs(
+            enabled: presentation.usesYIdentityLabels,
+            identity: \AutoChartDatum.yIdentity,
+            value: \AutoChartDatum.yCategoryValue,
+            preparedLabel: \AutoChartDatum.yLabel,
+            column: presentation.yCategoryColumn,
+            context: .axisTick)
+        yPairs = resolvedYPairs.pairs
+
+        let resolvedSeriesPairs = resolvedCategoryPairs(
+            enabled: presentation.usesSeriesIdentityLabels,
+            identity: \AutoChartDatum.seriesIdentity,
+            value: \AutoChartDatum.seriesCategoryValue,
+            preparedLabel: \AutoChartDatum.series,
+            column: presentation.seriesCategoryColumn,
+            context: .legend)
+        seriesPairs = resolvedSeriesPairs.pairs
+        needsMissingSeries = resolvedSeriesPairs.needsMissing
+
+        let resolvedFacetPairs = resolvedCategoryPairs(
+            enabled: presentation.usesFacetIdentityLabels,
+            identity: \AutoChartDatum.facetIdentity,
+            value: \AutoChartDatum.facetCategoryValue,
+            preparedLabel: \AutoChartDatum.facet,
+            column: presentation.facetCategoryColumn,
+            context: .facetHeader)
+        facetPairs = resolvedFacetPairs.pairs
+        needsMissingFacet = resolvedFacetPairs.needsMissing
 
         if needsMissingValue {
             resolvedMissingValue = resolve(
@@ -2073,6 +2205,7 @@ struct AutoChartKPIContent: View {
 public struct AutoChartView<RowID: Hashable & Sendable>: View {
     private struct PreparedViewState {
         let content: AutoChartViewContent<RowID>
+        let renderedData: [AutoChartDatum]
         let boxPlotData: [AutoChartDatum]
         let facetPanels: [AutoChartFacetPanel]
     }
@@ -2081,6 +2214,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     private let presentation: AutoChartPresentation
     private let formatters: AutoChartFormatters
     private let textResolver: AutoChartTextResolver
+    private let renderedData: [AutoChartDatum]
     private let boxPlotData: [AutoChartDatum]
     private let facetPanels: [AutoChartFacetPanel]
     @Binding private var selection: AutoChartSelection<RowID>?
@@ -2102,19 +2236,27 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             data: core.data,
             using: textResolver,
             formatters: formatters)
+        let renderedData = orderedPresentedData(
+            core.data,
+            specification: preparedChart.recommendation.specification,
+            xLabels: resolvedPresentation.xDisplayLabels,
+            yLabels: resolvedPresentation.yDisplayLabels,
+            missingValue: resolvedPresentation.missingValue,
+            locale: formatters.locale)
         return PreparedViewState(
             content: .chart(preparedChart, resolvedPresentation),
+            renderedData: renderedData,
             boxPlotData:
                 preparedChart.recommendation.specification.family == .boxPlot
                 ? orderedBoxPlotData(
-                    core.data,
+                    renderedData,
                     labels: resolvedPresentation.xDisplayLabels,
                     fallback: resolvedPresentation.missingValue,
                     locale: formatters.locale) : [],
             facetPanels:
                 preparedChart.recommendation.specification.family == .faceted
                 ? orderedFacetPanels(
-                    in: core.data,
+                    in: renderedData,
                     labels: resolvedPresentation.facetDisplayLabels,
                     fallback: resolvedPresentation.missingFacet,
                     locale: formatters.locale) : [])
@@ -2132,6 +2274,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             formatters: formatters,
             textResolver: textResolver)
         content = state.content
+        renderedData = state.renderedData
         boxPlotData = state.boxPlotData
         facetPanels = state.facetPanels
         self._selection = selection
@@ -2153,10 +2296,12 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
                 formatters: formatters,
                 textResolver: textResolver)
             content = state.content
+            renderedData = state.renderedData
             boxPlotData = state.boxPlotData
             facetPanels = state.facetPanels
         } else if case .tableFallback(let fallback) = analysis.outcome {
             content = .fallback(fallback)
+            renderedData = []
             boxPlotData = []
             facetPanels = []
         } else {
@@ -2166,6 +2311,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
                         category: .fallback,
                         code: .noSafeChart,
                         defaultText: "No prepared chart is available.")))
+            renderedData = []
             boxPlotData = []
             facetPanels = []
         }
@@ -2190,7 +2336,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     private var snapshot: AutoChartSnapshot { preparedChart.core.snapshot }
     private var recommendation: AutoChartRecommendation { preparedChart.recommendation }
     private var validation: AutoChartValidationResult { preparedChart.validation }
-    private var data: [AutoChartDatum] { preparedChart.core.data }
+    private var data: [AutoChartDatum] { renderedData }
     private var renderPresentation: AutoChartRenderPresentation { preparedChart.core.presentation }
     private var sizeBounds: (minimum: Double, maximum: Double)? { renderPresentation.sizeBounds }
     private var sharedYDomain: ClosedRange<Double>? { renderPresentation.sharedYDomain }
