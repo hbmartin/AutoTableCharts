@@ -176,6 +176,7 @@ enum AutoChartAccessibility {
             startText: lowerText,
             endText: upperText,
             code: .histogramBinAccessibility,
+            compatibilityCode: .markAccessibilityRange,
             textResolver: textResolver)
     }
 
@@ -183,17 +184,33 @@ enum AutoChartAccessibility {
         startText: String,
         endText: String,
         code: AutoChartMessage.Code = .markAccessibilityRange,
+        compatibilityCode: AutoChartMessage.Code? = nil,
         textResolver: AutoChartTextResolver
     ) -> String {
-        return textResolver(
-            AutoChartMessage(
-                category: .accessibility,
-                code: code,
-                arguments: [
-                    "start": .string(startText),
-                    "end": .string(endText),
-                ],
-                defaultText: "From \(startText) to \(endText)"))
+        let arguments: [String: AutoChartMessageArgument] = [
+            "start": .string(startText),
+            "end": .string(endText),
+        ]
+        let defaultText = "From \(startText) to \(endText)"
+        let message = AutoChartMessage(
+            category: .accessibility,
+            code: code,
+            arguments: arguments,
+            defaultText: defaultText)
+        if let resolved = textResolver.resolve(message) {
+            return resolved
+        }
+        if let compatibilityCode,
+            let resolved = textResolver.resolve(
+                AutoChartMessage(
+                    category: .accessibility,
+                    code: compatibilityCode,
+                    arguments: arguments,
+                    defaultText: defaultText))
+        {
+            return resolved
+        }
+        return defaultText
     }
 
     private static func label(
@@ -961,10 +978,15 @@ enum AutoChartDataPreparation {
             return []
         }
         if minimum == maximum {
-            let previous = minimum.nextDown
-            let next = maximum.nextUp
-            let lower = previous.isFinite ? previous : minimum
-            let upper = next.isFinite ? next : maximum
+            let padding = max(1, abs(minimum) * 0.05)
+            let paddedLower = minimum - padding
+            let paddedUpper = maximum + padding
+            let lower = paddedLower.isFinite ? paddedLower : minimum
+            let upper = paddedUpper.isFinite ? paddedUpper : maximum
+            guard lower < upper else {
+                assertionFailure("A finite histogram value requires finite display bounds.")
+                return []
+            }
             let midpoint = lower + (upper - lower) / 2
             return [
                 AutoChartDatum(
@@ -981,6 +1003,19 @@ enum AutoChartDataPreparation {
         let scaledMinimum = minimum / scale
         let scaledMaximum = maximum / scale
         let scaledWidth = (scaledMaximum - scaledMinimum) / Double(count)
+        let scaledSpan = scaledMaximum - scaledMinimum
+        func value(at fraction: Double) -> Double {
+            if fraction <= 0 { return minimum }
+            if fraction >= 1 { return maximum }
+            let candidate = scaledMinimum + scaledSpan * fraction
+            let clamped = min(max(candidate, scaledMinimum), scaledMaximum)
+            let value = clamped * scale
+            guard value.isFinite else {
+                assertionFailure("Scaled histogram boundaries must remain finite.")
+                return fraction < 0.5 ? minimum : maximum
+            }
+            return value
+        }
         var bins: [[(Double, Int)]] = Array(repeating: [], count: count)
         for value in values {
             let scaledValue = value.0 / scale
@@ -989,11 +1024,9 @@ enum AutoChartDataPreparation {
             bins[min(max(rawIndex, 0), count - 1)].append(value)
         }
         return bins.enumerated().map { index, bin in
-            let scaledStart = scaledMinimum + Double(index) * scaledWidth
-            let scaledEnd = scaledStart + scaledWidth
-            let start = scaledStart * scale
-            let end = scaledEnd * scale
-            let midpoint = (scaledStart + scaledWidth / 2) * scale
+            let start = value(at: Double(index) / Double(count))
+            let end = value(at: Double(index + 1) / Double(count))
+            let midpoint = value(at: (Double(index) + 0.5) / Double(count))
             return AutoChartDatum(
                 id: "bin-\(index)",
                 sourceRowIDs: Set(bin.map(\.1)),
@@ -1690,9 +1723,7 @@ struct AutoChartRenderPresentation: Sendable {
         usesSeriesIdentityLabels = specification.encoding.series != nil
         usesFacetIdentityLabels = specification.encoding.facet != nil
         usesSharedXCategoryDomain = specification.family == .faceted && xIsCategorical
-        uniqueXCount = specification.family == .histogram
-            ? data.count
-            : Set(data.compactMap { $0.xIdentity ?? $0.xLabel }).count
+        uniqueXCount = Set(data.compactMap { $0.xIdentity ?? $0.xLabel }).count
         let zoomSource = specification.family.zoomSource(for: xSemanticType)
         var minimumZoomDate: Date?
         var maximumZoomDate: Date?
@@ -1840,6 +1871,61 @@ struct AutoChartRenderPresentation: Sendable {
     }
 }
 
+private final class AutoChartHistogramBinAccessibilityCache: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cachedLabels: [String: String]?
+    private var buildLabels: (@Sendable () -> [String: String])?
+
+    init(
+        data: [AutoChartDatum],
+        column: AutoChartColumn?,
+        formatters: AutoChartFormatters,
+        textResolver: AutoChartTextResolver
+    ) {
+        buildLabels = {
+            var labels: [String: String] = [:]
+            labels.reserveCapacity(data.count)
+            for datum in data {
+                guard let lower = datum.lower, lower.isFinite,
+                    let upper = datum.upper, upper.isFinite
+                else {
+                    assertionFailure("Prepared histogram bins require finite bounds.")
+                    labels[datum.id] = AutoChartValue.unrepresentableValuePlaceholder
+                    continue
+                }
+                labels[datum.id] = AutoChartAccessibility.histogramBinLabel(
+                    lower: lower,
+                    upper: upper,
+                    column: column,
+                    formatters: formatters,
+                    textResolver: textResolver)
+            }
+            return labels
+        }
+    }
+
+    func label(for datum: AutoChartDatum) -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        let labels: [String: String]
+        if let cachedLabels {
+            labels = cachedLabels
+        } else if let buildLabels {
+            labels = buildLabels()
+            cachedLabels = labels
+            self.buildLabels = nil
+        } else {
+            assertionFailure("Histogram accessibility cache lost its resolver.")
+            return AutoChartValue.unrepresentableValuePlaceholder
+        }
+        guard let label = labels[datum.id] else {
+            assertionFailure("Prepared histogram bins require a cached accessibility label.")
+            return AutoChartValue.unrepresentableValuePlaceholder
+        }
+        return label
+    }
+}
+
 struct AutoChartResolvedPresentation: Sendable {
     var x: String
     var y: String
@@ -1857,7 +1943,7 @@ struct AutoChartResolvedPresentation: Sendable {
     var yDisplayLabels: [String: String]
     var seriesDisplayLabels: [String: String]
     var facetDisplayLabels: [String: String]
-    var histogramBinAccessibilityLabels: [String: String]
+    private var histogramBinAccessibilityCache: AutoChartHistogramBinAccessibilityCache?
 
     init(
         presentation: AutoChartRenderPresentation,
@@ -2065,27 +2151,6 @@ struct AutoChartResolvedPresentation: Sendable {
                 facetPairs,
                 reserving: needsMissingFacet ? [resolvedMissingFacet] : [],
                 textResolver: textResolver) : [:]
-        var resolvedHistogramBinAccessibilityLabels: [String: String] = [:]
-        if presentation.family == .histogram {
-            for datum in data {
-                guard let lower = datum.lower, lower.isFinite,
-                    let upper = datum.upper, upper.isFinite
-                else {
-                    assertionFailure("Prepared histogram bins require finite bounds.")
-                    resolvedHistogramBinAccessibilityLabels[datum.id] =
-                        AutoChartValue.unrepresentableValuePlaceholder
-                    continue
-                }
-                resolvedHistogramBinAccessibilityLabels[datum.id] =
-                    AutoChartAccessibility.histogramBinLabel(
-                        lower: lower,
-                        upper: upper,
-                        column: presentation.xCategoryColumn,
-                        formatters: formatters,
-                        textResolver: textResolver)
-            }
-        }
-
         x = resolvedX
         y = resolvedY
         series = resolvedSeries
@@ -2102,7 +2167,22 @@ struct AutoChartResolvedPresentation: Sendable {
         yDisplayLabels = resolvedYDisplayLabels
         seriesDisplayLabels = resolvedSeriesDisplayLabels
         facetDisplayLabels = resolvedFacetDisplayLabels
-        histogramBinAccessibilityLabels = resolvedHistogramBinAccessibilityLabels
+        histogramBinAccessibilityCache =
+            presentation.family == .histogram
+            ? AutoChartHistogramBinAccessibilityCache(
+                data: data,
+                column: presentation.xCategoryColumn,
+                formatters: formatters,
+                textResolver: textResolver)
+            : nil
+    }
+
+    func histogramBinAccessibilityLabel(for datum: AutoChartDatum) -> String {
+        guard let histogramBinAccessibilityCache else {
+            assertionFailure("Only histograms have cached bin accessibility labels.")
+            return AutoChartValue.unrepresentableValuePlaceholder
+        }
+        return histogramBinAccessibilityCache.label(for: datum)
     }
 }
 
@@ -3328,12 +3408,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         let xColumn = resolvedColumn(specification.encoding.x)
         let name: String
         if specification.family == .histogram {
-            if let label = resolvedPresentation.histogramBinAccessibilityLabels[datum.id] {
-                name = label
-            } else {
-                assertionFailure("Prepared histogram bins require a cached accessibility label.")
-                name = AutoChartValue.unrepresentableValuePlaceholder
-            }
+            name = resolvedPresentation.histogramBinAccessibilityLabel(for: datum)
         } else if [
             .bar, .groupedBar, .stackedBar, .normalizedBar, .rankedDot,
             .boxPlot, .donut, .range,

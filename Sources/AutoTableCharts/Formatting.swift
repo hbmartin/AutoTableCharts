@@ -349,62 +349,75 @@ public struct AutoChartFormatters: Sendable {
     ) -> String {
         switch number {
         case .integer(let value):
-            return AutoChartCategoryNumberPolicy.concise(
-                standard: value.formatted(
-                    .currency(code: code).locale(locale)
-                        .precision(.significantDigits(1...38))),
-                scientific: formatCategoryCurrencyScientific(number, code: code))
+            return formatCategoryCurrency(.decimal(Decimal(value)), code: code)
         case .double(let value):
+            let style = FloatingPointFormatStyle<Double>.Currency(
+                code: code,
+                locale: locale
+            ).precision(.significantDigits(1...17))
+            let standard = value.formatted(style)
+            let scientific: String
+            if #available(iOS 18, macOS 15, tvOS 18, watchOS 11, *) {
+                scientific = value.formatted(style.notation(.scientific))
+            } else {
+                let standardMagnitude = abs(value).formatted(
+                    .number.locale(locale).grouping(.automatic)
+                        .precision(.significantDigits(1...17)))
+                let scientificMagnitude = abs(value).formatted(
+                    .number.locale(locale).notation(.scientific)
+                        .precision(.significantDigits(1...17)))
+                scientific = replacingCurrencyMagnitude(
+                    in: standard,
+                    standardMagnitude: standardMagnitude,
+                    scientificMagnitude: scientificMagnitude)
+            }
             return AutoChartCategoryNumberPolicy.concise(
-                standard: value.formatted(
-                    .currency(code: code).locale(locale)
-                        .precision(.significantDigits(1...17))),
-                scientific: formatCategoryCurrencyScientific(number, code: code))
+                standard: standard,
+                scientific: scientific)
         case .decimal(let value):
+            let style = Decimal.FormatStyle.Currency(
+                code: code,
+                locale: locale
+            ).precision(.significantDigits(1...38))
+            let standard = value.formatted(style)
+            let scientific: String
+            if #available(iOS 18, macOS 15, tvOS 18, watchOS 11, *) {
+                scientific = value.formatted(style.notation(.scientific))
+            } else {
+                let standardMagnitude = abs(value).formatted(
+                    .number.locale(locale).grouping(.automatic)
+                        .precision(.significantDigits(1...38)))
+                let scientificMagnitude = abs(value).formatted(
+                    .number.locale(locale).notation(.scientific)
+                        .precision(.significantDigits(1...38)))
+                scientific = replacingCurrencyMagnitude(
+                    in: standard,
+                    standardMagnitude: standardMagnitude,
+                    scientificMagnitude: scientificMagnitude)
+            }
             return AutoChartCategoryNumberPolicy.concise(
-                standard: value.formatted(
-                    .currency(code: code).locale(locale)
-                        .precision(.significantDigits(1...38))),
-                scientific: formatCategoryCurrencyScientific(number, code: code))
+                standard: standard,
+                scientific: scientific)
         }
     }
 
-    private func formatCategoryCurrencyScientific(
-        _ number: CategoryNumber,
-        code: String
+    private func replacingCurrencyMagnitude(
+        in standard: String,
+        standardMagnitude: String,
+        scientificMagnitude: String
     ) -> String {
-        let isNegative: Bool
-        let magnitude: String
-        switch number {
-        case .integer(let value):
-            var decimal = Decimal(value)
-            isNegative = decimal < 0
-            if isNegative { decimal *= -1 }
-            magnitude = decimal.formatted(
-                .number.locale(locale).notation(.scientific)
-                    .precision(.significantDigits(1...38)))
-        case .double(let value):
-            isNegative = value.sign == .minus
-            magnitude = abs(value).formatted(
-                .number.locale(locale).notation(.scientific)
-                    .precision(.significantDigits(1...17)))
-        case .decimal(let value):
-            var decimal = value
-            isNegative = decimal < 0
-            if isNegative { decimal *= -1 }
-            magnitude = decimal.formatted(
-                .number.locale(locale).notation(.scientific)
-                    .precision(.significantDigits(1...38)))
+        guard standard != standardMagnitude else {
+            // Match native Currency.FormatStyle behavior for an unsupported
+            // code: without a currency affix, scientific currency notation is
+            // unavailable rather than silently borrowing the locale currency.
+            return standard
         }
-
-        let formatter = NumberFormatter()
-        formatter.locale = locale
-        formatter.numberStyle = .currency
-        formatter.currencyCode = code
-        let prefix = isNegative ? formatter.negativePrefix : formatter.positivePrefix
-        let suffix = isNegative ? formatter.negativeSuffix : formatter.positiveSuffix
-        guard prefix != nil || suffix != nil else { return "\(magnitude) \(code)" }
-        return "\(prefix ?? "")\(magnitude)\(suffix ?? "")"
+        guard let range = standard.range(of: standardMagnitude) else {
+            // Preserve the native currency output if Foundation uses a numeric
+            // pattern that cannot be isolated safely on an older OS.
+            return standard
+        }
+        return standard.replacingCharacters(in: range, with: scientificMagnitude)
     }
 
     private func formatCategoryPercent(
