@@ -665,6 +665,41 @@ struct AutoChartRenderedMeasureSemantics: Hashable, Sendable {
     }
 }
 
+private func expandedFiniteRange(
+    _ range: ClosedRange<Double>,
+    padding: Double
+) -> ClosedRange<Double>? {
+    guard range.lowerBound.isFinite, range.upperBound.isFinite,
+        padding.isFinite, padding >= 0
+    else { return nil }
+    let paddedLower = range.lowerBound - padding
+    let paddedUpper = range.upperBound + padding
+    let lower = paddedLower.isFinite ? paddedLower : range.lowerBound
+    let upper = paddedUpper.isFinite ? paddedUpper : range.upperBound
+    if lower < upper {
+        if (upper - lower).isFinite { return lower...upper }
+        // Padding near a finite limit can make an otherwise usable span
+        // overflow. Prefer the unpadded range in that case.
+        if range.lowerBound < range.upperBound,
+            (range.upperBound - range.lowerBound).isFinite
+        {
+            return range
+        }
+        return nil
+    }
+
+    // A zero or underflowed padding can leave a singleton. Move by one
+    // representable value where possible without creating infinity.
+    let previous = range.lowerBound.nextDown
+    let next = range.upperBound.nextUp
+    let finiteLower = previous.isFinite ? previous : range.lowerBound
+    let finiteUpper = next.isFinite ? next : range.upperBound
+    guard finiteLower < finiteUpper,
+        (finiteUpper - finiteLower).isFinite
+    else { return nil }
+    return finiteLower...finiteUpper
+}
+
 enum AutoChartDataPreparation {
     struct PreparedData: Sendable {
         var data: [AutoChartDatum]
@@ -978,55 +1013,75 @@ enum AutoChartDataPreparation {
             return []
         }
         if minimum == maximum {
-            let padding = max(1, abs(minimum) * 0.05)
-            let paddedLower = minimum - padding
-            let paddedUpper = maximum + padding
-            let lower = paddedLower.isFinite ? paddedLower : minimum
-            let upper = paddedUpper.isFinite ? paddedUpper : maximum
-            guard lower < upper else {
+            let relativePadding = abs(minimum) * 0.05
+            let padding = relativePadding > 0 ? relativePadding : (minimum == 0 ? 1 : 0)
+            guard let bounds = expandedFiniteRange(
+                minimum...maximum,
+                padding: padding)
+            else {
                 assertionFailure("A finite histogram value requires finite display bounds.")
                 return []
             }
-            let midpoint = lower + (upper - lower) / 2
+            let midpoint = bounds.lowerBound + (bounds.upperBound - bounds.lowerBound) / 2
             return [
                 AutoChartDatum(
                     id: "bin-0",
                     sourceRowIDs: Set(values.map(\.1)),
                     xNumber: midpoint,
                     yNumber: Double(values.count),
-                    lower: lower,
-                    upper: upper)
+                    lower: bounds.lowerBound,
+                    upper: bounds.upperBound)
             ]
         }
         let count = min(1_000, max(1, specification.binCount ?? 10))
         let scale = max(abs(minimum), abs(maximum))
         let scaledMinimum = minimum / scale
         let scaledMaximum = maximum / scale
-        let scaledWidth = (scaledMaximum - scaledMinimum) / Double(count)
         let scaledSpan = scaledMaximum - scaledMinimum
-        func value(at fraction: Double) -> Double {
+        func unscaledBoundary(at fraction: Double) -> Double {
             if fraction <= 0 { return minimum }
             if fraction >= 1 { return maximum }
-            let candidate = scaledMinimum + scaledSpan * fraction
-            let clamped = min(max(candidate, scaledMinimum), scaledMaximum)
-            let value = clamped * scale
-            guard value.isFinite else {
-                assertionFailure("Scaled histogram boundaries must remain finite.")
-                return fraction < 0.5 ? minimum : maximum
+            let scaledBoundary = scaledMinimum + scaledSpan * fraction
+            let clamped = min(max(scaledBoundary, scaledMinimum), scaledMaximum)
+            return min(max(clamped * scale, minimum), maximum)
+        }
+        var boundaries = [minimum]
+        boundaries.reserveCapacity(count + 1)
+        if count > 1 {
+            for index in 1..<count {
+                let candidate = unscaledBoundary(
+                    at: Double(index) / Double(count))
+                boundaries.append(max(boundaries[index - 1], candidate))
             }
-            return value
+        }
+        boundaries.append(max(boundaries[count - 1], maximum))
+
+        func binIndex(containing value: Double) -> Int {
+            var lowerIndex = 0
+            var upperIndex = count
+            while lowerIndex < upperIndex {
+                let index = lowerIndex + (upperIndex - lowerIndex) / 2
+                if value < boundaries[index + 1] {
+                    upperIndex = index
+                } else {
+                    lowerIndex = index + 1
+                }
+            }
+            return min(lowerIndex, count - 1)
         }
         var bins: [[(Double, Int)]] = Array(repeating: [], count: count)
-        for value in values {
-            let scaledValue = value.0 / scale
-            let position = (scaledValue - scaledMinimum) / scaledWidth
-            let rawIndex = position.isFinite ? Int(position.rounded(.down)) : 0
-            bins[min(max(rawIndex, 0), count - 1)].append(value)
+        for entry in values {
+            bins[binIndex(containing: entry.0)].append(entry)
         }
         return bins.enumerated().map { index, bin in
-            let start = value(at: Double(index) / Double(count))
-            let end = value(at: Double(index + 1) / Double(count))
-            let midpoint = value(at: (Double(index) + 0.5) / Double(count))
+            let start = boundaries[index]
+            let end = boundaries[index + 1]
+            let midpoint = min(
+                max(
+                    unscaledBoundary(
+                        at: (Double(index) + 0.5) / Double(count)),
+                    start),
+                end)
             return AutoChartDatum(
                 id: "bin-\(index)",
                 sourceRowIDs: Set(bin.map(\.1)),
@@ -1570,7 +1625,7 @@ struct AutoChartRenderPresentation: Sendable {
     fileprivate var seriesCategoryColumn: AutoChartColumn?
     fileprivate var facetCategoryColumn: AutoChartColumn?
     fileprivate var generatedTextRequirements: AutoChartGeneratedTextRequirements
-    var uniqueXCount: Int
+    var xCategoryCount: Int
     var timeZoomValueCount: Int
     var timeZoomSpan: TimeInterval
     var numberZoomValueCount: Int
@@ -1637,41 +1692,6 @@ struct AutoChartRenderPresentation: Sendable {
             let upper = Date(timeIntervalSinceReferenceDate: intervalRange.upperBound)
             return lower...upper
         }
-        func expandedFiniteRange(
-            _ range: ClosedRange<Double>,
-            padding: Double
-        ) -> ClosedRange<Double>? {
-            guard range.lowerBound.isFinite, range.upperBound.isFinite,
-                padding.isFinite, padding >= 0
-            else { return nil }
-            let paddedLower = range.lowerBound - padding
-            let paddedUpper = range.upperBound + padding
-            let lower = paddedLower.isFinite ? paddedLower : range.lowerBound
-            let upper = paddedUpper.isFinite ? paddedUpper : range.upperBound
-            if lower < upper {
-                if (upper - lower).isFinite { return lower...upper }
-                // Padding near a finite limit can make an otherwise usable span
-                // overflow. Prefer the unpadded range in that case.
-                if range.lowerBound < range.upperBound,
-                    (range.upperBound - range.lowerBound).isFinite
-                {
-                    return range
-                }
-                return nil
-            }
-
-            // A zero or underflowed padding can leave a singleton. Move by one
-            // representable value where possible without creating infinity.
-            let previous = range.lowerBound.nextDown
-            let next = range.upperBound.nextUp
-            let finiteLower = previous.isFinite ? previous : range.lowerBound
-            let finiteUpper = next.isFinite ? next : range.upperBound
-            guard finiteLower < finiteUpper,
-                (finiteUpper - finiteLower).isFinite
-            else { return nil }
-            return finiteLower...finiteUpper
-        }
-
         let xSemanticType = specification.encoding.x.flatMap { profiles[$0]?.semanticType }
         let xIsCategorical =
             specification.encoding.x.flatMap {
@@ -1723,7 +1743,7 @@ struct AutoChartRenderPresentation: Sendable {
         usesSeriesIdentityLabels = specification.encoding.series != nil
         usesFacetIdentityLabels = specification.encoding.facet != nil
         usesSharedXCategoryDomain = specification.family == .faceted && xIsCategorical
-        uniqueXCount = Set(data.compactMap { $0.xIdentity ?? $0.xLabel }).count
+        xCategoryCount = Set(data.compactMap { $0.xIdentity ?? $0.xLabel }).count
         let zoomSource = specification.family.zoomSource(for: xSemanticType)
         var minimumZoomDate: Date?
         var maximumZoomDate: Date?
@@ -1872,9 +1892,17 @@ struct AutoChartRenderPresentation: Sendable {
 }
 
 private final class AutoChartHistogramBinAccessibilityCache: @unchecked Sendable {
+    private struct Bounds: Sendable {
+        let lower: Double?
+        let upper: Double?
+    }
+
     private let lock = NSLock()
-    private var cachedLabels: [String: String]?
-    private var buildLabels: (@Sendable () -> [String: String])?
+    private let boundsByID: [String: Bounds]
+    private let column: AutoChartColumn?
+    private let formatters: AutoChartFormatters
+    private let textResolver: AutoChartTextResolver
+    private var cachedLabels: [String: String] = [:]
 
     init(
         data: [AutoChartDatum],
@@ -1882,46 +1910,46 @@ private final class AutoChartHistogramBinAccessibilityCache: @unchecked Sendable
         formatters: AutoChartFormatters,
         textResolver: AutoChartTextResolver
     ) {
-        buildLabels = {
-            var labels: [String: String] = [:]
-            labels.reserveCapacity(data.count)
-            for datum in data {
-                guard let lower = datum.lower, lower.isFinite,
-                    let upper = datum.upper, upper.isFinite
-                else {
-                    assertionFailure("Prepared histogram bins require finite bounds.")
-                    labels[datum.id] = AutoChartValue.unrepresentableValuePlaceholder
-                    continue
-                }
-                labels[datum.id] = AutoChartAccessibility.histogramBinLabel(
-                    lower: lower,
-                    upper: upper,
-                    column: column,
-                    formatters: formatters,
-                    textResolver: textResolver)
-            }
-            return labels
-        }
+        boundsByID = Dictionary(
+            uniqueKeysWithValues: data.map {
+                ($0.id, Bounds(lower: $0.lower, upper: $0.upper))
+            })
+        self.column = column
+        self.formatters = formatters
+        self.textResolver = textResolver
     }
 
     func label(for datum: AutoChartDatum) -> String {
         lock.lock()
-        defer { lock.unlock() }
-        let labels: [String: String]
-        if let cachedLabels {
-            labels = cachedLabels
-        } else if let buildLabels {
-            labels = buildLabels()
-            cachedLabels = labels
-            self.buildLabels = nil
+        if let cached = cachedLabels[datum.id] {
+            lock.unlock()
+            return cached
+        }
+        lock.unlock()
+
+        guard let bounds = boundsByID[datum.id] else {
+            assertionFailure("Prepared histogram bins require cached bounds.")
+            return AutoChartValue.unrepresentableValuePlaceholder
+        }
+        let resolved: String
+        if let lower = bounds.lower, lower.isFinite,
+            let upper = bounds.upper, upper.isFinite
+        {
+            resolved = AutoChartAccessibility.histogramBinLabel(
+                lower: lower,
+                upper: upper,
+                column: column,
+                formatters: formatters,
+                textResolver: textResolver)
         } else {
-            assertionFailure("Histogram accessibility cache lost its resolver.")
-            return AutoChartValue.unrepresentableValuePlaceholder
+            assertionFailure("Prepared histogram bins require finite bounds.")
+            resolved = AutoChartValue.unrepresentableValuePlaceholder
         }
-        guard let label = labels[datum.id] else {
-            assertionFailure("Prepared histogram bins require a cached accessibility label.")
-            return AutoChartValue.unrepresentableValuePlaceholder
-        }
+
+        lock.lock()
+        let label = cachedLabels[datum.id] ?? resolved
+        cachedLabels[datum.id] = label
+        lock.unlock()
         return label
     }
 }
@@ -1943,7 +1971,10 @@ struct AutoChartResolvedPresentation: Sendable {
     var yDisplayLabels: [String: String]
     var seriesDisplayLabels: [String: String]
     var facetDisplayLabels: [String: String]
-    private var histogramBinAccessibilityCache: AutoChartHistogramBinAccessibilityCache?
+    /// Reference-backed memoization is intentionally shared across value copies
+    /// so SwiftUI view copies do not repeat host formatting and localization.
+    private let sharedHistogramBinAccessibilityCache:
+        AutoChartHistogramBinAccessibilityCache?
 
     init(
         presentation: AutoChartRenderPresentation,
@@ -2167,7 +2198,7 @@ struct AutoChartResolvedPresentation: Sendable {
         yDisplayLabels = resolvedYDisplayLabels
         seriesDisplayLabels = resolvedSeriesDisplayLabels
         facetDisplayLabels = resolvedFacetDisplayLabels
-        histogramBinAccessibilityCache =
+        sharedHistogramBinAccessibilityCache =
             presentation.family == .histogram
             ? AutoChartHistogramBinAccessibilityCache(
                 data: data,
@@ -2178,11 +2209,11 @@ struct AutoChartResolvedPresentation: Sendable {
     }
 
     func histogramBinAccessibilityLabel(for datum: AutoChartDatum) -> String {
-        guard let histogramBinAccessibilityCache else {
+        guard let sharedHistogramBinAccessibilityCache else {
             assertionFailure("Only histograms have cached bin accessibility labels.")
             return AutoChartValue.unrepresentableValuePlaceholder
         }
-        return histogramBinAccessibilityCache.label(for: datum)
+        return sharedHistogramBinAccessibilityCache.label(for: datum)
     }
 }
 
@@ -2599,7 +2630,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     private var yDisplayLabels: [String: String] { resolvedPresentation.yDisplayLabels }
     private var seriesDisplayLabels: [String: String] { resolvedPresentation.seriesDisplayLabels }
     private var facetDisplayLabels: [String: String] { resolvedPresentation.facetDisplayLabels }
-    private var uniqueXCount: Int { renderPresentation.uniqueXCount }
+    private var xCategoryCount: Int { renderPresentation.xCategoryCount }
     private var timeZoomValueCount: Int { renderPresentation.timeZoomValueCount }
     private var timeZoomSpan: TimeInterval { renderPresentation.timeZoomSpan }
     private var numberZoomValueCount: Int { renderPresentation.numberZoomValueCount }
@@ -2774,7 +2805,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             .chartXAxisLabel(yTitle)
             .chartYAxisLabel(xTitle)
             .chartXAxis { yNumericAxis() }
-            selectableCategoryY(verticalZoom(chart, categoryCount: uniqueXCount))
+            selectableCategoryY(verticalZoom(chart, categoryCount: xCategoryCount))
         } else {
             let chart = Chart(data) { datum in
                 verticalBarMark(
@@ -2785,7 +2816,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             .chartXAxisLabel(xTitle)
             .chartYAxisLabel(yTitle)
             .chartYAxis { yNumericAxis() }
-            selectableCategoryX(horizontalZoom(chart, categoryCount: uniqueXCount))
+            selectableCategoryX(horizontalZoom(chart, categoryCount: xCategoryCount))
         }
     }
 
@@ -2807,7 +2838,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         .chartXAxisLabel(yTitle)
         .chartYAxisLabel(xTitle)
         .chartXAxis { yNumericAxis() }
-        return selectableCategoryY(verticalZoom(chart, categoryCount: uniqueXCount))
+        return selectableCategoryY(verticalZoom(chart, categoryCount: xCategoryCount))
     }
 
     @ViewBuilder
@@ -2850,7 +2881,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             .chartXAxisLabel(xTitle)
             .chartYAxisLabel(yTitle)
             .chartYAxis { yNumericAxis() }
-            selectableCategoryX(horizontalZoom(chart, categoryCount: uniqueXCount))
+            selectableCategoryX(horizontalZoom(chart, categoryCount: xCategoryCount))
         }
     }
 
@@ -2921,7 +2952,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         .chartXAxisLabel(xTitle)
         .chartYAxisLabel(yTitle)
         .chartYAxis { yNumericAxis() }
-        return selectableCategoryX(horizontalZoom(chart, categoryCount: uniqueXCount))
+        return selectableCategoryX(horizontalZoom(chart, categoryCount: xCategoryCount))
     }
 
     private var heatmapChart: some View {
@@ -2959,7 +2990,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
                 }
             }
         }
-        return selectableHeatmap(horizontalZoom(chart, categoryCount: uniqueXCount))
+        return selectableHeatmap(horizontalZoom(chart, categoryCount: xCategoryCount))
     }
 
     private var donutChart: some View {
