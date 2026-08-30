@@ -157,7 +157,7 @@ enum AutoChartAccessibility {
     }
 }
 
-/// Returns the one exact typed source value represented by every element.
+/// Returns one canonical typed source value represented by every element.
 ///
 /// Matching semantic identities are necessary but not sufficient: selection
 /// exposes an `AutoChartValue`, so it must not choose arbitrarily between raw
@@ -172,31 +172,40 @@ private func identicalSourceValue<Elements: Collection>(
     guard let firstValue = value(first),
         elements.dropFirst().allSatisfy({ element in
             identity(element) == firstIdentity
-                && hasSameStoredValue(value(element), as: firstValue)
+                && hasSameSemanticValue(value(element), as: firstValue)
         }),
         firstIdentity != nil || firstValue == .null
     else { return nil }
-    return firstValue
+    return canonicalSelectionValue(firstValue)
 }
 
-/// Floating-point and date payloads preserve their exact stored representation.
-/// Decimal values follow `Decimal`'s public equality semantics, which normalize
-/// equivalent coefficients and exponents.
-private func hasSameStoredValue(
+/// Selection follows `AutoChartValue`'s public equality semantics after category
+/// identity has established that the values represent the same dimension.
+private func hasSameSemanticValue(
     _ candidate: AutoChartValue?,
     as reference: AutoChartValue
 ) -> Bool {
-    guard let candidate else { return false }
-    switch (candidate, reference) {
-    case (.double(let candidate), .double(let reference)):
-        return candidate.bitPattern == reference.bitPattern
-    case (.decimal(let candidate), .decimal(let reference)):
-        return candidate == reference
-    case (.date(let candidate), .date(let reference)):
-        return candidate.timeIntervalSinceReferenceDate.bitPattern
-            == reference.timeIntervalSinceReferenceDate.bitPattern
+    candidate == reference
+}
+
+/// Removes storage-only distinctions from a selected value so merged categories
+/// return the same representation regardless of source-row order.
+private func canonicalSelectionValue(_ value: AutoChartValue) -> AutoChartValue {
+    switch value {
+    case .double(let number):
+        return .double(number == 0 ? 0 : number)
+    case .decimal(let number):
+        guard !number.isNaN,
+            let canonical = Decimal(
+                string: NSDecimalNumber(decimal: number).stringValue,
+                locale: AutoChartProfiler.posixLocale)
+        else { return value }
+        return .decimal(canonical)
+    case .date(let date):
+        let interval = date.timeIntervalSinceReferenceDate
+        return interval == 0 ? .date(Date(timeIntervalSinceReferenceDate: 0)) : value
     default:
-        return candidate == reference
+        return value
     }
 }
 
@@ -236,8 +245,13 @@ private func requiresContinuousXOrdering(
     family: AutoChartFamily,
     semanticType: AutoChartSemanticType?
 ) -> Bool {
-    [.line, .pointLine, .area, .faceted].contains(family)
-        && [.temporal, .quantitative].contains(semanticType)
+    guard semanticType == .temporal || semanticType == .quantitative else {
+        return false
+    }
+    return switch family {
+    case .line, .pointLine, .area, .faceted: true
+    default: false
+    }
 }
 
 private func orderedByMeasure(
@@ -262,6 +276,12 @@ private func orderedByMeasure(
             categoryKey: categoryKey(offset, datum)
         )
     }.sorted { lhs, rhs in
+        if lhs.value.isNaN || rhs.value.isNaN {
+            if lhs.value.isNaN != rhs.value.isNaN {
+                return !lhs.value.isNaN
+            }
+            return categoryPrecedes(lhs.categoryKey, rhs.categoryKey, locale: locale)
+        }
         if lhs.value != rhs.value {
             return sortsAscending ? lhs.value < rhs.value : lhs.value > rhs.value
         }
@@ -586,9 +606,6 @@ enum AutoChartDataPreparation {
     private static func categoryLabel(
         for identity: AutoChartValueIdentity
     ) -> String? {
-        if case .integer(let value) = identity {
-            return String(value)
-        }
         return identity.categoryValue?.categoryString()
     }
 
@@ -938,11 +955,11 @@ enum AutoChartDataPreparation {
             let xSourceValue = x.flatMap { _ -> AutoChartValue? in
                 guard let first = contributingValues.first?.xSourceValue,
                     contributingValues.dropFirst().allSatisfy({
-                        hasSameStoredValue($0.xSourceValue, as: first)
+                        hasSameSemanticValue($0.xSourceValue, as: first)
                     }),
                     groupIdentity != .missing || first == .null
                 else { return nil }
-                return first
+                return canonicalSelectionValue(first)
             }
             let xLabel: String
             if x == nil {
@@ -1225,7 +1242,6 @@ func orderedFacetPanels(
 func orderedPresentedData(
     _ data: [AutoChartDatum],
     specification: AutoChartSpecification,
-    xSemanticType: AutoChartSemanticType?,
     xLabels: [String: String],
     yLabels: [String: String],
     missingValue: String,
@@ -1268,13 +1284,6 @@ func orderedPresentedData(
             }
             return categoryPrecedes(lhs.y, rhs.y, locale: locale)
         }.map(\.datum)
-    }
-
-    if requiresContinuousXOrdering(
-        family: specification.family,
-        semanticType: xSemanticType)
-    {
-        return data
     }
 
     guard !xLabels.isEmpty else { return data }
@@ -1861,11 +1870,6 @@ struct AutoChartResolvedPresentation: Sendable {
                         calendar: calendar)
                 }.max()
             }
-            let numberNotation: AutoChartCategoryNumberNotation =
-                entries.values.contains { entry in
-                    entry.value?.categoryPrefersScientificNotation(
-                        locale: formatters.locale) == true
-                } ? .scientific : .standard
             return entries.values.compactMap { entry -> (String, String)? in
                 guard let value = entry.value else {
                     return entry.preparedLabel.map { (entry.identity, $0) }
@@ -1877,7 +1881,6 @@ struct AutoChartResolvedPresentation: Sendable {
                         value: value,
                         context: context,
                         datePrecision: datePrecision,
-                        numberNotation: numberNotation,
                         calendar: calendar))
             }
         }
@@ -1902,13 +1905,13 @@ struct AutoChartResolvedPresentation: Sendable {
         let seriesPairs = resolvedCategoryPairs(
             seriesEntries,
             column: presentation.seriesCategoryColumn,
-            context: .axisTick)
+            context: .legend)
         let needsMissingSeries = seriesEntries.needsMissing
 
         let facetPairs = resolvedCategoryPairs(
             facetEntries,
             column: presentation.facetCategoryColumn,
-            context: .axisTick)
+            context: .facetHeader)
         let needsMissingFacet = facetEntries.needsMissing
 
         if needsMissingValue {
@@ -1949,14 +1952,6 @@ struct AutoChartResolvedPresentation: Sendable {
                 reserving: needsMissingFacet ? [resolvedMissingFacet] : [],
                 textResolver: textResolver) : [:]
 
-        let resolvedSharedXCategoryDomain: [String] = {
-            guard presentation.usesSharedXCategoryDomain else { return [] }
-            return resolvedXCategoryDomain(
-                in: data,
-                labels: resolvedXDisplayLabels,
-                fallback: resolvedMissingValue)
-        }()
-
         x = resolvedX
         y = resolvedY
         series = resolvedSeries
@@ -1973,7 +1968,7 @@ struct AutoChartResolvedPresentation: Sendable {
         yDisplayLabels = resolvedYDisplayLabels
         seriesDisplayLabels = resolvedSeriesDisplayLabels
         facetDisplayLabels = resolvedFacetDisplayLabels
-        sharedXCategoryDomain = resolvedSharedXCategoryDomain
+        sharedXCategoryDomain = []
     }
 }
 
@@ -2271,7 +2266,6 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             renderedData = orderedPresentedData(
                 core.data,
                 specification: specification,
-                xSemanticType: core.presentation.xSemanticType,
                 xLabels: resolvedPresentation.xDisplayLabels,
                 yLabels: resolvedPresentation.yDisplayLabels,
                 missingValue: resolvedPresentation.missingValue,

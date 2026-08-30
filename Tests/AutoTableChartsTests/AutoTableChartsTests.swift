@@ -402,11 +402,20 @@ private let date = AutoChartColumn(
         let gregorianLabel = AutoChartValue.date(
             Date(timeIntervalSinceReferenceDate: 0)
         ).categoryString(locale: buddhistLocale, timeZone: .gmt)
+        let gregorianAccessibilityLabel = AutoChartFormatters(
+            locale: buddhistLocale,
+            timeZone: .gmt
+        ).format(
+            column: nil,
+            value: .date(Date(timeIntervalSinceReferenceDate: 0)),
+            context: .markAccessibility)
         #expect(gregorianLabel?.contains("2001") == true)
         #expect(gregorianLabel?.contains("2544") == false)
+        #expect(gregorianAccessibilityLabel.contains("2001"))
+        #expect(!gregorianAccessibilityLabel.contains("2544"))
     }
 
-    @Test func categoryPresentationUsesOneNumericNotationPerChannel() {
+    @Test func categoryPresentationChoosesNumericNotationPerValue() {
         let numericCategory = AutoChartColumn(
             id: "numeric-category",
             name: "Numeric category",
@@ -415,8 +424,8 @@ private let date = AutoChartColumn(
             table(
                 columns: [numericCategory, measure],
                 rows: [
-                    [.double(1e-22), .double(1)],
-                    [.double(1e-23), .double(2)],
+                    [.double(1), .double(1)],
+                    [.double(1e-30), .double(2)],
                 ]))
         let specification = AutoChartSpecification.bar(
             category: numericCategory.id,
@@ -439,7 +448,7 @@ private let date = AutoChartColumn(
                 locale: Locale(identifier: "en_US"),
                 timeZone: .gmt))
 
-        #expect(Set(resolved.xDisplayLabels.values) == ["1E-22", "1E-23"])
+        #expect(Set(resolved.xDisplayLabels.values) == ["1", "1E-30"])
     }
 
     @Test func accessibilityLabelsIncludeSeriesContext() {
@@ -3472,7 +3481,6 @@ private let date = AutoChartColumn(
         let ordered = orderedPresentedData(
             prepared.data,
             specification: specification,
-            xSemanticType: profiles[category.id]?.semanticType,
             xLabels: resolved.xDisplayLabels,
             yLabels: resolved.yDisplayLabels,
             missingValue: resolved.missingValue,
@@ -3481,31 +3489,34 @@ private let date = AutoChartColumn(
         #expect(ordered.compactMap(\.xLabel) == ["Alpha", "Zoo", "A"])
     }
 
-    @Test func presentedOrderingPreservesContinuousLineSequence() {
-        let specification = AutoChartSpecification(
-            family: .line,
-            encoding: .init(x: date.id, y: measure.id),
-            sort: .descending)
-        let first = Date(timeIntervalSinceReferenceDate: 0)
-        let second = first.addingTimeInterval(86_400)
+    @Test func presentedMeasureOrderingPlacesNaNLastDeterministically() {
         let data = [
             AutoChartDatum(
-                id: "first", sourceRowIDs: [0],
-                xIdentity: "first", xLabel: "Zulu", xDate: first, yNumber: 1),
+                id: "one", sourceRowIDs: [0],
+                xIdentity: "one", xLabel: "One", yNumber: 1),
             AutoChartDatum(
-                id: "second", sourceRowIDs: [1],
-                xIdentity: "second", xLabel: "Alpha", xDate: second, yNumber: 2),
+                id: "nan", sourceRowIDs: [1],
+                xIdentity: "nan", xLabel: "NaN", yNumber: .nan),
+            AutoChartDatum(
+                id: "two", sourceRowIDs: [2],
+                xIdentity: "two", xLabel: "Two", yNumber: 2),
         ]
-        let ordered = orderedPresentedData(
-            data,
-            specification: specification,
-            xSemanticType: .temporal,
-            xLabels: ["first": "Zulu", "second": "Alpha"],
-            yLabels: [:],
-            missingValue: "Missing",
-            locale: Locale(identifier: "en_US"))
+        func ordered(_ sort: AutoChartSort) -> [String] {
+            orderedPresentedData(
+                data,
+                specification: AutoChartSpecification(
+                    family: .bar,
+                    encoding: .init(x: category.id, y: measure.id),
+                    sort: sort),
+                xLabels: ["one": "One", "nan": "NaN", "two": "Two"],
+                yLabels: [:],
+                missingValue: "Missing",
+                locale: Locale(identifier: "en_US"))
+                .map(\.id)
+        }
 
-        #expect(ordered.map(\.id) == ["first", "second"])
+        #expect(ordered(.ascending) == ["one", "two", "nan"])
+        #expect(ordered(.descending) == ["two", "one", "nan"])
     }
 
     @Test func familySpecificChannelsAreRejectedWhenTheRendererWouldIgnoreThem() {
@@ -4566,7 +4577,6 @@ private let date = AutoChartColumn(
         let presented = orderedPresentedData(
             data,
             specification: specification,
-            xSemanticType: profiles[category.id]?.semanticType,
             xLabels: resolved.xDisplayLabels,
             yLabels: resolved.yDisplayLabels,
             missingValue: resolved.missingValue,
@@ -5172,7 +5182,7 @@ private let date = AutoChartColumn(
         #expect(overridden.xDisplayLabels.values.allSatisfy { $0.hasPrefix("category:") })
     }
 
-    @Test func categoryPresentationRetainsAxisTickContextForHostOverrides() {
+    @Test func categoryPresentationUsesSurfaceContextsForHostOverrides() {
         final class Recorder: @unchecked Sendable {
             var requests: [AutoChartFormattingRequest] = []
         }
@@ -5233,9 +5243,9 @@ private let date = AutoChartColumn(
         #expect(xRequests.count == 2)
         #expect(xRequests.allSatisfy { $0.context == .axisTick })
         #expect(seriesRequests.count == 2)
-        #expect(seriesRequests.allSatisfy { $0.context == .axisTick })
+        #expect(seriesRequests.allSatisfy { $0.context == .legend })
         #expect(facetRequests.count == 2)
-        #expect(facetRequests.allSatisfy { $0.context == .axisTick })
+        #expect(facetRequests.allSatisfy { $0.context == .facetHeader })
         #expect(resolved.facetDisplayLabels.count == 2)
         #expect(
             resolved.facetDisplayLabels.values.allSatisfy {
@@ -5414,18 +5424,22 @@ private let date = AutoChartColumn(
         let forward = try datum([.double(0.0), .double(-0.0)], category: ordinal)
         let reversed = try datum([.double(-0.0), .double(0.0)], category: ordinal)
         let nominalMixed = try datum([.double(-0.0), .double(0.0)], category: nominal)
+        func isCanonicalZero(_ value: AutoChartValue?) -> Bool {
+            guard case .double(let number)? = value else { return false }
+            return number.bitPattern == 0.0.bitPattern
+        }
         #expect(forward.sourceRowIDs == [0, 1])
         #expect(reversed.sourceRowIDs == forward.sourceRowIDs)
-        #expect(forward.xSourceValue == nil)
-        #expect(reversed.xSourceValue == nil)
-        #expect(nominalMixed.xSourceValue == nil)
+        #expect(
+            [negativeOnly, positiveOnly, forward, reversed, nominalMixed]
+                .allSatisfy { isCanonicalZero($0.xSourceValue) })
         #expect(
             [negativeOnly, positiveOnly, forward, reversed, nominalMixed]
                 .allSatisfy { $0.xLabel == "0" })
         #expect(nominalMixed.xLabel != AutoChartValue.unrepresentableValuePlaceholder)
     }
 
-    @Test func boxPlotSelectsEqualDecimalStorageRepresentationsSemantically() throws {
+    @Test func boxPlotCanonicalizesEqualDecimalStorageRepresentations() throws {
         let ordinal = AutoChartColumn(
             id: "ordinal", name: "ordinal",
             hints: AutoChartColumnHints(semanticType: .ordinal))
@@ -5464,17 +5478,28 @@ private let date = AutoChartColumn(
                 for: [datum],
                 specification: specification,
                 measureSemantics: prepared.measureSemantics)
-            #expect(
-                selection.dimensions
-                    == [AutoChartSelectedDimension(columnID: ordinal.id, value: .decimal(one))])
+            let dimension = try #require(selection.dimensions.first)
+            guard case .decimal(let selectedValue) = dimension.value else {
+                Issue.record("Expected a Decimal selection dimension.")
+                return datum
+            }
+            #expect(selection.dimensions.count == 1)
+            #expect(dimension.columnID == ordinal.id)
+            #expect(selectedValue.exponent == 0)
             return datum
         }
 
         let forward = try datum([one, onePointZero])
         let reversed = try datum([onePointZero, one])
         #expect(forward.xIdentity == reversed.xIdentity)
-        #expect(forward.xSourceValue == .decimal(one))
-        #expect(reversed.xSourceValue == .decimal(one))
+        guard case .decimal(let forwardValue)? = forward.xSourceValue,
+            case .decimal(let reversedValue)? = reversed.xSourceValue
+        else {
+            Issue.record("Expected canonical Decimal source values.")
+            return
+        }
+        #expect(forwardValue.exponent == 0)
+        #expect(reversedValue.exponent == 0)
         #expect(forward.xLabel == reversed.xLabel)
     }
 

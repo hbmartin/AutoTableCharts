@@ -2,22 +2,12 @@ import Foundation
 
 public enum AutoChartFormattingContext: String, CaseIterable, Hashable, Codable, Sendable {
     case axisTick
+    case legend
+    case facetHeader
     case markAccessibility
     case selectionSummary
     case kpi
     case detail
-
-    /// Series labels historically used the axis-tick formatting context.
-    /// Retain source compatibility for callers that briefly adopted the
-    /// dedicated spelling without adding another exhaustive enum case.
-    @available(*, deprecated, message: "Legend values use the axisTick context.")
-    public static var legend: Self { .axisTick }
-
-    /// Facet labels historically used the axis-tick formatting context.
-    /// Retain source compatibility for callers that briefly adopted the
-    /// dedicated spelling without adding another exhaustive enum case.
-    @available(*, deprecated, message: "Facet-header values use the axisTick context.")
-    public static var facetHeader: Self { .axisTick }
 }
 
 enum AutoChartDateLabelPrecision: Int, Comparable, Sendable {
@@ -39,7 +29,7 @@ enum AutoChartDateFormatting {
         guard date.timeIntervalSinceReferenceDate.isFinite else { return .date }
         return precision(
             for: date,
-            calendar: localeCalendar(locale: locale, timeZone: timeZone))
+            calendar: gregorianCalendar(locale: locale, timeZone: timeZone))
     }
 
     static func precision(
@@ -68,7 +58,7 @@ enum AutoChartDateFormatting {
             return AutoChartValue.unrepresentableValuePlaceholder
         }
         let calendar = suppliedCalendar
-            ?? localeCalendar(locale: locale, timeZone: timeZone)
+            ?? gregorianCalendar(locale: locale, timeZone: timeZone)
         let precision = precision
             ?? self.precision(for: date, calendar: calendar)
         let time: Date.FormatStyle.TimeStyle = switch precision {
@@ -95,15 +85,6 @@ enum AutoChartDateFormatting {
         return calendar
     }
 
-    private static func localeCalendar(
-        locale: Locale,
-        timeZone: TimeZone
-    ) -> Calendar {
-        var calendar = locale.calendar
-        calendar.locale = locale
-        calendar.timeZone = timeZone
-        return calendar
-    }
 }
 
 /// An aggregation that transforms source values into a rendered measure.
@@ -278,7 +259,6 @@ public struct AutoChartFormatters: Sendable {
         value: AutoChartValue,
         context: AutoChartFormattingContext,
         datePrecision: AutoChartDateLabelPrecision? = nil,
-        numberNotation: AutoChartCategoryNumberNotation = .automatic,
         calendar: Calendar? = nil
     ) -> String {
         let request = AutoChartFormattingRequest(
@@ -292,7 +272,6 @@ public struct AutoChartFormatters: Sendable {
             locale: locale,
             timeZone: timeZone,
             datePrecision: datePrecision,
-            numberNotation: numberNotation,
             calendar: calendar)
             ?? AutoChartValue.unrepresentableValuePlaceholder
     }
