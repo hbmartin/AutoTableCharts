@@ -52,17 +52,37 @@ enum AutoChartAccessibility {
     static func markLabel(
         name: String,
         series: String? = nil,
-        facet: String? = nil,
+        facetTitle: String? = nil,
+        facetValue: String? = nil,
         valueDescription: String? = nil,
         textResolver: AutoChartTextResolver = .default
     ) -> String {
-        label(
+        func present(_ value: String?) -> String? {
+            guard let value, !value.isEmpty else { return nil }
+            return value
+        }
+        let resolvedFacetTitle = present(facetTitle)
+        let resolvedFacetValue = present(facetValue)
+        let facetDescription: String?
+        switch (resolvedFacetTitle, resolvedFacetValue) {
+        case (.some(let title), .some(let value)):
+            facetDescription = "\(title): \(value)"
+        case (.some(let title), nil):
+            facetDescription = title
+        case (nil, .some(let value)):
+            facetDescription = value
+        case (nil, nil):
+            facetDescription = nil
+        }
+        return label(
             components: [
                 ("name", name),
                 ("series", series),
-                ("facet", facet),
+                ("facetTitle", facetTitle),
+                ("facetValue", facetValue),
                 ("value", valueDescription),
             ],
+            defaultValues: [name, series, facetDescription, valueDescription],
             textResolver: textResolver)
     }
 
@@ -126,6 +146,38 @@ enum AutoChartAccessibility {
             column: rangeColumns.end,
             value: .date(end),
             context: .markAccessibility)
+        return rangeLabel(
+            startText: startText,
+            endText: endText,
+            textResolver: textResolver)
+    }
+
+    static func histogramBinLabel(
+        lower: Double,
+        upper: Double,
+        column: AutoChartColumn?,
+        formatters: AutoChartFormatters,
+        textResolver: AutoChartTextResolver = .default
+    ) -> String {
+        let lowerText = formatters.format(
+            column: column,
+            value: .double(lower),
+            context: .markAccessibility)
+        let upperText = formatters.format(
+            column: column,
+            value: .double(upper),
+            context: .markAccessibility)
+        return rangeLabel(
+            startText: lowerText,
+            endText: upperText,
+            textResolver: textResolver)
+    }
+
+    private static func rangeLabel(
+        startText: String,
+        endText: String,
+        textResolver: AutoChartTextResolver
+    ) -> String {
         return textResolver(
             AutoChartMessage(
                 category: .accessibility,
@@ -139,12 +191,19 @@ enum AutoChartAccessibility {
 
     private static func label(
         components: [(key: String, value: String?)],
+        defaultValues: [String?]? = nil,
         textResolver: AutoChartTextResolver
     ) -> String {
         let present = components.compactMap { component -> (String, String)? in
             guard let value = component.value, !value.isEmpty else { return nil }
             return (component.key, value)
         }
+        let defaultText = (defaultValues ?? components.map { $0.value })
+            .compactMap { value -> String? in
+                guard let value, !value.isEmpty else { return nil }
+                return value
+            }
+            .joined(separator: ", ")
         return textResolver(
             AutoChartMessage(
                 category: .accessibility,
@@ -153,7 +212,7 @@ enum AutoChartAccessibility {
                     uniqueKeysWithValues: present.map {
                         ($0.0, AutoChartMessageArgument.string($0.1))
                     }),
-                defaultText: present.map(\.1).joined(separator: ", ")))
+                defaultText: defaultText))
     }
 }
 
@@ -842,7 +901,12 @@ enum AutoChartDataPreparation {
             case .count:
                 result = Double(group.count)
             case .countDistinct:
-                result = Double(Set(values).count)
+                result = Double(
+                    Set(
+                        group.compactMap {
+                            AutoChartProfiler.exactNumericIdentity($0.ySourceValue)
+                        }
+                    ).count)
             }
             let first = group[0]
             let xSourceValue = identicalSourceValue(
@@ -916,8 +980,6 @@ enum AutoChartDataPreparation {
             return AutoChartDatum(
                 id: "bin-\(index)",
                 sourceRowIDs: Set(bin.map(\.1)),
-                xLabel:
-                    "\(start.formatted(.number.precision(.fractionLength(0...2))))–\(end.formatted(.number.precision(.fractionLength(0...2))))",
                 xNumber: midpoint,
                 yNumber: Double(bin.count),
                 lower: start,
@@ -2251,7 +2313,6 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     private struct PreparedViewState {
         let content: AutoChartViewContent<RowID>
         let renderedData: [AutoChartDatum]
-        let boxPlotData: [AutoChartDatum]
         let facetPanels: [AutoChartFacetPanel]
         let sharedXCategoryDomain: [String]
     }
@@ -2261,7 +2322,6 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     private let formatters: AutoChartFormatters
     private let textResolver: AutoChartTextResolver
     private let renderedData: [AutoChartDatum]
-    private let boxPlotData: [AutoChartDatum]
     private let facetPanels: [AutoChartFacetPanel]
     private let sharedXCategoryDomain: [String]
     @Binding private var selection: AutoChartSelection<RowID>?
@@ -2285,14 +2345,12 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             using: textResolver,
             formatters: formatters)
         let renderedData: [AutoChartDatum]
-        let boxPlotData: [AutoChartDatum]
         if specification.family == .boxPlot {
-            boxPlotData = orderedBoxPlotData(
+            renderedData = orderedBoxPlotData(
                 core.data,
                 labels: resolvedPresentation.xDisplayLabels,
                 fallback: resolvedPresentation.missingValue,
                 locale: formatters.locale)
-            renderedData = boxPlotData
         } else {
             renderedData = orderedPresentedData(
                 core.data,
@@ -2301,7 +2359,6 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
                 yLabels: resolvedPresentation.yDisplayLabels,
                 missingValue: resolvedPresentation.missingValue,
                 locale: formatters.locale)
-            boxPlotData = []
         }
         let sharedXCategoryDomain =
             core.presentation.usesSharedXCategoryDomain
@@ -2313,7 +2370,6 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         return PreparedViewState(
             content: .chart(preparedChart, resolvedPresentation),
             renderedData: renderedData,
-            boxPlotData: boxPlotData,
             facetPanels:
                 specification.family == .faceted
                 ? orderedFacetPanels(
@@ -2337,7 +2393,6 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             textResolver: textResolver)
         content = state.content
         renderedData = state.renderedData
-        boxPlotData = state.boxPlotData
         facetPanels = state.facetPanels
         sharedXCategoryDomain = state.sharedXCategoryDomain
         self._selection = selection
@@ -2360,13 +2415,11 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
                 textResolver: textResolver)
             content = state.content
             renderedData = state.renderedData
-            boxPlotData = state.boxPlotData
             facetPanels = state.facetPanels
             sharedXCategoryDomain = state.sharedXCategoryDomain
         } else if case .tableFallback(let fallback) = analysis.outcome {
             content = .fallback(fallback)
             renderedData = []
-            boxPlotData = []
             facetPanels = []
             sharedXCategoryDomain = []
         } else {
@@ -2377,7 +2430,6 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
                         code: .noSafeChart,
                         defaultText: "No prepared chart is available.")))
             renderedData = []
-            boxPlotData = []
             facetPanels = []
             sharedXCategoryDomain = []
         }
@@ -2726,7 +2778,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     }
 
     private var boxPlotChart: some View {
-        let chart = Chart(boxPlotData) { datum in
+        let chart = Chart(data) { datum in
             RuleMark(
                 x: .value(xTitle, xCategoryValue(for: datum)),
                 yStart: .value(yTitle, datum.lower ?? 0),
@@ -3233,10 +3285,15 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         let xColumn = resolvedColumn(specification.encoding.x)
         let name: String
         if specification.family == .histogram {
-            if let label = datum.xLabel {
-                name = label
+            if let lower = datum.lower, let upper = datum.upper {
+                name = AutoChartAccessibility.histogramBinLabel(
+                    lower: lower,
+                    upper: upper,
+                    column: xColumn,
+                    formatters: formatters,
+                    textResolver: textResolver)
             } else {
-                assertionFailure("Prepared histogram bins require a display label.")
+                assertionFailure("Prepared histogram bins require finite bounds.")
                 name = AutoChartValue.unrepresentableValuePlaceholder
             }
         } else if [
@@ -3273,8 +3330,9 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             name: name,
             series: specification.encoding.series == nil
                 ? nil : accessibilitySeriesValue(for: datum),
-            facet: specification.encoding.facet == nil
-                ? nil : "\(facetTitle): \(accessibilityFacetValue(for: datum))",
+            facetTitle: specification.encoding.facet == nil ? nil : facetTitle,
+            facetValue: specification.encoding.facet == nil
+                ? nil : accessibilityFacetValue(for: datum),
             valueDescription: valueDescription,
             textResolver: textResolver)
     }

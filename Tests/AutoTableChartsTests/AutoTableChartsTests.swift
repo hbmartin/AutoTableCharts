@@ -486,19 +486,97 @@ private let date = AutoChartColumn(
         #expect(!label.contains("2001"))
     }
 
+    @Test func categoryDefaultsHonorUnitsWithoutCollapsingExactValues() throws {
+        let currencyCategory = AutoChartColumn(
+            id: "currency-category",
+            name: "Currency category",
+            hints: .init(
+                semanticType: .nominal,
+                role: .dimension,
+                unit: .currency(code: "USD")))
+        let percentCategory = AutoChartColumn(
+            id: "percent-category",
+            name: "Percent category",
+            hints: .init(
+                semanticType: .nominal,
+                role: .dimension,
+                unit: .percent(fractional: false)))
+        let areaCategory = AutoChartColumn(
+            id: "area-category",
+            name: "Area category",
+            hints: .init(
+                semanticType: .nominal,
+                role: .dimension,
+                unit: .area(unit: "sq ft")))
+        let formatter = AutoChartFormatters(
+            locale: Locale(identifier: "en_US"),
+            timeZone: .gmt)
+        let first = try #require(
+            Decimal(
+                string: "0.12345678901234567890123456789012345678",
+                locale: Locale(identifier: "en_US_POSIX")))
+        let second = try #require(
+            Decimal(
+                string: "0.12345678901234567890123456789012345679",
+                locale: Locale(identifier: "en_US_POSIX")))
+        let firstLabel = formatter.formatCategory(
+            column: currencyCategory,
+            value: .decimal(first),
+            context: .axisTick)
+        let secondLabel = formatter.formatCategory(
+            column: currencyCategory,
+            value: .decimal(second),
+            context: .axisTick)
+
+        #expect(firstLabel.contains("$"))
+        #expect(secondLabel.contains("$"))
+        #expect(firstLabel != secondLabel)
+        #expect(
+            formatter.formatCategory(
+                column: percentCategory,
+                value: .integer(25),
+                context: .axisTick) == "25%")
+        #expect(
+            formatter.formatCategory(
+                column: areaCategory,
+                value: .integer(1_000),
+                context: .axisTick) == "1000 sq ft")
+
+        let specification = AutoChartSpecification.bar(
+            category: currencyCategory.id,
+            measure: measure.id)
+        let selection = AutoChartSelection(
+            sourceRowIDs: Set([0]),
+            dimensions: [
+                AutoChartSelectedDimension(
+                    columnID: currencyCategory.id,
+                    value: .decimal(first))
+            ],
+            family: .bar,
+            specificationID: specification.id,
+            markID: "currency-category")
+        #expect(
+            selection.presentation(
+                columns: [currencyCategory],
+                formatters: formatter
+            ).label == firstLabel)
+    }
+
     @Test func accessibilityLabelsIncludeSeriesContext() {
         #expect(
             AutoChartAccessibility.markLabel(
                 name: "Office",
                 series: "North",
-                facet: "Region: West",
+                facetTitle: "Region",
+                facetValue: "West",
                 valueDescription: "2") == "Office, North, Region: West, 2")
         // Absent components drop out rather than leaving empty separators.
         #expect(
             AutoChartAccessibility.markLabel(
                 name: "Office",
                 series: nil,
-                facet: "",
+                facetTitle: nil,
+                facetValue: "",
                 valueDescription: "2") == "Office, 2")
     }
 
@@ -519,7 +597,8 @@ private let date = AutoChartColumn(
             AutoChartAccessibility.markLabel(
                 name: "Office",
                 series: "North",
-                facet: "Region: West",
+                facetTitle: "Region",
+                facetValue: "West",
                 valueDescription: "$12,000",
                 textResolver: resolver) == "resolved")
         #expect(recorder.message?.code == .markAccessibility)
@@ -528,7 +607,8 @@ private let date = AutoChartColumn(
             recorder.message?.arguments == [
                 "name": .string("Office"),
                 "series": .string("North"),
-                "facet": .string("Region: West"),
+                "facetTitle": .string("Region"),
+                "facetValue": .string("West"),
                 "value": .string("$12,000"),
             ])
         #expect(recorder.message?.defaultText == "Office, North, Region: West, $12,000")
@@ -545,6 +625,53 @@ private let date = AutoChartColumn(
                 "secondaryCategory": .string("Boston"),
                 "value": .string("3"),
             ])
+    }
+
+    @Test func histogramAccessibilityFormatsAndResolvesBoundsAtPresentationTime() {
+        final class Recorder: @unchecked Sendable {
+            var requests: [AutoChartFormattingRequest] = []
+            var message: AutoChartMessage?
+        }
+        let column = AutoChartColumn(
+            id: "histogram-value",
+            name: "Histogram value",
+            hints: .init(semanticType: .quantitative, role: .measure))
+        let recorder = Recorder()
+        let formatters = AutoChartFormatters(
+            locale: Locale(identifier: "de_DE"),
+            timeZone: .gmt
+        ) { request, _, _ in
+            recorder.requests.append(request)
+            return nil
+        }
+        let resolver = AutoChartTextResolver { message in
+            recorder.message = message
+            return nil
+        }
+        let label = AutoChartAccessibility.histogramBinLabel(
+            lower: 1.5,
+            upper: 2.75,
+            column: column,
+            formatters: formatters,
+            textResolver: resolver)
+
+        #expect(label.contains("1,5"))
+        #expect(label.contains("2,75"))
+        #expect(recorder.requests.count == 2)
+        #expect(recorder.requests.allSatisfy { $0.column?.id == column.id })
+        #expect(recorder.requests.allSatisfy { $0.context == .markAccessibility })
+        #expect(recorder.message?.code == .markAccessibilityRange)
+        #expect(recorder.message?.arguments["start"] == .string("1,5"))
+        #expect(recorder.message?.arguments["end"] == .string("2,75"))
+        #expect(
+            AutoChartAccessibility.histogramBinLabel(
+                lower: 1.5,
+                upper: 2.75,
+                column: column,
+                formatters: formatters,
+                textResolver: AutoChartTextResolver { message in
+                    message.code == .markAccessibilityRange ? "Localized bin" : nil
+                }) == "Localized bin")
     }
 
     @Test func quantitativeAccessibilityUsesTheNumericPosition() {
@@ -2183,6 +2310,7 @@ private let date = AutoChartColumn(
         let data = preparedDatumValues(
             snapshot: AutoChartSnapshot(input), specification: spec)
         #expect(data.reduce(0) { $0 + $1.sourceRowIDs.count } == 3)
+        #expect(data.allSatisfy { $0.xLabel == nil })
     }
 
     @Test func nullMeasuresAreOmittedRatherThanRenderedAsZero() {
@@ -2218,6 +2346,44 @@ private let date = AutoChartColumn(
         #expect(data.count == 1)
         #expect(data[0].yNumber == 3)
         #expect(data[0].sourceRowIDs == [0, 1])
+    }
+
+    @Test func distinctCountPreservesExactNumericSourceIdentity() throws {
+        let firstDecimal = try #require(
+            Decimal(
+                string: "0.12345678901234567890123456789012345678",
+                locale: Locale(identifier: "en_US_POSIX")))
+        let secondDecimal = try #require(
+            Decimal(
+                string: "0.12345678901234567890123456789012345679",
+                locale: Locale(identifier: "en_US_POSIX")))
+        let firstInteger: Int64 = 9_007_199_254_740_992
+        let input = table(
+            columns: [category, measure],
+            rows: [
+                [.text("Integers"), .integer(firstInteger)],
+                [.text("Integers"), .integer(firstInteger + 1)],
+                [.text("Decimals"), .decimal(firstDecimal)],
+                [.text("Decimals"), .decimal(secondDecimal)],
+                [.text("Equivalent"), .integer(1)],
+                [.text("Equivalent"), .double(1)],
+                [.text("Equivalent"), .decimal(1)],
+            ])
+        let specification = AutoChartSpecification(
+            family: .bar,
+            encoding: .init(x: category.id, y: measure.id),
+            aggregation: .countDistinct)
+        let prepared = preparedDatumValues(
+            snapshot: AutoChartSnapshot(input),
+            specification: specification)
+        let counts = Dictionary(
+            uniqueKeysWithValues: prepared.compactMap { datum in
+                datum.xLabel.map { ($0, datum.yNumber) }
+            })
+
+        #expect(counts["Integers"] == 2)
+        #expect(counts["Decimals"] == 2)
+        #expect(counts["Equivalent"] == 1)
     }
 
     @Test func boxPlotsExcludeNullMeasuresFromLineage() {

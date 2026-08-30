@@ -721,6 +721,22 @@ enum AutoChartProfiler {
         .number((number == 0 ? 0.0 : number).bitPattern)
     }
 
+    /// A lossless semantic identity for one finite numeric source value.
+    ///
+    /// Equal values represented as `Int64`, `Double`, or `Decimal` share an
+    /// identity when their exact decimal values agree. A finite `Double` that
+    /// Foundation `Decimal` cannot preserve falls back to its normalized bit
+    /// pattern instead of disappearing from a distinct-value aggregation.
+    static func exactNumericIdentity(
+        _ value: AutoChartValue?
+    ) -> AutoChartValueIdentity? {
+        guard let value, value.numericValue != nil else { return nil }
+        if let identity = exactNumberIdentity(value) { return identity }
+        guard case .double(let number) = value else { return nil }
+        let normalized = number == 0 ? 0.0 : number
+        return .double(normalized.bitPattern)
+    }
+
     /// A canonical, lossless identity for a numeric category.
     ///
     /// Finite Doubles use their exact decimal value when Foundation's Decimal can
