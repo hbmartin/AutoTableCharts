@@ -369,7 +369,10 @@ public enum AutoChartAggregation: String, CaseIterable, Codable, Sendable {
     case maximum
     /// Count contributing rows.
     case count
-    /// Count distinct contributing values.
+    /// Count distinct contributing values by exact numeric source identity.
+    /// Equivalent integral `Int64`, `Double`, and `Decimal` values share one
+    /// identity. An approximate fractional `Double` remains distinct from an
+    /// exact `Decimal` unless their exact values agree.
     case countDistinct
 }
 
@@ -1450,6 +1453,9 @@ public struct AutoChartMessage: Hashable, Codable, Sendable {
         public static let markAccessibility = Self(rawValue: "markAccessibility")
         public static let markAccessibilityDate = Self(rawValue: "markAccessibilityDate")
         public static let markAccessibilityRange = Self(rawValue: "markAccessibilityRange")
+        /// Describes the formatted lower and upper bounds of one numeric histogram bin.
+        public static let histogramBinAccessibility = Self(
+            rawValue: "histogramBinAccessibility")
         public static let kpiAccessibility = Self(rawValue: "kpiAccessibility")
         public static let categoryTitle = Self(rawValue: "categoryTitle")
         public static let valueTitle = Self(rawValue: "valueTitle")
