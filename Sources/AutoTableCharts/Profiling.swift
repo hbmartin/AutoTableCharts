@@ -1049,10 +1049,7 @@ extension AutoChartValue {
                 locale: locale,
                 timeZone: timeZone,
                 precision: datePrecision,
-                calendar: calendar
-                    ?? AutoChartDateFormatting.gregorianCalendar(
-                        locale: locale,
-                        timeZone: timeZone))
+                calendar: calendar)
         default:
             return displayString
         }

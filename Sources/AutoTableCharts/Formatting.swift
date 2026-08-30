@@ -29,7 +29,7 @@ enum AutoChartDateFormatting {
         guard date.timeIntervalSinceReferenceDate.isFinite else { return .date }
         return precision(
             for: date,
-            calendar: gregorianCalendar(locale: locale, timeZone: timeZone))
+            calendar: localeCalendar(locale: locale, timeZone: timeZone))
     }
 
     static func precision(
@@ -58,7 +58,7 @@ enum AutoChartDateFormatting {
             return AutoChartValue.unrepresentableValuePlaceholder
         }
         let calendar = suppliedCalendar
-            ?? gregorianCalendar(locale: locale, timeZone: timeZone)
+            ?? localeCalendar(locale: locale, timeZone: timeZone)
         let precision = precision
             ?? self.precision(for: date, calendar: calendar)
         let time: Date.FormatStyle.TimeStyle = switch precision {
@@ -75,16 +75,15 @@ enum AutoChartDateFormatting {
                 timeZone: timeZone))
     }
 
-    static func gregorianCalendar(
+    static func localeCalendar(
         locale: Locale,
         timeZone: TimeZone
     ) -> Calendar {
-        var calendar = Calendar(identifier: .gregorian)
+        var calendar = locale.calendar
         calendar.locale = locale
         calendar.timeZone = timeZone
         return calendar
     }
-
 }
 
 /// An aggregation that transforms source values into a rendered measure.
