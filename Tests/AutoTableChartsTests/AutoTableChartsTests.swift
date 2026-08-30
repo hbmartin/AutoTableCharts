@@ -399,20 +399,20 @@ private let date = AutoChartColumn(
         #expect(AutoChartValue.integer(1_234).categoryString(locale: arabic) == "١٢٣٤")
         #expect(AutoChartValue.double(1_234.5).categoryString(locale: arabic) == "١٢٣٤٫٥")
         let buddhistLocale = Locale(identifier: "en_US@calendar=buddhist")
-        let gregorianLabel = AutoChartValue.date(
+        let buddhistLabel = AutoChartValue.date(
             Date(timeIntervalSinceReferenceDate: 0)
         ).categoryString(locale: buddhistLocale, timeZone: .gmt)
-        let gregorianAccessibilityLabel = AutoChartFormatters(
+        let buddhistAccessibilityLabel = AutoChartFormatters(
             locale: buddhistLocale,
             timeZone: .gmt
         ).format(
             column: nil,
             value: .date(Date(timeIntervalSinceReferenceDate: 0)),
             context: .markAccessibility)
-        #expect(gregorianLabel?.contains("2001") == true)
-        #expect(gregorianLabel?.contains("2544") == false)
-        #expect(gregorianAccessibilityLabel.contains("2001"))
-        #expect(!gregorianAccessibilityLabel.contains("2544"))
+        #expect(buddhistLabel?.contains("2544") == true)
+        #expect(buddhistLabel?.contains("2001") == false)
+        #expect(buddhistAccessibilityLabel.contains("2544"))
+        #expect(!buddhistAccessibilityLabel.contains("2001"))
     }
 
     @Test func categoryPresentationChoosesNumericNotationPerValue() {
@@ -449,6 +449,41 @@ private let date = AutoChartColumn(
                 timeZone: .gmt))
 
         #expect(Set(resolved.xDisplayLabels.values) == ["1", "1E-30"])
+    }
+
+    @Test func categoryPresentationUsesTheHostLocaleCalendar() throws {
+        let dateCategory = AutoChartColumn(
+            id: "date-category",
+            name: "Date category",
+            hints: .init(semanticType: .nominal, role: .dimension))
+        let snapshot = AutoChartSnapshot(
+            table(
+                columns: [dateCategory, measure],
+                rows: [[.date(Date(timeIntervalSinceReferenceDate: 0)), .double(1)]]))
+        let specification = AutoChartSpecification.bar(
+            category: dateCategory.id,
+            measure: measure.id)
+        let profiles = AutoChartProfiler.profileIndex(snapshot)
+        let prepared = AutoChartDataPreparation.preparedData(
+            snapshot: snapshot,
+            specification: specification,
+            profiles: profiles)
+        let presentation = AutoChartRenderPresentation(
+            snapshot: snapshot,
+            specification: specification,
+            profiles: profiles,
+            data: prepared.data,
+            measureSemantics: prepared.measureSemantics)
+        let resolved = presentation.resolvedPresentation(
+            data: prepared.data,
+            using: .default,
+            formatters: AutoChartFormatters(
+                locale: Locale(identifier: "en_US@calendar=buddhist"),
+                timeZone: .gmt))
+        let label = try #require(resolved.xDisplayLabels.values.first)
+
+        #expect(label.contains("2544"))
+        #expect(!label.contains("2001"))
     }
 
     @Test func accessibilityLabelsIncludeSeriesContext() {
@@ -3489,16 +3524,22 @@ private let date = AutoChartColumn(
         #expect(ordered.compactMap(\.xLabel) == ["Alpha", "Zoo", "A"])
     }
 
-    @Test func presentedMeasureOrderingPlacesNaNLastDeterministically() {
+    @Test func presentedMeasureOrderingPlacesNaNAndMissingLastDeterministically() {
         let data = [
             AutoChartDatum(
-                id: "one", sourceRowIDs: [0],
+                id: "zero", sourceRowIDs: [0],
+                xIdentity: "zero", xLabel: "Zero", yNumber: 0),
+            AutoChartDatum(
+                id: "one", sourceRowIDs: [1],
                 xIdentity: "one", xLabel: "One", yNumber: 1),
             AutoChartDatum(
-                id: "nan", sourceRowIDs: [1],
+                id: "nan", sourceRowIDs: [2],
                 xIdentity: "nan", xLabel: "NaN", yNumber: .nan),
             AutoChartDatum(
-                id: "two", sourceRowIDs: [2],
+                id: "missing", sourceRowIDs: [3],
+                xIdentity: "missing", xLabel: "Missing", yNumber: nil),
+            AutoChartDatum(
+                id: "two", sourceRowIDs: [4],
                 xIdentity: "two", xLabel: "Two", yNumber: 2),
         ]
         func ordered(_ sort: AutoChartSort) -> [String] {
@@ -3508,15 +3549,21 @@ private let date = AutoChartColumn(
                     family: .bar,
                     encoding: .init(x: category.id, y: measure.id),
                     sort: sort),
-                xLabels: ["one": "One", "nan": "NaN", "two": "Two"],
+                xLabels: [
+                    "zero": "Zero",
+                    "one": "One",
+                    "nan": "NaN",
+                    "missing": "Missing",
+                    "two": "Two",
+                ],
                 yLabels: [:],
                 missingValue: "Missing",
                 locale: Locale(identifier: "en_US"))
                 .map(\.id)
         }
 
-        #expect(ordered(.ascending) == ["one", "two", "nan"])
-        #expect(ordered(.descending) == ["two", "one", "nan"])
+        #expect(ordered(.ascending) == ["zero", "one", "two", "nan", "missing"])
+        #expect(ordered(.descending) == ["two", "one", "zero", "nan", "missing"])
     }
 
     @Test func familySpecificChannelsAreRejectedWhenTheRendererWouldIgnoreThem() {
@@ -5251,6 +5298,38 @@ private let date = AutoChartColumn(
             resolved.facetDisplayLabels.values.allSatisfy {
                 $0.hasPrefix("custom:facet")
             })
+    }
+
+    @Test func accessibilityCategoryFormattingCanOverrideResolvedSurfaceLabels() {
+        let column = AutoChartColumn(
+            id: "region",
+            name: "Region",
+            hints: .init(semanticType: .nominal, role: .dimension))
+        let formatters = AutoChartFormatters { request, _, _ in
+            guard request.context == .markAccessibility else { return nil }
+            return "spoken:\(request.value.displayString)"
+        }
+
+        #expect(
+            categoryValueForSurface(
+                identity: "text:5:North",
+                value: .text("North"),
+                label: "North",
+                labels: ["text:5:North": "N"],
+                fallback: "Missing region",
+                column: column,
+                context: .markAccessibility,
+                formatters: formatters) == "spoken:North")
+        #expect(
+            categoryValueForSurface(
+                identity: "text:5:North",
+                value: .text("North"),
+                label: "North",
+                labels: ["text:5:North": "N"],
+                fallback: "Missing region",
+                column: column,
+                context: .selectionSummary,
+                formatters: formatters) == "N")
     }
 
     @Test func categorySelectionSummaryReusesResolvedDatePrecision() throws {

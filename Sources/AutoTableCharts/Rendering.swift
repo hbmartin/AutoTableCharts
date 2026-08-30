@@ -194,13 +194,10 @@ private func canonicalSelectionValue(_ value: AutoChartValue) -> AutoChartValue 
     switch value {
     case .double(let number):
         return .double(number == 0 ? 0 : number)
-    case .decimal(let number):
-        guard !number.isNaN,
-            let canonical = Decimal(
-                string: NSDecimalNumber(decimal: number).stringValue,
-                locale: AutoChartProfiler.posixLocale)
-        else { return value }
-        return .decimal(canonical)
+    case .decimal(var number):
+        guard !number.isNaN else { return value }
+        NSDecimalCompact(&number)
+        return .decimal(number)
     case .date(let date):
         let interval = date.timeIntervalSinceReferenceDate
         return interval == 0 ? .date(Date(timeIntervalSinceReferenceDate: 0)) : value
@@ -272,20 +269,29 @@ private func orderedByMeasure(
     return data.enumerated().map { offset, datum in
         (
             datum: datum,
-            value: datum.yNumber ?? 0,
+            value: datum.yNumber,
             categoryKey: categoryKey(offset, datum)
         )
     }.sorted { lhs, rhs in
-        if lhs.value.isNaN || rhs.value.isNaN {
-            if lhs.value.isNaN != rhs.value.isNaN {
-                return !lhs.value.isNaN
+        switch (lhs.value, rhs.value) {
+        case (nil, nil):
+            return categoryPrecedes(lhs.categoryKey, rhs.categoryKey, locale: locale)
+        case (nil, _):
+            return false
+        case (_, nil):
+            return true
+        case (.some(let left), .some(let right)):
+            if left.isNaN || right.isNaN {
+                if left.isNaN != right.isNaN {
+                    return !left.isNaN
+                }
+                return categoryPrecedes(lhs.categoryKey, rhs.categoryKey, locale: locale)
+            }
+            if left != right {
+                return sortsAscending ? left < right : left > right
             }
             return categoryPrecedes(lhs.categoryKey, rhs.categoryKey, locale: locale)
         }
-        if lhs.value != rhs.value {
-            return sortsAscending ? lhs.value < rhs.value : lhs.value > rhs.value
-        }
-        return categoryPrecedes(lhs.categoryKey, rhs.categoryKey, locale: locale)
     }.map(\.datum)
 }
 
@@ -1161,6 +1167,31 @@ func disambiguatedCategoryValue(
     return labels[identity] ?? label ?? identity
 }
 
+/// Gives a host one opportunity to specialize a resolved category for a second
+/// surface while preserving the visible, disambiguated label as the fallback.
+func categoryValueForSurface(
+    identity: String?,
+    value: AutoChartValue?,
+    label: String?,
+    labels: [String: String],
+    fallback: String,
+    column: AutoChartColumn?,
+    context: AutoChartFormattingContext,
+    formatters: AutoChartFormatters
+) -> String {
+    let resolved = disambiguatedCategoryValue(
+        identity: identity,
+        label: label,
+        labels: labels,
+        fallback: fallback)
+    guard let value else { return resolved }
+    return formatters.formatOverride(
+        AutoChartFormattingRequest(
+            column: column,
+            value: value,
+            context: context)) ?? resolved
+}
+
 func resolvedXCategoryDomain(
     in data: [AutoChartDatum],
     labels: [String: String],
@@ -1743,7 +1774,6 @@ struct AutoChartResolvedPresentation: Sendable {
     var yDisplayLabels: [String: String]
     var seriesDisplayLabels: [String: String]
     var facetDisplayLabels: [String: String]
-    var sharedXCategoryDomain: [String]
 
     init(
         presentation: AutoChartRenderPresentation,
@@ -1860,7 +1890,7 @@ struct AutoChartResolvedPresentation: Sendable {
                 return date
             }
             let calendar = dates.isEmpty ? nil
-                : AutoChartDateFormatting.gregorianCalendar(
+                : AutoChartDateFormatting.localeCalendar(
                     locale: formatters.locale,
                     timeZone: formatters.timeZone)
             let datePrecision = calendar.flatMap { calendar in
@@ -1968,7 +1998,6 @@ struct AutoChartResolvedPresentation: Sendable {
         yDisplayLabels = resolvedYDisplayLabels
         seriesDisplayLabels = resolvedSeriesDisplayLabels
         facetDisplayLabels = resolvedFacetDisplayLabels
-        sharedXCategoryDomain = []
     }
 }
 
@@ -2224,6 +2253,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         let renderedData: [AutoChartDatum]
         let boxPlotData: [AutoChartDatum]
         let facetPanels: [AutoChartFacetPanel]
+        let sharedXCategoryDomain: [String]
     }
 
     private let content: AutoChartViewContent<RowID>
@@ -2233,6 +2263,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     private let renderedData: [AutoChartDatum]
     private let boxPlotData: [AutoChartDatum]
     private let facetPanels: [AutoChartFacetPanel]
+    private let sharedXCategoryDomain: [String]
     @Binding private var selection: AutoChartSelection<RowID>?
 
     @State private var selectedCategory: String?
@@ -2249,7 +2280,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     ) -> PreparedViewState {
         let core = preparedChart.core
         let specification = preparedChart.recommendation.specification
-        var resolvedPresentation = core.presentation.resolvedPresentation(
+        let resolvedPresentation = core.presentation.resolvedPresentation(
             data: core.data,
             using: textResolver,
             formatters: formatters)
@@ -2272,12 +2303,13 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
                 locale: formatters.locale)
             boxPlotData = []
         }
-        if core.presentation.usesSharedXCategoryDomain {
-            resolvedPresentation.sharedXCategoryDomain = resolvedXCategoryDomain(
+        let sharedXCategoryDomain =
+            core.presentation.usesSharedXCategoryDomain
+            ? resolvedXCategoryDomain(
                 in: renderedData,
                 labels: resolvedPresentation.xDisplayLabels,
                 fallback: resolvedPresentation.missingValue)
-        }
+            : []
         return PreparedViewState(
             content: .chart(preparedChart, resolvedPresentation),
             renderedData: renderedData,
@@ -2288,7 +2320,8 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
                     in: renderedData,
                     labels: resolvedPresentation.facetDisplayLabels,
                     fallback: resolvedPresentation.missingFacet,
-                    locale: formatters.locale) : [])
+                    locale: formatters.locale) : [],
+            sharedXCategoryDomain: sharedXCategoryDomain)
     }
 
     public init(
@@ -2306,6 +2339,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         renderedData = state.renderedData
         boxPlotData = state.boxPlotData
         facetPanels = state.facetPanels
+        sharedXCategoryDomain = state.sharedXCategoryDomain
         self._selection = selection
         self.presentation = presentation
         self.formatters = formatters
@@ -2328,11 +2362,13 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             renderedData = state.renderedData
             boxPlotData = state.boxPlotData
             facetPanels = state.facetPanels
+            sharedXCategoryDomain = state.sharedXCategoryDomain
         } else if case .tableFallback(let fallback) = analysis.outcome {
             content = .fallback(fallback)
             renderedData = []
             boxPlotData = []
             facetPanels = []
+            sharedXCategoryDomain = []
         } else {
             content = .fallback(
                 AutoChartFallback(
@@ -2343,6 +2379,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             renderedData = []
             boxPlotData = []
             facetPanels = []
+            sharedXCategoryDomain = []
         }
         self._selection = selection
         self.presentation = presentation
@@ -2371,7 +2408,6 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     private var sharedYDomain: ClosedRange<Double>? { renderPresentation.sharedYDomain }
     private var sharedXDateDomain: ClosedRange<Date>? { renderPresentation.sharedXDateDomain }
     private var sharedXNumberDomain: ClosedRange<Double>? { renderPresentation.sharedXNumberDomain }
-    private var sharedXCategoryDomain: [String] { resolvedPresentation.sharedXCategoryDomain }
     private var facetBaseFamily: AutoChartFamily? { renderPresentation.facetBaseFamily }
     private var snapshotFingerprint: Int { preparedChart.core.fingerprint }
     private var xTitle: String { resolvedPresentation.x }
@@ -3124,6 +3160,42 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             fallback: resolvedPresentation.missingFacet)
     }
 
+    private func accessibilityXCategoryValue(for datum: AutoChartDatum) -> String {
+        categoryValueForSurface(
+            identity: datum.xIdentity,
+            value: datum.xCategoryValue,
+            label: datum.xLabel,
+            labels: xDisplayLabels,
+            fallback: resolvedPresentation.missingValue,
+            column: resolvedColumn(specification.encoding.x),
+            context: .markAccessibility,
+            formatters: formatters)
+    }
+
+    private func accessibilitySeriesValue(for datum: AutoChartDatum) -> String {
+        categoryValueForSurface(
+            identity: datum.seriesIdentity,
+            value: datum.seriesCategoryValue,
+            label: datum.series,
+            labels: seriesDisplayLabels,
+            fallback: resolvedPresentation.missingSeries,
+            column: resolvedColumn(specification.encoding.series),
+            context: .markAccessibility,
+            formatters: formatters)
+    }
+
+    private func accessibilityFacetValue(for datum: AutoChartDatum) -> String {
+        categoryValueForSurface(
+            identity: datum.facetIdentity,
+            value: datum.facetCategoryValue,
+            label: datum.facet,
+            labels: facetDisplayLabels,
+            fallback: resolvedPresentation.missingFacet,
+            column: resolvedColumn(specification.encoding.facet),
+            context: .markAccessibility,
+            formatters: formatters)
+    }
+
     private func resolvedSelectionDimensionLabel(
         _ dimension: AutoChartSelectedDimension
     ) -> String? {
@@ -3171,7 +3243,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             .bar, .groupedBar, .stackedBar, .normalizedBar, .rankedDot,
             .boxPlot, .donut, .range,
         ].contains(specification.family) {
-            name = xCategoryValue(for: datum)
+            name = accessibilityXCategoryValue(for: datum)
         } else if let date = datum.xDate {
             name = formatters.format(
                 column: xColumn, value: .date(date), context: .markAccessibility)
@@ -3179,7 +3251,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             name = formatters.format(
                 column: xColumn, value: .double(number), context: .markAccessibility)
         } else {
-            name = xCategoryValue(for: datum)
+            name = accessibilityXCategoryValue(for: datum)
         }
         let valueDescription: String? = {
             if specification.family == .range,
@@ -3199,9 +3271,10 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         }()
         return AutoChartAccessibility.markLabel(
             name: name,
-            series: specification.encoding.series == nil ? nil : seriesValue(for: datum),
+            series: specification.encoding.series == nil
+                ? nil : accessibilitySeriesValue(for: datum),
             facet: specification.encoding.facet == nil
-                ? nil : "\(facetTitle): \(facetValue(for: datum))",
+                ? nil : "\(facetTitle): \(accessibilityFacetValue(for: datum))",
             valueDescription: valueDescription,
             textResolver: textResolver)
     }
