@@ -731,10 +731,7 @@ enum AutoChartProfiler {
         _ value: AutoChartValue?
     ) -> AutoChartValueIdentity? {
         guard let value, value.numericValue != nil else { return nil }
-        if let identity = exactNumberIdentity(value) { return identity }
-        guard case .double(let number) = value else { return nil }
-        let normalized = number == 0 ? 0.0 : number
-        return .double(normalized.bitPattern)
+        return identity(value, semanticType: .ordinal)
     }
 
     /// A canonical, lossless identity for a numeric category.
@@ -996,21 +993,6 @@ enum AutoChartValueIdentity: Hashable, Sendable {
 }
 
 extension AutoChartValue {
-    private enum CategoryNumberPolicy {
-        static let maximumReadableStandardLength = 24
-
-        static func concise(
-            standard: String,
-            scientific: @autoclosure () -> String
-        ) -> String {
-            guard standard.count > maximumReadableStandardLength else {
-                return standard
-            }
-            let scientific = scientific()
-            return scientific.count < standard.count ? scientific : standard
-        }
-    }
-
     private static func conciseCategoryNumber(
         _ value: Double,
         locale: Locale
@@ -1019,7 +1001,7 @@ extension AutoChartValue {
         let standard = value.formatted(
             .number.locale(locale).grouping(.never)
                 .precision(.significantDigits(1...17)))
-        return CategoryNumberPolicy.concise(
+        return AutoChartCategoryNumberPolicy.concise(
             standard: standard,
             scientific: value.formatted(
                 .number.locale(locale).notation(.scientific)
@@ -1034,7 +1016,7 @@ extension AutoChartValue {
         let standard = value.formatted(
             .number.locale(locale).grouping(.never)
                 .precision(.significantDigits(1...38)))
-        return CategoryNumberPolicy.concise(
+        return AutoChartCategoryNumberPolicy.concise(
             standard: standard,
             scientific: value.formatted(
                 .number.locale(locale).notation(.scientific)

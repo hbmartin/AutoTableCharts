@@ -72,6 +72,12 @@ values and missing-value labels and typed category disambiguation labels are
 localizable as well. Source-column display names remain host-provided text.
 Return `nil` to use the package English fallback.
 
+The `.markAccessibility` message keeps its combined `facet` argument for
+compatibility and additionally supplies `facetTitle` and `facetValue` so hosts
+can reorder them. Numeric histogram intervals use
+`.histogramBinAccessibility` with `start` and `end` arguments; temporal range
+marks continue to use `.markAccessibilityRange` with the same argument names.
+
 ### Link semantic selection
 
 ``AutoChartSelection`` contains typed source row IDs, ordered dimension
@@ -97,6 +103,17 @@ let copy = selection.presentation(
 
 Clear selection when changing recommendation because mark identities and
 semantics belong to the prepared specification.
+
+Distinct-count aggregation compares numeric source values exactly. Equivalent
+integral values stored as `Int64`, `Double`, or `Decimal` merge, while an
+approximate fractional `Double` and an exact `Decimal` remain distinct unless
+their exact values agree. This avoids collapsing separate decimal values merely
+because both round to the same binary floating-point number.
+
+Selection scalar dimensions use exact category formatting so adjacent category
+identities do not collapse onto one rounded label. Numeric and temporal range
+endpoints use ordinary value formatting because they describe continuous
+bounds rather than category identities.
 
 ### Prepare alternatives asynchronously
 

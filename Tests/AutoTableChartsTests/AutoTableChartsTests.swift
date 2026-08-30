@@ -501,6 +501,13 @@ private let date = AutoChartColumn(
                 semanticType: .nominal,
                 role: .dimension,
                 unit: .percent(fractional: false)))
+        let fractionalPercentCategory = AutoChartColumn(
+            id: "fractional-percent-category",
+            name: "Fractional percent category",
+            hints: .init(
+                semanticType: .nominal,
+                role: .dimension,
+                unit: .percent(fractional: true)))
         let areaCategory = AutoChartColumn(
             id: "area-category",
             name: "Area category",
@@ -538,9 +545,37 @@ private let date = AutoChartColumn(
                 context: .axisTick) == "25%")
         #expect(
             formatter.formatCategory(
+                column: fractionalPercentCategory,
+                value: .integer(1),
+                context: .axisTick) == "100%")
+        #expect(
+            formatter.formatCategory(
+                column: percentCategory,
+                value: .double(1.1),
+                context: .axisTick) == "1.1%")
+        #expect(
+            formatter.formatCategory(
                 column: areaCategory,
                 value: .integer(1_000),
                 context: .axisTick) == "1000 sq ft")
+        let tiny = try #require(
+            Decimal(
+                string: "0.0000000000000000000000000000012345678",
+                locale: Locale(identifier: "en_US_POSIX")))
+        let tinyCurrency = formatter.formatCategory(
+            column: currencyCategory,
+            value: .decimal(tiny),
+            context: .axisTick)
+        let tinyPercent = formatter.formatCategory(
+            column: percentCategory,
+            value: .decimal(tiny),
+            context: .axisTick)
+        #expect(tinyCurrency.contains("$"))
+        #expect(tinyCurrency.contains("E"))
+        #expect(tinyCurrency.count <= 24)
+        #expect(tinyPercent.contains("%"))
+        #expect(tinyPercent.contains("E"))
+        #expect(tinyPercent.count <= 24)
 
         let specification = AutoChartSpecification.bar(
             category: currencyCategory.id,
@@ -607,11 +642,23 @@ private let date = AutoChartColumn(
             recorder.message?.arguments == [
                 "name": .string("Office"),
                 "series": .string("North"),
+                "facet": .string("Region: West"),
                 "facetTitle": .string("Region"),
                 "facetValue": .string("West"),
                 "value": .string("$12,000"),
             ])
         #expect(recorder.message?.defaultText == "Office, North, Region: West, $12,000")
+        #expect(
+            AutoChartAccessibility.markLabel(
+                name: "Office",
+                facetTitle: "Region",
+                facetValue: "West",
+                textResolver: AutoChartTextResolver { message in
+                    guard case .string(let facet)? = message.arguments["facet"] else {
+                        return nil
+                    }
+                    return facet
+                }) == "Region: West")
 
         #expect(
             AutoChartAccessibility.heatmapLabel(
@@ -660,7 +707,7 @@ private let date = AutoChartColumn(
         #expect(recorder.requests.count == 2)
         #expect(recorder.requests.allSatisfy { $0.column?.id == column.id })
         #expect(recorder.requests.allSatisfy { $0.context == .markAccessibility })
-        #expect(recorder.message?.code == .markAccessibilityRange)
+        #expect(recorder.message?.code == .histogramBinAccessibility)
         #expect(recorder.message?.arguments["start"] == .string("1,5"))
         #expect(recorder.message?.arguments["end"] == .string("2,75"))
         #expect(
@@ -670,8 +717,39 @@ private let date = AutoChartColumn(
                 column: column,
                 formatters: formatters,
                 textResolver: AutoChartTextResolver { message in
-                    message.code == .markAccessibilityRange ? "Localized bin" : nil
+                    message.code == .histogramBinAccessibility ? "Localized bin" : nil
                 }) == "Localized bin")
+
+        let snapshot = AutoChartSnapshot(
+            table(
+                columns: [column],
+                rows: [[.double(1.5)], [.double(2.75)]]))
+        let specification = AutoChartSpecification.histogram(
+            value: column.id,
+            binCount: 2)
+        let profiles = AutoChartProfiler.profileIndex(snapshot)
+        let prepared = AutoChartDataPreparation.preparedData(
+            snapshot: snapshot,
+            specification: specification,
+            profiles: profiles)
+        let presentation = AutoChartRenderPresentation(
+            snapshot: snapshot,
+            specification: specification,
+            profiles: profiles,
+            data: prepared.data,
+            measureSemantics: prepared.measureSemantics)
+        recorder.requests = []
+        recorder.message = nil
+        let resolved = presentation.resolvedPresentation(
+            data: prepared.data,
+            using: resolver,
+            formatters: formatters)
+        let requestCount = recorder.requests.count
+
+        #expect(requestCount == prepared.data.count * 2)
+        #expect(resolved.histogramBinAccessibilityLabels.count == prepared.data.count)
+        _ = resolved.histogramBinAccessibilityLabels.values.joined()
+        #expect(recorder.requests.count == requestCount)
     }
 
     @Test func quantitativeAccessibilityUsesTheNumericPosition() {
@@ -2311,6 +2389,20 @@ private let date = AutoChartColumn(
             snapshot: AutoChartSnapshot(input), specification: spec)
         #expect(data.reduce(0) { $0 + $1.sourceRowIDs.count } == 3)
         #expect(data.allSatisfy { $0.xLabel == nil })
+
+        let snapshot = AutoChartSnapshot(input)
+        let profiles = AutoChartProfiler.profileIndex(snapshot)
+        let prepared = AutoChartDataPreparation.preparedData(
+            snapshot: snapshot,
+            specification: spec,
+            profiles: profiles)
+        let presentation = AutoChartRenderPresentation(
+            snapshot: snapshot,
+            specification: spec,
+            profiles: profiles,
+            data: prepared.data,
+            measureSemantics: prepared.measureSemantics)
+        #expect(presentation.uniqueXCount == prepared.data.count)
     }
 
     @Test func nullMeasuresAreOmittedRatherThanRenderedAsZero() {
@@ -2358,6 +2450,10 @@ private let date = AutoChartColumn(
                 string: "0.12345678901234567890123456789012345679",
                 locale: Locale(identifier: "en_US_POSIX")))
         let firstInteger: Int64 = 9_007_199_254_740_992
+        let fractionalDecimal = try #require(
+            Decimal(
+                string: "0.1",
+                locale: Locale(identifier: "en_US_POSIX")))
         let input = table(
             columns: [category, measure],
             rows: [
@@ -2368,6 +2464,9 @@ private let date = AutoChartColumn(
                 [.text("Equivalent"), .integer(1)],
                 [.text("Equivalent"), .double(1)],
                 [.text("Equivalent"), .decimal(1)],
+                // Binary 0.1 and exact decimal 0.1 are different source values.
+                [.text("Fractional"), .double(0.1)],
+                [.text("Fractional"), .decimal(fractionalDecimal)],
             ])
         let specification = AutoChartSpecification(
             family: .bar,
@@ -2384,6 +2483,7 @@ private let date = AutoChartColumn(
         #expect(counts["Integers"] == 2)
         #expect(counts["Decimals"] == 2)
         #expect(counts["Equivalent"] == 1)
+        #expect(counts["Fractional"] == 2)
     }
 
     @Test func boxPlotsExcludeNullMeasuresFromLineage() {
@@ -2474,6 +2574,26 @@ private let date = AutoChartColumn(
         #expect(data.reduce(0) { $0 + $1.sourceRowIDs.count } == 2)
         #expect(data.compactMap(\.lower).allSatisfy { $0.isFinite })
         #expect(data.compactMap(\.upper).allSatisfy { $0.isFinite })
+    }
+
+    @Test func histogramKeepsSingletonExtremeBoundsFinite() {
+        let input = table(
+            columns: [measure],
+            rows: [[.double(.greatestFiniteMagnitude)]])
+        let specification = AutoChartSpecification(
+            family: .histogram,
+            encoding: AutoChartEncoding(x: measure.id),
+            aggregation: .count,
+            binCount: 10)
+        let data = preparedDatumValues(
+            snapshot: AutoChartSnapshot(input),
+            specification: specification)
+
+        #expect(data.count == 1)
+        #expect(data.first?.sourceRowIDs == [0])
+        #expect(data.first?.lower?.isFinite == true)
+        #expect(data.first?.upper?.isFinite == true)
+        #expect(data.first?.xNumber?.isFinite == true)
     }
 
     @Test func typedHourlyDatesRemainDistinctAndSortChronologically() throws {

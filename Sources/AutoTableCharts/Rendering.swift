@@ -47,7 +47,8 @@ struct AutoChartDatum: Identifiable, Sendable {
 /// so the timezone, locale, and unit a mark shows are the ones its label reads
 /// out. The components also reach the resolver as arguments: a host that wants
 /// to translate or reorder a label needs the pieces, not one English sentence
-/// it can only pass through unchanged.
+/// it can only pass through unchanged. Faceted labels retain the legacy combined
+/// `facet` argument and also provide `facetTitle` and `facetValue` separately.
 enum AutoChartAccessibility {
     static func markLabel(
         name: String,
@@ -74,15 +75,19 @@ enum AutoChartAccessibility {
         case (nil, nil):
             facetDescription = nil
         }
+        let defaultText = [name, series, facetDescription, valueDescription]
+            .compactMap(present)
+            .joined(separator: ", ")
         return label(
             components: [
                 ("name", name),
                 ("series", series),
+                ("facet", facetDescription),
                 ("facetTitle", facetTitle),
                 ("facetValue", facetValue),
                 ("value", valueDescription),
             ],
-            defaultValues: [name, series, facetDescription, valueDescription],
+            defaultText: defaultText,
             textResolver: textResolver)
     }
 
@@ -170,18 +175,20 @@ enum AutoChartAccessibility {
         return rangeLabel(
             startText: lowerText,
             endText: upperText,
+            code: .histogramBinAccessibility,
             textResolver: textResolver)
     }
 
     private static func rangeLabel(
         startText: String,
         endText: String,
+        code: AutoChartMessage.Code = .markAccessibilityRange,
         textResolver: AutoChartTextResolver
     ) -> String {
         return textResolver(
             AutoChartMessage(
                 category: .accessibility,
-                code: .markAccessibilityRange,
+                code: code,
                 arguments: [
                     "start": .string(startText),
                     "end": .string(endText),
@@ -191,19 +198,15 @@ enum AutoChartAccessibility {
 
     private static func label(
         components: [(key: String, value: String?)],
-        defaultValues: [String?]? = nil,
+        defaultText suppliedDefaultText: String? = nil,
         textResolver: AutoChartTextResolver
     ) -> String {
         let present = components.compactMap { component -> (String, String)? in
             guard let value = component.value, !value.isEmpty else { return nil }
             return (component.key, value)
         }
-        let defaultText = (defaultValues ?? components.map { $0.value })
-            .compactMap { value -> String? in
-                guard let value, !value.isEmpty else { return nil }
-                return value
-            }
-            .joined(separator: ", ")
+        let defaultText = suppliedDefaultText
+            ?? present.map(\.1).joined(separator: ", ")
         return textResolver(
             AutoChartMessage(
                 category: .accessibility,
@@ -957,13 +960,27 @@ enum AutoChartDataPreparation {
         guard let minimum = values.map(\.0).min(), let maximum = values.map(\.0).max() else {
             return []
         }
+        if minimum == maximum {
+            let previous = minimum.nextDown
+            let next = maximum.nextUp
+            let lower = previous.isFinite ? previous : minimum
+            let upper = next.isFinite ? next : maximum
+            let midpoint = lower + (upper - lower) / 2
+            return [
+                AutoChartDatum(
+                    id: "bin-0",
+                    sourceRowIDs: Set(values.map(\.1)),
+                    xNumber: midpoint,
+                    yNumber: Double(values.count),
+                    lower: lower,
+                    upper: upper)
+            ]
+        }
         let count = min(1_000, max(1, specification.binCount ?? 10))
-        let scale = maximum > minimum ? max(abs(minimum), abs(maximum)) : 1
+        let scale = max(abs(minimum), abs(maximum))
         let scaledMinimum = minimum / scale
         let scaledMaximum = maximum / scale
-        let scaledWidth =
-            scaledMaximum > scaledMinimum
-            ? (scaledMaximum - scaledMinimum) / Double(count) : 1
+        let scaledWidth = (scaledMaximum - scaledMinimum) / Double(count)
         var bins: [[(Double, Int)]] = Array(repeating: [], count: count)
         for value in values {
             let scaledValue = value.0 / scale
@@ -1499,6 +1516,7 @@ struct AutoChartRenderPresentation: Sendable {
     var sharedYDomain: ClosedRange<Double>?
     var sharedXDateDomain: ClosedRange<Date>?
     var sharedXNumberDomain: ClosedRange<Double>?
+    var family: AutoChartFamily
     var facetBaseFamily: AutoChartFamily?
     var xTitle: String
     var xTitleMessage: AutoChartMessage?
@@ -1660,6 +1678,7 @@ struct AutoChartRenderPresentation: Sendable {
             sharedXNumberDomain = nil
         }
 
+        family = specification.family
         self.facetBaseFamily = facetBaseFamily
         self.xSemanticType = xSemanticType
         xCategoryColumn = specification.encoding.x.flatMap(snapshot.column)
@@ -1671,7 +1690,9 @@ struct AutoChartRenderPresentation: Sendable {
         usesSeriesIdentityLabels = specification.encoding.series != nil
         usesFacetIdentityLabels = specification.encoding.facet != nil
         usesSharedXCategoryDomain = specification.family == .faceted && xIsCategorical
-        uniqueXCount = Set(data.compactMap { $0.xIdentity ?? $0.xLabel }).count
+        uniqueXCount = specification.family == .histogram
+            ? data.count
+            : Set(data.compactMap { $0.xIdentity ?? $0.xLabel }).count
         let zoomSource = specification.family.zoomSource(for: xSemanticType)
         var minimumZoomDate: Date?
         var maximumZoomDate: Date?
@@ -1836,6 +1857,7 @@ struct AutoChartResolvedPresentation: Sendable {
     var yDisplayLabels: [String: String]
     var seriesDisplayLabels: [String: String]
     var facetDisplayLabels: [String: String]
+    var histogramBinAccessibilityLabels: [String: String]
 
     init(
         presentation: AutoChartRenderPresentation,
@@ -2043,6 +2065,26 @@ struct AutoChartResolvedPresentation: Sendable {
                 facetPairs,
                 reserving: needsMissingFacet ? [resolvedMissingFacet] : [],
                 textResolver: textResolver) : [:]
+        var resolvedHistogramBinAccessibilityLabels: [String: String] = [:]
+        if presentation.family == .histogram {
+            for datum in data {
+                guard let lower = datum.lower, lower.isFinite,
+                    let upper = datum.upper, upper.isFinite
+                else {
+                    assertionFailure("Prepared histogram bins require finite bounds.")
+                    resolvedHistogramBinAccessibilityLabels[datum.id] =
+                        AutoChartValue.unrepresentableValuePlaceholder
+                    continue
+                }
+                resolvedHistogramBinAccessibilityLabels[datum.id] =
+                    AutoChartAccessibility.histogramBinLabel(
+                        lower: lower,
+                        upper: upper,
+                        column: presentation.xCategoryColumn,
+                        formatters: formatters,
+                        textResolver: textResolver)
+            }
+        }
 
         x = resolvedX
         y = resolvedY
@@ -2060,6 +2102,7 @@ struct AutoChartResolvedPresentation: Sendable {
         yDisplayLabels = resolvedYDisplayLabels
         seriesDisplayLabels = resolvedSeriesDisplayLabels
         facetDisplayLabels = resolvedFacetDisplayLabels
+        histogramBinAccessibilityLabels = resolvedHistogramBinAccessibilityLabels
     }
 }
 
@@ -3285,15 +3328,10 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         let xColumn = resolvedColumn(specification.encoding.x)
         let name: String
         if specification.family == .histogram {
-            if let lower = datum.lower, let upper = datum.upper {
-                name = AutoChartAccessibility.histogramBinLabel(
-                    lower: lower,
-                    upper: upper,
-                    column: xColumn,
-                    formatters: formatters,
-                    textResolver: textResolver)
+            if let label = resolvedPresentation.histogramBinAccessibilityLabels[datum.id] {
+                name = label
             } else {
-                assertionFailure("Prepared histogram bins require finite bounds.")
+                assertionFailure("Prepared histogram bins require a cached accessibility label.")
                 name = AutoChartValue.unrepresentableValuePlaceholder
             }
         } else if [

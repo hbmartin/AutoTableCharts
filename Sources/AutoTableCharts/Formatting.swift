@@ -181,6 +181,21 @@ public struct AutoChartFormattingRequest: Hashable, Sendable {
     }
 }
 
+enum AutoChartCategoryNumberPolicy {
+    static let maximumReadableStandardLength = 24
+
+    static func concise(
+        standard: String,
+        scientific: @autoclosure () -> String
+    ) -> String {
+        guard standard.count > maximumReadableStandardLength else {
+            return standard
+        }
+        let scientific = scientific()
+        return scientific.count < standard.count ? scientific : standard
+    }
+}
+
 /// Host formatting hooks applied at presentation time.
 public struct AutoChartFormatters: Sendable {
     /// A compatibility formatter for source values.
@@ -199,6 +214,25 @@ public struct AutoChartFormatters: Sendable {
     public var locale: Locale
     public var timeZone: TimeZone
     private let override: RequestFormatter?
+
+    private enum CategoryNumber {
+        case integer(Int64)
+        case double(Double)
+        case decimal(Decimal)
+
+        init?(_ value: AutoChartValue) {
+            switch value {
+            case .integer(let number):
+                self = .integer(number)
+            case .double(let number) where number.isFinite:
+                self = .double(number)
+            case .decimal(let number) where !number.isNaN:
+                self = .decimal(number)
+            default:
+                return nil
+            }
+        }
+    }
 
     public init(
         locale: Locale = .autoupdatingCurrent,
@@ -283,72 +317,117 @@ public struct AutoChartFormatters: Sendable {
         datePrecision: AutoChartDateLabelPrecision? = nil,
         calendar: Calendar? = nil
     ) -> String {
+        let number = CategoryNumber(value)
+        if let number {
+            switch column?.hints.unit {
+            case .currency(let code):
+                return formatCategoryCurrency(number, code: code)
+            case .percent(let fractional):
+                return formatCategoryPercent(number, fractional: fractional)
+            case .area, .duration, .custom, .number, nil:
+                break
+            }
+        }
         let base = value.categoryString(
             locale: locale,
             timeZone: timeZone,
             datePrecision: datePrecision,
             calendar: calendar)
             ?? AutoChartValue.unrepresentableValuePlaceholder
-        guard value.numericValue != nil else { return base }
+        guard number != nil else { return base }
         switch column?.hints.unit {
-        case .currency(let code):
-            return formatCategoryCurrency(value, code: code) ?? base
-        case .percent(let fractional):
-            return formatCategoryPercent(value, fractional: fractional) ?? base
         case .area(let unit), .duration(let unit), .custom(let unit):
             return "\(base) \(unit)"
-        case .number, nil:
+        case .currency, .percent, .number, nil:
             return base
         }
     }
 
     private func formatCategoryCurrency(
-        _ value: AutoChartValue,
+        _ number: CategoryNumber,
         code: String
-    ) -> String? {
-        switch value {
-        case .integer(let number):
-            return number.formatted(
-                .currency(code: code).locale(locale)
-                    .precision(.significantDigits(1...38)))
-        case .double(let number) where number.isFinite:
-            return number.formatted(
-                .currency(code: code).locale(locale)
-                    .precision(.significantDigits(1...17)))
-        case .decimal(let number) where !number.isNaN:
-            return number.formatted(
-                .currency(code: code).locale(locale)
-                    .precision(.significantDigits(1...38)))
-        default:
-            return nil
+    ) -> String {
+        switch number {
+        case .integer(let value):
+            return AutoChartCategoryNumberPolicy.concise(
+                standard: value.formatted(
+                    .currency(code: code).locale(locale)
+                        .precision(.significantDigits(1...38))),
+                scientific: formatCategoryCurrencyScientific(number, code: code))
+        case .double(let value):
+            return AutoChartCategoryNumberPolicy.concise(
+                standard: value.formatted(
+                    .currency(code: code).locale(locale)
+                        .precision(.significantDigits(1...17))),
+                scientific: formatCategoryCurrencyScientific(number, code: code))
+        case .decimal(let value):
+            return AutoChartCategoryNumberPolicy.concise(
+                standard: value.formatted(
+                    .currency(code: code).locale(locale)
+                        .precision(.significantDigits(1...38))),
+                scientific: formatCategoryCurrencyScientific(number, code: code))
         }
     }
 
+    private func formatCategoryCurrencyScientific(
+        _ number: CategoryNumber,
+        code: String
+    ) -> String {
+        let isNegative: Bool
+        let magnitude: String
+        switch number {
+        case .integer(let value):
+            var decimal = Decimal(value)
+            isNegative = decimal < 0
+            if isNegative { decimal *= -1 }
+            magnitude = decimal.formatted(
+                .number.locale(locale).notation(.scientific)
+                    .precision(.significantDigits(1...38)))
+        case .double(let value):
+            isNegative = value.sign == .minus
+            magnitude = abs(value).formatted(
+                .number.locale(locale).notation(.scientific)
+                    .precision(.significantDigits(1...17)))
+        case .decimal(let value):
+            var decimal = value
+            isNegative = decimal < 0
+            if isNegative { decimal *= -1 }
+            magnitude = decimal.formatted(
+                .number.locale(locale).notation(.scientific)
+                    .precision(.significantDigits(1...38)))
+        }
+
+        let formatter = NumberFormatter()
+        formatter.locale = locale
+        formatter.numberStyle = .currency
+        formatter.currencyCode = code
+        let prefix = isNegative ? formatter.negativePrefix : formatter.positivePrefix
+        let suffix = isNegative ? formatter.negativeSuffix : formatter.positiveSuffix
+        guard prefix != nil || suffix != nil else { return "\(magnitude) \(code)" }
+        return "\(prefix ?? "")\(magnitude)\(suffix ?? "")"
+    }
+
     private func formatCategoryPercent(
-        _ value: AutoChartValue,
+        _ number: CategoryNumber,
         fractional: Bool
-    ) -> String? {
-        switch value {
-        case .integer(let number):
-            if fractional {
-                return number.formatted(
-                    .percent.locale(locale).precision(.significantDigits(1...38)))
-            }
-            var scaled = Decimal(number)
-            scaled /= 100
-            return scaled.formatted(
-                .percent.locale(locale).precision(.significantDigits(1...38)))
-        case .double(let number) where number.isFinite:
-            let scaled = fractional ? number : number / 100
-            return scaled.formatted(
-                .percent.locale(locale).precision(.significantDigits(1...17)))
-        case .decimal(let number) where !number.isNaN:
-            var scaled = number
-            if !fractional { scaled /= 100 }
-            return scaled.formatted(
-                .percent.locale(locale).precision(.significantDigits(1...38)))
-        default:
-            return nil
+    ) -> String {
+        switch number {
+        case .integer(let value):
+            return formatCategoryPercent(.decimal(Decimal(value)), fractional: fractional)
+        case .double(let value):
+            let style = FloatingPointFormatStyle<Double>.Percent(locale: locale)
+                .scale(fractional ? 100 : 1)
+                .precision(.significantDigits(1...17))
+            return AutoChartCategoryNumberPolicy.concise(
+                standard: value.formatted(style),
+                scientific: value.formatted(style.notation(.scientific)))
+        case .decimal(let value):
+            let style = Decimal.FormatStyle.Percent(locale: locale)
+                .scale(fractional ? 100 : 1)
+                .precision(.significantDigits(1...38))
+            return AutoChartCategoryNumberPolicy.concise(
+                standard: value.formatted(style),
+                scientific: value.formatted(style.notation(.scientific)))
         }
     }
 
@@ -482,6 +561,10 @@ enum AutoChartFormattingLineage {
 }
 
 extension AutoChartSelection {
+    /// Resolves a human-readable selection without requiring a rendered view.
+    /// Scalar dimensions use exact category formatting so neighboring category
+    /// identities remain distinguishable; continuous range endpoints use normal
+    /// value formatting.
     public func presentation(
         columns: [AutoChartColumn],
         formatters: AutoChartFormatters = .init(),
