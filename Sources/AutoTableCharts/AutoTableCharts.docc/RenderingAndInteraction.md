@@ -77,6 +77,9 @@ compatibility and additionally supplies `facetTitle` and `facetValue` so hosts
 can reorder them. Numeric histogram intervals use
 `.histogramBinAccessibility` with `start` and `end` arguments; temporal range
 marks continue to use `.markAccessibilityRange` with the same argument names.
+When a resolver does not handle `.histogramBinAccessibility`, histogram
+intervals also try the legacy `.markAccessibilityRange` code before using the
+English fallback.
 
 ### Link semantic selection
 

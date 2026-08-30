@@ -1663,7 +1663,11 @@ public struct AutoChartTextResolver: Sendable {
     }
 
     public func callAsFunction(_ message: AutoChartMessage) -> String {
-        resolveValue(message) ?? message.defaultText
+        resolve(message) ?? message.defaultText
+    }
+
+    func resolve(_ message: AutoChartMessage) -> String? {
+        resolveValue(message)
     }
 
     public static let `default` = AutoChartTextResolver { _ in nil }
