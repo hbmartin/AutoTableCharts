@@ -186,13 +186,35 @@ enum AutoChartCategoryNumberPolicy {
 
     static func concise(
         standard: String,
-        scientific: @autoclosure () -> String
+        scientific: () -> String
     ) -> String {
         guard standard.count > maximumReadableStandardLength else {
             return standard
         }
         let scientific = scientific()
         return scientific.count < standard.count ? scientific : standard
+    }
+}
+
+enum AutoChartLegacyCurrencyFormatting {
+    static func replacingMagnitude(
+        in standard: String,
+        signedStandardMagnitude: String,
+        standardMagnitude: String,
+        scientificMagnitude: String
+    ) -> String {
+        guard standard != signedStandardMagnitude else {
+            // Match native Currency.FormatStyle behavior for an unsupported
+            // code: without a currency affix, scientific currency notation is
+            // unavailable rather than silently borrowing the locale currency.
+            return standard
+        }
+        guard let range = standard.range(of: standardMagnitude) else {
+            // Preserve the native currency output if Foundation uses a numeric
+            // pattern that cannot be isolated safely on an older OS.
+            return standard
+        }
+        return standard.replacingCharacters(in: range, with: scientificMagnitude)
     }
 }
 
@@ -356,68 +378,55 @@ public struct AutoChartFormatters: Sendable {
                 locale: locale
             ).precision(.significantDigits(1...17))
             let standard = value.formatted(style)
-            let scientific: String
-            if #available(iOS 18, macOS 15, tvOS 18, watchOS 11, *) {
-                scientific = value.formatted(style.notation(.scientific))
-            } else {
-                let standardMagnitude = abs(value).formatted(
-                    .number.locale(locale).grouping(.automatic)
-                        .precision(.significantDigits(1...17)))
-                let scientificMagnitude = abs(value).formatted(
-                    .number.locale(locale).notation(.scientific)
-                        .precision(.significantDigits(1...17)))
-                scientific = replacingCurrencyMagnitude(
-                    in: standard,
-                    standardMagnitude: standardMagnitude,
-                    scientificMagnitude: scientificMagnitude)
-            }
             return AutoChartCategoryNumberPolicy.concise(
                 standard: standard,
-                scientific: scientific)
+                scientific: {
+                    if #available(iOS 18, macOS 15, tvOS 18, watchOS 11, *) {
+                        return value.formatted(style.notation(.scientific))
+                    }
+                    let signedStandardMagnitude = value.formatted(
+                        .number.locale(locale).grouping(.automatic)
+                            .precision(.significantDigits(1...17)))
+                    let standardMagnitude = abs(value).formatted(
+                        .number.locale(locale).grouping(.automatic)
+                            .precision(.significantDigits(1...17)))
+                    let scientificMagnitude = abs(value).formatted(
+                        .number.locale(locale).notation(.scientific)
+                            .precision(.significantDigits(1...17)))
+                    return AutoChartLegacyCurrencyFormatting.replacingMagnitude(
+                        in: standard,
+                        signedStandardMagnitude: signedStandardMagnitude,
+                        standardMagnitude: standardMagnitude,
+                        scientificMagnitude: scientificMagnitude)
+                })
         case .decimal(let value):
             let style = Decimal.FormatStyle.Currency(
                 code: code,
                 locale: locale
             ).precision(.significantDigits(1...38))
             let standard = value.formatted(style)
-            let scientific: String
-            if #available(iOS 18, macOS 15, tvOS 18, watchOS 11, *) {
-                scientific = value.formatted(style.notation(.scientific))
-            } else {
-                let standardMagnitude = abs(value).formatted(
-                    .number.locale(locale).grouping(.automatic)
-                        .precision(.significantDigits(1...38)))
-                let scientificMagnitude = abs(value).formatted(
-                    .number.locale(locale).notation(.scientific)
-                        .precision(.significantDigits(1...38)))
-                scientific = replacingCurrencyMagnitude(
-                    in: standard,
-                    standardMagnitude: standardMagnitude,
-                    scientificMagnitude: scientificMagnitude)
-            }
             return AutoChartCategoryNumberPolicy.concise(
                 standard: standard,
-                scientific: scientific)
+                scientific: {
+                    if #available(iOS 18, macOS 15, tvOS 18, watchOS 11, *) {
+                        return value.formatted(style.notation(.scientific))
+                    }
+                    let signedStandardMagnitude = value.formatted(
+                        .number.locale(locale).grouping(.automatic)
+                            .precision(.significantDigits(1...38)))
+                    let standardMagnitude = abs(value).formatted(
+                        .number.locale(locale).grouping(.automatic)
+                            .precision(.significantDigits(1...38)))
+                    let scientificMagnitude = abs(value).formatted(
+                        .number.locale(locale).notation(.scientific)
+                            .precision(.significantDigits(1...38)))
+                    return AutoChartLegacyCurrencyFormatting.replacingMagnitude(
+                        in: standard,
+                        signedStandardMagnitude: signedStandardMagnitude,
+                        standardMagnitude: standardMagnitude,
+                        scientificMagnitude: scientificMagnitude)
+                })
         }
-    }
-
-    private func replacingCurrencyMagnitude(
-        in standard: String,
-        standardMagnitude: String,
-        scientificMagnitude: String
-    ) -> String {
-        guard standard != standardMagnitude else {
-            // Match native Currency.FormatStyle behavior for an unsupported
-            // code: without a currency affix, scientific currency notation is
-            // unavailable rather than silently borrowing the locale currency.
-            return standard
-        }
-        guard let range = standard.range(of: standardMagnitude) else {
-            // Preserve the native currency output if Foundation uses a numeric
-            // pattern that cannot be isolated safely on an older OS.
-            return standard
-        }
-        return standard.replacingCharacters(in: range, with: scientificMagnitude)
     }
 
     private func formatCategoryPercent(
@@ -433,14 +442,14 @@ public struct AutoChartFormatters: Sendable {
                 .precision(.significantDigits(1...17))
             return AutoChartCategoryNumberPolicy.concise(
                 standard: value.formatted(style),
-                scientific: value.formatted(style.notation(.scientific)))
+                scientific: { value.formatted(style.notation(.scientific)) })
         case .decimal(let value):
             let style = Decimal.FormatStyle.Percent(locale: locale)
                 .scale(fractional ? 100 : 1)
                 .precision(.significantDigits(1...38))
             return AutoChartCategoryNumberPolicy.concise(
                 standard: value.formatted(style),
-                scientific: value.formatted(style.notation(.scientific)))
+                scientific: { value.formatted(style.notation(.scientific)) })
         }
     }
 

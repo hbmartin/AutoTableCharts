@@ -1003,9 +1003,11 @@ extension AutoChartValue {
                 .precision(.significantDigits(1...17)))
         return AutoChartCategoryNumberPolicy.concise(
             standard: standard,
-            scientific: value.formatted(
-                .number.locale(locale).notation(.scientific)
-                    .precision(.significantDigits(1...17))))
+            scientific: {
+                value.formatted(
+                    .number.locale(locale).notation(.scientific)
+                        .precision(.significantDigits(1...17)))
+            })
     }
 
     private static func conciseCategoryNumber(
@@ -1018,9 +1020,11 @@ extension AutoChartValue {
                 .precision(.significantDigits(1...38)))
         return AutoChartCategoryNumberPolicy.concise(
             standard: standard,
-            scientific: value.formatted(
-                .number.locale(locale).notation(.scientific)
-                    .precision(.significantDigits(1...38))))
+            scientific: {
+                value.formatted(
+                    .number.locale(locale).notation(.scientific)
+                        .precision(.significantDigits(1...38)))
+            })
     }
 
     /// A deterministic category label. Presentation code supplies the chart's

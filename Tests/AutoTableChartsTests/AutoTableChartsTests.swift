@@ -486,6 +486,55 @@ private let date = AutoChartColumn(
         #expect(!label.contains("2001"))
     }
 
+    @Test func conciseCategoryNumbersPreserveTheLengthBoundaryAndRemainLazy() {
+        var scientificFormatCount = 0
+        func scientific() -> String {
+            scientificFormatCount += 1
+            return "1E24"
+        }
+        let limit = AutoChartCategoryNumberPolicy.maximumReadableStandardLength
+        let readable = String(repeating: "1", count: limit)
+        let oversized = String(repeating: "1", count: limit + 1)
+
+        #expect(
+            AutoChartCategoryNumberPolicy.concise(
+                standard: readable,
+                scientific: scientific) == readable)
+        #expect(scientificFormatCount == 0)
+        #expect(
+            AutoChartCategoryNumberPolicy.concise(
+                standard: oversized,
+                scientific: scientific) == "1E24")
+        #expect(scientificFormatCount == 1)
+    }
+
+    @Test func legacyAffixlessCurrencyFormattingIsSignSymmetric() {
+        #expect(
+            AutoChartLegacyCurrencyFormatting.replacingMagnitude(
+                in: "123",
+                signedStandardMagnitude: "123",
+                standardMagnitude: "123",
+                scientificMagnitude: "1.23E2") == "123")
+        #expect(
+            AutoChartLegacyCurrencyFormatting.replacingMagnitude(
+                in: "-123",
+                signedStandardMagnitude: "-123",
+                standardMagnitude: "123",
+                scientificMagnitude: "1.23E2") == "-123")
+        #expect(
+            AutoChartLegacyCurrencyFormatting.replacingMagnitude(
+                in: "$123",
+                signedStandardMagnitude: "123",
+                standardMagnitude: "123",
+                scientificMagnitude: "1.23E2") == "$1.23E2")
+        #expect(
+            AutoChartLegacyCurrencyFormatting.replacingMagnitude(
+                in: "-$123",
+                signedStandardMagnitude: "-123",
+                standardMagnitude: "123",
+                scientificMagnitude: "1.23E2") == "-$1.23E2")
+    }
+
     @Test func categoryDefaultsHonorUnitsWithoutCollapsingExactValues() throws {
         let currencyCategory = AutoChartColumn(
             id: "currency-category",
@@ -579,12 +628,18 @@ private let date = AutoChartColumn(
         ).scale(1).precision(.significantDigits(1...38))
         #expect(tinyCurrency.contains("$"))
         #expect(tinyCurrency.contains("E"))
+        #expect(
+            tinyCurrency.count
+                <= AutoChartCategoryNumberPolicy.maximumReadableStandardLength)
         if #available(iOS 18, macOS 15, tvOS 18, watchOS 11, *) {
             #expect(tinyCurrency == tiny.formatted(currencyStyle.notation(.scientific)))
         }
         #expect(tinyCurrency.count < tiny.formatted(currencyStyle).count)
         #expect(tinyPercent.contains("%"))
         #expect(tinyPercent.contains("E"))
+        #expect(
+            tinyPercent.count
+                <= AutoChartCategoryNumberPolicy.maximumReadableStandardLength)
         #expect(tinyPercent == tiny.formatted(percentStyle.notation(.scientific)))
         #expect(tinyPercent.count < tiny.formatted(percentStyle).count)
 
@@ -807,7 +862,17 @@ private let date = AutoChartColumn(
                     || $0.code == .markAccessibilityRange
             })
         recorder.messages = []
-        let labels = prepared.data.map(resolved.histogramBinAccessibilityLabel(for:))
+        let firstLabel = resolved.histogramBinAccessibilityLabel(for: prepared.data[0])
+
+        #expect(recorder.requests.count == 2)
+        #expect(recorder.messages.count == 2)
+        #expect(
+            resolved.histogramBinAccessibilityLabel(for: prepared.data[0]) == firstLabel)
+        #expect(recorder.requests.count == 2)
+        #expect(recorder.messages.count == 2)
+
+        let secondLabel = resolved.histogramBinAccessibilityLabel(for: prepared.data[1])
+        let labels = [firstLabel, secondLabel]
         let requestCount = recorder.requests.count
         let messageCount = recorder.messages.count
 
@@ -2463,6 +2528,51 @@ private let date = AutoChartColumn(
         #expect(data.allSatisfy { $0.xLabel == nil })
     }
 
+    @Test func renderPresentationCountsOnlyCategoricalXValues() {
+        let categoricalInput = table(
+            columns: [category, measure],
+            rows: [[.text("A"), .double(1)], [.text("B"), .double(2)]])
+        let categoricalSpecification = AutoChartSpecification(
+            family: .bar,
+            encoding: .init(x: category.id, y: measure.id))
+        let categoricalSnapshot = AutoChartSnapshot(categoricalInput)
+        let categoricalProfiles = AutoChartProfiler.profileIndex(categoricalSnapshot)
+        let categoricalPrepared = AutoChartDataPreparation.preparedData(
+            snapshot: categoricalSnapshot,
+            specification: categoricalSpecification,
+            profiles: categoricalProfiles)
+        let categoricalPresentation = AutoChartRenderPresentation(
+            snapshot: categoricalSnapshot,
+            specification: categoricalSpecification,
+            profiles: categoricalProfiles,
+            data: categoricalPrepared.data,
+            measureSemantics: categoricalPrepared.measureSemantics)
+
+        let histogramInput = table(
+            columns: [measure],
+            rows: [[.double(1)], [.double(2)], [.double(3)]])
+        let histogramSpecification = AutoChartSpecification(
+            family: .histogram,
+            encoding: .init(x: measure.id),
+            aggregation: .count,
+            binCount: 2)
+        let histogramSnapshot = AutoChartSnapshot(histogramInput)
+        let histogramProfiles = AutoChartProfiler.profileIndex(histogramSnapshot)
+        let histogramPrepared = AutoChartDataPreparation.preparedData(
+            snapshot: histogramSnapshot,
+            specification: histogramSpecification,
+            profiles: histogramProfiles)
+        let histogramPresentation = AutoChartRenderPresentation(
+            snapshot: histogramSnapshot,
+            specification: histogramSpecification,
+            profiles: histogramProfiles,
+            data: histogramPrepared.data,
+            measureSemantics: histogramPrepared.measureSemantics)
+
+        #expect(categoricalPresentation.xCategoryCount == 2)
+        #expect(histogramPresentation.xCategoryCount == 0)
+    }
+
     @Test func nullMeasuresAreOmittedRatherThanRenderedAsZero() {
         let input = table(
             columns: [category, measure],
@@ -2634,6 +2744,31 @@ private let date = AutoChartColumn(
         #expect(data.compactMap(\.upper).allSatisfy { $0.isFinite })
     }
 
+    @Test func histogramReportsBoundsThatContainEveryAssignedValue() throws {
+        let values = [
+            -5.409559967935998e-252,
+            6.554786997215165e-237,
+            1.3109573994430337e-236,
+        ]
+        let input = table(
+            columns: [measure],
+            rows: values.map { [.double($0)] })
+        let specification = AutoChartSpecification(
+            family: .histogram,
+            encoding: AutoChartEncoding(x: measure.id),
+            aggregation: .count,
+            binCount: 2)
+        let data = preparedDatumValues(
+            snapshot: AutoChartSnapshot(input),
+            specification: specification)
+
+        for (rowID, value) in values.enumerated() {
+            let bin = try #require(data.first { $0.sourceRowIDs.contains(rowID) })
+            #expect(try #require(bin.lower) <= value)
+            #expect(value <= (try #require(bin.upper)))
+        }
+    }
+
     @Test func histogramClampsAsymmetricExtremeBoundsToFiniteInputExtrema() throws {
         let maximum = Double.greatestFiniteMagnitude
         let minimum = -0.991 * maximum
@@ -2688,6 +2823,29 @@ private let date = AutoChartColumn(
                     column: measure,
                     value: .double(upper),
                     context: .markAccessibility))
+    }
+
+    @Test func histogramSingletonPaddingPreservesSmallValueScale() throws {
+        let value = 0.001
+        let input = table(columns: [measure], rows: [[.double(value)]])
+        let specification = AutoChartSpecification(
+            family: .histogram,
+            encoding: AutoChartEncoding(x: measure.id),
+            aggregation: .count,
+            binCount: 10)
+        let bin = try #require(
+            preparedDatumValues(
+                snapshot: AutoChartSnapshot(input),
+                specification: specification
+            ).first)
+        let lower = try #require(bin.lower)
+        let upper = try #require(bin.upper)
+
+        #expect(0 < lower)
+        #expect(lower < value)
+        #expect(value < upper)
+        #expect(upper < 0.002)
+        #expect(bin.xNumber == value)
     }
 
     @Test func histogramKeepsSingletonExtremeBoundsFinite() {
