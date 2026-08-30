@@ -406,6 +406,42 @@ private let date = AutoChartColumn(
         #expect(gregorianLabel?.contains("2544") == false)
     }
 
+    @Test func categoryPresentationUsesOneNumericNotationPerChannel() {
+        let numericCategory = AutoChartColumn(
+            id: "numeric-category",
+            name: "Numeric category",
+            hints: .init(semanticType: .nominal, role: .dimension))
+        let snapshot = AutoChartSnapshot(
+            table(
+                columns: [numericCategory, measure],
+                rows: [
+                    [.double(1e-22), .double(1)],
+                    [.double(1e-23), .double(2)],
+                ]))
+        let specification = AutoChartSpecification.bar(
+            category: numericCategory.id,
+            measure: measure.id)
+        let profiles = AutoChartProfiler.profileIndex(snapshot)
+        let prepared = AutoChartDataPreparation.preparedData(
+            snapshot: snapshot,
+            specification: specification,
+            profiles: profiles)
+        let presentation = AutoChartRenderPresentation(
+            snapshot: snapshot,
+            specification: specification,
+            profiles: profiles,
+            data: prepared.data,
+            measureSemantics: prepared.measureSemantics)
+        let resolved = presentation.resolvedPresentation(
+            data: prepared.data,
+            using: .default,
+            formatters: AutoChartFormatters(
+                locale: Locale(identifier: "en_US"),
+                timeZone: .gmt))
+
+        #expect(Set(resolved.xDisplayLabels.values) == ["1E-22", "1E-23"])
+    }
+
     @Test func accessibilityLabelsIncludeSeriesContext() {
         #expect(
             AutoChartAccessibility.markLabel(
@@ -3436,12 +3472,40 @@ private let date = AutoChartColumn(
         let ordered = orderedPresentedData(
             prepared.data,
             specification: specification,
+            xSemanticType: profiles[category.id]?.semanticType,
             xLabels: resolved.xDisplayLabels,
             yLabels: resolved.yDisplayLabels,
             missingValue: resolved.missingValue,
             locale: formatters.locale)
 
         #expect(ordered.compactMap(\.xLabel) == ["Alpha", "Zoo", "A"])
+    }
+
+    @Test func presentedOrderingPreservesContinuousLineSequence() {
+        let specification = AutoChartSpecification(
+            family: .line,
+            encoding: .init(x: date.id, y: measure.id),
+            sort: .descending)
+        let first = Date(timeIntervalSinceReferenceDate: 0)
+        let second = first.addingTimeInterval(86_400)
+        let data = [
+            AutoChartDatum(
+                id: "first", sourceRowIDs: [0],
+                xIdentity: "first", xLabel: "Zulu", xDate: first, yNumber: 1),
+            AutoChartDatum(
+                id: "second", sourceRowIDs: [1],
+                xIdentity: "second", xLabel: "Alpha", xDate: second, yNumber: 2),
+        ]
+        let ordered = orderedPresentedData(
+            data,
+            specification: specification,
+            xSemanticType: .temporal,
+            xLabels: ["first": "Zulu", "second": "Alpha"],
+            yLabels: [:],
+            missingValue: "Missing",
+            locale: Locale(identifier: "en_US"))
+
+        #expect(ordered.map(\.id) == ["first", "second"])
     }
 
     @Test func familySpecificChannelsAreRejectedWhenTheRendererWouldIgnoreThem() {
@@ -4470,9 +4534,11 @@ private let date = AutoChartColumn(
         let specification = AutoChartSpecification(
             family: .faceted,
             encoding: .init(x: category.id, y: measure.id, facet: facet.id),
-            facetBaseFamily: .bar)
+            facetBaseFamily: .bar,
+            sort: .ascending)
         let snapshot = AutoChartSnapshot(
             table(columns: [category, measure, facet], rows: []))
+        let profiles = AutoChartProfiler.profileIndex(snapshot)
         let data = [
             AutoChartDatum(
                 id: "integer", sourceRowIDs: [],
@@ -4480,13 +4546,13 @@ private let date = AutoChartColumn(
                 facetIdentity: "integer:1", facet: "1"),
             AutoChartDatum(
                 id: "text", sourceRowIDs: [],
-                xIdentity: "text:1:1", xLabel: "1", yNumber: 2,
+                xIdentity: "text:1:1", xLabel: "1", yNumber: 1,
                 facetIdentity: "text:1:1", facet: "1"),
         ]
         let presentation = AutoChartRenderPresentation(
             snapshot: snapshot,
             specification: specification,
-            profiles: AutoChartProfiler.profileIndex(snapshot),
+            profiles: profiles,
             data: data,
             measureSemantics: renderedValueSemantics(columnID: measure.id))
         let resolved = presentation.resolvedPresentation(
@@ -4497,8 +4563,21 @@ private let date = AutoChartColumn(
                 else { return nil }
                 return kind == "integer" ? "Zulu" : "Alpha"
             })
+        let presented = orderedPresentedData(
+            data,
+            specification: specification,
+            xSemanticType: profiles[category.id]?.semanticType,
+            xLabels: resolved.xDisplayLabels,
+            yLabels: resolved.yDisplayLabels,
+            missingValue: resolved.missingValue,
+            locale: Locale(identifier: "en_US"))
 
-        #expect(resolved.sharedXCategoryDomain == ["Zulu", "Alpha"])
+        #expect(
+            resolvedXCategoryDomain(
+                in: presented,
+                labels: resolved.xDisplayLabels,
+                fallback: resolved.missingValue)
+                == ["Alpha", "Zulu"])
         #expect(
             orderedFacetPanels(
                 in: data,
@@ -5093,7 +5172,7 @@ private let date = AutoChartColumn(
         #expect(overridden.xDisplayLabels.values.allSatisfy { $0.hasPrefix("category:") })
     }
 
-    @Test func categoryPresentationFormatsDistinctIdentitiesWithSurfaceContexts() {
+    @Test func categoryPresentationRetainsAxisTickContextForHostOverrides() {
         final class Recorder: @unchecked Sendable {
             var requests: [AutoChartFormattingRequest] = []
         }
@@ -5141,7 +5220,7 @@ private let date = AutoChartColumn(
             timeZone: .gmt
         ) { request, _, _ in
             recorder.requests.append(request)
-            return nil
+            return "custom:\(request.column?.id.rawValue ?? "none")"
         }
         let resolved = presentation.resolvedPresentation(
             data: prepared.data,
@@ -5154,11 +5233,78 @@ private let date = AutoChartColumn(
         #expect(xRequests.count == 2)
         #expect(xRequests.allSatisfy { $0.context == .axisTick })
         #expect(seriesRequests.count == 2)
-        #expect(seriesRequests.allSatisfy { $0.context == .legend })
+        #expect(seriesRequests.allSatisfy { $0.context == .axisTick })
         #expect(facetRequests.count == 2)
-        #expect(facetRequests.allSatisfy { $0.context == .facetHeader })
+        #expect(facetRequests.allSatisfy { $0.context == .axisTick })
         #expect(resolved.facetDisplayLabels.count == 2)
-        #expect(resolved.facetDisplayLabels.values.allSatisfy { $0.contains(":") })
+        #expect(
+            resolved.facetDisplayLabels.values.allSatisfy {
+                $0.hasPrefix("custom:facet")
+            })
+    }
+
+    @Test func categorySelectionSummaryReusesResolvedDatePrecision() throws {
+        let dateCategory = AutoChartColumn(
+            id: "date-category",
+            name: "Date category",
+            hints: .init(semanticType: .nominal, role: .dimension))
+        let midnight = Date(timeIntervalSinceReferenceDate: 0)
+        let withSeconds = midnight.addingTimeInterval(30 * 60 + 1)
+        let snapshot = AutoChartSnapshot(
+            table(
+                columns: [dateCategory, measure],
+                rows: [
+                    [.date(midnight), .double(1)],
+                    [.date(withSeconds), .double(2)],
+                ]))
+        let specification = AutoChartSpecification.bar(
+            category: dateCategory.id,
+            measure: measure.id)
+        let profiles = AutoChartProfiler.profileIndex(snapshot)
+        let prepared = AutoChartDataPreparation.preparedData(
+            snapshot: snapshot,
+            specification: specification,
+            profiles: profiles)
+        let presentation = AutoChartRenderPresentation(
+            snapshot: snapshot,
+            specification: specification,
+            profiles: profiles,
+            data: prepared.data,
+            measureSemantics: prepared.measureSemantics)
+        let formatters = AutoChartFormatters(
+            locale: Locale(identifier: "en_US_POSIX"),
+            timeZone: .gmt)
+        let resolved = presentation.resolvedPresentation(
+            data: prepared.data,
+            using: .default,
+            formatters: formatters)
+        let categoryIdentity = AutoChartProfiler.identity(
+            .date(midnight),
+            semanticType: profiles[dateCategory.id]?.semanticType)
+        let identity = try #require(categoryIdentity.stringValue)
+        let categoryLabel = try #require(resolved.xDisplayLabels[identity])
+        let selection = AutoChartSelection<Int>(
+            sourceRowIDs: [0],
+            dimensions: [.init(columnID: dateCategory.id, value: .date(midnight))],
+            family: .bar,
+            specificationID: specification.id,
+            markID: "midnight")
+        let summary = selection.presentation(
+            columns: snapshot.columns,
+            formatters: formatters,
+            textResolver: .default,
+            resolvedDimensionLabel: { _ in categoryLabel })
+        let overriddenSummary = selection.presentation(
+            columns: snapshot.columns,
+            formatters: AutoChartFormatters { request, _, _ in
+                request.context == .selectionSummary ? "selection override" : nil
+            },
+            textResolver: .default,
+            resolvedDimensionLabel: { _ in categoryLabel })
+
+        #expect(categoryLabel.contains(":"))
+        #expect(summary.label == categoryLabel)
+        #expect(overriddenSummary.label == "selection override")
     }
 
     @Test func boxPlotBoundsExtremeNumericCategoryLabels() {
@@ -5279,7 +5425,7 @@ private let date = AutoChartColumn(
         #expect(nominalMixed.xLabel != AutoChartValue.unrepresentableValuePlaceholder)
     }
 
-    @Test func boxPlotDoesNotSelectAmongEqualDecimalStorageRepresentations() throws {
+    @Test func boxPlotSelectsEqualDecimalStorageRepresentationsSemantically() throws {
         let ordinal = AutoChartColumn(
             id: "ordinal", name: "ordinal",
             hints: AutoChartColumnHints(semanticType: .ordinal))
@@ -5318,15 +5464,17 @@ private let date = AutoChartColumn(
                 for: [datum],
                 specification: specification,
                 measureSemantics: prepared.measureSemantics)
-            #expect(selection.dimensions.isEmpty)
+            #expect(
+                selection.dimensions
+                    == [AutoChartSelectedDimension(columnID: ordinal.id, value: .decimal(one))])
             return datum
         }
 
         let forward = try datum([one, onePointZero])
         let reversed = try datum([onePointZero, one])
         #expect(forward.xIdentity == reversed.xIdentity)
-        #expect(forward.xSourceValue == nil)
-        #expect(reversed.xSourceValue == nil)
+        #expect(forward.xSourceValue == .decimal(one))
+        #expect(reversed.xSourceValue == .decimal(one))
         #expect(forward.xLabel == reversed.xLabel)
     }
 
