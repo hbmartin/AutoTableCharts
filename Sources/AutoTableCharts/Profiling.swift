@@ -979,115 +979,50 @@ enum AutoChartValueIdentity: Hashable, Sendable {
     }
 }
 
-enum AutoChartCategoryNumberNotation: Equatable, Sendable {
-    case automatic
-    case standard
-    case scientific
-}
-
 extension AutoChartValue {
     private enum CategoryNumberPolicy {
         static let maximumReadableStandardLength = 24
 
-        static func prefersScientific(
+        static func concise(
             standard: String,
-            scientific: String
-        ) -> Bool {
-            standard.count > maximumReadableStandardLength
-                && scientific.count < standard.count
+            scientific: @autoclosure () -> String
+        ) -> String {
+            guard standard.count > maximumReadableStandardLength else {
+                return standard
+            }
+            let scientific = scientific()
+            return scientific.count < standard.count ? scientific : standard
         }
     }
 
     private static func conciseCategoryNumber(
         _ value: Double,
-        locale: Locale,
-        notation: AutoChartCategoryNumberNotation
+        locale: Locale
     ) -> String {
         guard value.isFinite else { return unrepresentableValuePlaceholder }
         let standard = value.formatted(
             .number.locale(locale).grouping(.never)
                 .precision(.significantDigits(1...17)))
-        switch notation {
-        case .standard:
-            return standard
-        case .scientific:
-            return value.formatted(
+        return CategoryNumberPolicy.concise(
+            standard: standard,
+            scientific: value.formatted(
                 .number.locale(locale).notation(.scientific)
-                    .precision(.significantDigits(1...17)))
-        case .automatic:
-            guard standard.count > CategoryNumberPolicy.maximumReadableStandardLength else {
-                return standard
-            }
-            let scientific = value.formatted(
-                .number.locale(locale).notation(.scientific)
-                    .precision(.significantDigits(1...17)))
-            return CategoryNumberPolicy.prefersScientific(
-                standard: standard,
-                scientific: scientific) ? scientific : standard
-        }
+                    .precision(.significantDigits(1...17))))
     }
 
     private static func conciseCategoryNumber(
         _ value: Decimal,
-        locale: Locale,
-        notation: AutoChartCategoryNumberNotation
+        locale: Locale
     ) -> String {
         guard !value.isNaN else { return unrepresentableValuePlaceholder }
         let standard = value.formatted(
             .number.locale(locale).grouping(.never)
                 .precision(.significantDigits(1...38)))
-        switch notation {
-        case .standard:
-            return standard
-        case .scientific:
-            return value.formatted(
-                .number.locale(locale).notation(.scientific)
-                    .precision(.significantDigits(1...38)))
-        case .automatic:
-            guard standard.count > CategoryNumberPolicy.maximumReadableStandardLength else {
-                return standard
-            }
-            let scientific = value.formatted(
-                .number.locale(locale).notation(.scientific)
-                    .precision(.significantDigits(1...38)))
-            return CategoryNumberPolicy.prefersScientific(
-                standard: standard,
-                scientific: scientific) ? scientific : standard
-        }
-    }
-
-    func categoryPrefersScientificNotation(locale: Locale) -> Bool {
-        let standard: String
-        let scientific: String
-        switch self {
-        case .double(let value):
-            guard value.isFinite else { return false }
-            standard = value.formatted(
-                .number.locale(locale).grouping(.never)
-                    .precision(.significantDigits(1...17)))
-            guard standard.count > CategoryNumberPolicy.maximumReadableStandardLength else {
-                return false
-            }
-            scientific = value.formatted(
-                .number.locale(locale).notation(.scientific)
-                    .precision(.significantDigits(1...17)))
-        case .decimal(let value):
-            guard !value.isNaN else { return false }
-            standard = value.formatted(
-                .number.locale(locale).grouping(.never)
-                    .precision(.significantDigits(1...38)))
-            guard standard.count > CategoryNumberPolicy.maximumReadableStandardLength else {
-                return false
-            }
-            scientific = value.formatted(
-                .number.locale(locale).notation(.scientific)
-                    .precision(.significantDigits(1...38)))
-        default:
-            return false
-        }
-        return CategoryNumberPolicy.prefersScientific(
+        return CategoryNumberPolicy.concise(
             standard: standard,
-            scientific: scientific)
+            scientific: value.formatted(
+                .number.locale(locale).notation(.scientific)
+                    .precision(.significantDigits(1...38))))
     }
 
     /// A deterministic category label. Presentation code supplies the chart's
@@ -1097,30 +1032,17 @@ extension AutoChartValue {
         locale: Locale = AutoChartProfiler.posixLocale,
         timeZone: TimeZone = .gmt,
         datePrecision: AutoChartDateLabelPrecision? = nil,
-        numberNotation: AutoChartCategoryNumberNotation = .automatic,
         calendar: Calendar? = nil
     ) -> String? {
         switch self {
         case .null, .binary:
             return nil
         case .integer(let value):
-            if numberNotation == .scientific {
-                return Self.conciseCategoryNumber(
-                    Decimal(value),
-                    locale: locale,
-                    notation: .scientific)
-            }
             return value.formatted(.number.locale(locale).grouping(.never))
         case .double(let value):
-            return Self.conciseCategoryNumber(
-                value,
-                locale: locale,
-                notation: numberNotation)
+            return Self.conciseCategoryNumber(value, locale: locale)
         case .decimal(let value):
-            return Self.conciseCategoryNumber(
-                value,
-                locale: locale,
-                notation: numberNotation)
+            return Self.conciseCategoryNumber(value, locale: locale)
         case .date(let value):
             return AutoChartDateFormatting.string(
                 value,

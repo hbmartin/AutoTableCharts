@@ -594,10 +594,12 @@ private struct CountingChartRowsTable: AutoChartTable {
 }
 
 @Suite struct V2FormattingAndPresentationTests {
-    @Test func formattingContextRemainsExhaustiveForExistingClients() {
+    @Test func formattingContextsRetainRawValuesAndExhaustiveCases() throws {
         func label(_ context: AutoChartFormattingContext) -> String {
             switch context {
             case .axisTick: "axis"
+            case .legend: "legend"
+            case .facetHeader: "facet"
             case .markAccessibility: "accessibility"
             case .selectionSummary: "selection"
             case .kpi: "kpi"
@@ -605,7 +607,13 @@ private struct CountingChartRowsTable: AutoChartTable {
             }
         }
 
-        #expect(AutoChartFormattingContext.allCases.map(label).count == 5)
+        #expect(AutoChartFormattingContext.allCases.map(label).count == 7)
+        #expect(AutoChartFormattingContext(rawValue: "legend") == .legend)
+        #expect(AutoChartFormattingContext(rawValue: "facetHeader") == .facetHeader)
+        #expect(
+            try JSONDecoder().decode(
+                AutoChartFormattingContext.self,
+                from: Data("\"legend\"".utf8)) == .legend)
     }
 
     @Test func formatterOverridesReceiveEveryContext() {
@@ -849,12 +857,12 @@ private struct CountingChartRowsTable: AutoChartTable {
         let buddhistFormatter = AutoChartFormatters(
             locale: Locale(identifier: "en_US@calendar=buddhist"),
             timeZone: .gmt)
-        let buddhistDate = buddhistFormatter.format(
+        let gregorianDate = buddhistFormatter.format(
             column: nil,
             value: .date(Date(timeIntervalSinceReferenceDate: 0)),
             context: .selectionSummary)
-        #expect(buddhistDate.contains("2544"))
-        #expect(!buddhistDate.contains("2001"))
+        #expect(gregorianDate.contains("2001"))
+        #expect(!gregorianDate.contains("2544"))
         #expect(formatter.formatNormalizedFraction(0.25, context: .axisTick).contains("25"))
         #expect(!formatter.formatNormalizedFraction(0.25, context: .axisTick).contains("0.25"))
     }
