@@ -180,6 +180,33 @@ enum AutoChartAccessibility {
             textResolver: textResolver)
     }
 
+    /// A callback-free label used when another request observes an in-flight
+    /// histogram label. Blocking here can deadlock across queues or bins, while
+    /// invoking the host callbacks again can recurse indefinitely.
+    static func histogramBinFallbackLabel(
+        lower: Double,
+        upper: Double,
+        column: AutoChartColumn?,
+        formatters: AutoChartFormatters
+    ) -> String {
+        let lowerText = formatters.formatDefault(
+            AutoChartFormattingRequest(
+                column: column,
+                value: .double(lower),
+                context: .markAccessibility))
+        let upperText = formatters.formatDefault(
+            AutoChartFormattingRequest(
+                column: column,
+                value: .double(upper),
+                context: .markAccessibility))
+        return rangeLabel(
+            startText: lowerText,
+            endText: upperText,
+            code: .histogramBinAccessibility,
+            compatibilityCode: .markAccessibilityRange,
+            textResolver: .default)
+    }
+
     private static func rangeLabel(
         startText: String,
         endText: String,
@@ -1674,7 +1701,8 @@ struct AutoChartRenderPresentation: Sendable {
             if includingZero {
                 return expandedFiniteRange(lower...upper, padding: 0)
             }
-            let padding = max(abs(lower), abs(upper)) * 0.05
+            let span = upper - lower
+            let padding = span.isFinite ? span * 0.05 : 0
             return expandedFiniteRange(lower...upper, padding: padding)
         }
         func xNumberDomain(_ values: [Double]) -> ClosedRange<Double>? {
@@ -1915,92 +1943,102 @@ struct AutoChartRenderPresentation: Sendable {
 }
 
 private final class AutoChartHistogramBinAccessibilityCache: @unchecked Sendable {
-    private struct Bounds: Equatable, Sendable {
-        let lower: Double?
-        let upper: Double?
+    private struct Key: Hashable, Sendable {
+        let id: String
+        let lowerBitPattern: UInt64
+        let upperBitPattern: UInt64
 
-        init(_ datum: AutoChartDatum) {
-            lower = datum.lower
-            upper = datum.upper
+        init(id: String, lower: Double, upper: Double) {
+            self.id = id
+            lowerBitPattern = lower.bitPattern
+            upperBitPattern = upper.bitPattern
         }
     }
 
     private enum Entry {
-        case resolving(owner: ObjectIdentifier)
+        case resolving(usedFallback: Bool)
         case resolved(String)
     }
 
-    private let condition = NSCondition()
-    private let boundsByID: [String: Bounds]
+    private let lock = NSLock()
     private let column: AutoChartColumn?
     private let formatters: AutoChartFormatters
     private let textResolver: AutoChartTextResolver
-    private var entries: [String: Entry] = [:]
+    private var entries: [Key: Entry] = [:]
 
     init(
-        data: [AutoChartDatum],
         column: AutoChartColumn?,
         formatters: AutoChartFormatters,
         textResolver: AutoChartTextResolver
     ) {
-        boundsByID = Dictionary(
-            uniqueKeysWithValues: data.map { ($0.id, Bounds($0)) })
         self.column = column
         self.formatters = formatters
         self.textResolver = textResolver
     }
 
     func label(for datum: AutoChartDatum) -> String {
-        guard let bounds = boundsByID[datum.id] else {
-            assertionFailure("Prepared histogram bins require cached bounds.")
+        guard let lower = datum.lower, lower.isFinite,
+            let upper = datum.upper, upper.isFinite
+        else {
+            assertionFailure("Prepared histogram bins require finite bounds.")
             return AutoChartValue.unrepresentableValuePlaceholder
         }
-        guard bounds == Bounds(datum) else {
-            assertionFailure("A cached histogram bin ID must retain its prepared bounds.")
-            return AutoChartValue.unrepresentableValuePlaceholder
-        }
+        let key = Key(id: datum.id, lower: lower, upper: upper)
 
-        let owner = ObjectIdentifier(Thread.current)
-        condition.lock()
-        while let entry = entries[datum.id] {
+        lock.lock()
+        if let entry = entries[key] {
             switch entry {
             case .resolved(let label):
-                condition.unlock()
+                lock.unlock()
                 return label
-            case .resolving(let resolvingOwner):
-                if resolvingOwner == owner {
-                    // A host formatter or resolver can capture the presentation
-                    // and ask for the same label again. Waiting here would
-                    // deadlock the non-recursive callback stack.
-                    condition.unlock()
-                    return AutoChartValue.unrepresentableValuePlaceholder
-                }
-                condition.wait()
+            case .resolving:
+                // Never wait for a callback-driven resolution. The owner may be
+                // synchronously waiting for this execution context, or two bins
+                // may be asking for each other from different threads.
+                entries[key] = .resolving(usedFallback: true)
+                lock.unlock()
+                return AutoChartAccessibility.histogramBinFallbackLabel(
+                    lower: lower,
+                    upper: upper,
+                    column: column,
+                    formatters: formatters)
             }
         }
-        entries[datum.id] = .resolving(owner: owner)
-        condition.unlock()
+        entries[key] = .resolving(usedFallback: false)
+        lock.unlock()
 
-        let resolved: String
-        if let lower = bounds.lower, lower.isFinite,
-            let upper = bounds.upper, upper.isFinite
-        {
-            resolved = AutoChartAccessibility.histogramBinLabel(
-                lower: lower,
-                upper: upper,
-                column: column,
-                formatters: formatters,
-                textResolver: textResolver)
-        } else {
-            assertionFailure("Prepared histogram bins require finite bounds.")
-            resolved = AutoChartValue.unrepresentableValuePlaceholder
+        let resolved = AutoChartAccessibility.histogramBinLabel(
+            lower: lower,
+            upper: upper,
+            column: column,
+            formatters: formatters,
+            textResolver: textResolver)
+
+        lock.lock()
+        guard case .resolving(let usedFallback) = entries[key] else {
+            assertionFailure("An in-flight histogram label must retain its cache entry.")
+            lock.unlock()
+            return resolved
         }
+        if !usedFallback {
+            entries[key] = .resolved(resolved)
+            lock.unlock()
+            return resolved
+        }
+        lock.unlock()
 
-        condition.lock()
-        entries[datum.id] = .resolved(resolved)
-        condition.broadcast()
-        condition.unlock()
-        return resolved
+        // Every caller observing the in-flight entry received this same safe
+        // fallback. Cache it instead of allowing a recursive placeholder or a
+        // partially recursive host result to contaminate future labels.
+        let fallback = AutoChartAccessibility.histogramBinFallbackLabel(
+            lower: lower,
+            upper: upper,
+            column: column,
+            formatters: formatters)
+        lock.lock()
+        entries[key] = .resolved(fallback)
+        lock.unlock()
+        return fallback
     }
 }
 
@@ -2251,7 +2289,6 @@ struct AutoChartResolvedPresentation: Sendable {
         sharedHistogramBinAccessibilityCache =
             presentation.family == .histogram
             ? AutoChartHistogramBinAccessibilityCache(
-                data: data,
                 column: presentation.xCategoryColumn,
                 formatters: formatters,
                 textResolver: textResolver)
