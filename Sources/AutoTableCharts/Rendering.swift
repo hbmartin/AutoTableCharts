@@ -700,6 +700,14 @@ private func expandedFiniteRange(
     return finiteLower...finiteUpper
 }
 
+private func finiteSingletonPadding(for value: Double) -> Double {
+    let relativePadding = abs(value) * 0.05
+    if relativePadding > 0, relativePadding.isFinite {
+        return relativePadding
+    }
+    return value == 0 ? 1 : 0
+}
+
 enum AutoChartDataPreparation {
     struct PreparedData: Sendable {
         var data: [AutoChartDatum]
@@ -1009,31 +1017,32 @@ enum AutoChartDataPreparation {
             guard let value = row.values[x]?.numericValue, value.isFinite else { return nil }
             return (value, row.id)
         }
-        guard let minimum = values.map(\.0).min(), let maximum = values.map(\.0).max() else {
-            return []
+        guard let first = values.first else { return [] }
+        var minimum = first.0
+        var maximum = first.0
+        for value in values.dropFirst() {
+            minimum = min(minimum, value.0)
+            maximum = max(maximum, value.0)
         }
         if minimum == maximum {
-            let relativePadding = abs(minimum) * 0.05
-            let padding = relativePadding > 0 ? relativePadding : (minimum == 0 ? 1 : 0)
             guard let bounds = expandedFiniteRange(
                 minimum...maximum,
-                padding: padding)
+                padding: finiteSingletonPadding(for: minimum))
             else {
                 assertionFailure("A finite histogram value requires finite display bounds.")
                 return []
             }
-            let midpoint = bounds.lowerBound + (bounds.upperBound - bounds.lowerBound) / 2
             return [
                 AutoChartDatum(
                     id: "bin-0",
                     sourceRowIDs: Set(values.map(\.1)),
-                    xNumber: midpoint,
+                    xNumber: minimum,
                     yNumber: Double(values.count),
                     lower: bounds.lowerBound,
                     upper: bounds.upperBound)
             ]
         }
-        let count = min(1_000, max(1, specification.binCount ?? 10))
+        let requestedCount = min(1_000, max(1, specification.binCount ?? 10))
         let scale = max(abs(minimum), abs(maximum))
         let scaledMinimum = minimum / scale
         let scaledMaximum = maximum / scale
@@ -1046,42 +1055,34 @@ enum AutoChartDataPreparation {
             return min(max(clamped * scale, minimum), maximum)
         }
         var boundaries = [minimum]
-        boundaries.reserveCapacity(count + 1)
-        if count > 1 {
-            for index in 1..<count {
-                let candidate = unscaledBoundary(
-                    at: Double(index) / Double(count))
-                boundaries.append(max(boundaries[index - 1], candidate))
+        boundaries.reserveCapacity(requestedCount + 1)
+        for index in 1..<requestedCount {
+            let candidate = unscaledBoundary(
+                at: Double(index) / Double(requestedCount))
+            if candidate > boundaries[boundaries.count - 1], candidate < maximum {
+                boundaries.append(candidate)
             }
         }
-        boundaries.append(max(boundaries[count - 1], maximum))
+        boundaries.append(maximum)
 
-        func binIndex(containing value: Double) -> Int {
-            var lowerIndex = 0
-            var upperIndex = count
-            while lowerIndex < upperIndex {
-                let index = lowerIndex + (upperIndex - lowerIndex) / 2
-                if value < boundaries[index + 1] {
-                    upperIndex = index
-                } else {
-                    lowerIndex = index + 1
-                }
-            }
-            return min(lowerIndex, count - 1)
-        }
+        let count = boundaries.count - 1
         var bins: [[(Double, Int)]] = Array(repeating: [], count: count)
         for entry in values {
-            bins[binIndex(containing: entry.0)].append(entry)
+            let index = histogramBinIndex(
+                containing: entry.0,
+                boundaries: boundaries)
+            bins[index].append(entry)
         }
         return bins.enumerated().map { index, bin in
             let start = boundaries[index]
             let end = boundaries[index + 1]
+            let exclusiveUpperBound = end.nextDown
+            let scaledStart = start / scale
+            let scaledEnd = end / scale
+            let scaledMidpoint = scaledStart + (scaledEnd - scaledStart) / 2
             let midpoint = min(
-                max(
-                    unscaledBoundary(
-                        at: (Double(index) + 0.5) / Double(count)),
-                    start),
-                end)
+                max(scaledMidpoint * scale, start),
+                exclusiveUpperBound)
             return AutoChartDatum(
                 id: "bin-\(index)",
                 sourceRowIDs: Set(bin.map(\.1)),
@@ -1090,6 +1091,24 @@ enum AutoChartDataPreparation {
                 lower: start,
                 upper: end)
         }
+    }
+
+    private static func histogramBinIndex(
+        containing value: Double,
+        boundaries: [Double]
+    ) -> Int {
+        let count = boundaries.count - 1
+        var lowerIndex = 0
+        var upperIndex = count
+        while lowerIndex < upperIndex {
+            let index = lowerIndex + (upperIndex - lowerIndex) / 2
+            if value < boundaries[index + 1] {
+                upperIndex = index
+            } else {
+                lowerIndex = index + 1
+            }
+        }
+        return min(lowerIndex, count - 1)
     }
 
     private static func boxPlot(
@@ -1658,8 +1677,9 @@ struct AutoChartRenderPresentation: Sendable {
         func xNumberDomain(_ values: [Double]) -> ClosedRange<Double>? {
             guard let minimum = values.min(), let maximum = values.max() else { return nil }
             if minimum == maximum {
-                let padding = max(1, abs(minimum) * 0.05)
-                return expandedFiniteRange(minimum...maximum, padding: padding)
+                return expandedFiniteRange(
+                    minimum...maximum,
+                    padding: finiteSingletonPadding(for: minimum))
             }
             let span = maximum - minimum
             let padding = span.isFinite ? span * 0.05 : 0
@@ -1892,28 +1912,17 @@ struct AutoChartRenderPresentation: Sendable {
 }
 
 private final class AutoChartHistogramBinAccessibilityCache: @unchecked Sendable {
-    private struct Bounds: Sendable {
-        let lower: Double?
-        let upper: Double?
-    }
-
     private let lock = NSLock()
-    private let boundsByID: [String: Bounds]
     private let column: AutoChartColumn?
     private let formatters: AutoChartFormatters
     private let textResolver: AutoChartTextResolver
     private var cachedLabels: [String: String] = [:]
 
     init(
-        data: [AutoChartDatum],
         column: AutoChartColumn?,
         formatters: AutoChartFormatters,
         textResolver: AutoChartTextResolver
     ) {
-        boundsByID = Dictionary(
-            uniqueKeysWithValues: data.map {
-                ($0.id, Bounds(lower: $0.lower, upper: $0.upper))
-            })
         self.column = column
         self.formatters = formatters
         self.textResolver = textResolver
@@ -1921,19 +1930,14 @@ private final class AutoChartHistogramBinAccessibilityCache: @unchecked Sendable
 
     func label(for datum: AutoChartDatum) -> String {
         lock.lock()
+        defer { lock.unlock() }
         if let cached = cachedLabels[datum.id] {
-            lock.unlock()
             return cached
         }
-        lock.unlock()
 
-        guard let bounds = boundsByID[datum.id] else {
-            assertionFailure("Prepared histogram bins require cached bounds.")
-            return AutoChartValue.unrepresentableValuePlaceholder
-        }
         let resolved: String
-        if let lower = bounds.lower, lower.isFinite,
-            let upper = bounds.upper, upper.isFinite
+        if let lower = datum.lower, lower.isFinite,
+            let upper = datum.upper, upper.isFinite
         {
             resolved = AutoChartAccessibility.histogramBinLabel(
                 lower: lower,
@@ -1946,11 +1950,8 @@ private final class AutoChartHistogramBinAccessibilityCache: @unchecked Sendable
             resolved = AutoChartValue.unrepresentableValuePlaceholder
         }
 
-        lock.lock()
-        let label = cachedLabels[datum.id] ?? resolved
-        cachedLabels[datum.id] = label
-        lock.unlock()
-        return label
+        cachedLabels[datum.id] = resolved
+        return resolved
     }
 }
 
@@ -2201,7 +2202,6 @@ struct AutoChartResolvedPresentation: Sendable {
         sharedHistogramBinAccessibilityCache =
             presentation.family == .histogram
             ? AutoChartHistogramBinAccessibilityCache(
-                data: data,
                 column: presentation.xCategoryColumn,
                 formatters: formatters,
                 textResolver: textResolver)

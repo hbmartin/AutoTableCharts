@@ -198,23 +198,28 @@ enum AutoChartCategoryNumberPolicy {
 
 enum AutoChartLegacyCurrencyFormatting {
     static func replacingMagnitude(
-        in standard: String,
-        signedStandardMagnitude: String,
-        standardMagnitude: String,
+        in standard: AttributedString,
         scientificMagnitude: String
     ) -> String {
-        guard standard != signedStandardMagnitude else {
+        let plainStandard = String(standard.characters)
+        guard standard.runs.contains(where: {
+            $0.attributes.numberSymbol == .currency
+        }) else {
             // Match native Currency.FormatStyle behavior for an unsupported
             // code: without a currency affix, scientific currency notation is
             // unavailable rather than silently borrowing the locale currency.
-            return standard
+            return plainStandard
         }
-        guard let range = standard.range(of: standardMagnitude) else {
+
+        let magnitudeRuns = standard.runs.filter { $0.attributes.numberPart != nil }
+        guard let first = magnitudeRuns.first, let last = magnitudeRuns.last else {
             // Preserve the native currency output if Foundation uses a numeric
             // pattern that cannot be isolated safely on an older OS.
-            return standard
+            return plainStandard
         }
-        return standard.replacingCharacters(in: range, with: scientificMagnitude)
+        return String(standard[..<first.range.lowerBound].characters)
+            + scientificMagnitude
+            + String(standard[last.range.upperBound...].characters)
     }
 }
 
@@ -384,19 +389,11 @@ public struct AutoChartFormatters: Sendable {
                     if #available(iOS 18, macOS 15, tvOS 18, watchOS 11, *) {
                         return value.formatted(style.notation(.scientific))
                     }
-                    let signedStandardMagnitude = value.formatted(
-                        .number.locale(locale).grouping(.automatic)
-                            .precision(.significantDigits(1...17)))
-                    let standardMagnitude = abs(value).formatted(
-                        .number.locale(locale).grouping(.automatic)
-                            .precision(.significantDigits(1...17)))
                     let scientificMagnitude = abs(value).formatted(
                         .number.locale(locale).notation(.scientific)
                             .precision(.significantDigits(1...17)))
                     return AutoChartLegacyCurrencyFormatting.replacingMagnitude(
-                        in: standard,
-                        signedStandardMagnitude: signedStandardMagnitude,
-                        standardMagnitude: standardMagnitude,
+                        in: value.formatted(style.attributed),
                         scientificMagnitude: scientificMagnitude)
                 })
         case .decimal(let value):
@@ -411,19 +408,11 @@ public struct AutoChartFormatters: Sendable {
                     if #available(iOS 18, macOS 15, tvOS 18, watchOS 11, *) {
                         return value.formatted(style.notation(.scientific))
                     }
-                    let signedStandardMagnitude = value.formatted(
-                        .number.locale(locale).grouping(.automatic)
-                            .precision(.significantDigits(1...38)))
-                    let standardMagnitude = abs(value).formatted(
-                        .number.locale(locale).grouping(.automatic)
-                            .precision(.significantDigits(1...38)))
                     let scientificMagnitude = abs(value).formatted(
                         .number.locale(locale).notation(.scientific)
                             .precision(.significantDigits(1...38)))
                     return AutoChartLegacyCurrencyFormatting.replacingMagnitude(
-                        in: standard,
-                        signedStandardMagnitude: signedStandardMagnitude,
-                        standardMagnitude: standardMagnitude,
+                        in: value.formatted(style.attributed),
                         scientificMagnitude: scientificMagnitude)
                 })
         }

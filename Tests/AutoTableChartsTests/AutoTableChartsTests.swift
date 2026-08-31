@@ -508,31 +508,37 @@ private let date = AutoChartColumn(
         #expect(scientificFormatCount == 1)
     }
 
-    @Test func legacyAffixlessCurrencyFormattingIsSignSymmetric() {
+    @Test func legacyCurrencyFormattingUsesAttributedAmountFields() throws {
+        let affixless = AttributedString("123.0")
         #expect(
             AutoChartLegacyCurrencyFormatting.replacingMagnitude(
-                in: "123",
-                signedStandardMagnitude: "123",
-                standardMagnitude: "123",
-                scientificMagnitude: "1.23E2") == "123")
+                in: affixless,
+                scientificMagnitude: "1.23E2") == "123.0")
         #expect(
             AutoChartLegacyCurrencyFormatting.replacingMagnitude(
-                in: "-123",
-                signedStandardMagnitude: "-123",
-                standardMagnitude: "123",
-                scientificMagnitude: "1.23E2") == "-123")
+                in: AttributedString("-123.0"),
+                scientificMagnitude: "1.23E2") == "-123.0")
+
+        // A numeric currency code deliberately collides with the amount text.
+        // The attributed currency field must remain untouched while only the
+        // attributed number field is replaced.
+        let style = FloatingPointFormatStyle<Double>.Currency(
+            code: "123",
+            locale: Locale(identifier: "en_US")
+        ).precision(.significantDigits(1...17))
+        let standard = 123.0.formatted(style.attributed)
+        let plainStandard = String(standard.characters)
+        let amountRange = try #require(
+            plainStandard.range(of: "123", options: .backwards))
+        let expected = plainStandard.replacingCharacters(
+            in: amountRange,
+            with: "1.23E2")
+
         #expect(
             AutoChartLegacyCurrencyFormatting.replacingMagnitude(
-                in: "$123",
-                signedStandardMagnitude: "123",
-                standardMagnitude: "123",
-                scientificMagnitude: "1.23E2") == "$1.23E2")
-        #expect(
-            AutoChartLegacyCurrencyFormatting.replacingMagnitude(
-                in: "-$123",
-                signedStandardMagnitude: "-123",
-                standardMagnitude: "123",
-                scientificMagnitude: "1.23E2") == "-$1.23E2")
+                in: standard,
+                scientificMagnitude: "1.23E2") == expected)
+        #expect(expected.hasPrefix("123"))
     }
 
     @Test func categoryDefaultsHonorUnitsWithoutCollapsingExactValues() throws {
@@ -887,6 +893,90 @@ private let date = AutoChartColumn(
             prepared.data.map(resolved.histogramBinAccessibilityLabel(for:)) == labels)
         #expect(recorder.requests.count == requestCount)
         #expect(recorder.messages.count == messageCount)
+    }
+
+    @Test func histogramAccessibilityComputesEachLabelOnceUnderConcurrency() async {
+        final class Recorder: @unchecked Sendable {
+            private let lock = NSLock()
+            private var requests = 0
+            private var messages = 0
+
+            func recordRequest() {
+                lock.lock()
+                requests += 1
+                lock.unlock()
+                Thread.sleep(forTimeInterval: 0.002)
+            }
+
+            func recordMessage() {
+                lock.lock()
+                messages += 1
+                lock.unlock()
+                Thread.sleep(forTimeInterval: 0.002)
+            }
+
+            var counts: (requests: Int, messages: Int) {
+                lock.lock()
+                defer { lock.unlock() }
+                return (requests, messages)
+            }
+        }
+
+        let column = AutoChartColumn(
+            id: "histogram-value",
+            name: "Histogram value",
+            hints: .init(semanticType: .quantitative, role: .measure))
+        let snapshot = AutoChartSnapshot(
+            table(columns: [column], rows: [[.double(1.5)], [.double(2.75)]]))
+        let specification = AutoChartSpecification.histogram(
+            value: column.id,
+            binCount: 2)
+        let profiles = AutoChartProfiler.profileIndex(snapshot)
+        let prepared = AutoChartDataPreparation.preparedData(
+            snapshot: snapshot,
+            specification: specification,
+            profiles: profiles)
+        let presentation = AutoChartRenderPresentation(
+            snapshot: snapshot,
+            specification: specification,
+            profiles: profiles,
+            data: prepared.data,
+            measureSemantics: prepared.measureSemantics)
+        let recorder = Recorder()
+        let formatters = AutoChartFormatters { _, _, _ in
+            recorder.recordRequest()
+            return nil
+        }
+        let resolver = AutoChartTextResolver { _ in
+            recorder.recordMessage()
+            return nil
+        }
+        let resolved = presentation.resolvedPresentation(
+            data: prepared.data,
+            using: resolver,
+            formatters: formatters)
+        let datum = prepared.data[0]
+        let baselineCounts = recorder.counts
+
+        let labels = await withTaskGroup(
+            of: String.self,
+            returning: [String].self
+        ) { group in
+            for _ in 0..<32 {
+                group.addTask {
+                    resolved.histogramBinAccessibilityLabel(for: datum)
+                }
+            }
+            var labels: [String] = []
+            for await label in group {
+                labels.append(label)
+            }
+            return labels
+        }
+
+        #expect(Set(labels).count == 1)
+        #expect(recorder.counts.requests - baselineCounts.requests == 2)
+        #expect(recorder.counts.messages - baselineCounts.messages == 2)
     }
 
     @Test func quantitativeAccessibilityUsesTheNumericPosition() {
@@ -2769,6 +2859,45 @@ private let date = AutoChartColumn(
         }
     }
 
+    @Test func histogramMergesCollapsedBinsAndKeepsMidpointsDistinct() throws {
+        var values = [1.0]
+        for _ in 0..<8 {
+            values.append(try #require(values.last).nextUp)
+        }
+        let input = table(
+            columns: [measure],
+            rows: values.map { [.double($0)] })
+        let specification = AutoChartSpecification(
+            family: .histogram,
+            encoding: AutoChartEncoding(x: measure.id),
+            aggregation: .count,
+            binCount: 20)
+        let data = preparedDatumValues(
+            snapshot: AutoChartSnapshot(input),
+            specification: specification)
+
+        #expect(data.count < 20)
+        #expect(data.reduce(0) { $0 + $1.sourceRowIDs.count } == values.count)
+        #expect(
+            data.allSatisfy { datum in
+                guard let lower = datum.lower, let upper = datum.upper,
+                    let midpoint = datum.xNumber
+                else { return false }
+                return lower < upper && lower <= midpoint && midpoint < upper
+            })
+        #expect(
+            zip(data, data.dropFirst()).allSatisfy { pair in
+                guard let left = pair.0.xNumber, let right = pair.1.xNumber else {
+                    return false
+                }
+                return left < right
+            })
+
+        let maximumBin = try #require(
+            data.first { $0.sourceRowIDs.contains(values.count - 1) })
+        #expect(try #require(maximumBin.lower) < (try #require(maximumBin.upper)))
+    }
+
     @Test func histogramClampsAsymmetricExtremeBoundsToFiniteInputExtrema() throws {
         let maximum = Double.greatestFiniteMagnitude
         let minimum = -0.991 * maximum
@@ -3927,6 +4056,37 @@ private let date = AutoChartColumn(
                 specification: fixture.specification,
                 for: fixture.input
             ).isValid)
+    }
+
+    @Test func singletonQuantitativeFacetDomainPreservesSmallValueScale() throws {
+        let facet = AutoChartColumn(
+            id: "facet", name: "region",
+            hints: AutoChartColumnHints(semanticType: .nominal))
+        let quantitativeX = AutoChartColumn(
+            id: "quantitative-x", name: "quantitative_x",
+            hints: AutoChartColumnHints(
+                semanticType: .quantitative,
+                role: .dimension))
+        let value = 0.001
+        let input = table(
+            columns: [facet, quantitativeX, measure],
+            rows: [[.text("West"), .double(value), .double(1)]])
+        let specification = AutoChartSpecification(
+            family: .faceted,
+            encoding: .init(x: quantitativeX.id, y: measure.id, facet: facet.id),
+            facetBaseFamily: .scatter)
+        let prepared = preparedPresentation(
+            for: input,
+            recommendation: AutoChartRecommendation(
+                specification: specification,
+                score: 0,
+                rationale: ["Small singleton-domain test"]))
+        let domain = try #require(prepared.presentation.sharedXNumberDomain)
+
+        #expect(0 < domain.lowerBound)
+        #expect(domain.lowerBound < value)
+        #expect(value < domain.upperBound)
+        #expect(domain.upperBound < 0.002)
     }
 
     @Test func extremeQuantitativeSpanDisablesZoom() {
