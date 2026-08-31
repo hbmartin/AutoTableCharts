@@ -81,15 +81,12 @@ When a resolver does not handle `.histogramBinAccessibility`, histogram
 intervals also try the legacy `.markAccessibilityRange` code before using the
 English fallback.
 
-Histogram labels are resolved lazily and cached. If a formatter or resolver
-reenters the same label, or another thread requests it while its callbacks are
-still running, that in-flight request receives a callback-free package fallback
-instead of blocking or recursively invoking the host. After any overlap, the
-current resolution also returns that fallback rather than trusting a host result
-that may depend on it. The next request makes one recovery attempt: an
-uncontended attempt caches the host-formatted, host-localized label. If that
-attempt also overlaps or reenters, the package caches the fallback so repeated
-requests converge without repeatedly invoking host callbacks.
+Each `AutoChartView` initialization resolves every prepared histogram label once
+through the host formatter and text resolver. The resulting labels are stored in
+an immutable table keyed by the prepared datum ID and exact finite bounds, so
+mark rendering and concurrent accessibility lookups invoke no host callbacks and
+cannot return different labels for the same bin. Recreating the view constructs
+a new resolved presentation and resolves its histogram labels again.
 
 ### Link semantic selection
 
