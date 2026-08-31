@@ -701,8 +701,9 @@ private func expandedFiniteRange(
 }
 
 private func finiteSingletonPadding(for value: Double) -> Double {
+    precondition(value.isFinite)
     let relativePadding = abs(value) * 0.05
-    if relativePadding > 0, relativePadding.isFinite {
+    if relativePadding > 0 {
         return relativePadding
     }
     return value == 0 ? 1 : 0
@@ -1097,6 +1098,7 @@ enum AutoChartDataPreparation {
         containing value: Double,
         boundaries: [Double]
     ) -> Int {
+        precondition(boundaries.count >= 2)
         let count = boundaries.count - 1
         var lowerIndex = 0
         var upperIndex = count
@@ -1665,8 +1667,9 @@ struct AutoChartRenderPresentation: Sendable {
             let lower = includingZero ? min(0, minimum) : minimum
             let upper = includingZero ? max(0, maximum) : maximum
             if lower == upper {
-                let padding = max(1, abs(lower) * 0.05)
-                return expandedFiniteRange(lower...upper, padding: padding)
+                return expandedFiniteRange(
+                    lower...upper,
+                    padding: finiteSingletonPadding(for: lower))
             }
             if includingZero {
                 return expandedFiniteRange(lower...upper, padding: 0)
@@ -1912,32 +1915,75 @@ struct AutoChartRenderPresentation: Sendable {
 }
 
 private final class AutoChartHistogramBinAccessibilityCache: @unchecked Sendable {
-    private let lock = NSLock()
+    private struct Bounds: Equatable, Sendable {
+        let lower: Double?
+        let upper: Double?
+
+        init(_ datum: AutoChartDatum) {
+            lower = datum.lower
+            upper = datum.upper
+        }
+    }
+
+    private enum Entry {
+        case resolving(owner: ObjectIdentifier)
+        case resolved(String)
+    }
+
+    private let condition = NSCondition()
+    private let boundsByID: [String: Bounds]
     private let column: AutoChartColumn?
     private let formatters: AutoChartFormatters
     private let textResolver: AutoChartTextResolver
-    private var cachedLabels: [String: String] = [:]
+    private var entries: [String: Entry] = [:]
 
     init(
+        data: [AutoChartDatum],
         column: AutoChartColumn?,
         formatters: AutoChartFormatters,
         textResolver: AutoChartTextResolver
     ) {
+        boundsByID = Dictionary(
+            uniqueKeysWithValues: data.map { ($0.id, Bounds($0)) })
         self.column = column
         self.formatters = formatters
         self.textResolver = textResolver
     }
 
     func label(for datum: AutoChartDatum) -> String {
-        lock.lock()
-        defer { lock.unlock() }
-        if let cached = cachedLabels[datum.id] {
-            return cached
+        guard let bounds = boundsByID[datum.id] else {
+            assertionFailure("Prepared histogram bins require cached bounds.")
+            return AutoChartValue.unrepresentableValuePlaceholder
+        }
+        guard bounds == Bounds(datum) else {
+            assertionFailure("A cached histogram bin ID must retain its prepared bounds.")
+            return AutoChartValue.unrepresentableValuePlaceholder
         }
 
+        let owner = ObjectIdentifier(Thread.current)
+        condition.lock()
+        while let entry = entries[datum.id] {
+            switch entry {
+            case .resolved(let label):
+                condition.unlock()
+                return label
+            case .resolving(let resolvingOwner):
+                if resolvingOwner == owner {
+                    // A host formatter or resolver can capture the presentation
+                    // and ask for the same label again. Waiting here would
+                    // deadlock the non-recursive callback stack.
+                    condition.unlock()
+                    return AutoChartValue.unrepresentableValuePlaceholder
+                }
+                condition.wait()
+            }
+        }
+        entries[datum.id] = .resolving(owner: owner)
+        condition.unlock()
+
         let resolved: String
-        if let lower = datum.lower, lower.isFinite,
-            let upper = datum.upper, upper.isFinite
+        if let lower = bounds.lower, lower.isFinite,
+            let upper = bounds.upper, upper.isFinite
         {
             resolved = AutoChartAccessibility.histogramBinLabel(
                 lower: lower,
@@ -1950,7 +1996,10 @@ private final class AutoChartHistogramBinAccessibilityCache: @unchecked Sendable
             resolved = AutoChartValue.unrepresentableValuePlaceholder
         }
 
-        cachedLabels[datum.id] = resolved
+        condition.lock()
+        entries[datum.id] = .resolved(resolved)
+        condition.broadcast()
+        condition.unlock()
         return resolved
     }
 }
@@ -2202,6 +2251,7 @@ struct AutoChartResolvedPresentation: Sendable {
         sharedHistogramBinAccessibilityCache =
             presentation.family == .histogram
             ? AutoChartHistogramBinAccessibilityCache(
+                data: data,
                 column: presentation.xCategoryColumn,
                 formatters: formatters,
                 textResolver: textResolver)

@@ -1,3 +1,4 @@
+import Dispatch
 import Foundation
 import Testing
 
@@ -539,6 +540,16 @@ private let date = AutoChartColumn(
                 in: standard,
                 scientificMagnitude: "1.23E2") == expected)
         #expect(expected.hasPrefix("123"))
+
+        let signedStyle = FloatingPointFormatStyle<Double>.Currency(
+            code: "USD",
+            locale: Locale(identifier: "en_US")
+        ).precision(.significantDigits(1...17))
+        let signedStandard = (-123.0).formatted(signedStyle.attributed)
+        #expect(
+            AutoChartLegacyCurrencyFormatting.replacingMagnitude(
+                in: signedStandard,
+                scientificMagnitude: "1.23E2") == "-$1.23E2")
     }
 
     @Test func categoryDefaultsHonorUnitsWithoutCollapsingExactValues() throws {
@@ -895,11 +906,12 @@ private let date = AutoChartColumn(
         #expect(recorder.messages.count == messageCount)
     }
 
-    @Test func histogramAccessibilityComputesEachLabelOnceUnderConcurrency() async {
+    @Test func histogramAccessibilityComputesEachLabelOnceUnderConcurrency() {
         final class Recorder: @unchecked Sendable {
             private let lock = NSLock()
             private var requests = 0
             private var messages = 0
+            private var labels: [String] = []
 
             func recordRequest() {
                 lock.lock()
@@ -915,10 +927,22 @@ private let date = AutoChartColumn(
                 Thread.sleep(forTimeInterval: 0.002)
             }
 
+            func recordLabel(_ label: String) {
+                lock.lock()
+                labels.append(label)
+                lock.unlock()
+            }
+
             var counts: (requests: Int, messages: Int) {
                 lock.lock()
                 defer { lock.unlock() }
                 return (requests, messages)
+            }
+
+            var capturedLabels: [String] {
+                lock.lock()
+                defer { lock.unlock() }
+                return labels
             }
         }
 
@@ -958,25 +982,95 @@ private let date = AutoChartColumn(
         let datum = prepared.data[0]
         let baselineCounts = recorder.counts
 
-        let labels = await withTaskGroup(
-            of: String.self,
-            returning: [String].self
-        ) { group in
-            for _ in 0..<32 {
-                group.addTask {
-                    resolved.histogramBinAccessibilityLabel(for: datum)
-                }
-            }
-            var labels: [String] = []
-            for await label in group {
-                labels.append(label)
-            }
-            return labels
+        DispatchQueue.concurrentPerform(iterations: 32) { _ in
+            let label = resolved.histogramBinAccessibilityLabel(for: datum)
+            recorder.recordLabel(label)
         }
 
-        #expect(Set(labels).count == 1)
+        #expect(Set(recorder.capturedLabels).count == 1)
         #expect(recorder.counts.requests - baselineCounts.requests == 2)
         #expect(recorder.counts.messages - baselineCounts.messages == 2)
+    }
+
+    @Test func histogramAccessibilityAllowsReentrantHostFormatting() {
+        final class ReentrantState: @unchecked Sendable {
+            private let lock = NSLock()
+            private var resolved: AutoChartResolvedPresentation?
+            private var datum: AutoChartDatum?
+            private var labels: [String] = []
+
+            func install(
+                resolved: AutoChartResolvedPresentation,
+                datum: AutoChartDatum
+            ) {
+                lock.lock()
+                self.resolved = resolved
+                self.datum = datum
+                lock.unlock()
+            }
+
+            func reenter() {
+                lock.lock()
+                let resolved = resolved
+                let datum = datum
+                lock.unlock()
+                guard let resolved, let datum else { return }
+
+                let label = resolved.histogramBinAccessibilityLabel(for: datum)
+                lock.lock()
+                labels.append(label)
+                lock.unlock()
+            }
+
+            var capturedLabels: [String] {
+                lock.lock()
+                defer { lock.unlock() }
+                return labels
+            }
+        }
+
+        let column = AutoChartColumn(
+            id: "histogram-value",
+            name: "Histogram value",
+            hints: .init(semanticType: .quantitative, role: .measure))
+        let snapshot = AutoChartSnapshot(
+            table(columns: [column], rows: [[.double(1.5)], [.double(2.75)]]))
+        let specification = AutoChartSpecification.histogram(
+            value: column.id,
+            binCount: 2)
+        let profiles = AutoChartProfiler.profileIndex(snapshot)
+        let prepared = AutoChartDataPreparation.preparedData(
+            snapshot: snapshot,
+            specification: specification,
+            profiles: profiles)
+        let presentation = AutoChartRenderPresentation(
+            snapshot: snapshot,
+            specification: specification,
+            profiles: profiles,
+            data: prepared.data,
+            measureSemantics: prepared.measureSemantics)
+        let state = ReentrantState()
+        let formatters = AutoChartFormatters { _, _, _ in
+            state.reenter()
+            return nil
+        }
+        let resolved = presentation.resolvedPresentation(
+            data: prepared.data,
+            using: .default,
+            formatters: formatters)
+        let datum = prepared.data[0]
+        state.install(resolved: resolved, datum: datum)
+
+        let label = resolved.histogramBinAccessibilityLabel(for: datum)
+
+        #expect(label != AutoChartValue.unrepresentableValuePlaceholder)
+        #expect(
+            state.capturedLabels
+                == Array(
+                    repeating: AutoChartValue.unrepresentableValuePlaceholder,
+                    count: 2))
+        #expect(resolved.histogramBinAccessibilityLabel(for: datum) == label)
+        #expect(state.capturedLabels.count == 2)
     }
 
     @Test func quantitativeAccessibilityUsesTheNumericPosition() {
@@ -4058,7 +4152,7 @@ private let date = AutoChartColumn(
             ).isValid)
     }
 
-    @Test func singletonQuantitativeFacetDomainPreservesSmallValueScale() throws {
+    @Test func singletonQuantitativeFacetDomainsPreserveSmallValueScale() throws {
         let facet = AutoChartColumn(
             id: "facet", name: "region",
             hints: AutoChartColumnHints(semanticType: .nominal))
@@ -4067,10 +4161,11 @@ private let date = AutoChartColumn(
             hints: AutoChartColumnHints(
                 semanticType: .quantitative,
                 role: .dimension))
-        let value = 0.001
+        let xValue = 0.001
+        let yValue = 0.002
         let input = table(
             columns: [facet, quantitativeX, measure],
-            rows: [[.text("West"), .double(value), .double(1)]])
+            rows: [[.text("West"), .double(xValue), .double(yValue)]])
         let specification = AutoChartSpecification(
             family: .faceted,
             encoding: .init(x: quantitativeX.id, y: measure.id, facet: facet.id),
@@ -4081,12 +4176,17 @@ private let date = AutoChartColumn(
                 specification: specification,
                 score: 0,
                 rationale: ["Small singleton-domain test"]))
-        let domain = try #require(prepared.presentation.sharedXNumberDomain)
+        let xDomain = try #require(prepared.presentation.sharedXNumberDomain)
+        let yDomain = try #require(prepared.presentation.sharedYDomain)
 
-        #expect(0 < domain.lowerBound)
-        #expect(domain.lowerBound < value)
-        #expect(value < domain.upperBound)
-        #expect(domain.upperBound < 0.002)
+        #expect(0 < xDomain.lowerBound)
+        #expect(xDomain.lowerBound < xValue)
+        #expect(xValue < xDomain.upperBound)
+        #expect(xDomain.upperBound < 0.002)
+        #expect(0 < yDomain.lowerBound)
+        #expect(yDomain.lowerBound < yValue)
+        #expect(yValue < yDomain.upperBound)
+        #expect(yDomain.upperBound < 0.004)
     }
 
     @Test func extremeQuantitativeSpanDisablesZoom() {

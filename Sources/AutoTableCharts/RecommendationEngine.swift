@@ -926,7 +926,7 @@ enum AutoChartRecommendationEngine {
                     .init(
                         severity: .error,
                         code: .validationFailed,
-                        message: "Histogram bin count must be between 1 and 1000."))
+                        message: "Requested histogram bin count must be between 1 and 1000."))
             }
         case .boxPlot:
             require(specification.encoding.y, .quantitative, "Measure")
