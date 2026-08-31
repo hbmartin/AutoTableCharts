@@ -381,15 +381,14 @@ public struct AutoChartFormatters: Sendable {
                 code: code,
                 locale: locale
             ).precision(.significantDigits(1...17))
+            let standard = value.formatted(style)
             if #available(iOS 18, macOS 15, tvOS 18, watchOS 11, *) {
-                let standard = value.formatted(style)
                 return AutoChartCategoryNumberPolicy.concise(
                     standard: standard,
                     scientific: {
                         value.formatted(style.notation(.scientific))
                     })
             }
-            let standard = value.formatted(style)
             return AutoChartCategoryNumberPolicy.concise(
                 standard: standard,
                 scientific: {
@@ -406,15 +405,14 @@ public struct AutoChartFormatters: Sendable {
                 code: code,
                 locale: locale
             ).precision(.significantDigits(1...38))
+            let standard = value.formatted(style)
             if #available(iOS 18, macOS 15, tvOS 18, watchOS 11, *) {
-                let standard = value.formatted(style)
                 return AutoChartCategoryNumberPolicy.concise(
                     standard: standard,
                     scientific: {
                         value.formatted(style.notation(.scientific))
                     })
             }
-            let standard = value.formatted(style)
             return AutoChartCategoryNumberPolicy.concise(
                 standard: standard,
                 scientific: {
