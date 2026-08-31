@@ -84,9 +84,12 @@ English fallback.
 Histogram labels are resolved lazily and cached. If a formatter or resolver
 reenters the same label, or another thread requests it while its callbacks are
 still running, that in-flight request receives a callback-free package fallback
-instead of blocking or recursively invoking the host. Cross-thread contention
-drops the temporary cache entry so the next uncontended request resolves and
-caches the host-formatted, host-localized label.
+instead of blocking or recursively invoking the host. After any overlap, the
+current resolution also returns that fallback rather than trusting a host result
+that may depend on it. The next request makes one recovery attempt: an
+uncontended attempt caches the host-formatted, host-localized label. If that
+attempt also overlaps or reenters, the package caches the fallback so repeated
+requests converge without repeatedly invoking host callbacks.
 
 ### Link semantic selection
 
