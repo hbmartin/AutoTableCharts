@@ -81,6 +81,13 @@ When a resolver does not handle `.histogramBinAccessibility`, histogram
 intervals also try the legacy `.markAccessibilityRange` code before using the
 English fallback.
 
+Histogram labels are resolved lazily and cached. If a formatter or resolver
+reenters the same label, or another thread requests it while its callbacks are
+still running, that in-flight request receives a callback-free package fallback
+instead of blocking or recursively invoking the host. Cross-thread contention
+drops the temporary cache entry so the next uncontended request resolves and
+caches the host-formatted, host-localized label.
+
 ### Link semantic selection
 
 ``AutoChartSelection`` contains typed source row IDs, ordered dimension
