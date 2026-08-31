@@ -906,31 +906,145 @@ private let date = AutoChartColumn(
         #expect(recorder.messages.count == messageCount)
     }
 
-    @Test func histogramAccessibilityComputesEachLabelOnceUnderConcurrency() {
+    @Test func histogramAccessibilityCacheDistinguishesReusedIDsByBounds() {
+        let column = AutoChartColumn(
+            id: "histogram-value",
+            name: "Histogram value",
+            hints: .init(semanticType: .quantitative, role: .measure))
+        let snapshot = AutoChartSnapshot(
+            table(columns: [column], rows: [[.double(1)], [.double(4)]]))
+        let specification = AutoChartSpecification.histogram(
+            value: column.id,
+            binCount: 2)
+        let profiles = AutoChartProfiler.profileIndex(snapshot)
+        let prepared = AutoChartDataPreparation.preparedData(
+            snapshot: snapshot,
+            specification: specification,
+            profiles: profiles)
+        let presentation = AutoChartRenderPresentation(
+            snapshot: snapshot,
+            specification: specification,
+            profiles: profiles,
+            data: prepared.data,
+            measureSemantics: prepared.measureSemantics)
+        let data = [
+            AutoChartDatum(
+                id: "reused-bin",
+                sourceRowIDs: [0],
+                lower: 1,
+                upper: 2),
+            AutoChartDatum(
+                id: "reused-bin",
+                sourceRowIDs: [1],
+                lower: 3,
+                upper: 4),
+        ]
+        let resolved = presentation.resolvedPresentation(
+            data: data,
+            using: .default)
+
+        let first = resolved.histogramBinAccessibilityLabel(for: data[0])
+        let second = resolved.histogramBinAccessibilityLabel(for: data[1])
+
+        #expect(first != second)
+        #expect(!first.contains(AutoChartValue.unrepresentableValuePlaceholder))
+        #expect(!second.contains(AutoChartValue.unrepresentableValuePlaceholder))
+        #expect(resolved.histogramBinAccessibilityLabel(for: data[0]) == first)
+        #expect(resolved.histogramBinAccessibilityLabel(for: data[1]) == second)
+    }
+
+    @Test func histogramAccessibilityComputesEachLabelOnceUnderConcurrency() async {
         final class Recorder: @unchecked Sendable {
             private let lock = NSLock()
+            private let releaseResolution = DispatchSemaphore(value: 0)
             private var requests = 0
             private var messages = 0
             private var labels: [String] = []
+            private var resolutionStarted = false
+            private var resolutionStartedContinuation: CheckedContinuation<Void, Never>?
+            private var resolutionReleased = false
+            private var safetyReleaseUsed = false
+            private var ownerFinished = false
+            private var ownerFinishedContinuation: CheckedContinuation<Void, Never>?
 
             func recordRequest() {
+                let shouldBlock: Bool
+                let continuation: CheckedContinuation<Void, Never>?
                 lock.lock()
                 requests += 1
+                shouldBlock = requests == 1
+                if shouldBlock {
+                    resolutionStarted = true
+                    continuation = resolutionStartedContinuation
+                    resolutionStartedContinuation = nil
+                } else {
+                    continuation = nil
+                }
                 lock.unlock()
-                Thread.sleep(forTimeInterval: 0.002)
+                continuation?.resume()
+                if shouldBlock {
+                    releaseResolution.wait()
+                }
             }
 
             func recordMessage() {
                 lock.lock()
                 messages += 1
                 lock.unlock()
-                Thread.sleep(forTimeInterval: 0.002)
             }
 
             func recordLabel(_ label: String) {
                 lock.lock()
                 labels.append(label)
                 lock.unlock()
+            }
+
+            func waitUntilResolutionStarts() async {
+                await withCheckedContinuation { continuation in
+                    lock.lock()
+                    if resolutionStarted {
+                        lock.unlock()
+                        continuation.resume()
+                    } else {
+                        resolutionStartedContinuation = continuation
+                        lock.unlock()
+                    }
+                }
+            }
+
+            func releaseBlockedResolution(forSafety: Bool = false) {
+                lock.lock()
+                guard !resolutionReleased else {
+                    lock.unlock()
+                    return
+                }
+                resolutionReleased = true
+                safetyReleaseUsed = forSafety
+                lock.unlock()
+                releaseResolution.signal()
+            }
+
+            func recordOwnerFinished() {
+                let continuation: CheckedContinuation<Void, Never>?
+                lock.lock()
+                ownerFinished = true
+                continuation = ownerFinishedContinuation
+                ownerFinishedContinuation = nil
+                lock.unlock()
+                continuation?.resume()
+            }
+
+            func waitUntilOwnerFinishes() async {
+                await withCheckedContinuation { continuation in
+                    lock.lock()
+                    if ownerFinished {
+                        lock.unlock()
+                        continuation.resume()
+                    } else {
+                        ownerFinishedContinuation = continuation
+                        lock.unlock()
+                    }
+                }
             }
 
             var counts: (requests: Int, messages: Int) {
@@ -943,6 +1057,12 @@ private let date = AutoChartColumn(
                 lock.lock()
                 defer { lock.unlock() }
                 return labels
+            }
+
+            var requiredSafetyRelease: Bool {
+                lock.lock()
+                defer { lock.unlock() }
+                return safetyReleaseUsed
             }
         }
 
@@ -982,12 +1102,38 @@ private let date = AutoChartColumn(
         let datum = prepared.data[0]
         let baselineCounts = recorder.counts
 
-        DispatchQueue.concurrentPerform(iterations: 32) { _ in
+        DispatchQueue.global().async {
             let label = resolved.histogramBinAccessibilityLabel(for: datum)
             recorder.recordLabel(label)
+            recorder.recordOwnerFinished()
+        }
+        await recorder.waitUntilResolutionStarts()
+        DispatchQueue.global().asyncAfter(deadline: .now() + 1) {
+            recorder.releaseBlockedResolution(forSafety: true)
         }
 
+        let taskLabels = await withTaskGroup(
+            of: String.self,
+            returning: [String].self
+        ) { group in
+            for _ in 0..<32 {
+                group.addTask {
+                    resolved.histogramBinAccessibilityLabel(for: datum)
+                }
+            }
+            var labels: [String] = []
+            for await label in group {
+                labels.append(label)
+            }
+            return labels
+        }
+        taskLabels.forEach(recorder.recordLabel)
+        recorder.releaseBlockedResolution()
+        await recorder.waitUntilOwnerFinishes()
+
         #expect(Set(recorder.capturedLabels).count == 1)
+        #expect(recorder.capturedLabels.count == 33)
+        #expect(!recorder.requiredSafetyRelease)
         #expect(recorder.counts.requests - baselineCounts.requests == 2)
         #expect(recorder.counts.messages - baselineCounts.messages == 2)
     }
@@ -1009,17 +1155,18 @@ private let date = AutoChartColumn(
                 lock.unlock()
             }
 
-            func reenter() {
+            func reenter() -> String? {
                 lock.lock()
                 let resolved = resolved
                 let datum = datum
                 lock.unlock()
-                guard let resolved, let datum else { return }
+                guard let resolved, let datum else { return nil }
 
                 let label = resolved.histogramBinAccessibilityLabel(for: datum)
                 lock.lock()
                 labels.append(label)
                 lock.unlock()
+                return label
             }
 
             var capturedLabels: [String] {
@@ -1052,7 +1199,6 @@ private let date = AutoChartColumn(
         let state = ReentrantState()
         let formatters = AutoChartFormatters { _, _, _ in
             state.reenter()
-            return nil
         }
         let resolved = presentation.resolvedPresentation(
             data: prepared.data,
@@ -1064,11 +1210,8 @@ private let date = AutoChartColumn(
         let label = resolved.histogramBinAccessibilityLabel(for: datum)
 
         #expect(label != AutoChartValue.unrepresentableValuePlaceholder)
-        #expect(
-            state.capturedLabels
-                == Array(
-                    repeating: AutoChartValue.unrepresentableValuePlaceholder,
-                    count: 2))
+        #expect(!label.contains(AutoChartValue.unrepresentableValuePlaceholder))
+        #expect(state.capturedLabels == Array(repeating: label, count: 2))
         #expect(resolved.histogramBinAccessibilityLabel(for: datum) == label)
         #expect(state.capturedLabels.count == 2)
     }
@@ -4187,6 +4330,40 @@ private let date = AutoChartColumn(
         #expect(yDomain.lowerBound < yValue)
         #expect(yValue < yDomain.upperBound)
         #expect(yDomain.upperBound < 0.004)
+    }
+
+    @Test func quantitativeFacetYDomainPadsBySpanInsteadOfMagnitude() throws {
+        let facet = AutoChartColumn(
+            id: "facet", name: "region",
+            hints: AutoChartColumnHints(semanticType: .nominal))
+        let quantitativeX = AutoChartColumn(
+            id: "quantitative-x", name: "quantitative_x",
+            hints: AutoChartColumnHints(
+                semanticType: .quantitative,
+                role: .dimension))
+        let input = table(
+            columns: [facet, quantitativeX, measure],
+            rows: [
+                [.text("West"), .double(1), .double(1_000)],
+                [.text("East"), .double(2), .double(1_000.1)],
+            ])
+        let specification = AutoChartSpecification(
+            family: .faceted,
+            encoding: .init(x: quantitativeX.id, y: measure.id, facet: facet.id),
+            facetBaseFamily: .scatter)
+        let prepared = preparedPresentation(
+            for: input,
+            recommendation: AutoChartRecommendation(
+                specification: specification,
+                score: 0,
+                rationale: ["Tight nonzero Y-domain test"]))
+        let domain = try #require(prepared.presentation.sharedYDomain)
+
+        #expect(domain.lowerBound < 1_000)
+        #expect(domain.upperBound > 1_000.1)
+        #expect(domain.lowerBound > 999.9)
+        #expect(domain.upperBound < 1_000.2)
+        #expect(domain.upperBound - domain.lowerBound < 0.2)
     }
 
     @Test func extremeQuantitativeSpanDisablesZoom() {

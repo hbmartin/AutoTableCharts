@@ -389,10 +389,11 @@ public struct AutoChartFormatters: Sendable {
                         value.formatted(style.notation(.scientific))
                     })
             }
-            let attributedStandard = value.formatted(style.attributed)
+            let standard = value.formatted(style)
             return AutoChartCategoryNumberPolicy.concise(
-                standard: String(attributedStandard.characters),
+                standard: standard,
                 scientific: {
+                    let attributedStandard = value.formatted(style.attributed)
                     let scientificMagnitude = abs(value).formatted(
                         .number.locale(locale).notation(.scientific)
                             .precision(.significantDigits(1...17)))
@@ -413,10 +414,11 @@ public struct AutoChartFormatters: Sendable {
                         value.formatted(style.notation(.scientific))
                     })
             }
-            let attributedStandard = value.formatted(style.attributed)
+            let standard = value.formatted(style)
             return AutoChartCategoryNumberPolicy.concise(
-                standard: String(attributedStandard.characters),
+                standard: standard,
                 scientific: {
+                    let attributedStandard = value.formatted(style.attributed)
                     let scientificMagnitude = abs(value).formatted(
                         .number.locale(locale).notation(.scientific)
                             .precision(.significantDigits(1...38)))
