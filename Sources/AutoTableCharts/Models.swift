@@ -872,7 +872,10 @@ public struct AutoChartSpecification: Identifiable, Hashable, Codable, Sendable 
     public var encoding: AutoChartEncoding
     /// The transformation applied when multiple source rows contribute to a mark.
     public var aggregation: AutoChartAggregation
-    /// The requested number of histogram bins, or `nil` for the renderer default.
+    /// The requested maximum number of histogram bins, or `nil` for the renderer default.
+    ///
+    /// The renderer can produce fewer bins when adjacent floating-point boundaries
+    /// collapse to the same representable value.
     public var binCount: Int?
     /// The layout direction for families that support orientation.
     public var orientation: AutoChartOrientation
@@ -894,7 +897,8 @@ public struct AutoChartSpecification: Identifiable, Hashable, Codable, Sendable 
     ///   - family: The chart family to render.
     ///   - encoding: Column-to-channel assignments.
     ///   - aggregation: A grouping transformation, if any.
-    ///   - binCount: The number of histogram bins.
+    ///   - binCount: The requested maximum number of histogram bins. The renderer can
+    ///     produce fewer when adjacent floating-point boundaries coincide.
     ///   - orientation: The primary layout direction.
     ///   - stacking: The series-stacking behavior.
     ///   - facetBaseFamily: The base family repeated by a faceted chart.
