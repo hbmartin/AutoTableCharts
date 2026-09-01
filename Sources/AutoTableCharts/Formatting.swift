@@ -532,6 +532,11 @@ public struct AutoChartFormatters: Sendable {
         overridden(request)
     }
 
+    /// Applies package formatting without invoking the host override.
+    func formatDefault(_ request: AutoChartFormattingRequest) -> String {
+        defaultFormat(request)
+    }
+
     private func defaultFormat(
         column: AutoChartColumn?,
         value: AutoChartValue
