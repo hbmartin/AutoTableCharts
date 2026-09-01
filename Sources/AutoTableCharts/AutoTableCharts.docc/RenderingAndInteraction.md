@@ -95,18 +95,27 @@ Other work performed while rendering a histogram mark remains presentation-time
 work. In particular, formatting the bin count and resolving the combined mark
 accessibility message can invoke host callbacks on each body evaluation. If any
 host formatter or text-resolver callback synchronously reenters presentation
-resolution in the same execution context, the nested presentation uses package
-formatting and text fallbacks. Callback activity is isolated between concurrent
-execution contexts, so an unrelated presentation does not lose its host
-overrides merely because another thread is invoking the same callback wrapper.
+resolution, the nested presentation uses package formatting and text fallbacks.
+Formatter and resolver wrappers likewise use their package behavior instead of
+invoking another host callback while callback activity remains active.
+Dynamic callback activity follows synchronous work that constructs fresh wrapper
+values. A child task created by a callback inherits that scope while the callback
+is active, but the inherited scope becomes inactive when the callback returns;
+later work in that task can use host overrides normally.
+
+Copies of one formatter or resolver share an activity token. That token also
+detects reentry that dispatches presentation construction to a raw thread and
+waits, where task-local context does not propagate. Because the library cannot
+distinguish that causal hop from unrelated concurrent work, another presentation
+that reuses the same wrapper while its callback is active conservatively uses
+package fallbacks. Independently constructed wrapper values remain isolated.
 Nested histogram presentations defer their callback-free interval formatting
 until lookup, which bounds both recursion depth and eager recovery cost.
 
-Do not synchronously dispatch presentation construction to a detached thread and
-wait for it from inside a callback. Detached work does not inherit the callback's
-execution context and cannot be distinguished from an independent concurrent
-presentation. An unexpected finite interval absent from the immutable prepared
-table is formatted on demand without mutating that table.
+A detached or raw-thread reentrant presentation must reuse the active formatter
+or resolver wrapper for its activity token to be recognized. A prepared interval
+absent from the immutable table is an invariant violation and returns the
+unrepresentable-value placeholder in production builds.
 
 ### Link semantic selection
 

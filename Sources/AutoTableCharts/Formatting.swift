@@ -240,6 +240,7 @@ public struct AutoChartFormatters: Sendable {
     public var locale: Locale
     public var timeZone: TimeZone
     private let override: RequestFormatter?
+    private let hostCallbackToken: AutoChartHostCallbackToken?
 
     private enum CategoryNumber {
         case integer(Int64)
@@ -276,8 +277,10 @@ public struct AutoChartFormatters: Sendable {
                     locale,
                     timeZone)
             }
+            hostCallbackToken = AutoChartHostCallbackToken()
         } else {
             override = nil
+            hostCallbackToken = nil
         }
     }
 
@@ -290,6 +293,7 @@ public struct AutoChartFormatters: Sendable {
         self.locale = locale
         self.timeZone = timeZone
         self.override = request
+        hostCallbackToken = AutoChartHostCallbackToken()
     }
 
     public func format(
@@ -527,14 +531,21 @@ public struct AutoChartFormatters: Sendable {
     }
 
     private func overridden(_ request: AutoChartFormattingRequest) -> String? {
-        guard let override else { return nil }
-        return AutoChartHostCallbackActivity.invoke {
-            override(request, locale, timeZone)
-        }
+        guard let override, let hostCallbackToken,
+            !AutoChartHostCallbackActivity.isInvoking,
+            !AutoChartHostCallbackActivity.isInvoking(hostCallbackToken)
+        else { return nil }
+        return AutoChartHostCallbackActivity.invoke(
+            hostCallbackToken,
+            { override(request, locale, timeZone) })
     }
 
     func formatOverride(_ request: AutoChartFormattingRequest) -> String? {
         overridden(request)
+    }
+
+    var isInvokingHostCallback: Bool {
+        AutoChartHostCallbackActivity.isInvoking(hostCallbackToken)
     }
 
     private func defaultFormat(

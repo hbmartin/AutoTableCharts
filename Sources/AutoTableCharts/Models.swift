@@ -1658,29 +1658,103 @@ enum AutoChartCategoryDisambiguationKind: String, Sendable {
     }
 }
 
+/// Copies of a host callback wrapper share this token. Tracking its dynamic
+/// invocation scope lets synchronous reentrant work choose package fallbacks
+/// even when the host forwards that work to another thread.
+final class AutoChartHostCallbackToken: @unchecked Sendable {}
+
 enum AutoChartHostCallbackActivity {
-    /// Dynamic execution-context state avoids treating a callback running on an
-    /// unrelated thread as reentry. It also follows synchronous work regardless
-    /// of which resolver or formatter wrapper the host constructs along the way.
-    @TaskLocal static var isInvoking = false
+    /// Child tasks inherit task-local values at creation. Keep the inherited
+    /// scope as a reference whose activity ends with the callback, rather than a
+    /// Boolean snapshot that would remain true for the child's entire lifetime.
+    private final class Scope: @unchecked Sendable {
+        private let lock = NSLock()
+        private var active = true
+
+        var isActive: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return active
+        }
+
+        func deactivate() {
+            lock.lock()
+            active = false
+            lock.unlock()
+        }
+    }
+
+    private final class State: @unchecked Sendable {
+        private let lock = NSLock()
+        private var activeTokens: [ObjectIdentifier: Int] = [:]
+
+        func isInvoking(_ token: AutoChartHostCallbackToken) -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return activeTokens[ObjectIdentifier(token)] != nil
+        }
+
+        func begin(_ token: AutoChartHostCallbackToken) {
+            lock.lock()
+            activeTokens[ObjectIdentifier(token), default: 0] += 1
+            lock.unlock()
+        }
+
+        func end(_ token: AutoChartHostCallbackToken) {
+            lock.lock()
+            let identifier = ObjectIdentifier(token)
+            if let count = activeTokens[identifier], count > 1 {
+                activeTokens[identifier] = count - 1
+            } else {
+                activeTokens.removeValue(forKey: identifier)
+            }
+            lock.unlock()
+        }
+    }
+
+    private static let state = State()
+    @TaskLocal private static var inheritedScope: Scope?
+
+    /// True only while the inherited callback scope itself remains active. A
+    /// task created by a callback may retain the scope reference after the
+    /// callback returns, but it no longer remains permanently reentrant.
+    static var isInvoking: Bool {
+        inheritedScope?.isActive == true
+    }
+
+    static func isInvoking(_ token: AutoChartHostCallbackToken?) -> Bool {
+        token.map(state.isInvoking) ?? false
+    }
 
     static func invoke<Value>(
+        _ token: AutoChartHostCallbackToken,
         _ body: () -> Value
     ) -> Value {
-        $isInvoking.withValue(true, operation: body)
+        let scope = Scope()
+        state.begin(token)
+        return $inheritedScope.withValue(scope) {
+            defer {
+                scope.deactivate()
+                state.end(token)
+            }
+            return body()
+        }
     }
 }
 
 /// Host override for package-authored text. Return `nil` to use `defaultText`.
 public struct AutoChartTextResolver: Sendable {
     private let resolveValue: (@Sendable (AutoChartMessage) -> String?)?
+    private let hostCallbackToken: AutoChartHostCallbackToken?
 
     public init(_ resolve: @escaping @Sendable (AutoChartMessage) -> String?) {
         self.resolveValue = resolve
+        hostCallbackToken = AutoChartHostCallbackToken()
     }
 
     private init() {
         resolveValue = nil
+        hostCallbackToken = nil
     }
 
     public func callAsFunction(_ message: AutoChartMessage) -> String {
@@ -1688,8 +1762,17 @@ public struct AutoChartTextResolver: Sendable {
     }
 
     func resolve(_ message: AutoChartMessage) -> String? {
-        guard let resolveValue else { return nil }
-        return AutoChartHostCallbackActivity.invoke { resolveValue(message) }
+        guard let resolveValue, let hostCallbackToken,
+            !AutoChartHostCallbackActivity.isInvoking,
+            !AutoChartHostCallbackActivity.isInvoking(hostCallbackToken)
+        else { return nil }
+        return AutoChartHostCallbackActivity.invoke(
+            hostCallbackToken,
+            { resolveValue(message) })
+    }
+
+    var isInvokingHostCallback: Bool {
+        AutoChartHostCallbackActivity.isInvoking(hostCallbackToken)
     }
 
     public static let `default` = AutoChartTextResolver()
