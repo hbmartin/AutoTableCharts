@@ -1642,6 +1642,10 @@ struct AutoChartRenderPresentation: Sendable {
     var usesYIdentityLabels: Bool
     var usesSeriesIdentityLabels: Bool
     var usesFacetIdentityLabels: Bool
+    var usesAnyIdentityLabels: Bool {
+        usesXIdentityLabels || usesYIdentityLabels
+            || usesSeriesIdentityLabels || usesFacetIdentityLabels
+    }
     var usesSharedXCategoryDomain: Bool
     fileprivate var xCategoryColumn: AutoChartColumn?
     fileprivate var yCategoryColumn: AutoChartColumn?
@@ -1909,8 +1913,7 @@ struct AutoChartRenderPresentation: Sendable {
         using textResolver: AutoChartTextResolver,
         formatters: AutoChartFormatters = .init()
     ) -> AutoChartResolvedPresentation {
-        let isReentrant = textResolver.isInvokingHostCallback
-            || formatters.isInvokingHostCallback
+        let isReentrant = AutoChartHostCallbackActivity.isInvoking
         let effectiveTextResolver: AutoChartTextResolver =
             isReentrant ? .default : textResolver
         let effectiveFormatters =
@@ -1924,7 +1927,7 @@ struct AutoChartRenderPresentation: Sendable {
             data: data,
             textResolver: effectiveTextResolver,
             formatters: effectiveFormatters,
-            eagerlyResolvesHistogramLabels: !isReentrant)
+            histogramLabelResolution: isReentrant ? .callbackFreeFallback : .prepared)
     }
 }
 
@@ -1955,7 +1958,11 @@ private struct AutoChartHistogramBinAccessibilityLabels: Sendable {
     }
 
     private enum Storage: Sendable {
-        case prepared([Key: String])
+        case prepared(
+            labels: [Key: String],
+            column: AutoChartColumn?,
+            formatters: AutoChartFormatters,
+            textResolver: AutoChartTextResolver)
         case callbackFreeFallback(
             column: AutoChartColumn?,
             formatters: AutoChartFormatters)
@@ -1986,7 +1993,11 @@ private struct AutoChartHistogramBinAccessibilityLabels: Sendable {
                 formatters: formatters,
                 textResolver: textResolver)
         }
-        storage = .prepared(labels)
+        storage = .prepared(
+            labels: labels,
+            column: column,
+            formatters: formatters,
+            textResolver: textResolver)
     }
 
     init(
@@ -1995,7 +2006,9 @@ private struct AutoChartHistogramBinAccessibilityLabels: Sendable {
     ) {
         storage = .callbackFreeFallback(
             column: column,
-            formatters: formatters)
+            formatters: AutoChartFormatters(
+                locale: formatters.locale,
+                timeZone: formatters.timeZone))
     }
 
     func label(for datum: AutoChartDatum) -> String {
@@ -2004,12 +2017,19 @@ private struct AutoChartHistogramBinAccessibilityLabels: Sendable {
             return AutoChartValue.unrepresentableValuePlaceholder
         }
         switch storage {
-        case .prepared(let labels):
-            guard let label = labels[bounds.key] else {
-                assertionFailure("A histogram bin must retain its exact prepared bounds.")
-                return AutoChartValue.unrepresentableValuePlaceholder
+        case .prepared(let labels, let column, let formatters, let textResolver):
+            if let label = labels[bounds.key] {
+                return label
             }
-            return label
+            // Production rendering looks up the immutable prepared data. Preserve
+            // correct behavior for an unexpected finite datum without making the
+            // common concurrent lookup path mutable.
+            return AutoChartAccessibility.histogramBinLabel(
+                lower: bounds.lower,
+                upper: bounds.upper,
+                column: column,
+                formatters: formatters,
+                textResolver: textResolver)
         case .callbackFreeFallback(let column, let formatters):
             return AutoChartAccessibility.histogramBinLabel(
                 lower: bounds.lower,
@@ -2019,6 +2039,11 @@ private struct AutoChartHistogramBinAccessibilityLabels: Sendable {
                 textResolver: .default)
         }
     }
+}
+
+fileprivate enum AutoChartHistogramLabelResolution {
+    case prepared
+    case callbackFreeFallback
 }
 
 struct AutoChartResolvedPresentation: Sendable {
@@ -2043,12 +2068,12 @@ struct AutoChartResolvedPresentation: Sendable {
     private let histogramBinAccessibilityLabels:
         AutoChartHistogramBinAccessibilityLabels?
 
-    init(
+    fileprivate init(
         presentation: AutoChartRenderPresentation,
         data: [AutoChartDatum],
         textResolver: AutoChartTextResolver,
         formatters: AutoChartFormatters,
-        eagerlyResolvesHistogramLabels: Bool
+        histogramLabelResolution: AutoChartHistogramLabelResolution
     ) {
         func resolve(_ message: AutoChartMessage?, fallback: String) -> String {
             message.map(textResolver.callAsFunction) ?? fallback
@@ -2121,10 +2146,7 @@ struct AutoChartResolvedPresentation: Sendable {
         var yEntries = CategoryEntries()
         var seriesEntries = CategoryEntries()
         var facetEntries = CategoryEntries()
-        if presentation.usesXIdentityLabels || presentation.usesYIdentityLabels
-            || presentation.usesSeriesIdentityLabels
-            || presentation.usesFacetIdentityLabels
-        {
+        if presentation.usesAnyIdentityLabels {
             for datum in data {
                 if presentation.usesXIdentityLabels {
                     xEntries.include(
@@ -2271,18 +2293,22 @@ struct AutoChartResolvedPresentation: Sendable {
         yDisplayLabels = resolvedYDisplayLabels
         seriesDisplayLabels = resolvedSeriesDisplayLabels
         facetDisplayLabels = resolvedFacetDisplayLabels
-        histogramBinAccessibilityLabels =
-            presentation.family == .histogram
-            ? eagerlyResolvesHistogramLabels
-                ? AutoChartHistogramBinAccessibilityLabels(
+        if presentation.family != .histogram {
+            histogramBinAccessibilityLabels = nil
+        } else {
+            switch histogramLabelResolution {
+            case .prepared:
+                histogramBinAccessibilityLabels = AutoChartHistogramBinAccessibilityLabels(
                     data: data,
                     column: presentation.xCategoryColumn,
                     formatters: formatters,
                     textResolver: textResolver)
-                : AutoChartHistogramBinAccessibilityLabels(
+            case .callbackFreeFallback:
+                histogramBinAccessibilityLabels = AutoChartHistogramBinAccessibilityLabels(
                     callbackFreeFallbackFor: presentation.xCategoryColumn,
                     formatters: formatters)
-            : nil
+            }
+        }
     }
 
     func histogramBinAccessibilityLabel(for datum: AutoChartDatum) -> String {

@@ -95,11 +95,18 @@ Other work performed while rendering a histogram mark remains presentation-time
 work. In particular, formatting the bin count and resolving the combined mark
 accessibility message can invoke host callbacks on each body evaluation. If any
 host formatter or text-resolver callback synchronously reenters presentation
-resolution, the nested presentation uses package formatting and text fallbacks.
+resolution in the same execution context, the nested presentation uses package
+formatting and text fallbacks. Callback activity is isolated between concurrent
+execution contexts, so an unrelated presentation does not lose its host
+overrides merely because another thread is invoking the same callback wrapper.
 Nested histogram presentations defer their callback-free interval formatting
-until lookup, which bounds both recursion depth and eager recovery cost. A
-prepared interval absent from the immutable table is an invariant violation and
-returns the unrepresentable-value placeholder in production builds.
+until lookup, which bounds both recursion depth and eager recovery cost.
+
+Do not synchronously dispatch presentation construction to a detached thread and
+wait for it from inside a callback. Detached work does not inherit the callback's
+execution context and cannot be distinguished from an independent concurrent
+presentation. An unexpected finite interval absent from the immutable prepared
+table is formatted on demand without mutating that table.
 
 ### Link semantic selection
 
