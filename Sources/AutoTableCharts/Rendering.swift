@@ -1999,7 +1999,7 @@ private struct AutoChartHistogramBinAccessibilityLabels: Sendable {
     ) {
         storage = .callbackFreeFallback(
             column: column,
-            formatters: formatters)
+            formatters: formatters.callbackFree)
     }
 
     private static func callbackFreeLabel(

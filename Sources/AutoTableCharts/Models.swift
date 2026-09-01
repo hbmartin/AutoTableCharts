@@ -1660,10 +1660,13 @@ enum AutoChartCategoryDisambiguationKind: String, Sendable {
     }
 }
 
-/// Copies of a host callback wrapper share this token so direct recursion through
-/// any copy can use package behavior without suppressing a different wrapper.
+/// Reference identity used to recognize recursion through one host callback.
 final class AutoChartHostCallbackToken: Sendable {}
 
+/// Keeps a host callback body and its recursion identity paired so invalid
+/// body-without-token states are unrepresentable. Copies share the token and
+/// therefore use package behavior for direct recursion through any copy without
+/// suppressing a different wrapper.
 struct AutoChartHostCallback<Body: Sendable>: Sendable {
     let body: Body
     let token = AutoChartHostCallbackToken()
@@ -1677,8 +1680,10 @@ enum AutoChartHostCallbackActivity {
     private static let logger = Logger(
         subsystem: "io.github.hbmartin.AutoTableCharts",
         category: "HostCallbacks")
-    private static let maximumDepthWarningState =
-        OSAllocatedUnfairLock(initialState: false)
+    private static let maximumDepthWarning: Void = {
+        logger.warning(
+            "Host callback delegation reached the supported maximum depth of \(maximumCallbackDepth, privacy: .public); using package fallback behavior.")
+    }()
 
     /// Callback delegation is expected to be shallow. Keep a finite ceiling so
     /// a synchronous chain that vends a fresh wrapper at every hop still falls
@@ -1720,10 +1725,7 @@ enum AutoChartHostCallbackActivity {
         /// Scans active ancestry once and rewires retained links around scopes
         /// that can never become active again. The returned parent is therefore
         /// safe for a new scope without retaining a dead inherited lineage.
-        func ancestry(
-            for token: AutoChartHostCallbackToken,
-            maximumDepth: Int
-        ) -> Ancestry {
+        func ancestry(for token: AutoChartHostCallbackToken) -> Ancestry {
             var scope: Scope? = self
             var firstActive: Scope?
             var previousActive: Scope?
@@ -1763,7 +1765,7 @@ enum AutoChartHostCallbackActivity {
             if repeatedToken {
                 return .repeatedToken
             }
-            if activeCount >= maximumDepth {
+            if activeCount >= AutoChartHostCallbackActivity.maximumCallbackDepth {
                 return .maximumDepth
             }
             return .available(parent: firstActive)
@@ -1811,10 +1813,7 @@ enum AutoChartHostCallbackActivity {
     ) -> Value {
         let parent: Scope?
         if let inheritedScope {
-            switch inheritedScope.ancestry(
-                for: token,
-                maximumDepth: maximumCallbackDepth)
-            {
+            switch inheritedScope.ancestry(for: token) {
             case .available(let activeParent):
                 parent = activeParent
             case .repeatedToken:
@@ -1835,14 +1834,7 @@ enum AutoChartHostCallbackActivity {
     }
 
     private static func logMaximumDepthWarningOnce() {
-        let shouldLog = maximumDepthWarningState.withLock { hasLogged in
-            guard !hasLogged else { return false }
-            hasLogged = true
-            return true
-        }
-        guard shouldLog else { return }
-        logger.warning(
-            "Host callback delegation reached the supported maximum depth of \(maximumCallbackDepth, privacy: .public); using package fallback behavior.")
+        _ = maximumDepthWarning
     }
 }
 
