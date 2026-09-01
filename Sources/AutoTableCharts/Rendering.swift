@@ -172,23 +172,6 @@ enum AutoChartAccessibility {
             textResolver: textResolver)
     }
 
-    /// A callback-free label used when another request observes an in-flight
-    /// histogram label. Blocking here can deadlock across queues or bins, while
-    /// invoking the host callbacks again can recurse indefinitely.
-    static func histogramBinFallbackLabel(
-        lower: Double,
-        upper: Double,
-        column: AutoChartColumn?,
-        formatters: AutoChartFormatters
-    ) -> String {
-        histogramBinLabel(
-            lower: lower,
-            upper: upper,
-            column: column,
-            format: { formatters.formatDefault($0) },
-            textResolver: .default)
-    }
-
     private static func histogramBinLabel(
         lower: Double,
         upper: Double,
@@ -1949,155 +1932,58 @@ struct AutoChartRenderPresentation: Sendable {
     }
 }
 
-private final class AutoChartHistogramBinAccessibilityCache: @unchecked Sendable {
+private struct AutoChartHistogramBinAccessibilityLabels: Sendable {
     private struct Key: Hashable, Sendable {
         let id: String
         let lowerBitPattern: UInt64
         let upperBitPattern: UInt64
 
-        init(id: String, lower: Double, upper: Double) {
-            self.id = id
+        init?(_ datum: AutoChartDatum) {
+            guard let lower = datum.lower, lower.isFinite,
+                let upper = datum.upper, upper.isFinite
+            else { return nil }
+            id = datum.id
             lowerBitPattern = lower.bitPattern
             upperBitPattern = upper.bitPattern
         }
     }
 
-    /// Mutable only while `lock` is held. Reference identity prevents a caller
-    /// that built a fallback outside the lock from updating a later attempt.
-    private final class Resolution {
-        let isRecovery: Bool
-        var fallback: String?
-        var observedOverlap = false
-
-        init(isRecovery: Bool, fallback: String? = nil) {
-            self.isRecovery = isRecovery
-            self.fallback = fallback
-        }
-    }
-
-    private enum Entry {
-        case resolving(Resolution)
-        case retryableFallback(String)
-        case resolved(String)
-    }
-
-    private let lock = NSLock()
-    private let column: AutoChartColumn?
-    private let formatters: AutoChartFormatters
-    private let textResolver: AutoChartTextResolver
-    private var entries: [Key: Entry] = [:]
+    private let labels: [Key: String]
 
     init(
+        data: [AutoChartDatum],
         column: AutoChartColumn?,
         formatters: AutoChartFormatters,
         textResolver: AutoChartTextResolver
     ) {
-        self.column = column
-        self.formatters = formatters
-        self.textResolver = textResolver
+        var labels: [Key: String] = [:]
+        labels.reserveCapacity(data.count)
+        for datum in data {
+            guard let key = Key(datum), let lower = datum.lower, let upper = datum.upper else {
+                assertionFailure("Prepared histogram bins require finite bounds.")
+                continue
+            }
+            guard labels[key] == nil else { continue }
+            labels[key] = AutoChartAccessibility.histogramBinLabel(
+                lower: lower,
+                upper: upper,
+                column: column,
+                formatters: formatters,
+                textResolver: textResolver)
+        }
+        self.labels = labels
     }
 
     func label(for datum: AutoChartDatum) -> String {
-        guard let lower = datum.lower, lower.isFinite,
-            let upper = datum.upper, upper.isFinite
-        else {
+        guard let key = Key(datum) else {
             assertionFailure("Prepared histogram bins require finite bounds.")
             return AutoChartValue.unrepresentableValuePlaceholder
         }
-        let key = Key(id: datum.id, lower: lower, upper: upper)
-
-        let resolution: Resolution
-        lock.lock()
-        if let entry = entries[key] {
-            switch entry {
-            case .resolved(let label):
-                lock.unlock()
-                return label
-            case .retryableFallback(let fallback):
-                resolution = Resolution(isRecovery: true, fallback: fallback)
-                entries[key] = .resolving(resolution)
-            case .resolving(let inFlight):
-                // Never wait for a callback-driven resolution. The owner may be
-                // synchronously waiting for this execution context, or two bins
-                // may be asking for each other from different threads.
-                inFlight.observedOverlap = true
-                let existingFallback = inFlight.fallback
-                lock.unlock()
-                if let existingFallback { return existingFallback }
-
-                let fallback = AutoChartAccessibility.histogramBinFallbackLabel(
-                    lower: lower,
-                    upper: upper,
-                    column: column,
-                    formatters: formatters)
-                lock.lock()
-                if case .resolving(let current)? = entries[key], current === inFlight {
-                    if let sharedFallback = current.fallback {
-                        lock.unlock()
-                        return sharedFallback
-                    }
-                    current.fallback = fallback
-                }
-                lock.unlock()
-                return fallback
-            }
-        } else {
-            resolution = Resolution(isRecovery: false)
-            entries[key] = .resolving(resolution)
+        guard let label = labels[key] else {
+            assertionFailure("A histogram bin must retain its prepared ID and bounds.")
+            return AutoChartValue.unrepresentableValuePlaceholder
         }
-        lock.unlock()
-
-        let resolved = AutoChartAccessibility.histogramBinLabel(
-            lower: lower,
-            upper: upper,
-            column: column,
-            formatters: formatters,
-            textResolver: textResolver)
-
-        lock.lock()
-        guard case .resolving(let current)? = entries[key], current === resolution else {
-            assertionFailure("An in-flight histogram label must retain its cache entry.")
-            lock.unlock()
-            return resolved
-        }
-        guard resolution.observedOverlap else {
-            entries[key] = .resolved(resolved)
-            lock.unlock()
-            return resolved
-        }
-
-        // An overlapping caller may have supplied its fallback to a host
-        // callback. Treat this result as provisional instead of caching a label
-        // that may depend on the recursive fallback.
-        if let fallback = resolution.fallback {
-            entries[key] = resolution.isRecovery
-                ? .resolved(fallback) : .retryableFallback(fallback)
-            lock.unlock()
-            return fallback
-        }
-
-        // Default formatting invokes no host callbacks. Build it outside the
-        // shared lock, then either allow one recovery attempt or settle on the
-        // fallback if that recovery also overlapped.
-        lock.unlock()
-
-        let builtFallback = AutoChartAccessibility.histogramBinFallbackLabel(
-            lower: lower,
-            upper: upper,
-            column: column,
-            formatters: formatters)
-
-        lock.lock()
-        guard case .resolving(let final)? = entries[key], final === resolution else {
-            assertionFailure("An in-flight histogram label must retain its cache entry.")
-            lock.unlock()
-            return builtFallback
-        }
-        let fallback = final.fallback ?? builtFallback
-        entries[key] = final.isRecovery
-            ? .resolved(fallback) : .retryableFallback(fallback)
-        lock.unlock()
-        return fallback
+        return label
     }
 }
 
@@ -2118,10 +2004,9 @@ struct AutoChartResolvedPresentation: Sendable {
     var yDisplayLabels: [String: String]
     var seriesDisplayLabels: [String: String]
     var facetDisplayLabels: [String: String]
-    /// Reference-backed memoization is intentionally shared across value copies
-    /// so SwiftUI view copies do not repeat host formatting and localization.
-    private let sharedHistogramBinAccessibilityCache:
-        AutoChartHistogramBinAccessibilityCache?
+    /// Immutable resolved labels are safe to read from concurrent SwiftUI view copies.
+    private let histogramBinAccessibilityLabels:
+        AutoChartHistogramBinAccessibilityLabels?
 
     init(
         presentation: AutoChartRenderPresentation,
@@ -2345,9 +2230,10 @@ struct AutoChartResolvedPresentation: Sendable {
         yDisplayLabels = resolvedYDisplayLabels
         seriesDisplayLabels = resolvedSeriesDisplayLabels
         facetDisplayLabels = resolvedFacetDisplayLabels
-        sharedHistogramBinAccessibilityCache =
+        histogramBinAccessibilityLabels =
             presentation.family == .histogram
-            ? AutoChartHistogramBinAccessibilityCache(
+            ? AutoChartHistogramBinAccessibilityLabels(
+                data: data,
                 column: presentation.xCategoryColumn,
                 formatters: formatters,
                 textResolver: textResolver)
@@ -2355,11 +2241,11 @@ struct AutoChartResolvedPresentation: Sendable {
     }
 
     func histogramBinAccessibilityLabel(for datum: AutoChartDatum) -> String {
-        guard let sharedHistogramBinAccessibilityCache else {
+        guard let histogramBinAccessibilityLabels else {
             assertionFailure("Only histograms have cached bin accessibility labels.")
             return AutoChartValue.unrepresentableValuePlaceholder
         }
-        return sharedHistogramBinAccessibilityCache.label(for: datum)
+        return histogramBinAccessibilityLabels.label(for: datum)
     }
 }
 

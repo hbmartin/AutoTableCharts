@@ -307,7 +307,7 @@ public struct AutoChartFormatters: Sendable {
         if let formatted = formatOverride(request) {
             return formatted
         }
-        return formatDefault(request)
+        return defaultFormat(request)
     }
 
     /// Formats one normalized category at presentation time. Host overrides
@@ -530,10 +530,6 @@ public struct AutoChartFormatters: Sendable {
 
     func formatOverride(_ request: AutoChartFormattingRequest) -> String? {
         overridden(request)
-    }
-
-    func formatDefault(_ request: AutoChartFormattingRequest) -> String {
-        defaultFormat(request)
     }
 
     private func defaultFormat(
