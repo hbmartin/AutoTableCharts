@@ -531,13 +531,11 @@ public struct AutoChartFormatters: Sendable {
     }
 
     private func overridden(_ request: AutoChartFormattingRequest) -> String? {
-        guard let override, let hostCallbackToken,
-            !AutoChartHostCallbackActivity.containsActiveCallback(
-                for: hostCallbackToken)
-        else { return nil }
+        guard let override else { return nil }
         return AutoChartHostCallbackActivity.invoke(
             hostCallbackToken,
-            { override(request, locale, timeZone) })
+            { override(request, locale, timeZone) },
+            fallback: nil)
     }
 
     func formatOverride(_ request: AutoChartFormattingRequest) -> String? {
