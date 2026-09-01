@@ -103,14 +103,15 @@ to a different wrapper; if the delegate constructs another presentation, the
 callback-free nested-presentation rule still applies.
 
 Synchronous callback ancestry detects delegation cycles such as `A → B → A`.
-Callback nesting also has a finite internal ceiling, so a chain that constructs a
-fresh wrapper at every direct delegation falls back to package behavior before it
-can exhaust the stack. A child task created by a callback inherits that scope
-while the callback is active, but its presentation activity becomes inactive
-when that callback returns, even if an outer callback remains active. Direct calls
-to a wrapper that is still active anywhere in the inherited ancestry remain
-suppressed. Independent concurrent presentations retain host overrides even when
-they reuse the same `Sendable` formatter or resolver wrapper.
+Callback nesting supports at most 32 active callbacks, so a chain that constructs
+a fresh wrapper at every direct delegation falls back to package behavior before
+it can exhaust the stack and writes a `HostCallbacks` warning to the system log.
+A child task created by a callback inherits that scope while the callback is
+active, but its presentation activity becomes inactive when that callback
+returns, even if an outer callback remains active. Direct calls to a wrapper that
+is still active anywhere in the inherited ancestry remain suppressed. Independent
+concurrent presentations retain host overrides even when they reuse the same
+`Sendable` formatter or resolver wrapper.
 Nested histogram presentations defer their callback-free interval formatting
 until lookup, which bounds both recursion depth and eager recovery cost.
 

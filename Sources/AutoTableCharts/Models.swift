@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 import os.lock
 
 /// A stable identifier for a column exposed through ``AutoChartTable``.
@@ -1664,6 +1665,10 @@ enum AutoChartCategoryDisambiguationKind: String, Sendable {
 final class AutoChartHostCallbackToken: Sendable {}
 
 enum AutoChartHostCallbackActivity {
+    private static let logger = Logger(
+        subsystem: "AutoTableCharts",
+        category: "HostCallbacks")
+
     /// Callback delegation is expected to be shallow. Keep a finite ceiling so
     /// a synchronous chain that vends a fresh wrapper at every hop still falls
     /// back to package behavior instead of exhausting the stack.
@@ -1673,41 +1678,102 @@ enum AutoChartHostCallbackActivity {
     /// scope as a reference whose activity ends with the callback, rather than a
     /// Boolean snapshot that would remain true for the child's entire lifetime.
     private final class Scope: Sendable {
+        private struct State: Sendable {
+            var isActive: Bool
+            var parent: Scope?
+        }
+
+        enum Ancestry {
+            case available(parent: Scope?)
+            case repeatedToken
+            case maximumDepth
+        }
+
         let token: AutoChartHostCallbackToken
-        let parent: Scope?
-        private let activity = OSAllocatedUnfairLock(initialState: true)
+        private let state: OSAllocatedUnfairLock<State>
 
         init(token: AutoChartHostCallbackToken, parent: Scope?) {
             self.token = token
-            self.parent = parent
+            state = OSAllocatedUnfairLock(
+                initialState: State(isActive: true, parent: parent))
         }
 
         var isActive: Bool {
-            activity.withLock { $0 }
+            state.withLock { $0.isActive }
         }
 
         func deactivate() {
-            activity.withLock { $0 = false }
+            state.withLock { $0.isActive = false }
         }
 
-        func activeCallbackCount(
-            for token: AutoChartHostCallbackToken? = nil
-        ) -> Int {
+        /// Scans active ancestry once and rewires retained links around scopes
+        /// that can never become active again. The returned parent is therefore
+        /// safe for a new scope without retaining a dead inherited lineage.
+        func ancestry(
+            for token: AutoChartHostCallbackToken,
+            maximumDepth: Int
+        ) -> Ancestry {
             var scope: Scope? = self
-            var count = 0
+            var firstActive: Scope?
+            var previousActive: Scope?
+            var activeCount = 0
+            var skippedInactiveScope = false
             while let current = scope {
-                if current.isActive,
-                    token == nil || current.token === token
-                {
-                    count += 1
+                let snapshot = current.state.withLock { $0 }
+                scope = snapshot.parent
+                guard snapshot.isActive else {
+                    skippedInactiveScope = true
+                    continue
                 }
-                scope = current.parent
+                guard current.token !== token else { return .repeatedToken }
+
+                activeCount += 1
+                guard activeCount < maximumDepth else { return .maximumDepth }
+
+                if let previousActive {
+                    if skippedInactiveScope {
+                        previousActive.replaceParent(with: current)
+                    }
+                } else {
+                    firstActive = current
+                }
+                previousActive = current
+                skippedInactiveScope = false
             }
-            return count
+
+            if skippedInactiveScope {
+                previousActive?.replaceParent(with: nil)
+            }
+            if firstActive !== self {
+                replaceParent(with: firstActive)
+            }
+            return .available(parent: firstActive)
         }
+
+        private func replaceParent(with parent: Scope?) {
+            state.withLock { $0.parent = parent }
+        }
+
+        #if DEBUG
+        var parentForTesting: Scope? {
+            state.withLock { $0.parent }
+        }
+        #endif
     }
 
     @TaskLocal private static var inheritedScope: Scope?
+
+    #if DEBUG
+    static var inheritedScopeDepthForTesting: Int {
+        var depth = 0
+        var scope = inheritedScope
+        while let current = scope {
+            depth += 1
+            scope = current.parentForTesting
+        }
+        return depth
+    }
+    #endif
 
     /// True only while the most recently inherited callback scope remains
     /// active. A child task that outlives that callback regains presentation
@@ -1719,22 +1785,43 @@ enum AutoChartHostCallbackActivity {
     /// True only when this execution context contains the supplied wrapper's
     /// active callback token. Unrelated wrappers may delegate to one another.
     static func containsActiveCallback(
-        for token: AutoChartHostCallbackToken?
+        for token: AutoChartHostCallbackToken
     ) -> Bool {
-        guard let token else { return false }
-        return (inheritedScope?.activeCallbackCount(for: token) ?? 0) > 0
+        guard let inheritedScope else { return false }
+        if case .repeatedToken = inheritedScope.ancestry(
+            for: token,
+            maximumDepth: .max)
+        {
+            return true
+        }
+        return false
     }
 
     static func invoke<Value>(
-        _ token: AutoChartHostCallbackToken?,
+        _ token: AutoChartHostCallbackToken,
         _ body: () -> Value,
         fallback: @autoclosure () -> Value
     ) -> Value {
-        guard let token,
-            !containsActiveCallback(for: token),
-            (inheritedScope?.activeCallbackCount() ?? 0) < maximumCallbackDepth
-        else { return fallback() }
-        let scope = Scope(token: token, parent: inheritedScope)
+        let parent: Scope?
+        if let inheritedScope {
+            switch inheritedScope.ancestry(
+                for: token,
+                maximumDepth: maximumCallbackDepth)
+            {
+            case .available(let activeParent):
+                parent = activeParent
+            case .repeatedToken:
+                return fallback()
+            case .maximumDepth:
+                logger.warning(
+                    "Host callback delegation reached the supported maximum depth of \(maximumCallbackDepth, privacy: .public); using package fallback behavior.")
+                return fallback()
+            }
+        } else {
+            parent = nil
+        }
+
+        let scope = Scope(token: token, parent: parent)
         return $inheritedScope.withValue(scope) {
             defer { scope.deactivate() }
             return body()
@@ -1762,7 +1849,10 @@ public struct AutoChartTextResolver: Sendable {
     }
 
     func resolve(_ message: AutoChartMessage) -> String? {
-        guard let resolveValue else { return nil }
+        assert(
+            (resolveValue == nil) == (hostCallbackToken == nil),
+            "A host text resolver and its callback token must be configured together.")
+        guard let resolveValue, let hostCallbackToken else { return nil }
         return AutoChartHostCallbackActivity.invoke(
             hostCallbackToken,
             { resolveValue(message) },

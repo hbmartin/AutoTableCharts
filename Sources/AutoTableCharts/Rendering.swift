@@ -1916,12 +1916,7 @@ struct AutoChartRenderPresentation: Sendable {
         let isReentrant = AutoChartHostCallbackActivity.hasActiveCallback
         let effectiveTextResolver: AutoChartTextResolver =
             isReentrant ? .default : textResolver
-        let effectiveFormatters =
-            isReentrant
-            ? AutoChartFormatters(
-                locale: formatters.locale,
-                timeZone: formatters.timeZone)
-            : formatters
+        let effectiveFormatters = isReentrant ? formatters.callbackFree : formatters
         return AutoChartResolvedPresentation(
             presentation: self,
             data: data,
@@ -1961,8 +1956,7 @@ private struct AutoChartHistogramBinAccessibilityLabels: Sendable {
         case prepared(
             labels: [Key: String],
             column: AutoChartColumn?,
-            locale: Locale,
-            timeZone: TimeZone)
+            fallbackFormatters: AutoChartFormatters)
         case callbackFreeFallback(
             column: AutoChartColumn?,
             formatters: AutoChartFormatters)
@@ -1996,20 +1990,16 @@ private struct AutoChartHistogramBinAccessibilityLabels: Sendable {
         storage = .prepared(
             labels: labels,
             column: column,
-            locale: formatters.locale,
-            timeZone: formatters.timeZone)
+            fallbackFormatters: formatters.callbackFree)
     }
 
     init(
         callbackFreeFallbackFor column: AutoChartColumn?,
-        locale: Locale,
-        timeZone: TimeZone
+        formatters: AutoChartFormatters
     ) {
         storage = .callbackFreeFallback(
             column: column,
-            formatters: AutoChartFormatters(
-                locale: locale,
-                timeZone: timeZone))
+            formatters: formatters.callbackFree)
     }
 
     private static func callbackFreeLabel(
@@ -2031,15 +2021,13 @@ private struct AutoChartHistogramBinAccessibilityLabels: Sendable {
             return AutoChartValue.unrepresentableValuePlaceholder
         }
         switch storage {
-        case .prepared(let labels, let column, let locale, let timeZone):
+        case .prepared(let labels, let column, let fallbackFormatters):
             guard let label = labels[bounds.key] else {
                 assertionFailure("A histogram bin must retain its exact prepared bounds.")
                 return Self.callbackFreeLabel(
                     for: bounds,
                     column: column,
-                    formatters: AutoChartFormatters(
-                        locale: locale,
-                        timeZone: timeZone))
+                    formatters: fallbackFormatters)
             }
             return label
         case .callbackFreeFallback(let column, let formatters):
@@ -2316,8 +2304,7 @@ struct AutoChartResolvedPresentation: Sendable {
             case .callbackFreeFallback:
                 histogramBinAccessibilityLabels = AutoChartHistogramBinAccessibilityLabels(
                     callbackFreeFallbackFor: presentation.xCategoryColumn,
-                    locale: formatters.locale,
-                    timeZone: formatters.timeZone)
+                    formatters: formatters)
             }
         }
     }

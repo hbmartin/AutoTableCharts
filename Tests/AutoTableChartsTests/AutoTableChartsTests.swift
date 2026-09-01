@@ -4,6 +4,23 @@ import Testing
 
 @testable import AutoTableCharts
 
+@available(macOS 15.0, iOS 18.0, tvOS 18.0, watchOS 11.0, *)
+private final class DedicatedTestTaskExecutor: TaskExecutor {
+    private let queue: DispatchQueue
+
+    init(label: String) {
+        queue = DispatchQueue(label: label)
+    }
+
+    func enqueue(_ job: consuming ExecutorJob) {
+        let unownedJob = UnownedJob(job)
+        let executor = asUnownedTaskExecutor()
+        queue.async {
+            unownedJob.runSynchronously(on: executor)
+        }
+    }
+}
+
 private let posixCategoryFormatters = AutoChartFormatters(
     locale: Locale(identifier: "en_US_POSIX"),
     timeZone: .gmt)
@@ -1255,6 +1272,57 @@ private let date = AutoChartColumn(
                 == AutoChartHostCallbackActivity.maximumCallbackDepth)
     }
 
+    #if DEBUG
+    @Test func completedCallbackScopesArePrunedBeforeLaterDelegation() async {
+        final class Gate: @unchecked Sendable {
+            private let lock = NSLock()
+            private var released = false
+
+            func release() {
+                lock.lock()
+                released = true
+                lock.unlock()
+            }
+
+            var isReleased: Bool {
+                lock.lock()
+                defer { lock.unlock() }
+                return released
+            }
+        }
+
+        let gate = Gate()
+        let firstToken = AutoChartHostCallbackToken()
+        let secondToken = AutoChartHostCallbackToken()
+        var childTask: Task<Int, Never>?
+
+        AutoChartHostCallbackActivity.invoke(
+            firstToken,
+            {
+                childTask = Task {
+                    while !gate.isReleased {
+                        await Task.yield()
+                    }
+                    return AutoChartHostCallbackActivity.invoke(
+                        secondToken,
+                        {
+                            AutoChartHostCallbackActivity
+                                .inheritedScopeDepthForTesting
+                        },
+                        fallback: -1)
+                }
+            },
+            fallback: ())
+        gate.release()
+
+        guard let childTask else {
+            Issue.record("The callback did not create its child task.")
+            return
+        }
+        #expect(await childTask.value == 1)
+    }
+    #endif
+
     @Test func hostCallbackWrapperCopiesPreventDirectRecursion() {
         final class RecursiveState: @unchecked Sendable {
             private let lock = NSLock()
@@ -1826,6 +1894,7 @@ private let date = AutoChartColumn(
         #expect(childResult?.labels.allSatisfy { $0.contains("Host endpoint") } == true)
     }
 
+    @available(macOS 15.0, iOS 18.0, tvOS 18.0, watchOS 11.0, *)
     @Test func childTaskStopsInheritingCompletedNestedCallbackScope() async {
         final class ChildState: @unchecked Sendable {
             private let lock = NSLock()
@@ -1858,10 +1927,12 @@ private let date = AutoChartColumn(
                 lock.unlock()
             }
 
-            var installedTask: Task<Void, Never>? {
+            func takeTask() -> Task<Void, Never>? {
                 lock.lock()
                 defer { lock.unlock() }
-                return task
+                let installedTask = task
+                task = nil
+                return installedTask
             }
 
             var recordedResult: (hasActiveCallback: Bool, containsOuter: Bool)? {
@@ -1874,43 +1945,58 @@ private let date = AutoChartColumn(
         let state = ChildState()
         let outerToken = AutoChartHostCallbackToken()
         let innerToken = AutoChartHostCallbackToken()
-        var childCompletedBeforeTimeout = false
+        let parentExecutor = DedicatedTestTaskExecutor(
+            label: "AutoTableChartsTests.callback-parent")
+        let childExecutor = DedicatedTestTaskExecutor(
+            label: "AutoTableChartsTests.callback-child")
 
-        AutoChartHostCallbackActivity.invoke(
-            outerToken,
-            {
-                AutoChartHostCallbackActivity.invoke(
-                    innerToken,
-                    {
-                        state.install(
-                            Task {
-                                while !state.isReleased {
-                                    await Task.yield()
-                                }
-                                state.record(
-                                    hasActiveCallback:
-                                        AutoChartHostCallbackActivity.hasActiveCallback,
-                                    containsOuter:
-                                        AutoChartHostCallbackActivity
-                                        .containsActiveCallback(for: outerToken))
-                                state.childFinished.signal()
-                            })
-                    },
-                    fallback: ())
-                state.releaseChild()
-                childCompletedBeforeTimeout =
-                    state.childFinished.wait(timeout: .now() + 10) == .success
-            },
-            fallback: ())
-        guard let childTask = state.installedTask else {
-            Issue.record("The nested callback did not create its child task.")
-            return
-        }
-        await childTask.value
+        let result = await Task(executorPreference: parentExecutor) {
+            var childCompletedBeforeTimeout = false
+            AutoChartHostCallbackActivity.invoke(
+                outerToken,
+                {
+                    AutoChartHostCallbackActivity.invoke(
+                        innerToken,
+                        {
+                            state.install(
+                                Task(executorPreference: childExecutor) {
+                                    while !state.isReleased {
+                                        await Task.yield()
+                                    }
+                                    state.record(
+                                        hasActiveCallback:
+                                            AutoChartHostCallbackActivity
+                                            .hasActiveCallback,
+                                        containsOuter:
+                                            AutoChartHostCallbackActivity
+                                            .containsActiveCallback(for: outerToken))
+                                    state.childFinished.signal()
+                                })
+                        },
+                        fallback: ())
+                    state.releaseChild()
+                    childCompletedBeforeTimeout =
+                        state.childFinished.wait(timeout: .now() + 10) == .success
+                },
+                fallback: ())
 
-        #expect(childCompletedBeforeTimeout)
-        #expect(state.recordedResult?.hasActiveCallback == false)
-        #expect(state.recordedResult?.containsOuter == true)
+            guard let childTask = state.takeTask() else {
+                return (
+                    installedTask: false,
+                    completedBeforeTimeout: childCompletedBeforeTimeout,
+                    recorded: state.recordedResult)
+            }
+            await childTask.value
+            return (
+                installedTask: true,
+                completedBeforeTimeout: childCompletedBeforeTimeout,
+                recorded: state.recordedResult)
+        }.value
+
+        #expect(result.installedTask)
+        #expect(result.completedBeforeTimeout)
+        #expect(result.recorded?.hasActiveCallback == false)
+        #expect(result.recorded?.containsOuter == true)
     }
 
     @Test func histogramAccessibilityEagerResolutionUsesLegacyMessage() {
