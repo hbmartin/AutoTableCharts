@@ -970,6 +970,78 @@ private let date = AutoChartColumn(
         #expect(resolved.histogramBinAccessibilityLabel(for: data[1]) == second)
     }
 
+    #if !DEBUG
+    @Test func histogramPreparedMissUsesCallbackFreeReleaseFallback() {
+        final class Recorder: @unchecked Sendable {
+            private let lock = NSLock()
+            private var callbacks = 0
+
+            func record() {
+                lock.lock()
+                callbacks += 1
+                lock.unlock()
+            }
+
+            var count: Int {
+                lock.lock()
+                defer { lock.unlock() }
+                return callbacks
+            }
+        }
+
+        let column = AutoChartColumn(
+            id: "histogram-value",
+            name: "Histogram value",
+            hints: .init(semanticType: .quantitative, role: .measure))
+        let snapshot = AutoChartSnapshot(
+            table(columns: [column], rows: [[.double(1)], [.double(4)]]))
+        let specification = AutoChartSpecification.histogram(
+            value: column.id,
+            binCount: 2)
+        let profiles = AutoChartProfiler.profileIndex(snapshot)
+        let prepared = AutoChartDataPreparation.preparedData(
+            snapshot: snapshot,
+            specification: specification,
+            profiles: profiles)
+        let presentation = AutoChartRenderPresentation(
+            snapshot: snapshot,
+            specification: specification,
+            profiles: profiles,
+            data: prepared.data,
+            measureSemantics: prepared.measureSemantics)
+        let preparedDatum = AutoChartDatum(
+            id: "prepared-bin",
+            sourceRowIDs: [0],
+            lower: 1,
+            upper: 2)
+        let missingDatum = AutoChartDatum(
+            id: "missing-bin",
+            sourceRowIDs: [1],
+            lower: 3,
+            upper: 4)
+        let recorder = Recorder()
+        let resolved = presentation.resolvedPresentation(
+            data: [preparedDatum],
+            using: AutoChartTextResolver { _ in
+                recorder.record()
+                return "Host label"
+            },
+            formatters: AutoChartFormatters(
+                locale: Locale(identifier: "en_US"),
+                request: { _, _, _ in
+                    recorder.record()
+                    return "Host endpoint"
+                }))
+        let preparedCallbackCount = recorder.count
+
+        let fallback = resolved.histogramBinAccessibilityLabel(for: missingDatum)
+
+        #expect(recorder.count == preparedCallbackCount)
+        #expect(!fallback.contains("Host"))
+        #expect(!fallback.contains(AutoChartValue.unrepresentableValuePlaceholder))
+    }
+    #endif
+
     @Test func distinctHostCallbackWrappersMayDelegate() {
         final class Recorder: @unchecked Sendable {
             private let lock = NSLock()
@@ -1026,6 +1098,163 @@ private let date = AutoChartColumn(
         #expect(recorder.count("nested formatter") == 1)
     }
 
+    @Test func distinctHostCallbackWrapperCyclesTerminate() {
+        final class RecursiveState: @unchecked Sendable {
+            private let lock = NSLock()
+            private var firstResolver: AutoChartTextResolver?
+            private var secondResolver: AutoChartTextResolver?
+            private var firstFormatters: AutoChartFormatters?
+            private var secondFormatters: AutoChartFormatters?
+            private var counts: [String: Int] = [:]
+
+            func install(
+                firstResolver: AutoChartTextResolver,
+                secondResolver: AutoChartTextResolver,
+                firstFormatters: AutoChartFormatters,
+                secondFormatters: AutoChartFormatters
+            ) {
+                lock.lock()
+                self.firstResolver = firstResolver
+                self.secondResolver = secondResolver
+                self.firstFormatters = firstFormatters
+                self.secondFormatters = secondFormatters
+                lock.unlock()
+            }
+
+            func clear() {
+                lock.lock()
+                firstResolver = nil
+                secondResolver = nil
+                firstFormatters = nil
+                secondFormatters = nil
+                lock.unlock()
+            }
+
+            func resolveFirst(_ message: AutoChartMessage) -> String? {
+                lock.lock()
+                counts["first resolver", default: 0] += 1
+                let resolver = secondResolver
+                lock.unlock()
+                return resolver?(message)
+            }
+
+            func resolveSecond(_ message: AutoChartMessage) -> String? {
+                lock.lock()
+                counts["second resolver", default: 0] += 1
+                let resolver = firstResolver
+                lock.unlock()
+                return resolver?(message)
+            }
+
+            func formatFirst(_ request: AutoChartFormattingRequest) -> String? {
+                lock.lock()
+                counts["first formatter", default: 0] += 1
+                let formatters = secondFormatters
+                lock.unlock()
+                return formatters?.format(request)
+            }
+
+            func formatSecond(_ request: AutoChartFormattingRequest) -> String? {
+                lock.lock()
+                counts["second formatter", default: 0] += 1
+                let formatters = firstFormatters
+                lock.unlock()
+                return formatters?.format(request)
+            }
+
+            func count(_ key: String) -> Int {
+                lock.lock()
+                defer { lock.unlock() }
+                return counts[key, default: 0]
+            }
+        }
+
+        let state = RecursiveState()
+        let message = AutoChartMessage(
+            category: .interface,
+            code: .countTitle,
+            defaultText: "Package count")
+        let firstResolver = AutoChartTextResolver(state.resolveFirst)
+        let secondResolver = AutoChartTextResolver(state.resolveSecond)
+        let firstFormatters = AutoChartFormatters(
+            locale: Locale(identifier: "en_US"),
+            request: { request, _, _ in state.formatFirst(request) })
+        let secondFormatters = AutoChartFormatters(
+            locale: Locale(identifier: "en_US"),
+            request: { request, _, _ in state.formatSecond(request) })
+        let request = AutoChartFormattingRequest(
+            column: nil,
+            value: .integer(1),
+            context: .markAccessibility)
+        state.install(
+            firstResolver: firstResolver,
+            secondResolver: secondResolver,
+            firstFormatters: firstFormatters,
+            secondFormatters: secondFormatters)
+        defer { state.clear() }
+
+        #expect(firstResolver(message) == "Package count")
+        #expect(firstFormatters.format(request) == "1")
+        #expect(state.count("first resolver") == 1)
+        #expect(state.count("second resolver") == 1)
+        #expect(state.count("first formatter") == 1)
+        #expect(state.count("second formatter") == 1)
+    }
+
+    @Test func freshHostCallbackWrappersHaveFiniteDelegationDepth() {
+        final class RecursiveState: @unchecked Sendable {
+            private let lock = NSLock()
+            private var resolverCallbacks = 0
+            private var formatterCallbacks = 0
+
+            func resolve(_ message: AutoChartMessage) -> String? {
+                lock.lock()
+                resolverCallbacks += 1
+                lock.unlock()
+                return AutoChartTextResolver(resolve)(message)
+            }
+
+            func format(_ request: AutoChartFormattingRequest) -> String? {
+                lock.lock()
+                formatterCallbacks += 1
+                lock.unlock()
+                return AutoChartFormatters(
+                    locale: Locale(identifier: "en_US"),
+                    request: { request, _, _ in self.format(request) }
+                ).format(request)
+            }
+
+            var callbackCounts: (resolver: Int, formatter: Int) {
+                lock.lock()
+                defer { lock.unlock() }
+                return (resolverCallbacks, formatterCallbacks)
+            }
+        }
+
+        let state = RecursiveState()
+        let message = AutoChartMessage(
+            category: .interface,
+            code: .countTitle,
+            defaultText: "Package count")
+        let resolver = AutoChartTextResolver(state.resolve)
+        let formatters = AutoChartFormatters(
+            locale: Locale(identifier: "en_US"),
+            request: { request, _, _ in state.format(request) })
+        let request = AutoChartFormattingRequest(
+            column: nil,
+            value: .integer(1),
+            context: .markAccessibility)
+
+        #expect(resolver(message) == "Package count")
+        #expect(formatters.format(request) == "1")
+        #expect(
+            state.callbackCounts.resolver
+                == AutoChartHostCallbackActivity.maximumCallbackDepth)
+        #expect(
+            state.callbackCounts.formatter
+                == AutoChartHostCallbackActivity.maximumCallbackDepth)
+    }
+
     @Test func hostCallbackWrapperCopiesPreventDirectRecursion() {
         final class RecursiveState: @unchecked Sendable {
             private let lock = NSLock()
@@ -1041,6 +1270,13 @@ private let date = AutoChartColumn(
                 lock.lock()
                 self.resolver = resolver
                 self.formatters = formatters
+                lock.unlock()
+            }
+
+            func clear() {
+                lock.lock()
+                resolver = nil
+                formatters = nil
                 lock.unlock()
             }
 
@@ -1083,6 +1319,7 @@ private let date = AutoChartColumn(
             value: .integer(1),
             context: .markAccessibility)
         state.install(resolver: resolver, formatters: formatters)
+        defer { state.clear() }
 
         #expect(resolver(message) == "Package count")
         #expect(formatters.format(request) == "1")
@@ -1587,6 +1824,93 @@ private let date = AutoChartColumn(
         #expect(outerResolved.count == "Host count")
         #expect(childResult?.count == "Host count")
         #expect(childResult?.labels.allSatisfy { $0.contains("Host endpoint") } == true)
+    }
+
+    @Test func childTaskStopsInheritingCompletedNestedCallbackScope() async {
+        final class ChildState: @unchecked Sendable {
+            private let lock = NSLock()
+            private var task: Task<Void, Never>?
+            private var result: (hasActiveCallback: Bool, containsOuter: Bool)?
+            private var released = false
+            let childFinished = DispatchSemaphore(value: 0)
+
+            func install(_ task: Task<Void, Never>) {
+                lock.lock()
+                self.task = task
+                lock.unlock()
+            }
+
+            func releaseChild() {
+                lock.lock()
+                released = true
+                lock.unlock()
+            }
+
+            var isReleased: Bool {
+                lock.lock()
+                defer { lock.unlock() }
+                return released
+            }
+
+            func record(hasActiveCallback: Bool, containsOuter: Bool) {
+                lock.lock()
+                result = (hasActiveCallback, containsOuter)
+                lock.unlock()
+            }
+
+            var installedTask: Task<Void, Never>? {
+                lock.lock()
+                defer { lock.unlock() }
+                return task
+            }
+
+            var recordedResult: (hasActiveCallback: Bool, containsOuter: Bool)? {
+                lock.lock()
+                defer { lock.unlock() }
+                return result
+            }
+        }
+
+        let state = ChildState()
+        let outerToken = AutoChartHostCallbackToken()
+        let innerToken = AutoChartHostCallbackToken()
+        var childCompletedBeforeTimeout = false
+
+        AutoChartHostCallbackActivity.invoke(
+            outerToken,
+            {
+                AutoChartHostCallbackActivity.invoke(
+                    innerToken,
+                    {
+                        state.install(
+                            Task {
+                                while !state.isReleased {
+                                    await Task.yield()
+                                }
+                                state.record(
+                                    hasActiveCallback:
+                                        AutoChartHostCallbackActivity.hasActiveCallback,
+                                    containsOuter:
+                                        AutoChartHostCallbackActivity
+                                        .containsActiveCallback(for: outerToken))
+                                state.childFinished.signal()
+                            })
+                    },
+                    fallback: ())
+                state.releaseChild()
+                childCompletedBeforeTimeout =
+                    state.childFinished.wait(timeout: .now() + 10) == .success
+            },
+            fallback: ())
+        guard let childTask = state.installedTask else {
+            Issue.record("The nested callback did not create its child task.")
+            return
+        }
+        await childTask.value
+
+        #expect(childCompletedBeforeTimeout)
+        #expect(state.recordedResult?.hasActiveCallback == false)
+        #expect(state.recordedResult?.containsOuter == true)
     }
 
     @Test func histogramAccessibilityEagerResolutionUsesLegacyMessage() {

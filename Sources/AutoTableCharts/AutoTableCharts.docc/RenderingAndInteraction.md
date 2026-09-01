@@ -98,15 +98,19 @@ host formatter or text-resolver callback synchronously reenters presentation
 resolution in the same task-local execution context, the nested presentation
 uses package formatting and text fallbacks. Copies of one formatter or resolver
 share an activity token and use package behavior for direct recursion through
-that wrapper. A callback may delegate normally to a different formatter or
-resolver wrapper.
+that wrapper. Direct value formatting or message resolution may delegate normally
+to a different wrapper; if the delegate constructs another presentation, the
+callback-free nested-presentation rule still applies.
 
-Dynamic callback activity follows synchronous work that constructs fresh wrapper
-values. A child task created by a callback inherits that scope while the callback
-is active, but the inherited scope becomes inactive when the callback returns;
-later work in that task can use host overrides normally. Independent concurrent
-presentations retain host overrides even when they reuse the same `Sendable`
-formatter or resolver wrapper.
+Synchronous callback ancestry detects delegation cycles such as `A → B → A`.
+Callback nesting also has a finite internal ceiling, so a chain that constructs a
+fresh wrapper at every direct delegation falls back to package behavior before it
+can exhaust the stack. A child task created by a callback inherits that scope
+while the callback is active, but its presentation activity becomes inactive
+when that callback returns, even if an outer callback remains active. Direct calls
+to a wrapper that is still active anywhere in the inherited ancestry remain
+suppressed. Independent concurrent presentations retain host overrides even when
+they reuse the same `Sendable` formatter or resolver wrapper.
 Nested histogram presentations defer their callback-free interval formatting
 until lookup, which bounds both recursion depth and eager recovery cost.
 
