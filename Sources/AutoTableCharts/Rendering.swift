@@ -164,43 +164,12 @@ enum AutoChartAccessibility {
         formatters: AutoChartFormatters,
         textResolver: AutoChartTextResolver = .default
     ) -> String {
-        histogramBinLabel(
-            lower: lower,
-            upper: upper,
-            column: column,
-            format: { formatters.format($0) },
-            textResolver: textResolver)
-    }
-
-    /// A callback-free label for a nested histogram resolution. Host callbacks
-    /// can synchronously rebuild a view, so invoking them again would recurse.
-    static func histogramBinFallbackLabel(
-        lower: Double,
-        upper: Double,
-        column: AutoChartColumn?,
-        formatters: AutoChartFormatters
-    ) -> String {
-        histogramBinLabel(
-            lower: lower,
-            upper: upper,
-            column: column,
-            format: { formatters.formatDefault($0) },
-            textResolver: .default)
-    }
-
-    private static func histogramBinLabel(
-        lower: Double,
-        upper: Double,
-        column: AutoChartColumn?,
-        format: (AutoChartFormattingRequest) -> String,
-        textResolver: AutoChartTextResolver
-    ) -> String {
-        let lowerText = format(
+        let lowerText = formatters.format(
             AutoChartFormattingRequest(
                 column: column,
                 value: .double(lower),
                 context: .markAccessibility))
-        let upperText = format(
+        let upperText = formatters.format(
             AutoChartFormattingRequest(
                 column: column,
                 value: .double(upper),
@@ -1940,39 +1909,22 @@ struct AutoChartRenderPresentation: Sendable {
         using textResolver: AutoChartTextResolver,
         formatters: AutoChartFormatters = .init()
     ) -> AutoChartResolvedPresentation {
-        AutoChartResolvedPresentation(
+        let isReentrant = textResolver.isInvokingHostCallback
+            || formatters.isInvokingHostCallback
+        let effectiveTextResolver: AutoChartTextResolver =
+            isReentrant ? .default : textResolver
+        let effectiveFormatters =
+            isReentrant
+            ? AutoChartFormatters(
+                locale: formatters.locale,
+                timeZone: formatters.timeZone)
+            : formatters
+        return AutoChartResolvedPresentation(
             presentation: self,
             data: data,
-            textResolver: textResolver,
-            formatters: formatters)
-    }
-}
-
-private enum AutoChartHistogramBinAccessibilityResolution {
-    @TaskLocal static var invokesHostCallbacks = false
-
-    static func label(
-        lower: Double,
-        upper: Double,
-        column: AutoChartColumn?,
-        formatters: AutoChartFormatters,
-        textResolver: AutoChartTextResolver
-    ) -> String {
-        guard !invokesHostCallbacks else {
-            return AutoChartAccessibility.histogramBinFallbackLabel(
-                lower: lower,
-                upper: upper,
-                column: column,
-                formatters: formatters)
-        }
-        return $invokesHostCallbacks.withValue(true) {
-            AutoChartAccessibility.histogramBinLabel(
-                lower: lower,
-                upper: upper,
-                column: column,
-                formatters: formatters,
-                textResolver: textResolver)
-        }
+            textResolver: effectiveTextResolver,
+            formatters: effectiveFormatters,
+            eagerlyResolvesHistogramLabels: !isReentrant)
     }
 }
 
@@ -2002,10 +1954,14 @@ private struct AutoChartHistogramBinAccessibilityLabels: Sendable {
         }
     }
 
-    private let labels: [Key: String]
-    private let column: AutoChartColumn?
-    private let formatters: AutoChartFormatters
-    private let textResolver: AutoChartTextResolver
+    private enum Storage: Sendable {
+        case prepared([Key: String])
+        case callbackFreeFallback(
+            column: AutoChartColumn?,
+            formatters: AutoChartFormatters)
+    }
+
+    private let storage: Storage
 
     init(
         data: [AutoChartDatum],
@@ -2023,17 +1979,23 @@ private struct AutoChartHistogramBinAccessibilityLabels: Sendable {
             // Equivalent intervals have the same semantic label regardless of
             // datum identity. Resolve each exact pair only once.
             guard labels[bounds.key] == nil else { continue }
-            labels[bounds.key] = AutoChartHistogramBinAccessibilityResolution.label(
+            labels[bounds.key] = AutoChartAccessibility.histogramBinLabel(
                 lower: bounds.lower,
                 upper: bounds.upper,
                 column: column,
                 formatters: formatters,
                 textResolver: textResolver)
         }
-        self.labels = labels
-        self.column = column
-        self.formatters = formatters
-        self.textResolver = textResolver
+        storage = .prepared(labels)
+    }
+
+    init(
+        callbackFreeFallbackFor column: AutoChartColumn?,
+        formatters: AutoChartFormatters
+    ) {
+        storage = .callbackFreeFallback(
+            column: column,
+            formatters: formatters)
     }
 
     func label(for datum: AutoChartDatum) -> String {
@@ -2041,18 +2003,21 @@ private struct AutoChartHistogramBinAccessibilityLabels: Sendable {
             assertionFailure("Prepared histogram bins require finite bounds.")
             return AutoChartValue.unrepresentableValuePlaceholder
         }
-        if let label = labels[bounds.key] {
+        switch storage {
+        case .prepared(let labels):
+            guard let label = labels[bounds.key] else {
+                assertionFailure("A histogram bin must retain its exact prepared bounds.")
+                return AutoChartValue.unrepresentableValuePlaceholder
+            }
             return label
+        case .callbackFreeFallback(let column, let formatters):
+            return AutoChartAccessibility.histogramBinLabel(
+                lower: bounds.lower,
+                upper: bounds.upper,
+                column: column,
+                formatters: formatters,
+                textResolver: .default)
         }
-        // Production rendering looks up the immutable prepared data. Preserve
-        // correct behavior for an unexpected finite datum without making the
-        // common concurrent lookup path mutable.
-        return AutoChartHistogramBinAccessibilityResolution.label(
-            lower: bounds.lower,
-            upper: bounds.upper,
-            column: column,
-            formatters: formatters,
-            textResolver: textResolver)
     }
 }
 
@@ -2073,7 +2038,8 @@ struct AutoChartResolvedPresentation: Sendable {
     var yDisplayLabels: [String: String]
     var seriesDisplayLabels: [String: String]
     var facetDisplayLabels: [String: String]
-    /// Immutable resolved labels are safe to read from concurrent SwiftUI view copies.
+    /// Prepared labels and callback-free fallback state are safe to read from
+    /// concurrent SwiftUI view copies.
     private let histogramBinAccessibilityLabels:
         AutoChartHistogramBinAccessibilityLabels?
 
@@ -2081,7 +2047,8 @@ struct AutoChartResolvedPresentation: Sendable {
         presentation: AutoChartRenderPresentation,
         data: [AutoChartDatum],
         textResolver: AutoChartTextResolver,
-        formatters: AutoChartFormatters
+        formatters: AutoChartFormatters,
+        eagerlyResolvesHistogramLabels: Bool
     ) {
         func resolve(_ message: AutoChartMessage?, fallback: String) -> String {
             message.map(textResolver.callAsFunction) ?? fallback
@@ -2154,30 +2121,35 @@ struct AutoChartResolvedPresentation: Sendable {
         var yEntries = CategoryEntries()
         var seriesEntries = CategoryEntries()
         var facetEntries = CategoryEntries()
-        for datum in data {
-            if presentation.usesXIdentityLabels {
-                xEntries.include(
-                    identity: datum.xIdentity,
-                    value: datum.xCategoryValue,
-                    preparedLabel: datum.xLabel)
-            }
-            if presentation.usesYIdentityLabels {
-                yEntries.include(
-                    identity: datum.yIdentity,
-                    value: datum.yCategoryValue,
-                    preparedLabel: datum.yLabel)
-            }
-            if presentation.usesSeriesIdentityLabels {
-                seriesEntries.include(
-                    identity: datum.seriesIdentity,
-                    value: datum.seriesCategoryValue,
-                    preparedLabel: datum.series)
-            }
-            if presentation.usesFacetIdentityLabels {
-                facetEntries.include(
-                    identity: datum.facetIdentity,
-                    value: datum.facetCategoryValue,
-                    preparedLabel: datum.facet)
+        if presentation.usesXIdentityLabels || presentation.usesYIdentityLabels
+            || presentation.usesSeriesIdentityLabels
+            || presentation.usesFacetIdentityLabels
+        {
+            for datum in data {
+                if presentation.usesXIdentityLabels {
+                    xEntries.include(
+                        identity: datum.xIdentity,
+                        value: datum.xCategoryValue,
+                        preparedLabel: datum.xLabel)
+                }
+                if presentation.usesYIdentityLabels {
+                    yEntries.include(
+                        identity: datum.yIdentity,
+                        value: datum.yCategoryValue,
+                        preparedLabel: datum.yLabel)
+                }
+                if presentation.usesSeriesIdentityLabels {
+                    seriesEntries.include(
+                        identity: datum.seriesIdentity,
+                        value: datum.seriesCategoryValue,
+                        preparedLabel: datum.series)
+                }
+                if presentation.usesFacetIdentityLabels {
+                    facetEntries.include(
+                        identity: datum.facetIdentity,
+                        value: datum.facetCategoryValue,
+                        preparedLabel: datum.facet)
+                }
             }
         }
 
@@ -2301,11 +2273,15 @@ struct AutoChartResolvedPresentation: Sendable {
         facetDisplayLabels = resolvedFacetDisplayLabels
         histogramBinAccessibilityLabels =
             presentation.family == .histogram
-            ? AutoChartHistogramBinAccessibilityLabels(
-                data: data,
-                column: presentation.xCategoryColumn,
-                formatters: formatters,
-                textResolver: textResolver)
+            ? eagerlyResolvesHistogramLabels
+                ? AutoChartHistogramBinAccessibilityLabels(
+                    data: data,
+                    column: presentation.xCategoryColumn,
+                    formatters: formatters,
+                    textResolver: textResolver)
+                : AutoChartHistogramBinAccessibilityLabels(
+                    callbackFreeFallbackFor: presentation.xCategoryColumn,
+                    formatters: formatters)
             : nil
     }
 

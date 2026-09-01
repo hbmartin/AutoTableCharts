@@ -88,14 +88,18 @@ table keyed by their exact finite bounds, so prepared interval-name lookups from
 concurrent view copies invoke no host callbacks and cannot return different
 labels for the same bounds. Recreating the view constructs a new resolved
 presentation and resolves the labels again, even if its body is never evaluated.
+`AutoChartPlot` constructs `AutoChartView` from its `body`, so each evaluation of
+the plot wrapper's body also performs this eager resolution.
 
 Other work performed while rendering a histogram mark remains presentation-time
 work. In particular, formatting the bin count and resolving the combined mark
-accessibility message can invoke host callbacks on each body evaluation. A
-synchronous formatter or interval-message resolver that reenters histogram
-resolution receives a callback-free package fallback from the nested resolution,
-which bounds recursion. An unexpected finite interval absent from the prepared
-table is formatted on demand without mutating the table.
+accessibility message can invoke host callbacks on each body evaluation. If any
+host formatter or text-resolver callback synchronously reenters presentation
+resolution, the nested presentation uses package formatting and text fallbacks.
+Nested histogram presentations defer their callback-free interval formatting
+until lookup, which bounds both recursion depth and eager recovery cost. A
+prepared interval absent from the immutable table is an invariant violation and
+returns the unrepresentable-value placeholder in production builds.
 
 ### Link semantic selection
 
