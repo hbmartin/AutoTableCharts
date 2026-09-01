@@ -239,8 +239,7 @@ public struct AutoChartFormatters: Sendable {
 
     public var locale: Locale
     public var timeZone: TimeZone
-    private let override: RequestFormatter?
-    private let hostCallbackToken: AutoChartHostCallbackToken?
+    private let hostOverride: AutoChartHostCallback<RequestFormatter>?
 
     private enum CategoryNumber {
         case integer(Int64)
@@ -269,7 +268,7 @@ public struct AutoChartFormatters: Sendable {
         self.locale = locale
         self.timeZone = timeZone
         if let value {
-            self.override = { request, locale, timeZone in
+            let requestFormatter: RequestFormatter = { request, locale, timeZone in
                 value(
                     Self.legacyColumn(for: request),
                     request.value,
@@ -277,10 +276,9 @@ public struct AutoChartFormatters: Sendable {
                     locale,
                     timeZone)
             }
-            hostCallbackToken = AutoChartHostCallbackToken()
+            hostOverride = AutoChartHostCallback(requestFormatter)
         } else {
-            override = nil
-            hostCallbackToken = nil
+            hostOverride = nil
         }
     }
 
@@ -292,8 +290,7 @@ public struct AutoChartFormatters: Sendable {
     ) {
         self.locale = locale
         self.timeZone = timeZone
-        self.override = request
-        hostCallbackToken = AutoChartHostCallbackToken()
+        hostOverride = AutoChartHostCallback(request)
     }
 
     public func format(
@@ -531,19 +528,16 @@ public struct AutoChartFormatters: Sendable {
     }
 
     private func overridden(_ request: AutoChartFormattingRequest) -> String? {
-        assert(
-            (override == nil) == (hostCallbackToken == nil),
-            "A host formatter override and its callback token must be configured together.")
-        guard let override, let hostCallbackToken else { return nil }
+        guard let hostOverride else { return nil }
         return AutoChartHostCallbackActivity.invoke(
-            hostCallbackToken,
-            { override(request, locale, timeZone) },
+            hostOverride.token,
+            { hostOverride.body(request, locale, timeZone) },
             fallback: nil)
     }
 
     /// Retains locale and time-zone policy while removing host-authored code.
     var callbackFree: AutoChartFormatters {
-        guard override != nil else { return self }
+        guard hostOverride != nil else { return self }
         return AutoChartFormatters(locale: locale, timeZone: timeZone)
     }
 

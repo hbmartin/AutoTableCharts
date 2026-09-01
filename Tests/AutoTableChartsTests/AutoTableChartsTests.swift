@@ -4,23 +4,6 @@ import Testing
 
 @testable import AutoTableCharts
 
-@available(macOS 15.0, iOS 18.0, tvOS 18.0, watchOS 11.0, *)
-private final class DedicatedTestTaskExecutor: TaskExecutor {
-    private let queue: DispatchQueue
-
-    init(label: String) {
-        queue = DispatchQueue(label: label)
-    }
-
-    func enqueue(_ job: consuming ExecutorJob) {
-        let unownedJob = UnownedJob(job)
-        let executor = asUnownedTaskExecutor()
-        queue.async {
-            unownedJob.runSynchronously(on: executor)
-        }
-    }
-}
-
 private let posixCategoryFormatters = AutoChartFormatters(
     locale: Locale(identifier: "en_US_POSIX"),
     timeZone: .gmt)
@@ -1894,12 +1877,15 @@ private let date = AutoChartColumn(
         #expect(childResult?.labels.allSatisfy { $0.contains("Host endpoint") } == true)
     }
 
-    @available(macOS 15.0, iOS 18.0, tvOS 18.0, watchOS 11.0, *)
     @Test func childTaskStopsInheritingCompletedNestedCallbackScope() async {
         final class ChildState: @unchecked Sendable {
             private let lock = NSLock()
             private var task: Task<Void, Never>?
-            private var result: (hasActiveCallback: Bool, containsOuter: Bool)?
+            private var result: (
+                hasActiveCallback: Bool,
+                suppressesOuterCallback: Bool,
+                inheritedScopeDepth: Int?
+            )?
             private var released = false
             let childFinished = DispatchSemaphore(value: 0)
 
@@ -1921,9 +1907,16 @@ private let date = AutoChartColumn(
                 return released
             }
 
-            func record(hasActiveCallback: Bool, containsOuter: Bool) {
+            func record(
+                hasActiveCallback: Bool,
+                suppressesOuterCallback: Bool,
+                inheritedScopeDepth: Int?
+            ) {
                 lock.lock()
-                result = (hasActiveCallback, containsOuter)
+                result = (
+                    hasActiveCallback,
+                    suppressesOuterCallback,
+                    inheritedScopeDepth)
                 lock.unlock()
             }
 
@@ -1935,7 +1928,11 @@ private let date = AutoChartColumn(
                 return installedTask
             }
 
-            var recordedResult: (hasActiveCallback: Bool, containsOuter: Bool)? {
+            var recordedResult: (
+                hasActiveCallback: Bool,
+                suppressesOuterCallback: Bool,
+                inheritedScopeDepth: Int?
+            )? {
                 lock.lock()
                 defer { lock.unlock() }
                 return result
@@ -1944,59 +1941,76 @@ private let date = AutoChartColumn(
 
         let state = ChildState()
         let outerToken = AutoChartHostCallbackToken()
+        let middleToken = AutoChartHostCallbackToken()
         let innerToken = AutoChartHostCallbackToken()
-        let parentExecutor = DedicatedTestTaskExecutor(
+        let parentQueue = DispatchQueue(
             label: "AutoTableChartsTests.callback-parent")
-        let childExecutor = DedicatedTestTaskExecutor(
-            label: "AutoTableChartsTests.callback-child")
 
-        let result = await Task(executorPreference: parentExecutor) {
-            var childCompletedBeforeTimeout = false
-            AutoChartHostCallbackActivity.invoke(
-                outerToken,
-                {
-                    AutoChartHostCallbackActivity.invoke(
-                        innerToken,
-                        {
-                            state.install(
-                                Task(executorPreference: childExecutor) {
-                                    while !state.isReleased {
-                                        await Task.yield()
-                                    }
-                                    state.record(
-                                        hasActiveCallback:
-                                            AutoChartHostCallbackActivity
-                                            .hasActiveCallback,
-                                        containsOuter:
-                                            AutoChartHostCallbackActivity
-                                            .containsActiveCallback(for: outerToken))
-                                    state.childFinished.signal()
-                                })
-                        },
-                        fallback: ())
-                    state.releaseChild()
-                    childCompletedBeforeTimeout =
-                        state.childFinished.wait(timeout: .now() + 10) == .success
-                },
-                fallback: ())
+        let result = await withCheckedContinuation { continuation in
+            parentQueue.async {
+                var childCompletedBeforeTimeout = false
+                AutoChartHostCallbackActivity.invoke(
+                    outerToken,
+                    {
+                        AutoChartHostCallbackActivity.invoke(
+                            middleToken,
+                            {
+                                AutoChartHostCallbackActivity.invoke(
+                                    innerToken,
+                                    {
+                                        state.install(
+                                            Task {
+                                                while !state.isReleased {
+                                                    await Task.yield()
+                                                }
+                                                let suppressesOuterCallback =
+                                                    AutoChartHostCallbackActivity.invoke(
+                                                        outerToken,
+                                                        { false },
+                                                        fallback: true)
+                                                #if DEBUG
+                                                let inheritedScopeDepth =
+                                                    AutoChartHostCallbackActivity
+                                                    .inheritedScopeDepthForTesting
+                                                #else
+                                                let inheritedScopeDepth: Int? = nil
+                                                #endif
+                                                state.record(
+                                                    hasActiveCallback:
+                                                        AutoChartHostCallbackActivity
+                                                        .hasActiveCallback,
+                                                    suppressesOuterCallback:
+                                                        suppressesOuterCallback,
+                                                    inheritedScopeDepth:
+                                                        inheritedScopeDepth)
+                                                state.childFinished.signal()
+                                            })
+                                    },
+                                    fallback: ())
+                            },
+                            fallback: ())
+                        state.releaseChild()
+                        childCompletedBeforeTimeout =
+                            state.childFinished.wait(timeout: .now() + 10) == .success
+                    },
+                    fallback: ())
 
-            guard let childTask = state.takeTask() else {
-                return (
-                    installedTask: false,
-                    completedBeforeTimeout: childCompletedBeforeTimeout,
-                    recorded: state.recordedResult)
+                continuation.resume(
+                    returning: (
+                        completedBeforeTimeout: childCompletedBeforeTimeout,
+                        childTask: state.takeTask()))
             }
-            await childTask.value
-            return (
-                installedTask: true,
-                completedBeforeTimeout: childCompletedBeforeTimeout,
-                recorded: state.recordedResult)
-        }.value
+        }
 
-        #expect(result.installedTask)
+        await result.childTask?.value
+
+        #expect(result.childTask != nil)
         #expect(result.completedBeforeTimeout)
-        #expect(result.recorded?.hasActiveCallback == false)
-        #expect(result.recorded?.containsOuter == true)
+        #expect(state.recordedResult?.hasActiveCallback == false)
+        #expect(state.recordedResult?.suppressesOuterCallback == true)
+        #if DEBUG
+        #expect(state.recordedResult?.inheritedScopeDepth == 2)
+        #endif
     }
 
     @Test func histogramAccessibilityEagerResolutionUsesLegacyMessage() {
