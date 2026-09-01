@@ -172,6 +172,22 @@ enum AutoChartAccessibility {
             textResolver: textResolver)
     }
 
+    /// A callback-free label for a nested histogram resolution. Host callbacks
+    /// can synchronously rebuild a view, so invoking them again would recurse.
+    static func histogramBinFallbackLabel(
+        lower: Double,
+        upper: Double,
+        column: AutoChartColumn?,
+        formatters: AutoChartFormatters
+    ) -> String {
+        histogramBinLabel(
+            lower: lower,
+            upper: upper,
+            column: column,
+            format: { formatters.formatDefault($0) },
+            textResolver: .default)
+    }
+
     private static func histogramBinLabel(
         lower: Double,
         upper: Double,
@@ -1932,23 +1948,64 @@ struct AutoChartRenderPresentation: Sendable {
     }
 }
 
+private enum AutoChartHistogramBinAccessibilityResolution {
+    @TaskLocal static var invokesHostCallbacks = false
+
+    static func label(
+        lower: Double,
+        upper: Double,
+        column: AutoChartColumn?,
+        formatters: AutoChartFormatters,
+        textResolver: AutoChartTextResolver
+    ) -> String {
+        guard !invokesHostCallbacks else {
+            return AutoChartAccessibility.histogramBinFallbackLabel(
+                lower: lower,
+                upper: upper,
+                column: column,
+                formatters: formatters)
+        }
+        return $invokesHostCallbacks.withValue(true) {
+            AutoChartAccessibility.histogramBinLabel(
+                lower: lower,
+                upper: upper,
+                column: column,
+                formatters: formatters,
+                textResolver: textResolver)
+        }
+    }
+}
+
 private struct AutoChartHistogramBinAccessibilityLabels: Sendable {
     private struct Key: Hashable, Sendable {
-        let id: String
         let lowerBitPattern: UInt64
         let upperBitPattern: UInt64
 
-        init?(_ datum: AutoChartDatum) {
-            guard let lower = datum.lower, lower.isFinite,
-                let upper = datum.upper, upper.isFinite
-            else { return nil }
-            id = datum.id
+        init(lower: Double, upper: Double) {
             lowerBitPattern = lower.bitPattern
             upperBitPattern = upper.bitPattern
         }
     }
 
+    private struct Bounds {
+        let key: Key
+        let lower: Double
+        let upper: Double
+
+        init?(_ datum: AutoChartDatum) {
+            guard let lower = datum.lower, lower.isFinite,
+                let upper = datum.upper, upper.isFinite
+            else { return nil }
+            key = Key(lower: lower, upper: upper)
+            self.lower = lower
+            self.upper = upper
+        }
+    }
+
     private let labels: [Key: String]
+    private let column: AutoChartColumn?
+    private let formatters: AutoChartFormatters
+    private let textResolver: AutoChartTextResolver
 
     init(
         data: [AutoChartDatum],
@@ -1959,31 +2016,43 @@ private struct AutoChartHistogramBinAccessibilityLabels: Sendable {
         var labels: [Key: String] = [:]
         labels.reserveCapacity(data.count)
         for datum in data {
-            guard let key = Key(datum), let lower = datum.lower, let upper = datum.upper else {
+            guard let bounds = Bounds(datum) else {
                 assertionFailure("Prepared histogram bins require finite bounds.")
                 continue
             }
-            guard labels[key] == nil else { continue }
-            labels[key] = AutoChartAccessibility.histogramBinLabel(
-                lower: lower,
-                upper: upper,
+            // Equivalent intervals have the same semantic label regardless of
+            // datum identity. Resolve each exact pair only once.
+            guard labels[bounds.key] == nil else { continue }
+            labels[bounds.key] = AutoChartHistogramBinAccessibilityResolution.label(
+                lower: bounds.lower,
+                upper: bounds.upper,
                 column: column,
                 formatters: formatters,
                 textResolver: textResolver)
         }
         self.labels = labels
+        self.column = column
+        self.formatters = formatters
+        self.textResolver = textResolver
     }
 
     func label(for datum: AutoChartDatum) -> String {
-        guard let key = Key(datum) else {
+        guard let bounds = Bounds(datum) else {
             assertionFailure("Prepared histogram bins require finite bounds.")
             return AutoChartValue.unrepresentableValuePlaceholder
         }
-        guard let label = labels[key] else {
-            assertionFailure("A histogram bin must retain its prepared ID and bounds.")
-            return AutoChartValue.unrepresentableValuePlaceholder
+        if let label = labels[bounds.key] {
+            return label
         }
-        return label
+        // Production rendering looks up the immutable prepared data. Preserve
+        // correct behavior for an unexpected finite datum without making the
+        // common concurrent lookup path mutable.
+        return AutoChartHistogramBinAccessibilityResolution.label(
+            lower: bounds.lower,
+            upper: bounds.upper,
+            column: column,
+            formatters: formatters,
+            textResolver: textResolver)
     }
 }
 
@@ -2242,7 +2311,7 @@ struct AutoChartResolvedPresentation: Sendable {
 
     func histogramBinAccessibilityLabel(for datum: AutoChartDatum) -> String {
         guard let histogramBinAccessibilityLabels else {
-            assertionFailure("Only histograms have cached bin accessibility labels.")
+            assertionFailure("Only histograms have prepared bin accessibility labels.")
             return AutoChartValue.unrepresentableValuePlaceholder
         }
         return histogramBinAccessibilityLabels.label(for: datum)

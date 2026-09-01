@@ -81,12 +81,21 @@ When a resolver does not handle `.histogramBinAccessibility`, histogram
 intervals also try the legacy `.markAccessibilityRange` code before using the
 English fallback.
 
-Each `AutoChartView` initialization resolves every prepared histogram label once
-through the host formatter and text resolver. The resulting labels are stored in
-an immutable table keyed by the prepared datum ID and exact finite bounds, so
-mark rendering and concurrent accessibility lookups invoke no host callbacks and
-cannot return different labels for the same bin. Recreating the view constructs
-a new resolved presentation and resolves its histogram labels again.
+Each `AutoChartView` initialization resolves every prepared histogram interval
+label once through the host formatter and text resolver. Histogram preparation
+produces at most 1,000 bins. The resulting labels are stored in an immutable
+table keyed by their exact finite bounds, so prepared interval-name lookups from
+concurrent view copies invoke no host callbacks and cannot return different
+labels for the same bounds. Recreating the view constructs a new resolved
+presentation and resolves the labels again, even if its body is never evaluated.
+
+Other work performed while rendering a histogram mark remains presentation-time
+work. In particular, formatting the bin count and resolving the combined mark
+accessibility message can invoke host callbacks on each body evaluation. A
+synchronous formatter or interval-message resolver that reenters histogram
+resolution receives a callback-free package fallback from the nested resolution,
+which bounds recursion. An unexpected finite interval absent from the prepared
+table is formatted on demand without mutating the table.
 
 ### Link semantic selection
 
