@@ -240,6 +240,7 @@ public struct AutoChartFormatters: Sendable {
     public var locale: Locale
     public var timeZone: TimeZone
     private let override: RequestFormatter?
+    private let hostCallbackToken: AutoChartHostCallbackToken?
 
     private enum CategoryNumber {
         case integer(Int64)
@@ -267,15 +268,19 @@ public struct AutoChartFormatters: Sendable {
     ) {
         self.locale = locale
         self.timeZone = timeZone
-        self.override = value.map { valueFormatter -> RequestFormatter in
-            { request, locale, timeZone in
-                valueFormatter(
+        if let value {
+            self.override = { request, locale, timeZone in
+                value(
                     Self.legacyColumn(for: request),
                     request.value,
                     request.context,
                     locale,
                     timeZone)
             }
+            hostCallbackToken = AutoChartHostCallbackToken()
+        } else {
+            override = nil
+            hostCallbackToken = nil
         }
     }
 
@@ -288,6 +293,7 @@ public struct AutoChartFormatters: Sendable {
         self.locale = locale
         self.timeZone = timeZone
         self.override = request
+        hostCallbackToken = AutoChartHostCallbackToken()
     }
 
     public func format(
@@ -525,16 +531,18 @@ public struct AutoChartFormatters: Sendable {
     }
 
     private func overridden(_ request: AutoChartFormattingRequest) -> String? {
-        override?(request, locale, timeZone)
+        guard let override, let hostCallbackToken else { return nil }
+        return AutoChartHostCallbackActivity.invoke(
+            hostCallbackToken,
+            { override(request, locale, timeZone) })
     }
 
     func formatOverride(_ request: AutoChartFormattingRequest) -> String? {
         overridden(request)
     }
 
-    /// Applies package formatting without invoking the host override.
-    func formatDefault(_ request: AutoChartFormattingRequest) -> String {
-        defaultFormat(request)
+    var isInvokingHostCallback: Bool {
+        AutoChartHostCallbackActivity.isInvoking(hostCallbackToken)
     }
 
     private func defaultFormat(

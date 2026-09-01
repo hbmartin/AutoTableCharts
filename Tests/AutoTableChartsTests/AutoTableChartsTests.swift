@@ -892,6 +892,24 @@ private let date = AutoChartColumn(
     }
 
     @Test func histogramAccessibilityTableUsesExactBoundsRatherThanDatumIDs() {
+        final class Recorder: @unchecked Sendable {
+            private let lock = NSLock()
+            private var callbacks = 0
+
+            func nextLabel() -> String {
+                lock.lock()
+                defer { lock.unlock() }
+                callbacks += 1
+                return "Host label \(callbacks)"
+            }
+
+            var callbackCount: Int {
+                lock.lock()
+                defer { lock.unlock() }
+                return callbacks
+            }
+        }
+
         let column = AutoChartColumn(
             id: "histogram-value",
             name: "Histogram value",
@@ -924,9 +942,14 @@ private let date = AutoChartColumn(
                 lower: 3,
                 upper: 4),
         ]
+        let recorder = Recorder()
         let resolved = presentation.resolvedPresentation(
             data: data,
-            using: .default)
+            using: AutoChartTextResolver { message in
+                guard message.code == .histogramBinAccessibility else { return nil }
+                return recorder.nextLabel()
+            })
+        let preparedCallbackCount = recorder.callbackCount
 
         let first = resolved.histogramBinAccessibilityLabel(for: data[0])
         let second = resolved.histogramBinAccessibilityLabel(for: data[1])
@@ -939,13 +962,15 @@ private let date = AutoChartColumn(
 
         #expect(first != second)
         #expect(firstWithDifferentID == first)
+        #expect(preparedCallbackCount == data.count)
+        #expect(recorder.callbackCount == preparedCallbackCount)
         #expect(!first.contains(AutoChartValue.unrepresentableValuePlaceholder))
         #expect(!second.contains(AutoChartValue.unrepresentableValuePlaceholder))
         #expect(resolved.histogramBinAccessibilityLabel(for: data[0]) == first)
         #expect(resolved.histogramBinAccessibilityLabel(for: data[1]) == second)
     }
 
-    @Test func histogramAccessibilityFormatsUnpreparedSignedZeroBoundOnDemand() {
+    @Test func histogramAccessibilityPreparedTableDistinguishesSignedZeroBounds() {
         final class Recorder: @unchecked Sendable {
             private let lock = NSLock()
             private var requests = 0
@@ -995,7 +1020,7 @@ private let date = AutoChartColumn(
             upper: 1)
         let recorder = Recorder()
         let resolved = presentation.resolvedPresentation(
-            data: [negativeZero],
+            data: [negativeZero, positiveZero],
             using: .default,
             formatters: AutoChartFormatters(request: { request, _, _ in
                 recorder.recordRequest()
@@ -1013,14 +1038,16 @@ private let date = AutoChartColumn(
         #expect(first != second)
         #expect(recorder.requestCount == 4)
         #expect(resolved.histogramBinAccessibilityLabel(for: negativeZero) == first)
+        #expect(resolved.histogramBinAccessibilityLabel(for: positiveZero) == second)
         #expect(recorder.requestCount == 4)
     }
 
-    @Test func histogramAccessibilityConcurrentPreparedLookupsInvokeNoCallbacks() async {
+    @Test func histogramAccessibilityConcurrentPreparedLookupsInvokeNoCallbacks() {
         final class Recorder: @unchecked Sendable {
             private let lock = NSLock()
             private var requests = 0
             private var messages = 0
+            private var labels: [String] = []
 
             func recordRequest() {
                 lock.lock()
@@ -1037,10 +1064,22 @@ private let date = AutoChartColumn(
                 lock.unlock()
             }
 
+            func recordLabel(_ label: String) {
+                lock.lock()
+                labels.append(label)
+                lock.unlock()
+            }
+
             var counts: (requests: Int, messages: Int) {
                 lock.lock()
                 defer { lock.unlock() }
                 return (requests, messages)
+            }
+
+            var capturedLabels: [String] {
+                lock.lock()
+                defer { lock.unlock() }
+                return labels
             }
         }
 
@@ -1081,34 +1120,44 @@ private let date = AutoChartColumn(
         let datum = prepared.data[0]
         let baselineCounts = recorder.counts
 
-        let observerLabels = await withTaskGroup(
-            of: String.self,
-            returning: [String].self
-        ) { group in
-            for _ in 0..<32 {
-                group.addTask {
-                    resolved.histogramBinAccessibilityLabel(for: datum)
-                }
+        let observersReady = DispatchGroup()
+        let observersFinished = DispatchGroup()
+        let startObservers = DispatchSemaphore(value: 0)
+        for _ in 0..<32 {
+            observersReady.enter()
+            observersFinished.enter()
+            DispatchQueue.global().async {
+                observersReady.leave()
+                startObservers.wait()
+                recorder.recordLabel(
+                    resolved.histogramBinAccessibilityLabel(for: datum))
+                observersFinished.leave()
             }
-            var labels: [String] = []
-            for await label in group {
-                labels.append(label)
-            }
-            return labels
         }
+        let observersStartedBeforeTimeout =
+            observersReady.wait(timeout: .now() + 10) == .success
+        for _ in 0..<32 {
+            startObservers.signal()
+        }
+        let observersCompletedBeforeTimeout =
+            observersFinished.wait(timeout: .now() + 10) == .success
 
-        #expect(observerLabels.count == 32)
-        #expect(Set(observerLabels) == Set([hostLabel]))
+        #expect(observersStartedBeforeTimeout)
+        #expect(observersCompletedBeforeTimeout)
+        guard observersCompletedBeforeTimeout else { return }
+        #expect(recorder.capturedLabels.count == 32)
+        #expect(Set(recorder.capturedLabels) == Set([hostLabel]))
         #expect(baselineCounts.requests == prepared.data.count * 2)
         #expect(baselineCounts.messages == prepared.data.count)
         #expect(recorder.counts == baselineCounts)
     }
 
-    @Test func histogramAccessibilityBoundsReentrantEagerResolution() {
+    @Test func histogramAccessibilityBoundsCrossThreadReentrantPresentationResolution() {
         final class ReentrantState: @unchecked Sendable {
             private let lock = NSLock()
             private var build: (@Sendable () -> Void)?
             private var calls = 0
+            private let maximumBuilds = 32
 
             func install(_ build: @escaping @Sendable () -> Void) {
                 lock.lock()
@@ -1116,13 +1165,26 @@ private let date = AutoChartColumn(
                 lock.unlock()
             }
 
+            func clearBuild() {
+                lock.lock()
+                build = nil
+                lock.unlock()
+            }
+
             func reenter() -> String? {
                 let build: (@Sendable () -> Void)?
                 lock.lock()
                 calls += 1
-                build = self.build
+                build = calls <= maximumBuilds ? self.build : nil
                 lock.unlock()
-                build?()
+                if let build {
+                    let finished = DispatchSemaphore(value: 0)
+                    Thread.detachNewThread {
+                        build()
+                        finished.signal()
+                    }
+                    finished.wait()
+                }
                 return nil
             }
 
@@ -1158,7 +1220,8 @@ private let date = AutoChartColumn(
             state.reenter()
         }
         let resolver = AutoChartTextResolver { message in
-            guard message.code == .histogramBinAccessibility
+            guard message.code == .countTitle
+                || message.code == .histogramBinAccessibility
                 || message.code == .markAccessibilityRange
             else { return nil }
             return state.reenter()
@@ -1169,6 +1232,7 @@ private let date = AutoChartColumn(
                 using: resolver,
                 formatters: formatters)
         }
+        defer { state.clearBuild() }
 
         let resolved = presentation.resolvedPresentation(
             data: prepared.data,
@@ -1181,7 +1245,7 @@ private let date = AutoChartColumn(
             labels.allSatisfy {
                 !$0.contains(AutoChartValue.unrepresentableValuePlaceholder)
             })
-        #expect(state.callCount == prepared.data.count * 4)
+        #expect(state.callCount == prepared.data.count * 4 + 1)
     }
 
     @Test func histogramAccessibilityEagerResolutionUsesLegacyMessage() {

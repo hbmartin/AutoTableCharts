@@ -1658,12 +1658,70 @@ enum AutoChartCategoryDisambiguationKind: String, Sendable {
     }
 }
 
+/// Copies of a host callback wrapper share this token. Tracking its dynamic
+/// invocation scope lets synchronous reentrant work choose package fallbacks
+/// even when the host forwards that work to another thread.
+final class AutoChartHostCallbackToken: @unchecked Sendable {}
+
+enum AutoChartHostCallbackActivity {
+    private final class State: @unchecked Sendable {
+        private let lock = NSLock()
+        private var activeTokens: [ObjectIdentifier: Int] = [:]
+
+        func isInvoking(_ token: AutoChartHostCallbackToken) -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return activeTokens[ObjectIdentifier(token)] != nil
+        }
+
+        func begin(_ token: AutoChartHostCallbackToken) {
+            lock.lock()
+            let identifier = ObjectIdentifier(token)
+            activeTokens[identifier, default: 0] += 1
+            lock.unlock()
+        }
+
+        func end(_ token: AutoChartHostCallbackToken) {
+            lock.lock()
+            let identifier = ObjectIdentifier(token)
+            if let count = activeTokens[identifier], count > 1 {
+                activeTokens[identifier] = count - 1
+            } else {
+                activeTokens.removeValue(forKey: identifier)
+            }
+            lock.unlock()
+        }
+    }
+
+    private static let state = State()
+
+    static func isInvoking(_ token: AutoChartHostCallbackToken?) -> Bool {
+        token.map(state.isInvoking) ?? false
+    }
+
+    static func invoke<Value>(
+        _ token: AutoChartHostCallbackToken,
+        _ body: () -> Value
+    ) -> Value {
+        state.begin(token)
+        defer { state.end(token) }
+        return body()
+    }
+}
+
 /// Host override for package-authored text. Return `nil` to use `defaultText`.
 public struct AutoChartTextResolver: Sendable {
-    private let resolveValue: @Sendable (AutoChartMessage) -> String?
+    private let resolveValue: (@Sendable (AutoChartMessage) -> String?)?
+    private let hostCallbackToken: AutoChartHostCallbackToken?
 
     public init(_ resolve: @escaping @Sendable (AutoChartMessage) -> String?) {
         self.resolveValue = resolve
+        hostCallbackToken = AutoChartHostCallbackToken()
+    }
+
+    private init() {
+        resolveValue = nil
+        hostCallbackToken = nil
     }
 
     public func callAsFunction(_ message: AutoChartMessage) -> String {
@@ -1671,10 +1729,17 @@ public struct AutoChartTextResolver: Sendable {
     }
 
     func resolve(_ message: AutoChartMessage) -> String? {
-        resolveValue(message)
+        guard let resolveValue, let hostCallbackToken else { return nil }
+        return AutoChartHostCallbackActivity.invoke(
+            hostCallbackToken,
+            { resolveValue(message) })
     }
 
-    public static let `default` = AutoChartTextResolver { _ in nil }
+    var isInvokingHostCallback: Bool {
+        AutoChartHostCallbackActivity.isInvoking(hostCallbackToken)
+    }
+
+    public static let `default` = AutoChartTextResolver()
 }
 
 /// The impact of an analysis or specification diagnostic.
