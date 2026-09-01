@@ -970,7 +970,7 @@ private let date = AutoChartColumn(
         #expect(resolved.histogramBinAccessibilityLabel(for: data[1]) == second)
     }
 
-    @Test func nestedHostCallbackWrappersUsePackageBehavior() {
+    @Test func distinctHostCallbackWrappersMayDelegate() {
         final class Recorder: @unchecked Sendable {
             private let lock = NSLock()
             private var counts: [String: Int] = [:]
@@ -1018,12 +1018,76 @@ private let date = AutoChartColumn(
             value: .integer(1),
             context: .markAccessibility)
 
-        #expect(outerResolver(message) == "Package count")
-        #expect(outerFormatters.format(request) == "1")
+        #expect(outerResolver(message) == "Nested host count")
+        #expect(outerFormatters.format(request) == "Nested host value")
         #expect(recorder.count("outer resolver") == 1)
-        #expect(recorder.count("nested resolver") == 0)
+        #expect(recorder.count("nested resolver") == 1)
         #expect(recorder.count("outer formatter") == 1)
-        #expect(recorder.count("nested formatter") == 0)
+        #expect(recorder.count("nested formatter") == 1)
+    }
+
+    @Test func hostCallbackWrapperCopiesPreventDirectRecursion() {
+        final class RecursiveState: @unchecked Sendable {
+            private let lock = NSLock()
+            private var resolver: AutoChartTextResolver?
+            private var formatters: AutoChartFormatters?
+            private var resolverCallbacks = 0
+            private var formatterCallbacks = 0
+
+            func install(
+                resolver: AutoChartTextResolver,
+                formatters: AutoChartFormatters
+            ) {
+                lock.lock()
+                self.resolver = resolver
+                self.formatters = formatters
+                lock.unlock()
+            }
+
+            func resolve(_ message: AutoChartMessage) -> String? {
+                let resolver: AutoChartTextResolver?
+                lock.lock()
+                resolverCallbacks += 1
+                resolver = self.resolver
+                lock.unlock()
+                return resolver?(message)
+            }
+
+            func format(_ request: AutoChartFormattingRequest) -> String? {
+                let formatters: AutoChartFormatters?
+                lock.lock()
+                formatterCallbacks += 1
+                formatters = self.formatters
+                lock.unlock()
+                return formatters?.format(request)
+            }
+
+            var callbackCounts: (resolver: Int, formatter: Int) {
+                lock.lock()
+                defer { lock.unlock() }
+                return (resolverCallbacks, formatterCallbacks)
+            }
+        }
+
+        let state = RecursiveState()
+        let message = AutoChartMessage(
+            category: .interface,
+            code: .countTitle,
+            defaultText: "Package count")
+        let resolver = AutoChartTextResolver(state.resolve)
+        let formatters = AutoChartFormatters(
+            locale: Locale(identifier: "en_US"),
+            request: { request, _, _ in state.format(request) })
+        let request = AutoChartFormattingRequest(
+            column: nil,
+            value: .integer(1),
+            context: .markAccessibility)
+        state.install(resolver: resolver, formatters: formatters)
+
+        #expect(resolver(message) == "Package count")
+        #expect(formatters.format(request) == "1")
+        #expect(state.callbackCounts.resolver == 1)
+        #expect(state.callbackCounts.formatter == 1)
     }
 
     @Test func histogramAccessibilityPreparedTableDistinguishesSignedZeroBounds() {
@@ -1208,7 +1272,7 @@ private let date = AutoChartColumn(
         #expect(recorder.counts == baselineCounts)
     }
 
-    @Test func histogramPresentationResolutionKeepsIndependentConcurrentWrappers() {
+    @Test func histogramPresentationResolutionKeepsSharedConcurrentWrappers() {
         final class CallbackState: @unchecked Sendable {
             private let lock = NSLock()
             private var shouldBlockCountTitle = true
@@ -1263,16 +1327,14 @@ private let date = AutoChartColumn(
             data: prepared.data,
             measureSemantics: prepared.measureSemantics)
         let state = CallbackState()
-        let backgroundResolver = AutoChartTextResolver(state.resolve)
-        let backgroundFormatters = AutoChartFormatters { _, _, _ in "Host endpoint" }
-        let concurrentResolver = AutoChartTextResolver(state.resolve)
-        let concurrentFormatters = AutoChartFormatters { _, _, _ in "Host endpoint" }
+        let resolver = AutoChartTextResolver(state.resolve)
+        let formatters = AutoChartFormatters { _, _, _ in "Host endpoint" }
         let backgroundFinished = DispatchSemaphore(value: 0)
         Thread.detachNewThread {
             let backgroundResolved = presentation.resolvedPresentation(
                 data: prepared.data,
-                using: backgroundResolver,
-                formatters: backgroundFormatters)
+                using: resolver,
+                formatters: formatters)
             state.recordBackground(
                 count: backgroundResolved.count,
                 labels: prepared.data.map(
@@ -1290,8 +1352,8 @@ private let date = AutoChartColumn(
         }
         let concurrentResolved = presentation.resolvedPresentation(
             data: prepared.data,
-            using: concurrentResolver,
-            formatters: concurrentFormatters)
+            using: resolver,
+            formatters: formatters)
         state.releaseFirstCountTitle.signal()
         let backgroundCompleted =
             backgroundFinished.wait(timeout: .now() + 10) == .success
@@ -1305,102 +1367,6 @@ private let date = AutoChartColumn(
         #expect(backgroundResult?.count == "Host count")
         #expect(
             backgroundResult?.labels.allSatisfy { $0.contains("Host endpoint") } == true)
-    }
-
-    @Test func histogramAccessibilityBoundsCrossThreadReentrantPresentationResolution() {
-        final class ReentrantState: @unchecked Sendable {
-            private let lock = NSLock()
-            private var build: (@Sendable () -> Void)?
-            private var calls = 0
-            private let maximumBuilds = 32
-
-            func install(_ build: @escaping @Sendable () -> Void) {
-                lock.lock()
-                self.build = build
-                lock.unlock()
-            }
-
-            func clearBuild() {
-                lock.lock()
-                build = nil
-                lock.unlock()
-            }
-
-            func reenter() -> String? {
-                let build: (@Sendable () -> Void)?
-                lock.lock()
-                calls += 1
-                build = calls <= maximumBuilds ? self.build : nil
-                lock.unlock()
-                if let build {
-                    let finished = DispatchSemaphore(value: 0)
-                    Thread.detachNewThread {
-                        build()
-                        finished.signal()
-                    }
-                    finished.wait()
-                }
-                return nil
-            }
-
-            var callCount: Int {
-                lock.lock()
-                defer { lock.unlock() }
-                return calls
-            }
-        }
-
-        let column = AutoChartColumn(
-            id: "histogram-value",
-            name: "Histogram value",
-            hints: .init(semanticType: .quantitative, role: .measure))
-        let snapshot = AutoChartSnapshot(
-            table(columns: [column], rows: [[.double(1.5)], [.double(2.75)]]))
-        let specification = AutoChartSpecification.histogram(
-            value: column.id,
-            binCount: 2)
-        let profiles = AutoChartProfiler.profileIndex(snapshot)
-        let prepared = AutoChartDataPreparation.preparedData(
-            snapshot: snapshot,
-            specification: specification,
-            profiles: profiles)
-        let presentation = AutoChartRenderPresentation(
-            snapshot: snapshot,
-            specification: specification,
-            profiles: profiles,
-            data: prepared.data,
-            measureSemantics: prepared.measureSemantics)
-        let state = ReentrantState()
-        let formatters = AutoChartFormatters { _, _, _ in
-            state.reenter()
-        }
-        let resolver = AutoChartTextResolver { message in
-            guard message.code == .countTitle
-                || message.code == .histogramBinAccessibility
-                || message.code == .markAccessibilityRange
-            else { return nil }
-            return state.reenter()
-        }
-        state.install {
-            _ = presentation.resolvedPresentation(
-                data: prepared.data,
-                using: resolver,
-                formatters: formatters)
-        }
-        defer { state.clearBuild() }
-
-        let resolved = presentation.resolvedPresentation(
-            data: prepared.data,
-            using: resolver,
-            formatters: formatters)
-        let labels = prepared.data.map(resolved.histogramBinAccessibilityLabel(for:))
-
-        #expect(labels.count == prepared.data.count)
-        #expect(
-            labels.allSatisfy {
-                !$0.contains(AutoChartValue.unrepresentableValuePlaceholder)
-            })
-        #expect(state.callCount == prepared.data.count * 4 + 1)
     }
 
     @Test func histogramAccessibilityBoundsFreshWrapperReentrantPresentationResolution() {

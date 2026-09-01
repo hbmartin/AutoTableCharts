@@ -532,8 +532,8 @@ public struct AutoChartFormatters: Sendable {
 
     private func overridden(_ request: AutoChartFormattingRequest) -> String? {
         guard let override, let hostCallbackToken,
-            !AutoChartHostCallbackActivity.isInvoking,
-            !AutoChartHostCallbackActivity.isInvoking(hostCallbackToken)
+            !AutoChartHostCallbackActivity.containsActiveCallback(
+                for: hostCallbackToken)
         else { return nil }
         return AutoChartHostCallbackActivity.invoke(
             hostCallbackToken,
@@ -542,10 +542,6 @@ public struct AutoChartFormatters: Sendable {
 
     func formatOverride(_ request: AutoChartFormattingRequest) -> String? {
         overridden(request)
-    }
-
-    var isInvokingHostCallback: Bool {
-        AutoChartHostCallbackActivity.isInvoking(hostCallbackToken)
     }
 
     private func defaultFormat(

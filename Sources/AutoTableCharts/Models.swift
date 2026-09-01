@@ -1,4 +1,5 @@
 import Foundation
+import os.lock
 
 /// A stable identifier for a column exposed through ``AutoChartTable``.
 ///
@@ -1658,85 +1659,81 @@ enum AutoChartCategoryDisambiguationKind: String, Sendable {
     }
 }
 
-/// Copies of a host callback wrapper share this token. Tracking its dynamic
-/// invocation scope lets synchronous reentrant work choose package fallbacks
-/// even when the host forwards that work to another thread.
-final class AutoChartHostCallbackToken: @unchecked Sendable {}
+/// Copies of a host callback wrapper share this token so direct recursion through
+/// any copy can use package behavior without suppressing a different wrapper.
+final class AutoChartHostCallbackToken: Sendable {}
 
 enum AutoChartHostCallbackActivity {
     /// Child tasks inherit task-local values at creation. Keep the inherited
     /// scope as a reference whose activity ends with the callback, rather than a
     /// Boolean snapshot that would remain true for the child's entire lifetime.
     private final class Scope: @unchecked Sendable {
-        private let lock = NSLock()
+        let token: AutoChartHostCallbackToken
+        let parent: Scope?
+        private var lock = os_unfair_lock_s()
         private var active = true
 
+        init(token: AutoChartHostCallbackToken, parent: Scope?) {
+            self.token = token
+            self.parent = parent
+        }
+
         var isActive: Bool {
-            lock.lock()
-            defer { lock.unlock() }
+            os_unfair_lock_lock(&lock)
+            defer { os_unfair_lock_unlock(&lock) }
             return active
         }
 
         func deactivate() {
-            lock.lock()
+            os_unfair_lock_lock(&lock)
             active = false
-            lock.unlock()
-        }
-    }
-
-    private final class State: @unchecked Sendable {
-        private let lock = NSLock()
-        private var activeTokens: [ObjectIdentifier: Int] = [:]
-
-        func isInvoking(_ token: AutoChartHostCallbackToken) -> Bool {
-            lock.lock()
-            defer { lock.unlock() }
-            return activeTokens[ObjectIdentifier(token)] != nil
+            os_unfair_lock_unlock(&lock)
         }
 
-        func begin(_ token: AutoChartHostCallbackToken) {
-            lock.lock()
-            activeTokens[ObjectIdentifier(token), default: 0] += 1
-            lock.unlock()
-        }
-
-        func end(_ token: AutoChartHostCallbackToken) {
-            lock.lock()
-            let identifier = ObjectIdentifier(token)
-            if let count = activeTokens[identifier], count > 1 {
-                activeTokens[identifier] = count - 1
-            } else {
-                activeTokens.removeValue(forKey: identifier)
+        var hasActiveCallback: Bool {
+            var scope: Scope? = self
+            while let current = scope {
+                if current.isActive { return true }
+                scope = current.parent
             }
-            lock.unlock()
+            return false
+        }
+
+        func containsActiveCallback(for token: AutoChartHostCallbackToken) -> Bool {
+            var scope: Scope? = self
+            while let current = scope {
+                if current.token === token, current.isActive { return true }
+                scope = current.parent
+            }
+            return false
         }
     }
 
-    private static let state = State()
     @TaskLocal private static var inheritedScope: Scope?
 
-    /// True only while the inherited callback scope itself remains active. A
-    /// task created by a callback may retain the scope reference after the
-    /// callback returns, but it no longer remains permanently reentrant.
-    static var isInvoking: Bool {
-        inheritedScope?.isActive == true
+    /// True while this execution context inherits any active callback scope.
+    /// Scope state expires when the callback returns, so a child task does not
+    /// remain permanently reentrant after its parent callback completes.
+    static var hasActiveCallback: Bool {
+        inheritedScope?.hasActiveCallback == true
     }
 
-    static func isInvoking(_ token: AutoChartHostCallbackToken?) -> Bool {
-        token.map(state.isInvoking) ?? false
+    /// True only when this execution context contains the supplied wrapper's
+    /// active callback token. Unrelated wrappers may delegate to one another.
+    static func containsActiveCallback(
+        for token: AutoChartHostCallbackToken?
+    ) -> Bool {
+        guard let token else { return false }
+        return inheritedScope?.containsActiveCallback(for: token) == true
     }
 
     static func invoke<Value>(
         _ token: AutoChartHostCallbackToken,
         _ body: () -> Value
     ) -> Value {
-        let scope = Scope()
-        state.begin(token)
+        let scope = Scope(token: token, parent: inheritedScope)
         return $inheritedScope.withValue(scope) {
-            defer {
-                scope.deactivate()
-                state.end(token)
-            }
+            defer { scope.deactivate() }
             return body()
         }
     }
@@ -1763,16 +1760,12 @@ public struct AutoChartTextResolver: Sendable {
 
     func resolve(_ message: AutoChartMessage) -> String? {
         guard let resolveValue, let hostCallbackToken,
-            !AutoChartHostCallbackActivity.isInvoking,
-            !AutoChartHostCallbackActivity.isInvoking(hostCallbackToken)
+            !AutoChartHostCallbackActivity.containsActiveCallback(
+                for: hostCallbackToken)
         else { return nil }
         return AutoChartHostCallbackActivity.invoke(
             hostCallbackToken,
             { resolveValue(message) })
-    }
-
-    var isInvokingHostCallback: Bool {
-        AutoChartHostCallbackActivity.isInvoking(hostCallbackToken)
     }
 
     public static let `default` = AutoChartTextResolver()
