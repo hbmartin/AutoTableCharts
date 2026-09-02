@@ -3,6 +3,13 @@
 
 import PackageDescription
 
+/// Test-only hooks (`#if ATC_TEST_HOOKS`) compile into debug builds and stay
+/// out of the release binaries consumers ship. Release test runs opt back in
+/// with `swift test -c release -Xswiftc -DATC_TEST_HOOKS`.
+let testHookSettings: [SwiftSetting] = [
+    .define("ATC_TEST_HOOKS", .when(configuration: .debug))
+]
+
 let package = Package(
     name: "AutoTableCharts",
     platforms: [
@@ -25,11 +32,13 @@ let package = Package(
     ],
     targets: [
         .target(
-            name: "AutoTableCharts"
+            name: "AutoTableCharts",
+            swiftSettings: testHookSettings
         ),
         .testTarget(
             name: "AutoTableChartsTests",
-            dependencies: ["AutoTableCharts"]
+            dependencies: ["AutoTableCharts"],
+            swiftSettings: testHookSettings
         ),
     ]
 )

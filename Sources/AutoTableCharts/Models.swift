@@ -1778,24 +1778,25 @@ enum AutoChartHostCallbackActivity {
             }
         }
 
-        #if DEBUG || ATC_TEST_HOOKS
-        var parentForTesting: Scope? {
-            state.withLock { $0.parent }
+        #if ATC_TEST_HOOKS
+        /// Number of scopes retained in this lineage, including this one.
+        var lineageDepthForTesting: Int {
+            var depth = 0
+            var scope: Scope? = self
+            while let current = scope {
+                depth += 1
+                scope = current.state.withLock { $0.parent }
+            }
+            return depth
         }
         #endif
     }
 
     @TaskLocal private static var inheritedScope: Scope?
 
-    #if DEBUG || ATC_TEST_HOOKS
+    #if ATC_TEST_HOOKS
     static var inheritedScopeDepthForTesting: Int {
-        var depth = 0
-        var scope = inheritedScope
-        while let current = scope {
-            depth += 1
-            scope = current.parentForTesting
-        }
-        return depth
+        inheritedScope?.lineageDepthForTesting ?? 0
     }
     #endif
 

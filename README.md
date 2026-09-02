@@ -133,6 +133,10 @@ a bounded plot height can pass `nil` to preserve SwiftUI-managed sizing.
 ```sh
 swift test
 
+# Release runs need the test-only hooks re-enabled; without the flag the
+# hook-dependent tests are reported as skipped rather than silently omitted.
+swift test -c release -Xswiftc -DATC_TEST_HOOKS
+
 swift package --allow-writing-to-directory .build/docc generate-documentation \
   --target AutoTableCharts \
   --disable-indexing \
