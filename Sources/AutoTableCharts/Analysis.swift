@@ -451,6 +451,7 @@ private struct AutoChartCachedAnalysis<RowID: Hashable & Sendable>: Sendable {
     let recommendations: [AutoChartRecommendation]
 }
 
+#if ATC_TEST_HOOKS
 /// Internal synchronization points used only by deterministic concurrency tests.
 struct AutoChartAnalyzerTestHooks: Sendable {
     let chartPreparationWillBegin: (@Sendable () async -> Void)?
@@ -484,6 +485,7 @@ struct AutoChartAnalyzerTestHooks: Sendable {
             keyedMaterializationWillBegin: hook)
     }
 }
+#endif
 
 /// Instance-owned analysis, preparation, and cache lifecycle service.
 public actor AutoChartAnalyzer {
@@ -620,7 +622,9 @@ public actor AutoChartAnalyzer {
     }
 
     private let configuration: AutoChartAnalyzerConfiguration
+    #if ATC_TEST_HOOKS
     private let testHooks: AutoChartAnalyzerTestHooks
+    #endif
     private var tableEntries: [TableKey: AutoChartAnyCacheBox] = [:]
     private var tableRecency: [TableKey] = []
     private var analysisEntries: [AnalysisKey: AutoChartAnyCacheBox] = [:]
@@ -639,9 +643,12 @@ public actor AutoChartAnalyzer {
 
     public init(configuration: AutoChartAnalyzerConfiguration = .standard) {
         self.configuration = configuration
+        #if ATC_TEST_HOOKS
         self.testHooks = .disabled
+        #endif
     }
 
+    #if ATC_TEST_HOOKS
     init(
         configuration: AutoChartAnalyzerConfiguration = .standard,
         testHooks: AutoChartAnalyzerTestHooks
@@ -649,6 +656,7 @@ public actor AutoChartAnalyzer {
         self.configuration = configuration
         self.testHooks = testHooks
     }
+    #endif
 
     public var cacheStatistics: AutoChartCacheStatistics {
         var value = statistics
@@ -884,7 +892,9 @@ public actor AutoChartAnalyzer {
             let fingerprint: Int
             switch preparation {
             case .keyed(_, let materialize):
+                #if ATC_TEST_HOOKS
                 await testHooks.keyedMaterializationWillBegin?()
+                #endif
                 try Task.checkCancellation()
                 let materialized = try materialize()
                 snapshot = materialized.snapshot
@@ -1407,12 +1417,16 @@ public actor AutoChartAnalyzer {
         statistics.preparedCharts.misses += 1
         let flightID = UUID()
         let preparedEpoch = requestToken?.cacheEpoch ?? cacheEpoch
+        #if ATC_TEST_HOOKS
         let preparationHook = testHooks.chartPreparationWillBegin
+        #endif
         let task = Task.detached {
-            [recommendation, source, key, preparedEpoch, preparationHook] in
+            [recommendation, source, key, preparedEpoch] in
             try Task.checkCancellation()
+            #if ATC_TEST_HOOKS
             await preparationHook?()
             try Task.checkCancellation()
+            #endif
             let core = try AutoChartRenderCore.prepare(
                 snapshot: source.snapshot,
                 profiles: source.profiles,
