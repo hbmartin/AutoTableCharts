@@ -24,7 +24,7 @@ jobs:
         run: swift test
 
       - name: Run release tests
-        run: swift test -c release
+        run: swift test -c release -Xswiftc -DATC_TEST_HOOKS
 
       - name: Compile UIKit integration
         run: |
