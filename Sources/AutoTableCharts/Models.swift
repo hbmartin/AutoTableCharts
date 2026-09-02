@@ -1660,14 +1660,30 @@ enum AutoChartCategoryDisambiguationKind: String, Sendable {
     }
 }
 
-/// Copies of a host callback wrapper share this token so direct recursion through
-/// any copy can use package behavior without suppressing a different wrapper.
+/// Reference identity used to recognize recursion through one host callback.
 final class AutoChartHostCallbackToken: Sendable {}
+
+/// Keeps a host callback body and its recursion identity paired so invalid
+/// body-without-token states are unrepresentable. Copies share the token and
+/// therefore use package behavior for direct recursion through any copy without
+/// suppressing a different wrapper.
+struct AutoChartHostCallback<Body: Sendable>: Sendable {
+    let body: Body
+    let token = AutoChartHostCallbackToken()
+
+    init(_ body: Body) {
+        self.body = body
+    }
+}
 
 enum AutoChartHostCallbackActivity {
     private static let logger = Logger(
-        subsystem: "AutoTableCharts",
+        subsystem: "io.github.hbmartin.AutoTableCharts",
         category: "HostCallbacks")
+    private static let maximumDepthWarning: Void = {
+        logger.warning(
+            "Host callback delegation reached the supported maximum depth of \(maximumCallbackDepth, privacy: .public); using package fallback behavior.")
+    }()
 
     /// Callback delegation is expected to be shallow. Keep a finite ceiling so
     /// a synchronous chain that vends a fresh wrapper at every hop still falls
@@ -1709,15 +1725,13 @@ enum AutoChartHostCallbackActivity {
         /// Scans active ancestry once and rewires retained links around scopes
         /// that can never become active again. The returned parent is therefore
         /// safe for a new scope without retaining a dead inherited lineage.
-        func ancestry(
-            for token: AutoChartHostCallbackToken,
-            maximumDepth: Int
-        ) -> Ancestry {
+        func ancestry(for token: AutoChartHostCallbackToken) -> Ancestry {
             var scope: Scope? = self
             var firstActive: Scope?
             var previousActive: Scope?
             var activeCount = 0
             var skippedInactiveScope = false
+            var repeatedToken = false
             while let current = scope {
                 let snapshot = current.state.withLock { $0 }
                 scope = snapshot.parent
@@ -1725,10 +1739,6 @@ enum AutoChartHostCallbackActivity {
                     skippedInactiveScope = true
                     continue
                 }
-                guard current.token !== token else { return .repeatedToken }
-
-                activeCount += 1
-                guard activeCount < maximumDepth else { return .maximumDepth }
 
                 if let previousActive {
                     if skippedInactiveScope {
@@ -1739,6 +1749,11 @@ enum AutoChartHostCallbackActivity {
                 }
                 previousActive = current
                 skippedInactiveScope = false
+
+                if current.token === token {
+                    repeatedToken = true
+                }
+                activeCount += 1
             }
 
             if skippedInactiveScope {
@@ -1747,11 +1762,20 @@ enum AutoChartHostCallbackActivity {
             if firstActive !== self {
                 replaceParent(with: firstActive)
             }
+            if repeatedToken {
+                return .repeatedToken
+            }
+            if activeCount >= AutoChartHostCallbackActivity.maximumCallbackDepth {
+                return .maximumDepth
+            }
             return .available(parent: firstActive)
         }
 
         private func replaceParent(with parent: Scope?) {
-            state.withLock { $0.parent = parent }
+            state.withLock {
+                guard $0.parent !== parent else { return }
+                $0.parent = parent
+            }
         }
 
         #if DEBUG
@@ -1782,21 +1806,6 @@ enum AutoChartHostCallbackActivity {
         inheritedScope?.isActive == true
     }
 
-    /// True only when this execution context contains the supplied wrapper's
-    /// active callback token. Unrelated wrappers may delegate to one another.
-    static func containsActiveCallback(
-        for token: AutoChartHostCallbackToken
-    ) -> Bool {
-        guard let inheritedScope else { return false }
-        if case .repeatedToken = inheritedScope.ancestry(
-            for: token,
-            maximumDepth: .max)
-        {
-            return true
-        }
-        return false
-    }
-
     static func invoke<Value>(
         _ token: AutoChartHostCallbackToken,
         _ body: () -> Value,
@@ -1804,17 +1813,13 @@ enum AutoChartHostCallbackActivity {
     ) -> Value {
         let parent: Scope?
         if let inheritedScope {
-            switch inheritedScope.ancestry(
-                for: token,
-                maximumDepth: maximumCallbackDepth)
-            {
+            switch inheritedScope.ancestry(for: token) {
             case .available(let activeParent):
                 parent = activeParent
             case .repeatedToken:
                 return fallback()
             case .maximumDepth:
-                logger.warning(
-                    "Host callback delegation reached the supported maximum depth of \(maximumCallbackDepth, privacy: .public); using package fallback behavior.")
+                logMaximumDepthWarningOnce()
                 return fallback()
             }
         } else {
@@ -1827,21 +1832,23 @@ enum AutoChartHostCallbackActivity {
             return body()
         }
     }
+
+    private static func logMaximumDepthWarningOnce() {
+        _ = maximumDepthWarning
+    }
 }
 
 /// Host override for package-authored text. Return `nil` to use `defaultText`.
 public struct AutoChartTextResolver: Sendable {
-    private let resolveValue: (@Sendable (AutoChartMessage) -> String?)?
-    private let hostCallbackToken: AutoChartHostCallbackToken?
+    private typealias ResolveValue = @Sendable (AutoChartMessage) -> String?
+    private let hostCallback: AutoChartHostCallback<ResolveValue>?
 
     public init(_ resolve: @escaping @Sendable (AutoChartMessage) -> String?) {
-        self.resolveValue = resolve
-        hostCallbackToken = AutoChartHostCallbackToken()
+        hostCallback = AutoChartHostCallback(resolve)
     }
 
     private init() {
-        resolveValue = nil
-        hostCallbackToken = nil
+        hostCallback = nil
     }
 
     public func callAsFunction(_ message: AutoChartMessage) -> String {
@@ -1849,13 +1856,10 @@ public struct AutoChartTextResolver: Sendable {
     }
 
     func resolve(_ message: AutoChartMessage) -> String? {
-        assert(
-            (resolveValue == nil) == (hostCallbackToken == nil),
-            "A host text resolver and its callback token must be configured together.")
-        guard let resolveValue, let hostCallbackToken else { return nil }
+        guard let hostCallback else { return nil }
         return AutoChartHostCallbackActivity.invoke(
-            hostCallbackToken,
-            { resolveValue(message) },
+            hostCallback.token,
+            { hostCallback.body(message) },
             fallback: nil)
     }
 

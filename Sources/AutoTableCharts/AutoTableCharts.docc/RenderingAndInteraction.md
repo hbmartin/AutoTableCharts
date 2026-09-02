@@ -105,7 +105,9 @@ callback-free nested-presentation rule still applies.
 Synchronous callback ancestry detects delegation cycles such as `A → B → A`.
 Callback nesting supports at most 32 active callbacks, so a chain that constructs
 a fresh wrapper at every direct delegation falls back to package behavior before
-it can exhaust the stack and writes a `HostCallbacks` warning to the system log.
+it can exhaust the stack. The first such overflow in the process writes a
+warning to the system log under subsystem
+`io.github.hbmartin.AutoTableCharts` and category `HostCallbacks`.
 A child task created by a callback inherits that scope while the callback is
 active, but its presentation activity becomes inactive when that callback
 returns, even if an outer callback remains active. Direct calls to a wrapper that

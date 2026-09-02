@@ -4,26 +4,82 @@ import Testing
 
 @testable import AutoTableCharts
 
-@available(macOS 15.0, iOS 18.0, tvOS 18.0, watchOS 11.0, *)
-private final class DedicatedTestTaskExecutor: TaskExecutor {
-    private let queue: DispatchQueue
-
-    init(label: String) {
-        queue = DispatchQueue(label: label)
-    }
-
-    func enqueue(_ job: consuming ExecutorJob) {
-        let unownedJob = UnownedJob(job)
-        let executor = asUnownedTaskExecutor()
-        queue.async {
-            unownedJob.runSynchronously(on: executor)
-        }
-    }
-}
-
 private let posixCategoryFormatters = AutoChartFormatters(
     locale: Locale(identifier: "en_US_POSIX"),
     timeZone: .gmt)
+
+private final class OneShotAsyncTestGate: @unchecked Sendable {
+    private struct Waiter {
+        let id: UUID
+        let continuation: CheckedContinuation<Bool, Never>
+        let timeoutTask: Task<Void, Never>
+    }
+
+    private let lock = NSLock()
+    private var isReleased = false
+    private var waiter: Waiter?
+
+    func wait(timeout: Duration = .seconds(10)) async -> Bool {
+        let id = UUID()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                lock.lock()
+                if isReleased {
+                    lock.unlock()
+                    continuation.resume(returning: true)
+                    return
+                }
+                if Task.isCancelled || waiter != nil {
+                    lock.unlock()
+                    continuation.resume(returning: false)
+                    return
+                }
+                let timeoutTask = Task { [weak self] in
+                    do {
+                        try await Task.sleep(for: timeout)
+                    } catch {
+                        return
+                    }
+                    self?.finishWait(id: id, wasReleased: false)
+                }
+                waiter = Waiter(
+                    id: id,
+                    continuation: continuation,
+                    timeoutTask: timeoutTask)
+                lock.unlock()
+            }
+        } onCancel: {
+            finishWait(id: id, wasReleased: false)
+        }
+    }
+
+    func release() {
+        let waiter: Waiter?
+        lock.lock()
+        isReleased = true
+        waiter = self.waiter
+        self.waiter = nil
+        lock.unlock()
+
+        waiter?.timeoutTask.cancel()
+        waiter?.continuation.resume(returning: true)
+    }
+
+    private func finishWait(id: UUID, wasReleased: Bool) {
+        let waiter: Waiter
+        lock.lock()
+        guard let pendingWaiter = self.waiter, pendingWaiter.id == id else {
+            lock.unlock()
+            return
+        }
+        waiter = pendingWaiter
+        self.waiter = nil
+        lock.unlock()
+
+        waiter.timeoutTask.cancel()
+        waiter.continuation.resume(returning: wasReleased)
+    }
+}
 
 private func renderedValueSemantics(
     columnID: AutoChartColumnID?,
@@ -1273,25 +1329,9 @@ private let date = AutoChartColumn(
     }
 
     #if DEBUG
-    @Test func completedCallbackScopesArePrunedBeforeLaterDelegation() async {
-        final class Gate: @unchecked Sendable {
-            private let lock = NSLock()
-            private var released = false
-
-            func release() {
-                lock.lock()
-                released = true
-                lock.unlock()
-            }
-
-            var isReleased: Bool {
-                lock.lock()
-                defer { lock.unlock() }
-                return released
-            }
-        }
-
-        let gate = Gate()
+    @Test(.timeLimit(.minutes(1)))
+    func completedCallbackScopesArePrunedBeforeLaterDelegation() async {
+        let gate = OneShotAsyncTestGate()
         let firstToken = AutoChartHostCallbackToken()
         let secondToken = AutoChartHostCallbackToken()
         var childTask: Task<Int, Never>?
@@ -1300,8 +1340,10 @@ private let date = AutoChartColumn(
             firstToken,
             {
                 childTask = Task {
-                    while !gate.isReleased {
-                        await Task.yield()
+                    guard await gate.wait() else {
+                        Issue.record(
+                            "Callback-scope gate timed out or was cancelled.")
+                        return -1
                     }
                     return AutoChartHostCallbackActivity.invoke(
                         secondToken,
@@ -1773,12 +1815,12 @@ private let date = AutoChartColumn(
         #expect(state.callCount == prepared.data.count * 4 + 1)
     }
 
-    @Test func histogramPresentationResolutionDoesNotRetainActivityInChildTask() async {
+    @Test(.timeLimit(.minutes(1)))
+    func histogramPresentationResolutionDoesNotRetainActivityInChildTask() async {
         final class ChildState: @unchecked Sendable {
             private let lock = NSLock()
             private var build: (@Sendable () -> Task<Void, Never>)?
             private var didSpawn = false
-            private var released = false
             private var childTask: Task<Void, Never>?
             private var childResult: (count: String, labels: [String])?
 
@@ -1805,18 +1847,6 @@ private let date = AutoChartColumn(
                     lock.unlock()
                 }
                 return "Host count"
-            }
-
-            func releaseChild() {
-                lock.lock()
-                released = true
-                lock.unlock()
-            }
-
-            var isReleased: Bool {
-                lock.lock()
-                defer { lock.unlock() }
-                return released
             }
 
             var spawnedTask: Task<Void, Never>? {
@@ -1859,12 +1889,15 @@ private let date = AutoChartColumn(
             data: prepared.data,
             measureSemantics: prepared.measureSemantics)
         let state = ChildState()
+        let childGate = OneShotAsyncTestGate()
         let resolver = AutoChartTextResolver(state.resolve)
         let formatters = AutoChartFormatters { _, _, _ in "Host endpoint" }
         state.install {
             Task {
-                while !state.isReleased {
-                    await Task.yield()
+                guard await childGate.wait() else {
+                    Issue.record(
+                        "Child-presentation gate timed out or was cancelled.")
+                    return
                 }
                 let childResolved = presentation.resolvedPresentation(
                     data: prepared.data,
@@ -1885,7 +1918,7 @@ private let date = AutoChartColumn(
             Issue.record("The count-title callback did not create its child task.")
             return
         }
-        state.releaseChild()
+        childGate.release()
         await childTask.value
         let childResult = state.recordedChildResult
 
@@ -1894,13 +1927,16 @@ private let date = AutoChartColumn(
         #expect(childResult?.labels.allSatisfy { $0.contains("Host endpoint") } == true)
     }
 
-    @available(macOS 15.0, iOS 18.0, tvOS 18.0, watchOS 11.0, *)
-    @Test func childTaskStopsInheritingCompletedNestedCallbackScope() async {
+    @Test(.timeLimit(.minutes(1)))
+    func childTaskStopsInheritingCompletedNestedCallbackScope() async {
         final class ChildState: @unchecked Sendable {
             private let lock = NSLock()
             private var task: Task<Void, Never>?
-            private var result: (hasActiveCallback: Bool, containsOuter: Bool)?
-            private var released = false
+            private var result: (
+                hasActiveCallback: Bool,
+                suppressesOuterCallback: Bool,
+                inheritedScopeDepth: Int?
+            )?
             let childFinished = DispatchSemaphore(value: 0)
 
             func install(_ task: Task<Void, Never>) {
@@ -1909,21 +1945,16 @@ private let date = AutoChartColumn(
                 lock.unlock()
             }
 
-            func releaseChild() {
+            func record(
+                hasActiveCallback: Bool,
+                suppressesOuterCallback: Bool,
+                inheritedScopeDepth: Int?
+            ) {
                 lock.lock()
-                released = true
-                lock.unlock()
-            }
-
-            var isReleased: Bool {
-                lock.lock()
-                defer { lock.unlock() }
-                return released
-            }
-
-            func record(hasActiveCallback: Bool, containsOuter: Bool) {
-                lock.lock()
-                result = (hasActiveCallback, containsOuter)
+                result = (
+                    hasActiveCallback,
+                    suppressesOuterCallback,
+                    inheritedScopeDepth)
                 lock.unlock()
             }
 
@@ -1935,7 +1966,11 @@ private let date = AutoChartColumn(
                 return installedTask
             }
 
-            var recordedResult: (hasActiveCallback: Bool, containsOuter: Bool)? {
+            var recordedResult: (
+                hasActiveCallback: Bool,
+                suppressesOuterCallback: Bool,
+                inheritedScopeDepth: Int?
+            )? {
                 lock.lock()
                 defer { lock.unlock() }
                 return result
@@ -1943,60 +1978,82 @@ private let date = AutoChartColumn(
         }
 
         let state = ChildState()
+        let childGate = OneShotAsyncTestGate()
         let outerToken = AutoChartHostCallbackToken()
+        let middleToken = AutoChartHostCallbackToken()
         let innerToken = AutoChartHostCallbackToken()
-        let parentExecutor = DedicatedTestTaskExecutor(
+        let parentQueue = DispatchQueue(
             label: "AutoTableChartsTests.callback-parent")
-        let childExecutor = DedicatedTestTaskExecutor(
-            label: "AutoTableChartsTests.callback-child")
 
-        let result = await Task(executorPreference: parentExecutor) {
-            var childCompletedBeforeTimeout = false
-            AutoChartHostCallbackActivity.invoke(
-                outerToken,
-                {
-                    AutoChartHostCallbackActivity.invoke(
-                        innerToken,
-                        {
-                            state.install(
-                                Task(executorPreference: childExecutor) {
-                                    while !state.isReleased {
-                                        await Task.yield()
-                                    }
-                                    state.record(
-                                        hasActiveCallback:
-                                            AutoChartHostCallbackActivity
-                                            .hasActiveCallback,
-                                        containsOuter:
-                                            AutoChartHostCallbackActivity
-                                            .containsActiveCallback(for: outerToken))
-                                    state.childFinished.signal()
-                                })
-                        },
-                        fallback: ())
-                    state.releaseChild()
-                    childCompletedBeforeTimeout =
-                        state.childFinished.wait(timeout: .now() + 10) == .success
-                },
-                fallback: ())
+        let result = await withCheckedContinuation { continuation in
+            parentQueue.async {
+                var childCompletedBeforeTimeout = false
+                AutoChartHostCallbackActivity.invoke(
+                    outerToken,
+                    {
+                        AutoChartHostCallbackActivity.invoke(
+                            middleToken,
+                            {
+                                AutoChartHostCallbackActivity.invoke(
+                                    innerToken,
+                                    {
+                                        state.install(
+                                            Task {
+                                                defer {
+                                                    state.childFinished.signal()
+                                                }
+                                                guard await childGate.wait() else {
+                                                    Issue.record(
+                                                        "Nested-callback gate timed out or was cancelled.")
+                                                    return
+                                                }
+                                                let suppressesOuterCallback =
+                                                    AutoChartHostCallbackActivity.invoke(
+                                                        outerToken,
+                                                        { false },
+                                                        fallback: true)
+                                                #if DEBUG
+                                                let inheritedScopeDepth =
+                                                    AutoChartHostCallbackActivity
+                                                    .inheritedScopeDepthForTesting
+                                                #else
+                                                let inheritedScopeDepth: Int? = nil
+                                                #endif
+                                                state.record(
+                                                    hasActiveCallback:
+                                                        AutoChartHostCallbackActivity
+                                                        .hasActiveCallback,
+                                                    suppressesOuterCallback:
+                                                        suppressesOuterCallback,
+                                                    inheritedScopeDepth:
+                                                        inheritedScopeDepth)
+                                            })
+                                    },
+                                    fallback: ())
+                            },
+                            fallback: ())
+                        childGate.release()
+                        childCompletedBeforeTimeout =
+                            state.childFinished.wait(timeout: .now() + 10) == .success
+                    },
+                    fallback: ())
 
-            guard let childTask = state.takeTask() else {
-                return (
-                    installedTask: false,
-                    completedBeforeTimeout: childCompletedBeforeTimeout,
-                    recorded: state.recordedResult)
+                continuation.resume(
+                    returning: (
+                        completedBeforeTimeout: childCompletedBeforeTimeout,
+                        childTask: state.takeTask()))
             }
-            await childTask.value
-            return (
-                installedTask: true,
-                completedBeforeTimeout: childCompletedBeforeTimeout,
-                recorded: state.recordedResult)
-        }.value
+        }
 
-        #expect(result.installedTask)
+        await result.childTask?.value
+
+        #expect(result.childTask != nil)
         #expect(result.completedBeforeTimeout)
-        #expect(result.recorded?.hasActiveCallback == false)
-        #expect(result.recorded?.containsOuter == true)
+        #expect(state.recordedResult?.hasActiveCallback == false)
+        #expect(state.recordedResult?.suppressesOuterCallback == true)
+        #if DEBUG
+        #expect(state.recordedResult?.inheritedScopeDepth == 2)
+        #endif
     }
 
     @Test func histogramAccessibilityEagerResolutionUsesLegacyMessage() {
