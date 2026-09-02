@@ -23,6 +23,9 @@ jobs:
       - name: Run tests
         run: swift test
 
+      - name: Build release library as consumers receive it
+        run: swift build -c release
+
       - name: Run release tests
         run: swift test -c release -Xswiftc -DATC_TEST_HOOKS
 

@@ -84,36 +84,12 @@ private final class OneShotAsyncTestGate: @unchecked Sendable {
     }
 }
 
-private final class AsyncTestCountdown: @unchecked Sendable {
-    private let lock = NSLock()
-    private var remainingCount: Int
-    private let completionGate = OneShotAsyncTestGate()
-
-    init(count: Int) {
-        precondition(count > 0)
-        remainingCount = count
-    }
-
-    func signal() {
-        let shouldRelease: Bool
-        lock.lock()
-        if remainingCount > 0 {
-            remainingCount -= 1
-            shouldRelease = remainingCount == 0
-        } else {
-            shouldRelease = false
-        }
-        lock.unlock()
-
-        if shouldRelease {
-            completionGate.release()
-        }
-    }
-
-    func wait(timeout: Duration = .seconds(5)) async -> Bool {
-        await completionGate.wait(timeout: timeout)
-    }
-}
+#if !ATC_TEST_HOOKS
+private let testHooksUnavailable: Comment = """
+    Requires the ATC_TEST_HOOKS compilation condition; \
+    run `swift test -c release -Xswiftc -DATC_TEST_HOOKS`.
+    """
+#endif
 
 private func valuePropagatingCancellation<Value: Sendable>(
     of task: Task<Value, Never>
@@ -301,23 +277,22 @@ private let date = AutoChartColumn(
     @Test(.timeLimit(.minutes(1)))
     func oneShotAsyncTestGateReleasesEveryWaiter() async {
         let gate = OneShotAsyncTestGate()
-        let waiterRegistrations = AsyncTestCountdown(count: 2)
+        let firstRegistration = OneShotAsyncTestGate()
+        let secondRegistration = OneShotAsyncTestGate()
         let firstWaiter = Task {
-            await gate.wait(onWaiting: { waiterRegistrations.signal() })
+            await gate.wait(onWaiting: { firstRegistration.release() })
         }
         let secondWaiter = Task {
-            await gate.wait(onWaiting: { waiterRegistrations.signal() })
+            await gate.wait(onWaiting: { secondRegistration.release() })
         }
-        let bothWaitersRegistered = await waiterRegistrations.wait()
-        guard bothWaitersRegistered else {
-            firstWaiter.cancel()
-            secondWaiter.cancel()
-            gate.release()
-            Issue.record("The async gate did not register both waiters promptly.")
-            _ = await firstWaiter.value
-            _ = await secondWaiter.value
-            return
-        }
+        let firstWaiterRegistered = await firstRegistration.wait()
+        let secondWaiterRegistered = await secondRegistration.wait()
+        #expect(
+            firstWaiterRegistered,
+            "The async gate did not register the first waiter promptly.")
+        #expect(
+            secondWaiterRegistered,
+            "The async gate did not register the second waiter promptly.")
 
         gate.release()
 
@@ -1399,7 +1374,7 @@ private let date = AutoChartColumn(
                 == AutoChartHostCallbackActivity.maximumCallbackDepth)
     }
 
-    #if DEBUG || ATC_TEST_HOOKS
+    #if ATC_TEST_HOOKS
     @Test(.timeLimit(.minutes(1)))
     func completedCallbackScopesArePrunedBeforeLaterDelegation() async {
         let gate = OneShotAsyncTestGate()
@@ -1434,6 +1409,9 @@ private let date = AutoChartColumn(
         }
         #expect(await valuePropagatingCancellation(of: childTask) == 1)
     }
+    #else
+    @Test(.disabled(testHooksUnavailable))
+    func completedCallbackScopesArePrunedBeforeLaterDelegation() {}
     #endif
 
     @Test func hostCallbackWrapperCopiesPreventDirectRecursion() {
@@ -1998,18 +1976,20 @@ private let date = AutoChartColumn(
         #expect(childResult?.labels.allSatisfy { $0.contains("Host endpoint") } == true)
     }
 
-    #if DEBUG || ATC_TEST_HOOKS
+    #if ATC_TEST_HOOKS
     @Test(.timeLimit(.minutes(1)))
     func childTaskStopsInheritingCompletedNestedCallbackScope() async {
+        struct ChildResult: Sendable {
+            let hasActiveCallback: Bool
+            let suppressesOuterCallback: Bool
+            let inheritedScopeDepthBeforeCompaction: Int
+            let compactedInheritedScopeDepth: Int
+        }
+
         final class ChildState: @unchecked Sendable {
             private let lock = NSLock()
             private var task: Task<Void, Never>?
-            private var result: (
-                hasActiveCallback: Bool,
-                suppressesOuterCallback: Bool,
-                inheritedScopeDepthBeforeCompaction: Int,
-                compactedInheritedScopeDepth: Int
-            )?
+            private var result: ChildResult?
             let childFinished = DispatchSemaphore(value: 0)
 
             func install(_ task: Task<Void, Never>) {
@@ -2018,18 +1998,9 @@ private let date = AutoChartColumn(
                 lock.unlock()
             }
 
-            func record(
-                hasActiveCallback: Bool,
-                suppressesOuterCallback: Bool,
-                inheritedScopeDepthBeforeCompaction: Int,
-                compactedInheritedScopeDepth: Int
-            ) {
+            func record(_ result: ChildResult) {
                 lock.lock()
-                result = (
-                    hasActiveCallback,
-                    suppressesOuterCallback,
-                    inheritedScopeDepthBeforeCompaction,
-                    compactedInheritedScopeDepth)
+                self.result = result
                 lock.unlock()
             }
 
@@ -2041,12 +2012,7 @@ private let date = AutoChartColumn(
                 return installedTask
             }
 
-            var recordedResult: (
-                hasActiveCallback: Bool,
-                suppressesOuterCallback: Bool,
-                inheritedScopeDepthBeforeCompaction: Int,
-                compactedInheritedScopeDepth: Int
-            )? {
+            var recordedResult: ChildResult? {
                 lock.lock()
                 defer { lock.unlock() }
                 return result
@@ -2086,9 +2052,11 @@ private let date = AutoChartColumn(
                                                     defer {
                                                         state.childFinished.signal()
                                                     }
+                                                    // A gate failure leaves the result
+                                                    // unrecorded; the test body reports
+                                                    // it so the issue is attributed to
+                                                    // this test rather than to no test.
                                                     guard await childGate.wait() else {
-                                                        Issue.record(
-                                                            "Nested-callback gate timed out or was cancelled.")
                                                         return
                                                     }
                                                     let inheritedScopeDepthBeforeCompaction =
@@ -2107,15 +2075,16 @@ private let date = AutoChartColumn(
                                                         AutoChartHostCallbackActivity
                                                         .inheritedScopeDepthForTesting
                                                     state.record(
-                                                        hasActiveCallback:
-                                                            AutoChartHostCallbackActivity
-                                                            .hasActiveCallback,
-                                                        suppressesOuterCallback:
-                                                            suppressesOuterCallback,
-                                                        inheritedScopeDepthBeforeCompaction:
-                                                            inheritedScopeDepthBeforeCompaction,
-                                                        compactedInheritedScopeDepth:
-                                                            compactedInheritedScopeDepth)
+                                                        ChildResult(
+                                                            hasActiveCallback:
+                                                                AutoChartHostCallbackActivity
+                                                                .hasActiveCallback,
+                                                            suppressesOuterCallback:
+                                                                suppressesOuterCallback,
+                                                            inheritedScopeDepthBeforeCompaction:
+                                                                inheritedScopeDepthBeforeCompaction,
+                                                            compactedInheritedScopeDepth:
+                                                                compactedInheritedScopeDepth))
                                                 })
                                         },
                                         fallback: ())
@@ -2145,11 +2114,18 @@ private let date = AutoChartColumn(
         await valuePropagatingCancellation(of: childTask)
 
         #expect(result.completedBeforeTimeout)
-        #expect(state.recordedResult?.hasActiveCallback == false)
-        #expect(state.recordedResult?.suppressesOuterCallback == true)
-        #expect(state.recordedResult?.inheritedScopeDepthBeforeCompaction == 3)
-        #expect(state.recordedResult?.compactedInheritedScopeDepth == 2)
+        guard let recordedResult = state.recordedResult else {
+            Issue.record("Nested-callback gate timed out or was cancelled.")
+            return
+        }
+        #expect(recordedResult.hasActiveCallback == false)
+        #expect(recordedResult.suppressesOuterCallback == true)
+        #expect(recordedResult.inheritedScopeDepthBeforeCompaction == 3)
+        #expect(recordedResult.compactedInheritedScopeDepth == 2)
     }
+    #else
+    @Test(.disabled(testHooksUnavailable))
+    func childTaskStopsInheritingCompletedNestedCallbackScope() {}
     #endif
 
     @Test func histogramAccessibilityEagerResolutionUsesLegacyMessage() {
