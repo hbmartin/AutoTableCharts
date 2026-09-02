@@ -1778,16 +1778,13 @@ enum AutoChartHostCallbackActivity {
             }
         }
 
-        #if DEBUG
         var parentForTesting: Scope? {
             state.withLock { $0.parent }
         }
-        #endif
     }
 
     @TaskLocal private static var inheritedScope: Scope?
 
-    #if DEBUG
     static var inheritedScopeDepthForTesting: Int {
         var depth = 0
         var scope = inheritedScope
@@ -1797,7 +1794,6 @@ enum AutoChartHostCallbackActivity {
         }
         return depth
     }
-    #endif
 
     /// True only while the most recently inherited callback scope remains
     /// active. A child task that outlives that callback regains presentation
