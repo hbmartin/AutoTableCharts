@@ -6,6 +6,8 @@ import PackageDescription
 /// Test-only hooks (`#if ATC_TEST_HOOKS`) compile into debug builds and stay
 /// out of the release binaries consumers ship. Release test runs opt back in
 /// with `swift test -c release -Xswiftc -DATC_TEST_HOOKS`.
+/// Every hook-only surface is rooted in a type or accessor whose name includes
+/// `TestHook` or `ForTesting`, allowing the release-artifact audit to detect leaks.
 let testHookSettings: [SwiftSetting] = [
     .define("ATC_TEST_HOOKS", .when(configuration: .debug))
 ]

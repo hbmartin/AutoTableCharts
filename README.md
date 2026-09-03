@@ -133,16 +133,18 @@ a bounded plot height can pass `nil` to preserve SwiftUI-managed sizing.
 ```sh
 swift test
 
-# Build the consumer configuration and verify that neither its object symbols
-# nor its serialized module metadata contains test-only hooks.
+# Build the consumer configuration in a clean scratch directory and verify that
+# neither its object symbols nor serialized module metadata contains test hooks.
 Scripts/verify-release-library.sh
 
-# Verify that every hook-dependent test is reported as skipped rather than
-# silently omitted from the consumer-configuration test run.
-Scripts/verify-release-test-skips.sh
+# Verify both halves of the hook-dependent test contract from one manifest:
+# explicit skips without hooks and actual execution with hooks.
+Scripts/verify-release-tests.sh without-hooks
+Scripts/verify-release-tests.sh with-hooks
 
-# Re-enable the test-only hooks to execute the complete release test suite.
-swift test -c release -Xswiftc -DATC_TEST_HOOKS
+# After an Xcode Release build, audit the consumer object and every architecture's
+# serialized module metadata from that build as well.
+Scripts/verify-release-library.sh --xcode-derived-data /path/to/DerivedData
 
 swift package --allow-writing-to-directory .build/docc generate-documentation \
   --target AutoTableCharts \

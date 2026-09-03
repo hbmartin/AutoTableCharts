@@ -1819,11 +1819,7 @@ private struct CountingChartRowsTable: AutoChartTable {
         #expect(statistics.preparedCharts.evictions == 0)
     }
 
-    #if ATC_TEST_HOOKS
-    @Test
-    #else
-    @Test(.disabled(testHooksUnavailable))
-    #endif
+    @Test(.disabled(if: !testHooksAvailable, testHooksUnavailable))
     func removeAllDoesNotFailConcurrentAnalyzeCallers() async throws {
         #if ATC_TEST_HOOKS
         let gate = OneShotPreparationGate()
@@ -1845,6 +1841,8 @@ private struct CountingChartRowsTable: AutoChartTable {
         #expect(analysis.primaryChart != nil)
         #expect(counter.count >= 2)
         #expect(await analyzer.cacheStatistics.inFlightRequests == 0)
+        #else
+        Issue.record(testHooksUnavailable)
         #endif
     }
 
@@ -1881,11 +1879,7 @@ private struct CountingChartRowsTable: AutoChartTable {
         await #expect(throws: CancellationError.self) { try await task.value }
     }
 
-    #if ATC_TEST_HOOKS
-    @Test
-    #else
-    @Test(.disabled(testHooksUnavailable))
-    #endif
+    @Test(.disabled(if: !testHooksAvailable, testHooksUnavailable))
     func cancellationBeforeKeyedMaterializationDoesNotReadRows() async throws {
         #if ATC_TEST_HOOKS
         let gate = OneShotPreparationGate()
@@ -1920,6 +1914,8 @@ private struct CountingChartRowsTable: AutoChartTable {
             _ = try? await pending.value
             throw error
         }
+        #else
+        Issue.record(testHooksUnavailable)
         #endif
     }
 }
@@ -1960,11 +1956,7 @@ private struct CountingChartRowsTable: AutoChartTable {
     /// A memory trim must release memory: work already in flight when the host
     /// trimmed must not repopulate the cache it was asked to empty, and it must
     /// still hand its caller a result.
-    #if ATC_TEST_HOOKS
-    @Test
-    #else
-    @Test(.disabled(testHooksUnavailable))
-    #endif
+    @Test(.disabled(if: !testHooksAvailable, testHooksUnavailable))
     func trimStopsInFlightWorkFromRepopulatingTheCache() async throws {
         #if ATC_TEST_HOOKS
         let gate = OneShotPreparationGate()
@@ -1988,6 +1980,8 @@ private struct CountingChartRowsTable: AutoChartTable {
         #expect(statistics.preparedCharts.entries == 0)
         // The caller still gets its analysis; only caching was suppressed.
         #expect(analysis.primaryChart != nil)
+        #else
+        Issue.record(testHooksUnavailable)
         #endif
     }
 
@@ -2015,11 +2009,7 @@ private struct CountingChartRowsTable: AutoChartTable {
         #expect(statistics.hits > baseline.hits)
     }
 
-    #if ATC_TEST_HOOKS
-    @Test
-    #else
-    @Test(.disabled(testHooksUnavailable))
-    #endif
+    @Test(.disabled(if: !testHooksAvailable, testHooksUnavailable))
     func removeAllRetriesUncancelledPreparedChartWaiters() async throws {
         #if ATC_TEST_HOOKS
         let gate = OneShotPreparationGate()
@@ -2040,6 +2030,8 @@ private struct CountingChartRowsTable: AutoChartTable {
         let prepared = try await pending.value
         #expect(prepared.validation.isValid)
         #expect(!Task.isCancelled)
+        #else
+        Issue.record(testHooksUnavailable)
         #endif
     }
 
@@ -2068,11 +2060,7 @@ private struct CountingChartRowsTable: AutoChartTable {
 
     /// Converting an invalid preparation into a validation result must not
     /// override cancellation that arrived while that preparation was running.
-    #if ATC_TEST_HOOKS
-    @Test
-    #else
-    @Test(.disabled(testHooksUnavailable))
-    #endif
+    @Test(.disabled(if: !testHooksAvailable, testHooksUnavailable))
     func asyncValidationPreservesCancellationForInvalidSpecifications() async throws {
         #if ATC_TEST_HOOKS
         let gate = OneShotPreparationGate()
@@ -2107,14 +2095,12 @@ private struct CountingChartRowsTable: AutoChartTable {
         await #expect(throws: CancellationError.self) {
             try await pending.value
         }
+        #else
+        Issue.record(testHooksUnavailable)
         #endif
     }
 
-    #if ATC_TEST_HOOKS
-    @Test
-    #else
-    @Test(.disabled(testHooksUnavailable))
-    #endif
+    @Test(.disabled(if: !testHooksAvailable, testHooksUnavailable))
     func prepareCancellationTakesPriorityOverInvalidSpecification() async throws {
         #if ATC_TEST_HOOKS
         let gate = OneShotPreparationGate()
@@ -2144,6 +2130,8 @@ private struct CountingChartRowsTable: AutoChartTable {
         await #expect(throws: CancellationError.self) {
             try await pending.value
         }
+        #else
+        Issue.record(testHooksUnavailable)
         #endif
     }
 
