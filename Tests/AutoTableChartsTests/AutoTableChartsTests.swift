@@ -85,7 +85,7 @@ private final class OneShotAsyncTestGate: @unchecked Sendable {
 }
 
 #if !ATC_TEST_HOOKS
-private let testHooksUnavailable: Comment = """
+let testHooksUnavailable: Comment = """
     Requires the ATC_TEST_HOOKS compilation condition; \
     run `swift test -c release -Xswiftc -DATC_TEST_HOOKS`.
     """

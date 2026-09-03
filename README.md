@@ -133,8 +133,11 @@ a bounded plot height can pass `nil` to preserve SwiftUI-managed sizing.
 ```sh
 swift test
 
-# Release runs need the test-only hooks re-enabled; without the flag the
-# hook-dependent tests are reported as skipped rather than silently omitted.
+# Validate the consumer configuration. Hook-dependent tests are reported as
+# skipped rather than silently omitted.
+swift test -c release
+
+# Re-enable the test-only hooks to execute the complete release test suite.
 swift test -c release -Xswiftc -DATC_TEST_HOOKS
 
 swift package --allow-writing-to-directory .build/docc generate-documentation \

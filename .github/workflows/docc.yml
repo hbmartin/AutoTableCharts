@@ -26,13 +26,36 @@ jobs:
       - name: Build release library as consumers receive it
         run: swift build -c release
 
-      - name: Run release tests
+      - name: Verify release library excludes test hooks
+        run: |
+          atc_release_bin_path="$(swift build -c release --show-bin-path)"
+          atc_release_objects=("$atc_release_bin_path"/AutoTableCharts.build/*.o)
+          test -e "${atc_release_objects[0]}"
+          if ! atc_release_symbols="$(
+            nm "${atc_release_objects[@]}" | swift demangle
+          )"; then
+            echo "Could not inspect release-library symbols." >&2
+            exit 1
+          fi
+          if grep -E \
+            'AutoChartAnalyzerTestHooks|inheritedScopeDepthForTesting|lineageDepthForTesting' \
+            <<<"$atc_release_symbols"
+          then
+            echo "Test hooks leaked into the release library." >&2
+            exit 1
+          fi
+
+      - name: Run release tests without test hooks
+        run: swift test -c release
+
+      - name: Run release tests with test hooks
         run: swift test -c release -Xswiftc -DATC_TEST_HOOKS
 
-      - name: Compile UIKit integration
+      - name: Compile UIKit integration in release
         run: |
           xcodebuild \
             -scheme AutoTableCharts \
+            -configuration Release \
             -destination 'generic/platform=iOS Simulator' \
             -derivedDataPath "$RUNNER_TEMP/autotablecharts-ios" \
             CODE_SIGNING_ALLOWED=NO \
