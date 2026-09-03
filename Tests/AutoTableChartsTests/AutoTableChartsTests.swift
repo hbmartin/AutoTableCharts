@@ -1376,7 +1376,11 @@ private let date = AutoChartColumn(
 
     #if ATC_TEST_HOOKS
     @Test(.timeLimit(.minutes(1)))
+    #else
+    @Test(.disabled(testHooksUnavailable))
+    #endif
     func completedCallbackScopesArePrunedBeforeLaterDelegation() async {
+        #if ATC_TEST_HOOKS
         let gate = OneShotAsyncTestGate()
         let firstToken = AutoChartHostCallbackToken()
         let secondToken = AutoChartHostCallbackToken()
@@ -1408,11 +1412,8 @@ private let date = AutoChartColumn(
             return
         }
         #expect(await valuePropagatingCancellation(of: childTask) == 1)
+        #endif
     }
-    #else
-    @Test(.disabled(testHooksUnavailable))
-    func completedCallbackScopesArePrunedBeforeLaterDelegation() {}
-    #endif
 
     @Test func hostCallbackWrapperCopiesPreventDirectRecursion() {
         final class RecursiveState: @unchecked Sendable {
@@ -1978,7 +1979,11 @@ private let date = AutoChartColumn(
 
     #if ATC_TEST_HOOKS
     @Test(.timeLimit(.minutes(1)))
+    #else
+    @Test(.disabled(testHooksUnavailable))
+    #endif
     func childTaskStopsInheritingCompletedNestedCallbackScope() async {
+        #if ATC_TEST_HOOKS
         struct ChildResult: Sendable {
             let hasActiveCallback: Bool
             let suppressesOuterCallback: Bool
@@ -2122,11 +2127,8 @@ private let date = AutoChartColumn(
         #expect(recordedResult.suppressesOuterCallback == true)
         #expect(recordedResult.inheritedScopeDepthBeforeCompaction == 3)
         #expect(recordedResult.compactedInheritedScopeDepth == 2)
+        #endif
     }
-    #else
-    @Test(.disabled(testHooksUnavailable))
-    func childTaskStopsInheritingCompletedNestedCallbackScope() {}
-    #endif
 
     @Test func histogramAccessibilityEagerResolutionUsesLegacyMessage() {
         // This resolver is invoked synchronously while constructing `resolved`.
