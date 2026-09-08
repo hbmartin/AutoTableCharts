@@ -3,6 +3,7 @@ import Foundation
 import Testing
 
 @testable import AutoTableCharts
+@testable import AutoTableChartsUI
 
 private let v2Category = AutoChartColumn(
     id: "category",
@@ -287,7 +288,7 @@ private struct CountingChartRowsTable: AutoChartTable {
     let counter: ChartRowsReadCounter
     let chartColumns = [v2Measure]
     let chartMetadata = AutoChartTableMetadata()
-    var chartDataKey: AutoChartDataKey? = nil
+    var chartDataKey: AutoChartDataKey = .contentAddressed()
 
     var chartRows: [DuplicateIDRow] { counter.read(rows) }
 }
@@ -368,7 +369,7 @@ private struct CountingChartRowsTable: AutoChartTable {
             rows: [[.text("Office"), .double(42)]],
             rowIDs: [UUID()],
             metadata: .init(grain: "asset", provenance: "test"),
-            key: .init(identity: "result", revision: "2"))
+            key: .trusted(identity: "result", revision: "2"))
         let decoded = try JSONDecoder().decode(
             AutoChartDataset<UUID>.self,
             from: JSONEncoder().encode(original))
@@ -424,7 +425,7 @@ private struct CountingChartRowsTable: AutoChartTable {
     }
 
     @Test func resolutionReportsExactAndPolicyDefaulting() async throws {
-        #expect(AutoTableCharts.recommendationPolicyVersion == 11)
+        #expect(AutoTableCharts.recommendationPolicyVersion == 12)
         let dataset = try AutoChartDataset<Int>(
             columns: [v2Category, v2Measure],
             rows: [[.text("A"), .double(1)], [.text("B"), .double(2)]])
@@ -458,7 +459,7 @@ private struct CountingChartRowsTable: AutoChartTable {
         }
         #expect(defaulted.id == primary.id)
         #expect(previous == 10)
-        #expect(current == 11)
+        #expect(current == 12)
 
         let absent = AutoChartRecommendationID(
             policyVersion: AutoTableCharts.recommendationPolicyVersion,
@@ -1054,7 +1055,8 @@ private struct CountingChartRowsTable: AutoChartTable {
             }
             return "\(request.context.rawValue):\(aggregation.rawValue):\(request.column?.id.rawValue ?? "nil")"
         }
-        let view = AutoChartView(preparedChart: prepared, formatters: formatter)
+        let view = AutoChartView(
+            preparedChart: prepared, analysisID: analysis.id, formatters: formatter)
 
         #expect(
             view.formattedMeasureValue(2, for: .axisTick)
@@ -1065,6 +1067,7 @@ private struct CountingChartRowsTable: AutoChartTable {
 
         let defaultView = AutoChartView(
             preparedChart: prepared,
+            analysisID: analysis.id,
             formatters: AutoChartFormatters(locale: Locale(identifier: "en_US")))
         let axisValue = defaultView.formattedMeasureValue(2, for: .axisTick)
         let accessibilityValue = defaultView.formattedMeasureValue(
@@ -1105,7 +1108,8 @@ private struct CountingChartRowsTable: AutoChartTable {
                 return nil
             }
         }
-        let view = AutoChartView(preparedChart: prepared, formatters: formatter)
+        let view = AutoChartView(
+            preparedChart: prepared, analysisID: analysis.id, formatters: formatter)
 
         #expect(
             view.formattedMeasureValue(0.25, for: .axisTick)
@@ -1185,8 +1189,12 @@ private struct CountingChartRowsTable: AutoChartTable {
                 return nil
             }
         }
-        for prepared in [histogram, heatmap] {
-            let view = AutoChartView(preparedChart: prepared, formatters: formatter)
+        for (prepared, analysisID) in [
+            (histogram, histogramAnalysis.id),
+            (heatmap, heatmapAnalysis.id),
+        ] {
+            let view = AutoChartView(
+                preparedChart: prepared, analysisID: analysisID, formatters: formatter)
             #expect(
                 view.formattedMeasureValue(2, for: .axisTick)
                     == "axisTick:count:nil")
@@ -1197,6 +1205,7 @@ private struct CountingChartRowsTable: AutoChartTable {
 
         let boxView = AutoChartView(
             preparedChart: boxPlot,
+            analysisID: boxAnalysis.id,
             formatters: formatter)
         #expect(
             boxView.formattedMeasureValue(3, for: .axisTick)
@@ -1207,6 +1216,7 @@ private struct CountingChartRowsTable: AutoChartTable {
 
         let donutView = AutoChartView(
             preparedChart: donut,
+            analysisID: donutAnalysis.id,
             formatters: formatter)
         #expect(
             donutView.formattedMeasureValue(3, for: .axisTick)
@@ -1524,7 +1534,7 @@ private struct CountingChartRowsTable: AutoChartTable {
         let dataset = try AutoChartDataset<Int>(
             columns: [v2Category, v2Measure],
             rows: (0..<200).map { [.text("A"), .double(Double($0))] },
-            key: .init(identity: "coalesced", revision: "1"))
+            key: .trusted(identity: "coalesced", revision: "1"))
         let analyzer = AutoChartAnalyzer()
         async let first = analyzer.analyze(dataset)
         async let second = analyzer.analyze(dataset)
@@ -1547,7 +1557,7 @@ private struct CountingChartRowsTable: AutoChartTable {
                 .init(chartRowID: 2, value: 20),
             ],
             counter: counter,
-            chartDataKey: .init(identity: "counted-analysis", revision: "1"))
+            chartDataKey: .trusted(identity: "counted-analysis", revision: "1"))
         let analyzer = AutoChartAnalyzer(
             configuration: AutoChartAnalyzerConfiguration(
                 tables: .init(maximumEntries: 0),
@@ -1623,7 +1633,7 @@ private struct CountingChartRowsTable: AutoChartTable {
                 .init(chartRowID: 2, value: 20),
             ],
             counter: analysisCounter,
-            chartDataKey: .init(identity: "keyed-analysis-layer", revision: "1"))
+            chartDataKey: .trusted(identity: "keyed-analysis-layer", revision: "1"))
         let analysisBacked = AutoChartAnalyzer(
             configuration: AutoChartAnalyzerConfiguration(
                 tables: .init(maximumEntries: 0),
@@ -1647,7 +1657,7 @@ private struct CountingChartRowsTable: AutoChartTable {
                 .init(chartRowID: 2, value: 20),
             ],
             counter: chartCounter,
-            chartDataKey: .init(identity: "keyed-chart-layer", revision: "1"))
+            chartDataKey: .trusted(identity: "keyed-chart-layer", revision: "1"))
         let chartBacked = AutoChartAnalyzer(
             configuration: AutoChartAnalyzerConfiguration(
                 tables: .init(maximumEntries: 0),
@@ -1769,7 +1779,7 @@ private struct CountingChartRowsTable: AutoChartTable {
         let dataset = try AutoChartDataset<Int>(
             columns: [v2Category, v2Measure],
             rows: (0..<100).map { [.text("Category \($0)"), .double(Double($0))] },
-            key: .init(identity: "costed", revision: "1"))
+            key: .trusted(identity: "costed", revision: "1"))
         let analyzer = AutoChartAnalyzer(
             configuration: AutoChartAnalyzerConfiguration(
                 tables: .init(maximumEntries: 0),
@@ -1798,7 +1808,7 @@ private struct CountingChartRowsTable: AutoChartTable {
         let resident = try AutoChartDataset<Int>(
             columns: [v2Category, v2Measure],
             rows: [[.text("A"), .double(1)]],
-            key: .init(identity: "resident", revision: "1"))
+            key: .trusted(identity: "resident", revision: "1"))
         _ = try await analyzer.analyze(resident)
         let baseline = await analyzer.cacheStatistics
         #expect(baseline.tables.entries == 1)
@@ -1807,7 +1817,7 @@ private struct CountingChartRowsTable: AutoChartTable {
         let oversized = try AutoChartDataset<Int>(
             columns: [v2Category, v2Measure],
             rows: (0..<1_000).map { [.text("Category \($0)"), .double(Double($0))] },
-            key: .init(identity: "oversized", revision: "1"))
+            key: .trusted(identity: "oversized", revision: "1"))
         let analysis = try await analyzer.analyze(oversized)
         let statistics = await analyzer.cacheStatistics
 
@@ -1856,11 +1866,11 @@ private struct CountingChartRowsTable: AutoChartTable {
         let first = try AutoChartDataset<Int>(
             columns: [v2Category, v2Measure],
             rows: [[.text("A"), .double(1)]],
-            key: .init(identity: "first", revision: "1"))
+            key: .trusted(identity: "first", revision: "1"))
         let second = try AutoChartDataset<Int>(
             columns: [v2Category, v2Measure],
             rows: [[.text("B"), .double(2)]],
-            key: .init(identity: "second", revision: "1"))
+            key: .trusted(identity: "second", revision: "1"))
         let live = try await analyzer.analyze(first)
         let primaryID = try #require(live.primaryChart?.recommendation.id)
         _ = try await analyzer.analyze(second)
@@ -1887,7 +1897,7 @@ private struct CountingChartRowsTable: AutoChartTable {
         let table = CountingChartRowsTable(
             rows: [DuplicateIDRow(chartRowID: 0, value: 0)],
             counter: counter,
-            chartDataKey: .init(identity: "cancel-before-materialization", revision: "1"))
+            chartDataKey: .trusted(identity: "cancel-before-materialization", revision: "1"))
         let analyzer = AutoChartAnalyzer(
             testHooks: .keyedMaterialization { await gate.waitWhenArmed() })
         try #require(await gate.arm())
@@ -2257,11 +2267,11 @@ private struct CountingChartRowsTable: AutoChartTable {
         let first = try AutoChartDataset<Int>(
             columns: [v2Category, v2Measure],
             rows: [[.text("A"), .double(1)]],
-            key: .init(identity: "sales:2024", revision: "1"))
+            key: .trusted(identity: "sales:2024", revision: "1"))
         let second = try AutoChartDataset<Int>(
             columns: [v2Category, v2Measure],
             rows: [[.text("A"), .double(1)], [.text("B"), .double(2)]],
-            key: .init(identity: "sales", revision: "2024:1"))
+            key: .trusted(identity: "sales", revision: "2024:1"))
         let firstAnalysis = try await analyzer.analyze(first)
         let secondAnalysis = try await analyzer.analyze(second)
         #expect(try #require(firstAnalysis.primaryChart).marks.count == 1)
@@ -2274,7 +2284,7 @@ private struct CountingChartRowsTable: AutoChartTable {
         let dataset = try AutoChartDataset<Int>(
             columns: [v2Category, v2Measure],
             rows: [[.text("A"), .double(1)], [.text("B"), .double(2)]],
-            key: .init(identity: "metadata", revision: "1"))
+            key: .trusted(identity: "metadata", revision: "1"))
         let analyzer = AutoChartAnalyzer()
         let analysis = try await analyzer.analyze(dataset)
         guard case .charts(let recommendations) = analysis.outcome,
@@ -2336,7 +2346,7 @@ private struct CountingChartRowsTable: AutoChartTable {
             let analysis = try await AutoChartAnalyzer(configuration: .uncached)
                 .analyze(dataset)
             guard case .charts(let recommendations) = analysis.outcome else { return [] }
-            return recommendations
+            return Array(recommendations)
         }
         let summed = try await recommendations(source: .aggregated(.sum))
         #expect(summed.contains { $0.specification.aggregation == .sum })

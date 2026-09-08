@@ -4,22 +4,23 @@ Persist a typed choice and resolve it against a fresh analysis.
 
 ## Overview
 
-``AutoChartRecommendationOutcome`` is either `.charts`, containing a ranked
-list of renderable recommendations, or `.tableFallback`, containing a typed
+``AutoChartRecommendationOutcome`` is either `.charts`, containing an
+``AutoChartRecommendationCatalog``, or `.tableFallback`, containing a typed
 fallback message and diagnostics. A table is host UI, not a chart family.
 
 ``AutoChartSpecification/id`` is structural and excludes policy and title.
-``AutoChartRecommendationID`` adds the policy version and is `Codable`, making
-it the value to persist for a user's selected recommendation.
+``AutoChartRecommendationID`` adds the policy version. Persist it through the
+`Codable` ``AutoChartPreference`` shape when the user selects a specific chart.
 
 ```swift
-switch analysis.resolve(savedRecommendationID) {
-case .exact(let recommendation):
-    // The same policy and specification are available.
-case .defaulted(let primary, let reason):
-    // No preference, policy change, or unavailable specification.
-case .unavailable(let fallback):
+let resolution = analysis.resolve(savedPreference)
+if resolution.usesTable {
     // Keep the host's table visible.
+} else if let recommendation = resolution.recommendation {
+    // Prepare or present this exact recommendation.
+}
+if let repair = resolution.replacementPreference {
+    // Optionally persist the package's typed replacement suggestion.
 }
 ```
 
@@ -33,7 +34,9 @@ English fallback.
 
 ## Topics
 
-- ``AutoChartRecommendationResolution``
+- ``AutoChartRecommendationCatalog``
+- ``AutoChartPreference``
+- ``AutoChartPreferenceResolution``
 - ``AutoChartRecommendationID``
 - ``AutoChartSpecificationID``
 - ``AutoChartFallback``

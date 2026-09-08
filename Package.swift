@@ -25,6 +25,10 @@ let package = Package(
             name: "AutoTableCharts",
             targets: ["AutoTableCharts"]
         ),
+        .library(
+            name: "AutoTableChartsUI",
+            targets: ["AutoTableChartsUI"]
+        ),
     ],
     dependencies: [
         .package(
@@ -37,9 +41,13 @@ let package = Package(
             name: "AutoTableCharts",
             swiftSettings: testHookSettings
         ),
+        .target(
+            name: "AutoTableChartsUI",
+            dependencies: ["AutoTableCharts"]
+        ),
         .testTarget(
             name: "AutoTableChartsTests",
-            dependencies: ["AutoTableCharts"],
+            dependencies: ["AutoTableCharts", "AutoTableChartsUI"],
             swiftSettings: testHookSettings
         ),
     ]

@@ -142,7 +142,7 @@ jobs:
           ATC_DERIVED_DATA: ${{ runner.temp }}/autotablecharts-${{ matrix.slug }}
         run: |
           xcodebuild \
-            -scheme AutoTableCharts \
+            -scheme AutoTableChartsUI \
             -configuration "$ATC_CONFIGURATION" \
             -destination "$ATC_DESTINATION" \
             -derivedDataPath "$ATC_DERIVED_DATA" \

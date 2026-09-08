@@ -1,4 +1,5 @@
 import AutoTableCharts
+import AutoTableChartsUI
 import Testing
 
 #if canImport(SwiftUI)
@@ -28,19 +29,14 @@ private struct DocumentationHoldingsTable: AutoChartTable {
         AutoChartColumn(
             id: "propertyType",
             name: "Property Type",
-            hints: AutoChartColumnHints(
-                semanticType: .nominal,
-                role: .dimension
-            )
+            semantics: .dimension(semanticType: .nominal)
         ),
         AutoChartColumn(
             id: "marketValue",
             name: "Current Market Value",
-            hints: AutoChartColumnHints(
-                semanticType: .quantitative,
-                role: .measure,
+            semantics: .measure(
                 unit: .currency(code: "USD"),
-                measureSemantics: AutoChartMeasureSemantics(
+                semantics: AutoChartMeasureSemantics(
                     source: .rowLevel,
                     rollup: .additive
                 )
@@ -63,20 +59,20 @@ private struct DocumentationHoldingsTable: AutoChartTable {
                 id: "industrial", propertyType: "Industrial", marketValue: 15),
         ])
 
-        let analyzer = AutoChartAnalyzer()
-        let analysis = try await analyzer.analyze(
-            table,
+        let cache = AutoChartCache()
+        let analyzer = AutoChartAnalyzer(cache: cache)
+        let request = try AutoChartRequest(
+            table: table,
             context: AutoChartContext(
                 goal: .comparison,
-                title: "Current Market Value by Property Type"
-            )
-        )
+                title: "Current Market Value by Property Type"))
+        let analysis = try await analyzer.analyze(request)
         let primary = try #require(analysis.primaryChart)
         #expect(primary.recommendation.specification.family == .bar)
 
-        let specification = AutoChartSpecification(
-            family: .bar,
-            encoding: AutoChartEncoding(x: "propertyType", y: "marketValue"),
+        let specification = AutoChartSpecification.bar(
+            category: "propertyType",
+            measure: "marketValue",
             aggregation: .none,
             orientation: .horizontal,
             sort: .descending,
@@ -86,6 +82,8 @@ private struct DocumentationHoldingsTable: AutoChartTable {
         let customChart = try await analysis.prepare(specification)
 
         let selection = AutoChartSelection(
+            analysisID: analysis.id,
+            preparedChartID: customChart.id,
             sourceRowIDs: ["office"],
             dimensions: [
                 AutoChartSelectedDimension(columnID: "propertyType", value: .text("Office"))
@@ -104,7 +102,9 @@ private struct DocumentationHoldingsTable: AutoChartTable {
         await MainActor.run {
             let view = AutoChartView(
                 preparedChart: customChart,
-                selection: Binding<AutoChartSelection<String>?>.constant(selection),
+                analysisID: analysis.id,
+                selection: Binding<AutoChartSelectionSet<String>>.constant(
+                    AutoChartSelectionSet([selection])),
                 presentation: .explorer(plotHeight: 280)
             )
             _ = view

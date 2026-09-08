@@ -23,7 +23,7 @@ of truth: change its revision whenever any chart-affecting input changes.
 - ``AutoChartDataset``
 - ``AutoChartDatasetError``
 - ``AutoChartColumn``
-- ``AutoChartColumnHints``
+- ``AutoChartColumnSemantics``
 - ``AutoChartTableMetadata``
 - ``AutoChartValue``
 - ``AutoChartDataKey``

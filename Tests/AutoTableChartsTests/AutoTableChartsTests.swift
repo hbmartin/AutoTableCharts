@@ -248,10 +248,10 @@ private struct VersionedCountingTable: AutoChartTable {
     var chartDataIdentity: String?
     var chartDataVersion: String?
 
-    var chartDataKey: AutoChartDataKey? {
+    var chartDataKey: AutoChartDataKey {
         chartDataIdentity.map {
-            AutoChartDataKey(identity: $0, revision: chartDataVersion ?? "")
-        }
+            AutoChartDataKey.trusted(identity: $0, revision: chartDataVersion ?? "")
+        } ?? .contentAddressed()
     }
 }
 
@@ -6154,11 +6154,6 @@ private let date = AutoChartColumn(
         #expect(presentation.label.contains("0"))
         #expect(presentation.label.contains("10"))
         #expect(presentation.valueDescription.contains("1"))
-        #expect(
-            try JSONDecoder().decode(
-                AutoChartSelection<String>.self,
-                from: JSONEncoder().encode(selection)) == selection)
-
         let sectors = [
             AutoChartDatum(id: "missing-lineage", sourceRowIDs: [], yNumber: 1),
             AutoChartDatum(id: "selectable", sourceRowIDs: [2], yNumber: 2),
@@ -6263,10 +6258,6 @@ private let date = AutoChartColumn(
                 columns: [category, startColumn, endColumn],
                 formatters: formatter
             ).valueDescription == "start–end")
-        #expect(
-            try JSONDecoder().decode(
-                AutoChartSelection<String>.self,
-                from: JSONEncoder().encode(selection)) == selection)
     }
 
     @Test func selectionSummariesRespectNonadditiveAggregations() {

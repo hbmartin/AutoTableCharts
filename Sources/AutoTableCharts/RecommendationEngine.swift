@@ -281,12 +281,14 @@ enum AutoChartRecommendationEngine {
     static func recommendations<Table: AutoChartTable>(
         for table: Table,
         context: AutoChartContext = .init(),
-        options: AutoChartOptions = .init()
+        options: AutoChartOptions = .init(),
+        constraints: AutoChartRecommendationConstraints = .init()
     ) -> AutoChartCandidateResults {
         recommendations(
             snapshot: AutoChartSnapshot(table),
             context: context,
-            options: options)
+            options: options,
+            constraints: constraints)
     }
 
     static func validate<Table: AutoChartTable>(
@@ -299,7 +301,8 @@ enum AutoChartRecommendationEngine {
     static func recommendations(
         snapshot: AutoChartSnapshot,
         context: AutoChartContext,
-        options: AutoChartOptions
+        options: AutoChartOptions,
+        constraints: AutoChartRecommendationConstraints = .init()
     ) -> AutoChartCandidateResults {
         guard !snapshot.rows.isEmpty, !snapshot.columns.isEmpty else {
             return AutoChartCandidateResults(
@@ -695,7 +698,8 @@ enum AutoChartRecommendationEngine {
             candidates.append(faceted)
         }
 
-        let best = bestCandidatesByID(candidates)
+        // Apply request constraints before structural or prepared-domain validation.
+        let best = bestCandidatesByID(candidates.filter { constraints.allows($0.specification) })
         let unique = best.filter {
             cachedStructuralValidation($0.specification).isValid
         }
