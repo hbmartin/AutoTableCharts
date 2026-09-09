@@ -1,0 +1,219 @@
+import Foundation
+import Observation
+import AutoTableCharts
+
+/// Main-actor lifecycle owner for one independently displayed chart result.
+@MainActor
+@Observable
+public final class AutoChartSession<RowID: Hashable & Sendable> {
+    public enum State: Sendable {
+        case idle
+        case analyzing(AutoChartProgress?)
+        case preparing(AutoChartAnalysis<RowID>, AutoChartProgress?)
+        case ready(AutoChartAnalysis<RowID>, AutoChartPresentedChart<RowID>?)
+        case fallback(AutoChartAnalysis<RowID>, AutoChartFallback?)
+        case failed(AutoChartFailure)
+    }
+
+    public private(set) var state: State = .idle
+    public private(set) var preference: AutoChartPreference = .automatic
+    public var selection = AutoChartSelectionSet<RowID>()
+
+    private let cache: AutoChartCache
+    private let analyzer: AutoChartAnalyzer
+    private let presenter: AutoChartPresenter
+    private var request: AutoChartRequest<RowID>?
+    private var strategy: AutoChartPreparationStrategy = .preferredOrPrimary
+    private var presentationContext = AutoChartPresentationContext()
+    private var formatters: AutoChartFormatters?
+    private var textResolver = AutoChartTextResolver.default
+    private var generation: UInt64 = 0
+    @ObservationIgnored private var task: Task<Void, Never>?
+
+    public init(
+        cache: AutoChartCache = AutoChartCache(),
+        presenter: AutoChartPresenter = AutoChartPresenter()
+    ) {
+        self.cache = cache
+        self.analyzer = AutoChartAnalyzer(cache: cache)
+        self.presenter = presenter
+    }
+
+    deinit { task?.cancel() }
+
+    /// Starts or supersedes a request. Replacement requests clear visible state immediately.
+    public func load(
+        _ request: AutoChartRequest<RowID>,
+        preference: AutoChartPreference = .automatic,
+        preparation: AutoChartPreparationStrategy = .preferredOrPrimary,
+        presentationContext: AutoChartPresentationContext = .init(),
+        formatters: AutoChartFormatters? = nil,
+        textResolver: AutoChartTextResolver = .default
+    ) {
+        start(
+            request,
+            preference: preference,
+            preparation: preparation,
+            presentationContext: presentationContext,
+            formatters: formatters,
+            textResolver: textResolver,
+            clearsVisibleState: self.request?.id != request.id)
+    }
+
+    /// Selects and prepares an alternative without changing analysis identity.
+    public func select(_ recommendationID: AutoChartRecommendationID) {
+        setPreference(.chart(.specific(recommendationID)))
+    }
+
+    /// Reconciles a new preference against the current analysis and prepared-chart cache.
+    public func setPreference(_ preference: AutoChartPreference) {
+        guard let request else {
+            self.preference = preference
+            return
+        }
+        start(
+            request,
+            preference: preference,
+            preparation: .preferredOrPrimary,
+            presentationContext: presentationContext,
+            formatters: formatters,
+            textResolver: textResolver,
+            clearsVisibleState: false)
+    }
+
+    /// Rebuilds presentation for the current prepared chart without repeating analysis.
+    /// Change `context.identity` whenever formatter or resolver behavior changes.
+    public func setPresentationContext(
+        _ context: AutoChartPresentationContext,
+        formatters: AutoChartFormatters? = nil,
+        textResolver: AutoChartTextResolver = .default
+    ) {
+        presentationContext = context
+        self.formatters = formatters
+        self.textResolver = textResolver
+        guard case .ready(let analysis, _) = state,
+            let chart = analysis.primaryChart
+        else { return }
+        state = .ready(
+            analysis,
+            presenter.present(
+                chart,
+                context: context,
+                formatters: formatters,
+                textResolver: textResolver))
+    }
+
+    /// Starts a fresh attempt after a retryable failure.
+    public func retry() {
+        guard let request else { return }
+        cache.beginRetry(for: request.id)
+        start(
+            request,
+            preference: preference,
+            preparation: strategy,
+            presentationContext: presentationContext,
+            formatters: formatters,
+            textResolver: textResolver,
+            clearsVisibleState: true)
+    }
+
+    /// Cancels the current attempt. Cancellation never becomes a failure state.
+    public func cancel() {
+        generation &+= 1
+        task?.cancel()
+        task = nil
+        state = .idle
+    }
+
+    private func start(
+        _ request: AutoChartRequest<RowID>,
+        preference: AutoChartPreference,
+        preparation: AutoChartPreparationStrategy,
+        presentationContext: AutoChartPresentationContext,
+        formatters: AutoChartFormatters?,
+        textResolver: AutoChartTextResolver,
+        clearsVisibleState: Bool
+    ) {
+        generation &+= 1
+        let token = generation
+        task?.cancel()
+        self.request = request
+        self.preference = preference
+        self.strategy = preparation
+        self.presentationContext = presentationContext
+        self.formatters = formatters
+        self.textResolver = textResolver
+        if clearsVisibleState {
+            selection.removeAll()
+        } else if !selection.isEmpty, selection.analysisID == nil {
+            selection.removeAll()
+        }
+        if preparation != .none,
+            let completed: AutoChartAnalysis<RowID> = cache.completedAnalysis(
+                for: request.id),
+            !completed.resolve(preference).usesTable
+        {
+            state = .preparing(completed, nil)
+        } else {
+            state = .analyzing(nil)
+        }
+        task = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let analysis = try await analyzer.analyze(
+                    request,
+                    preference: preference,
+                    preparation: preparation,
+                    progress: { [weak self] progress in
+                        Task { @MainActor [weak self] in
+                            guard let self, self.generation == token else { return }
+                            switch progress.phase {
+                            case .chartPreparation, .presentationPreparation:
+                                if case .preparing(let analysis, _) = self.state {
+                                    self.state = .preparing(analysis, progress)
+                                }
+                            default:
+                                self.state = .analyzing(progress)
+                            }
+                        }
+                    })
+                try Task.checkCancellation()
+                guard generation == token else { return }
+                if !selection.belongs(to: analysis) { selection.removeAll() }
+                if case .tableFallback(let fallback) = analysis.outcome {
+                    state = .fallback(analysis, fallback)
+                    return
+                }
+                guard let chart = analysis.primaryChart else {
+                    state = .fallback(analysis, nil)
+                    return
+                }
+                state = .preparing(
+                    analysis,
+                    AutoChartProgress(phase: .presentationPreparation))
+                let presented = presenter.present(
+                    chart,
+                    context: presentationContext,
+                    formatters: formatters,
+                    textResolver: textResolver)
+                guard generation == token, !Task.isCancelled else { return }
+                if !selection.belongs(to: chart) { selection.removeAll() }
+                state = .ready(analysis, presented)
+            } catch is CancellationError {
+                // Supersession and explicit cancellation intentionally publish no failure.
+            } catch let failure as AutoChartFailure {
+                guard generation == token else { return }
+                state = .failed(failure)
+            } catch {
+                guard generation == token else { return }
+                state = .failed(
+                    AutoChartFailure(
+                        stage: .recommendation,
+                        kind: .internalFailure,
+                        isRetryable: true,
+                        diagnosticID: "ATC.session.internalFailure",
+                        message: String(describing: error)))
+            }
+        }
+    }
+}

@@ -20,18 +20,34 @@ public struct AutoChartColumnID: RawRepresentable, Hashable, Codable, Sendable,
     public var description: String { rawValue }
 }
 
-/// A caller-managed identity and revision for immutable chart data.
-///
-/// Keep `identity` stable for one logical result and change `revision` whenever
-/// columns, values, row identifiers, hints, or metadata change. An analyzer can
-/// use this contract to find prepared state without rescanning every cell.
-public struct AutoChartDataKey: Hashable, Codable, Sendable {
-    public var identity: String
-    public var revision: String
+/// The cache-validation contract for immutable chart data.
+public enum AutoChartDataKey: Hashable, Codable, Sendable {
+    /// Trust a caller-managed revision and avoid reading table cells on a cache hit.
+    ///
+    /// Keep `identity` stable for one logical result and change `revision` whenever
+    /// columns, values, row identifiers, semantics, or metadata change.
+    case trusted(identity: String, revision: String)
 
-    public init(identity: String, revision: String) {
-        self.identity = identity
-        self.revision = revision
+    /// Derive cache identity from the complete immutable table contents.
+    ///
+    /// The optional logical identity scopes collision checks without being trusted
+    /// as a content revision.
+    case contentAddressed(identity: String? = nil)
+
+    /// The caller-defined logical identity, when one was supplied.
+    public var identity: String? {
+        switch self {
+        case .trusted(let identity, _), .contentAddressed(.some(let identity)):
+            identity
+        case .contentAddressed(nil):
+            nil
+        }
+    }
+
+    /// The trusted revision, or `nil` for content-addressed data.
+    public var trustedRevision: String? {
+        guard case .trusted(_, let revision) = self else { return nil }
+        return revision
     }
 }
 
@@ -443,32 +459,24 @@ public struct AutoChartMeasureSemantics: Hashable, Codable, Sendable {
     }
 }
 
-/// Caller-supplied semantic metadata for a column.
+/// Read-only normalized semantic metadata derived from ``AutoChartColumnSemantics``.
 ///
-/// Explicit hints take precedence over value-based inference. Supplying roles,
-/// units, aggregation safety, and grain is the best way to prevent a plausible
-/// chart from misrepresenting a result.
+/// New columns are declared with the coherent associated-value cases on
+/// ``AutoChartColumnSemantics``. This flattened view remains available for
+/// inspection and internal recommendation rules.
 public struct AutoChartColumnHints: Hashable, Codable, Sendable {
     /// An explicit semantic type, or `nil` to infer it from values and the column name.
-    public var semanticType: AutoChartSemanticType?
+    public let semanticType: AutoChartSemanticType?
     /// The column's intended analytical role.
-    public var role: AutoChartAnalyticRole?
+    public let role: AutoChartAnalyticRole?
     /// Unit metadata used for formatting and semantic context.
-    public var unit: AutoChartUnit?
+    public let unit: AutoChartUnit?
     /// Provenance and safe rollup behavior for a measure.
-    public var measureSemantics: AutoChartMeasureSemantics?
+    public let measureSemantics: AutoChartMeasureSemantics?
     /// A caller-defined description of the entity or grouping level represented.
-    public var grain: String?
+    public let grain: String?
 
-    /// Creates semantic hints for a column.
-    ///
-    /// - Parameters:
-    ///   - semanticType: An explicit type, or `nil` to use inference.
-    ///   - role: The column's analytical role.
-    ///   - unit: Formatting and domain unit metadata.
-    ///   - measureSemantics: Provenance and safe rollup behavior for a measure.
-    ///   - grain: A human-readable description of the value grain.
-    public init(
+    init(
         semanticType: AutoChartSemanticType? = nil,
         role: AutoChartAnalyticRole? = nil,
         unit: AutoChartUnit? = nil,
@@ -483,6 +491,117 @@ public struct AutoChartColumnHints: Hashable, Codable, Sendable {
     }
 }
 
+/// A coherent semantic declaration for one source column.
+///
+/// Cases make contradictory role combinations unrepresentable while preserving
+/// value-based inference when the caller has no domain metadata.
+public enum AutoChartColumnSemantics: Hashable, Codable, Sendable {
+    public enum DimensionRole: String, Hashable, Codable, Sendable {
+        case dimension
+        case label
+        case series
+
+        var analyticRole: AutoChartAnalyticRole {
+            switch self {
+            case .dimension: .dimension
+            case .label: .label
+            case .series: .series
+            }
+        }
+    }
+
+    case inferred(
+        semanticType: AutoChartSemanticType? = nil,
+        unit: AutoChartUnit? = nil,
+        measureSemantics: AutoChartMeasureSemantics? = nil,
+        grain: String? = nil)
+    case dimension(
+        role: DimensionRole = .dimension,
+        semanticType: AutoChartSemanticType? = nil,
+        unit: AutoChartUnit? = nil,
+        grain: String? = nil)
+    case measure(
+        semanticType: AutoChartSemanticType? = .quantitative,
+        unit: AutoChartUnit? = nil,
+        semantics: AutoChartMeasureSemantics = .init(),
+        grain: String? = nil)
+    case identifier(
+        semanticType: AutoChartSemanticType? = nil,
+        unit: AutoChartUnit? = nil,
+        grain: String? = nil)
+    case intervalStart(unit: AutoChartUnit? = nil, grain: String? = nil)
+    case intervalEnd(unit: AutoChartUnit? = nil, grain: String? = nil)
+
+    var hints: AutoChartColumnHints {
+        switch self {
+        case .inferred(let type, let unit, let measureSemantics, let grain):
+            AutoChartColumnHints(
+                semanticType: type,
+                unit: unit,
+                measureSemantics: measureSemantics,
+                grain: grain)
+        case .dimension(let role, let type, let unit, let grain):
+            AutoChartColumnHints(
+                semanticType: type, role: role.analyticRole, unit: unit, grain: grain)
+        case .measure(let type, let unit, let semantics, let grain):
+            AutoChartColumnHints(
+                semanticType: type,
+                role: .measure,
+                unit: unit,
+                measureSemantics: semantics,
+                grain: grain)
+        case .identifier(let type, let unit, let grain):
+            AutoChartColumnHints(
+                semanticType: type, role: .identifier, unit: unit, grain: grain)
+        case .intervalStart(let unit, let grain):
+            AutoChartColumnHints(
+                semanticType: .temporal, role: .intervalStart, unit: unit, grain: grain)
+        case .intervalEnd(let unit, let grain):
+            AutoChartColumnHints(
+                semanticType: .temporal, role: .intervalEnd, unit: unit, grain: grain)
+        }
+    }
+
+    init(hints: AutoChartColumnHints) {
+        switch hints.role {
+        case .dimension:
+            self = .dimension(
+                semanticType: hints.semanticType, unit: hints.unit, grain: hints.grain)
+        case .label:
+            self = .dimension(
+                role: .label,
+                semanticType: hints.semanticType,
+                unit: hints.unit,
+                grain: hints.grain)
+        case .series:
+            self = .dimension(
+                role: .series,
+                semanticType: hints.semanticType,
+                unit: hints.unit,
+                grain: hints.grain)
+        case .measure:
+            self = .measure(
+                semanticType: hints.semanticType,
+                unit: hints.unit,
+                semantics: hints.measureSemantics ?? .init(),
+                grain: hints.grain)
+        case .identifier:
+            self = .identifier(
+                semanticType: hints.semanticType, unit: hints.unit, grain: hints.grain)
+        case .intervalStart:
+            self = .intervalStart(unit: hints.unit, grain: hints.grain)
+        case .intervalEnd:
+            self = .intervalEnd(unit: hints.unit, grain: hints.grain)
+        case nil:
+            self = .inferred(
+                semanticType: hints.semanticType,
+                unit: hints.unit,
+                measureSemantics: hints.measureSemantics,
+                grain: hints.grain)
+        }
+    }
+}
+
 /// The identity, display name, and semantic hints for a table column.
 public struct AutoChartColumn: Identifiable, Hashable, Codable, Sendable {
     /// The stable identifier used by row lookups and chart encodings.
@@ -492,7 +611,11 @@ public struct AutoChartColumn: Identifiable, Hashable, Codable, Sendable {
     /// An optional presentation label used verbatim in generated titles and axes.
     public var displayName: String?
     /// Semantic metadata that overrides or supplements profiling.
-    public var hints: AutoChartColumnHints
+    public var semantics: AutoChartColumnSemantics
+    private var normalizedHints: AutoChartColumnHints
+
+    /// Normalized hints consumed by profiling and validation.
+    public var hints: AutoChartColumnHints { normalizedHints }
 
     /// Creates a column description.
     ///
@@ -500,17 +623,64 @@ public struct AutoChartColumn: Identifiable, Hashable, Codable, Sendable {
     ///   - id: The stable column identifier.
     ///   - name: A source or display name.
     ///   - displayName: An optional caller-authored presentation label.
-    ///   - hints: Optional semantic metadata.
+    ///   - semantics: A coherent semantic declaration.
     public init(
         id: AutoChartColumnID,
         name: String,
         displayName: String? = nil,
-        hints: AutoChartColumnHints = AutoChartColumnHints()
+        semantics: AutoChartColumnSemantics = .inferred()
     ) {
         self.id = id
         self.name = name
         self.displayName = displayName
-        self.hints = hints
+        self.semantics = semantics
+        self.normalizedHints = semantics.hints
+    }
+
+    // Package implementation and tests use this bridge while candidate generation
+    // is expressed in normalized hints. It is intentionally not public v3 API.
+    init(
+        id: AutoChartColumnID,
+        name: String,
+        displayName: String? = nil,
+        hints: AutoChartColumnHints
+    ) {
+        self.id = id
+        self.name = name
+        self.displayName = displayName
+        self.semantics = AutoChartColumnSemantics(hints: hints)
+        self.normalizedHints = hints
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, displayName, semantics
+        case hints
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(AutoChartColumnID.self, forKey: .id)
+        name = try container.decode(String.self, forKey: .name)
+        displayName = try container.decodeIfPresent(String.self, forKey: .displayName)
+        if let decoded = try container.decodeIfPresent(
+            AutoChartColumnSemantics.self, forKey: .semantics)
+        {
+            semantics = decoded
+            normalizedHints = decoded.hints
+        } else {
+            let legacy = try container.decodeIfPresent(
+                AutoChartColumnHints.self, forKey: .hints) ?? .init()
+            semantics = AutoChartColumnSemantics(hints: legacy)
+            normalizedHints = legacy
+        }
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(name, forKey: .name)
+        try container.encodeIfPresent(displayName, forKey: .displayName)
+        try container.encode(semantics, forKey: .semantics)
     }
 }
 
@@ -571,12 +741,12 @@ public protocol AutoChartTable<RowID>: Sendable {
     var chartRows: ChartRows { get }
     /// Result-level completeness, grain, and provenance metadata.
     var chartMetadata: AutoChartTableMetadata { get }
-    /// An optional caller-managed identity and content revision for cache lookup.
-    var chartDataKey: AutoChartDataKey? { get }
+    /// The explicit cache-validation contract for this table.
+    var chartDataKey: AutoChartDataKey { get }
 }
 
 extension AutoChartTable {
-    public var chartDataKey: AutoChartDataKey? { nil }
+    public var chartDataKey: AutoChartDataKey { .contentAddressed() }
 }
 
 /// The analytical task used to favor otherwise valid recommendations.
@@ -713,7 +883,7 @@ public struct AutoChartOptions: Hashable, Codable, Sendable {
 }
 
 /// A visualization family supported by recommendation, validation, and rendering.
-public enum AutoChartFamily: String, CaseIterable, Codable, Sendable {
+public enum AutoChartFamily: String, CaseIterable, Hashable, Codable, Sendable {
     /// A single quantitative key value from a complete one-row result.
     case kpi
     /// Length-encoded categorical comparison.
@@ -869,29 +1039,29 @@ extension AutoChartEncoding {
 /// specifications have already passed the same validation rules.
 public struct AutoChartSpecification: Identifiable, Hashable, Codable, Sendable {
     /// The visual family and its required channel semantics.
-    public var family: AutoChartFamily
+    public internal(set) var family: AutoChartFamily
     /// Column assignments for the family's visual channels.
-    public var encoding: AutoChartEncoding
+    public internal(set) var encoding: AutoChartEncoding
     /// The transformation applied when multiple source rows contribute to a mark.
-    public var aggregation: AutoChartAggregation
+    public internal(set) var aggregation: AutoChartAggregation
     /// The requested maximum number of histogram bins, or `nil` for the renderer default.
     ///
     /// The renderer can produce fewer bins when adjacent floating-point boundaries
     /// collapse to the same representable value.
-    public var binCount: Int?
+    public internal(set) var binCount: Int?
     /// The layout direction for families that support orientation.
-    public var orientation: AutoChartOrientation
+    public internal(set) var orientation: AutoChartOrientation
     /// The series-stacking behavior.
-    public var stacking: AutoChartStacking
+    public internal(set) var stacking: AutoChartStacking
     /// The line, bar, or scatter family repeated by a faceted chart.
     ///
     /// Legacy decoded specifications may leave this `nil`; validation then reports
     /// a warning and the renderer infers a compatible family from the x-axis type.
-    public var facetBaseFamily: AutoChartFamily?
+    public internal(set) var facetBaseFamily: AutoChartFamily?
     /// The order applied to prepared marks.
-    public var sort: AutoChartSort
+    public internal(set) var sort: AutoChartSort
     /// The visible and accessible chart title.
-    public var title: String
+    public internal(set) var title: String
 
     /// Creates a chart specification.
     ///
@@ -906,7 +1076,7 @@ public struct AutoChartSpecification: Identifiable, Hashable, Codable, Sendable 
     ///   - facetBaseFamily: The base family repeated by a faceted chart.
     ///   - sort: The mark order.
     ///   - title: The visible and accessible title.
-    public init(
+    init(
         family: AutoChartFamily,
         encoding: AutoChartEncoding = AutoChartEncoding(),
         aggregation: AutoChartAggregation = .none,
@@ -1899,7 +2069,7 @@ public struct AutoChartDiagnostic: Hashable, Codable, Sendable {
 
 /// A validated chart specification plus its rank, explanation, and cautions.
 public struct AutoChartRecommendation: Identifiable, Hashable, Codable, Sendable {
-    /// The specification that can be rendered by ``AutoChartView``.
+    /// The specification that can be prepared and rendered by a compatible UI.
     public var specification: AutoChartSpecification
     /// The policy score used to rank candidates within this recommendation request.
     ///
@@ -2005,13 +2175,13 @@ public struct AutoChartFallback: Hashable, Codable, Sendable {
 
 /// Coherent result of automatic recommendation.
 public enum AutoChartRecommendationOutcome: Hashable, Codable, Sendable {
-    case charts([AutoChartRecommendation])
+    case charts(AutoChartRecommendationCatalog)
     case tableFallback(AutoChartFallback)
 }
 
 /// Result of resolving a persisted recommendation preference.
-public enum AutoChartRecommendationResolution: Sendable {
-    public enum DefaultReason: Hashable, Codable, Sendable {
+enum AutoChartRecommendationResolution: Sendable {
+    enum DefaultReason: Hashable, Codable, Sendable {
         case noPersistedPreference
         case policyVersionChanged(previous: Int, current: Int)
         case specificationUnavailable
@@ -2144,6 +2314,8 @@ public struct AutoChartSelectedMeasure: Hashable, Codable, Sendable {
 
 /// Exact typed lineage and semantic values represented by a selected mark.
 public struct AutoChartSelection<RowID: Hashable & Sendable>: Hashable, Sendable {
+    public var analysisID: AutoChartAnalysisID
+    public var preparedChartID: AutoChartPreparedChartID
     public var sourceRowIDs: Set<RowID>
     public var dimensions: [AutoChartSelectedDimension]
     public var rangeDimensions: [AutoChartSelectedRangeDimension]
@@ -2153,6 +2325,8 @@ public struct AutoChartSelection<RowID: Hashable & Sendable>: Hashable, Sendable
     public var markID: String
 
     public init(
+        analysisID: AutoChartAnalysisID,
+        preparedChartID: AutoChartPreparedChartID,
         sourceRowIDs: Set<RowID>,
         dimensions: [AutoChartSelectedDimension] = [],
         rangeDimensions: [AutoChartSelectedRangeDimension] = [],
@@ -2161,6 +2335,8 @@ public struct AutoChartSelection<RowID: Hashable & Sendable>: Hashable, Sendable
         specificationID: AutoChartSpecificationID,
         markID: String
     ) {
+        self.analysisID = analysisID
+        self.preparedChartID = preparedChartID
         self.sourceRowIDs = sourceRowIDs
         self.dimensions = dimensions
         self.rangeDimensions = rangeDimensions
@@ -2169,40 +2345,28 @@ public struct AutoChartSelection<RowID: Hashable & Sendable>: Hashable, Sendable
         self.specificationID = specificationID
         self.markID = markID
     }
-}
 
-extension AutoChartSelection: Codable where RowID: Codable {
-    private enum CodingKeys: String, CodingKey {
-        case sourceRowIDs, dimensions, rangeDimensions, measure, family, specificationID, markID
-    }
-
-    public init(from decoder: any Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
+    /// Creates a process-local detached selection for previews and static presentation.
+    /// Use prepared-chart helpers for selections that must belong to a live chart.
+    public init(
+        sourceRowIDs: Set<RowID>,
+        dimensions: [AutoChartSelectedDimension] = [],
+        rangeDimensions: [AutoChartSelectedRangeDimension] = [],
+        measure: AutoChartSelectedMeasure? = nil,
+        family: AutoChartFamily,
+        specificationID: AutoChartSpecificationID,
+        markID: String
+    ) {
         self.init(
-            sourceRowIDs: try container.decode(Set<RowID>.self, forKey: .sourceRowIDs),
-            dimensions: try container.decode(
-                [AutoChartSelectedDimension].self, forKey: .dimensions),
-            rangeDimensions: try container.decodeIfPresent(
-                [AutoChartSelectedRangeDimension].self, forKey: .rangeDimensions) ?? [],
-            measure: try container.decodeIfPresent(
-                AutoChartSelectedMeasure.self, forKey: .measure),
-            family: try container.decode(AutoChartFamily.self, forKey: .family),
-            specificationID: try container.decode(
-                AutoChartSpecificationID.self, forKey: .specificationID),
-            markID: try container.decode(String.self, forKey: .markID))
-    }
-
-    public func encode(to encoder: any Encoder) throws {
-        var container = encoder.container(keyedBy: CodingKeys.self)
-        try container.encode(sourceRowIDs, forKey: .sourceRowIDs)
-        try container.encode(dimensions, forKey: .dimensions)
-        if !rangeDimensions.isEmpty {
-            try container.encode(rangeDimensions, forKey: .rangeDimensions)
-        }
-        try container.encodeIfPresent(measure, forKey: .measure)
-        try container.encode(family, forKey: .family)
-        try container.encode(specificationID, forKey: .specificationID)
-        try container.encode(markID, forKey: .markID)
+            analysisID: AutoChartAnalysisID(),
+            preparedChartID: AutoChartPreparedChartID(),
+            sourceRowIDs: sourceRowIDs,
+            dimensions: dimensions,
+            rangeDimensions: rangeDimensions,
+            measure: measure,
+            family: family,
+            specificationID: specificationID,
+            markID: markID)
     }
 }
 

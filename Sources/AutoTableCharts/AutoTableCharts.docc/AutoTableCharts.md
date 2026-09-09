@@ -1,28 +1,29 @@
 # ``AutoTableCharts``
 
-Turn typed tabular results into immutable prepared native Swift Charts.
+Turn typed tabular results into safe, immutable chart recommendations.
 
 ## Overview
 
 AutoTableCharts snapshots and validates caller data, profiles every column,
-generates semantically safe candidates, and eagerly prepares the primary chart.
-The package is deterministic and offline: it does not sample rows, invoke a
-model, mutate a table, or own application-global state.
+generates semantically safe candidates, and prepares only the charts requested
+by an explicit strategy. The package is deterministic and offline: it does not
+sample rows, invoke a model, or mutate a table. The separate
+`AutoTableChartsUI` product provides SwiftUI and Swift Charts integration.
 
 ```swift
-let analyzer = AutoChartAnalyzer()
-let analysis = try await analyzer.analyze(
-    dataset,
+let cache = AutoChartCache()
+let analyzer = AutoChartAnalyzer(cache: cache)
+let request = try AutoChartRequest(
+    table: dataset,
     context: AutoChartContext(goal: .comparison))
-
-if let primary = analysis.primaryChart {
-    AutoChartView(preparedChart: primary)
-}
+let analysis = try await analyzer.analyze(
+    request,
+    preference: .automatic,
+    preparation: .preferredOrPrimary)
 ```
 
-Retain the analyzer at the scope where reuse should occur and retain each
-``AutoChartAnalysis`` in async view state. An analysis remains usable after the
-analyzer is trimmed or cleared.
+Retain ``AutoChartCache`` at the scope where analyzers and sessions should share
+reuse. An ``AutoChartAnalysis`` remains usable after the cache is trimmed.
 
 ## Topics
 
@@ -31,7 +32,6 @@ analyzer is trimmed or cleared.
 - <doc:GettingStarted>
 - <doc:ModelingTypedTables>
 - <doc:GeneratingRecommendations>
-- <doc:RenderingAndInteraction>
 - <doc:CustomSpecifications>
 
 ### Input and Meaning
@@ -40,7 +40,7 @@ analyzer is trimmed or cleared.
 - ``AutoChartTable``
 - ``AutoChartRow``
 - ``AutoChartColumn``
-- ``AutoChartColumnHints``
+- ``AutoChartColumnSemantics``
 - ``AutoChartMeasureSemantics``
 - ``AutoChartTableMetadata``
 
@@ -49,23 +49,24 @@ analyzer is trimmed or cleared.
 - <doc:PreparedAnalysisAndCaching>
 - <doc:OutcomesAndResolution>
 - ``AutoChartAnalyzer``
+- ``AutoChartCache``
+- ``AutoChartRequest``
 - ``AutoChartAnalysis``
 - ``AutoChartRecommendationOutcome``
+- ``AutoChartRecommendationCatalog``
 - ``AutoChartRecommendation``
 - ``AutoChartPreparedChart``
 - ``AutoChartColumnProfile``
 - ``AutoChartDecisionTrace``
 
-### Rendering and Presentation
+### Formatting and Selection Models
 
-- ``AutoChartView``
-- ``AutoChartPlot``
-- ``AutoChartPresentation``
 - ``AutoChartFormatters``
 - ``AutoChartFormattingRequest``
 - ``AutoChartFormattingPurpose``
 - ``AutoChartAppliedAggregation``
 - ``AutoChartSelection``
+- ``AutoChartSelectionSet``
 - ``AutoChartTextResolver``
 
 ### Design

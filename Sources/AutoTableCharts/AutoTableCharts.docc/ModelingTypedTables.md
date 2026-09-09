@@ -25,8 +25,8 @@ key, or composite value. IDs must be unique within one table. Conditional
 | Date | `.date` | Temporal |
 | Binary | `.binary` | Unsupported for chart channels |
 
-Explicit semantic type and role hints take precedence over inference. Unit
-hints control formatting but never authorize arithmetic.
+Explicit ``AutoChartColumnSemantics`` cases take precedence over inference.
+Units control formatting but never authorize arithmetic.
 
 ### Describe measure truth
 
@@ -50,6 +50,7 @@ views with diagnostics.
 
 ### Supply a reuse key
 
-``AutoChartDataKey`` avoids repeated fingerprint scans. Its revision must change
-for row order, row IDs, values, columns, hints, or metadata. If that contract is
-inconvenient, omit the key and let the analyzer fingerprint and compare input.
+Use ``AutoChartDataKey/trusted(identity:revision:)`` to avoid repeated cell
+reads; its revision must change for row order, row IDs, values, columns,
+semantics, or metadata. Use ``AutoChartDataKey/contentAddressed(identity:)`` to
+snapshot and collision-check complete contents before reuse.

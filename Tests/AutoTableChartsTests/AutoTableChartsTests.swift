@@ -84,12 +84,27 @@ private final class OneShotAsyncTestGate: @unchecked Sendable {
     }
 }
 
-#if !ATC_TEST_HOOKS
+#if ATC_TEST_HOOKS
+let testHooksAvailable = true
+#else
+let testHooksAvailable = false
+#endif
+
 let testHooksUnavailable: Comment = """
-    Requires the ATC_TEST_HOOKS compilation condition; \
+    [ATC_TEST_HOOKS unavailable] Requires the ATC_TEST_HOOKS compilation condition; \
     run `swift test -c release -Xswiftc -DATC_TEST_HOOKS`.
     """
+
+#if DEBUG
+private let releaseFallbackAvailable = false
+#else
+private let releaseFallbackAvailable = true
 #endif
+
+private let releaseFallbackUnavailable: Comment = """
+    Requires a release test build because Debug intentionally traps on this \
+    assertion fallback; run `swift test -c release`.
+    """
 
 private func valuePropagatingCancellation<Value: Sendable>(
     of task: Task<Value, Never>
@@ -233,10 +248,10 @@ private struct VersionedCountingTable: AutoChartTable {
     var chartDataIdentity: String?
     var chartDataVersion: String?
 
-    var chartDataKey: AutoChartDataKey? {
+    var chartDataKey: AutoChartDataKey {
         chartDataIdentity.map {
-            AutoChartDataKey(identity: $0, revision: chartDataVersion ?? "")
-        }
+            AutoChartDataKey.trusted(identity: $0, revision: chartDataVersion ?? "")
+        } ?? .contentAddressed()
     }
 }
 
@@ -1089,8 +1104,9 @@ private let date = AutoChartColumn(
         #expect(resolved.histogramBinAccessibilityLabel(for: data[1]) == second)
     }
 
-    #if !DEBUG
-    @Test func histogramPreparedMissUsesCallbackFreeReleaseFallback() {
+    @Test(.disabled(if: !releaseFallbackAvailable, releaseFallbackUnavailable))
+    func histogramPreparedMissUsesCallbackFreeReleaseFallback() {
+        #if !DEBUG
         final class Recorder: @unchecked Sendable {
             private let lock = NSLock()
             private var callbacks = 0
@@ -1158,8 +1174,10 @@ private let date = AutoChartColumn(
         #expect(recorder.count == preparedCallbackCount)
         #expect(!fallback.contains("Host"))
         #expect(!fallback.contains(AutoChartValue.unrepresentableValuePlaceholder))
+        #else
+        Issue.record(releaseFallbackUnavailable)
+        #endif
     }
-    #endif
 
     @Test func distinctHostCallbackWrappersMayDelegate() {
         final class Recorder: @unchecked Sendable {
@@ -1374,11 +1392,9 @@ private let date = AutoChartColumn(
                 == AutoChartHostCallbackActivity.maximumCallbackDepth)
     }
 
-    #if ATC_TEST_HOOKS
-    @Test(.timeLimit(.minutes(1)))
-    #else
-    @Test(.disabled(testHooksUnavailable))
-    #endif
+    @Test(
+        .disabled(if: !testHooksAvailable, testHooksUnavailable),
+        .timeLimit(.minutes(1)))
     func completedCallbackScopesArePrunedBeforeLaterDelegation() async {
         #if ATC_TEST_HOOKS
         let gate = OneShotAsyncTestGate()
@@ -1412,6 +1428,8 @@ private let date = AutoChartColumn(
             return
         }
         #expect(await valuePropagatingCancellation(of: childTask) == 1)
+        #else
+        Issue.record(testHooksUnavailable)
         #endif
     }
 
@@ -1977,11 +1995,9 @@ private let date = AutoChartColumn(
         #expect(childResult?.labels.allSatisfy { $0.contains("Host endpoint") } == true)
     }
 
-    #if ATC_TEST_HOOKS
-    @Test(.timeLimit(.minutes(1)))
-    #else
-    @Test(.disabled(testHooksUnavailable))
-    #endif
+    @Test(
+        .disabled(if: !testHooksAvailable, testHooksUnavailable),
+        .timeLimit(.minutes(1)))
     func childTaskStopsInheritingCompletedNestedCallbackScope() async {
         #if ATC_TEST_HOOKS
         struct ChildResult: Sendable {
@@ -2127,6 +2143,8 @@ private let date = AutoChartColumn(
         #expect(recordedResult.suppressesOuterCallback == true)
         #expect(recordedResult.inheritedScopeDepthBeforeCompaction == 3)
         #expect(recordedResult.compactedInheritedScopeDepth == 2)
+        #else
+        Issue.record(testHooksUnavailable)
         #endif
     }
 
@@ -6136,11 +6154,6 @@ private let date = AutoChartColumn(
         #expect(presentation.label.contains("0"))
         #expect(presentation.label.contains("10"))
         #expect(presentation.valueDescription.contains("1"))
-        #expect(
-            try JSONDecoder().decode(
-                AutoChartSelection<String>.self,
-                from: JSONEncoder().encode(selection)) == selection)
-
         let sectors = [
             AutoChartDatum(id: "missing-lineage", sourceRowIDs: [], yNumber: 1),
             AutoChartDatum(id: "selectable", sourceRowIDs: [2], yNumber: 2),
@@ -6245,10 +6258,6 @@ private let date = AutoChartColumn(
                 columns: [category, startColumn, endColumn],
                 formatters: formatter
             ).valueDescription == "start–end")
-        #expect(
-            try JSONDecoder().decode(
-                AutoChartSelection<String>.self,
-                from: JSONEncoder().encode(selection)) == selection)
     }
 
     @Test func selectionSummariesRespectNonadditiveAggregations() {

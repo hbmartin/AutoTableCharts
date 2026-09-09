@@ -606,7 +606,7 @@ extension AutoChartSelection {
             resolvedDimensionLabel: { _ in nil })
     }
 
-    func presentation(
+    package func presentation(
         columns: [AutoChartColumn],
         formatters: AutoChartFormatters,
         textResolver: AutoChartTextResolver,
@@ -709,7 +709,7 @@ extension AutoChartSelection {
                 defaultText:
                     "\(sourceRowIDs.count) source \(sourceRowIDs.count == 1 ? "row" : "rows")")
         }
-        let resolvedLabel = label.isEmpty ? family.displayName : label
+        let resolvedLabel = label.isEmpty ? textResolver(family.localizationMessage) : label
         let valueDescription = textResolver(valueMessage)
         let summary = textResolver(
             AutoChartMessage(

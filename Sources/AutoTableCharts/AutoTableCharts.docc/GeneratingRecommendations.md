@@ -4,26 +4,30 @@ Inspect typed outcomes, rationales, diagnostics, profiles, and optional decision
 
 ## Overview
 
-``AutoChartAnalyzer/analyze(_:context:options:)`` returns an immutable
+``AutoChartAnalyzer/analyze(_:preference:preparation:progress:)`` accepts an
+identity-bearing ``AutoChartRequest`` and returns an immutable
 ``AutoChartAnalysis``. The context goal affects ranking but never bypasses hard
-validation. Options bound candidate count and visual density without sampling
-the supplied rows.
+validation. Options bound visual density without sampling supplied rows, while
+``AutoChartRecommendationConstraints`` filter candidate families and columns
+before expensive validation.
 
 ```swift
-let analysis = try await analyzer.analyze(
-    dataset,
+let request = try AutoChartRequest(
+    table: dataset,
     context: AutoChartContext(goal: .trend, title: "Monthly Revenue"),
-    options: AutoChartOptions(
-        maximumRecommendations: 3,
-        includesDecisionTrace: true))
+    options: AutoChartOptions(includesDecisionTrace: true))
+let analysis = try await analyzer.analyze(
+    request,
+    preference: .automatic,
+    preparation: .preferredOrPrimary)
 ```
 
 Switch on the outcome:
 
 ```swift
 switch analysis.outcome {
-case .charts(let recommendations):
-    if let primary = recommendations.first {
+case .charts(let catalog):
+    if let primary = catalog.primary {
         presentChart(primary)
     } else {
         presentTable(message: "No chart recommendation is available.")
@@ -40,10 +44,13 @@ counts and ranges without retaining raw public values. Enable the trace to
 inspect inferred semantics, ranks, scores, exclusions, and stable rejection
 codes.
 
-Use ``AutoChartAnalysis/resolve(_:)`` for a persisted
-``AutoChartRecommendationID``. Resolution distinguishes an exact match, a
-default caused by no preference, a changed policy, or an unavailable
-specification, and a table-only outcome.
+Use ``AutoChartAnalysis/resolve(_:)->AutoChartPreferenceResolution`` for a
+persisted ``AutoChartPreference``. Resolution distinguishes an exact match, an
+automatic or recommended default, a changed policy, an unavailable
+specification, and a table-only outcome. Its replacement preference can be
+persisted by the host using its own ordering or compare-and-swap policy.
 
-The primary recommendation is always prepared during analysis. Calling
-`AutoChartAnalysis.prepare(_:)` for another ID is explicit asynchronous work.
+Preparation follows ``AutoChartPreparationStrategy``. A table preference
+prepares no chart, a valid saved preference prepares that exact chart, and an
+automatic preference prepares the primary when requested. Calling
+`AutoChartAnalysis.prepare(_:)` remains explicit asynchronous work.

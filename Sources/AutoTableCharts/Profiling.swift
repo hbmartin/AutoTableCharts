@@ -9,14 +9,14 @@ private func dateBits(_ date: Date) -> UInt64 {
     return (interval == 0 ? 0.0 : interval).bitPattern
 }
 
-struct AutoChartErasedRowID: @unchecked Sendable, Hashable, CustomStringConvertible {
+package struct AutoChartErasedRowID: @unchecked Sendable, Hashable, CustomStringConvertible {
     private let value: AnyHashable
 
     init<RowID: Hashable & Sendable>(_ value: RowID) {
         self.value = AnyHashable(value)
     }
 
-    var description: String { String(describing: value.base) }
+    package var description: String { String(describing: value.base) }
 
     var estimatedRetainedCost: Int {
         let payloadCost = switch value.base {
@@ -30,33 +30,33 @@ struct AutoChartErasedRowID: @unchecked Sendable, Hashable, CustomStringConverti
     }
 }
 
-struct AutoChartSnapshot: Sendable {
-    struct RowValues: Sendable {
-        let storage: AutoChartMatrixStorage
-        let rowIndex: Int
+package struct AutoChartSnapshot: Sendable {
+    package struct RowValues: Sendable {
+        package let storage: AutoChartMatrixStorage
+        package let rowIndex: Int
 
-        subscript(columnID: AutoChartColumnID) -> AutoChartValue? {
+        package subscript(columnID: AutoChartColumnID) -> AutoChartValue? {
             storage.value(row: rowIndex, columnID: columnID)
         }
 
-        subscript(columnIndex: Int) -> AutoChartValue {
+        package subscript(columnIndex: Int) -> AutoChartValue {
             storage.value(row: rowIndex, columnIndex: columnIndex)
         }
     }
 
-    struct Row: Sendable {
+    package struct Row: Sendable {
         /// Internal source offset. Public typed IDs are retained by `AutoChartAnalysis`.
-        let id: Int
-        let values: RowValues
+        package let id: Int
+        package let values: RowValues
     }
 
-    let storage: AutoChartMatrixStorage
-    let rowIdentities: [AutoChartErasedRowID]
-    let rows: [Row]
-    let validationIdentity: UUID
+    package let storage: AutoChartMatrixStorage
+    package let rowIdentities: [AutoChartErasedRowID]
+    package let rows: [Row]
+    package let validationIdentity: UUID
 
-    var columns: [AutoChartColumn] { storage.columns }
-    var metadata: AutoChartTableMetadata { storage.metadata }
+    package var columns: [AutoChartColumn] { storage.columns }
+    package var metadata: AutoChartTableMetadata { storage.metadata }
 
     init<Table: AutoChartTable>(_ table: Table) {
         do {
@@ -402,8 +402,8 @@ public struct AutoChartColumnProfile: Sendable {
     }
 }
 
-enum AutoChartProfiler {
-    static let posixLocale = Locale(identifier: "en_US_POSIX")
+package enum AutoChartProfiler {
+    package static let posixLocale = Locale(identifier: "en_US_POSIX")
 
     static func profiles(_ snapshot: AutoChartSnapshot) -> [AutoChartColumnProfile] {
         snapshot.columns.enumerated().map { columnIndex, column in
@@ -669,7 +669,7 @@ enum AutoChartProfiler {
         return Int(component)
     }
 
-    static func identity(
+    package static func identity(
         _ value: AutoChartValue?,
         semanticType: AutoChartSemanticType?
     ) -> AutoChartValueIdentity {
@@ -926,7 +926,7 @@ enum AutoChartProfiler {
     }
 }
 
-enum AutoChartValueIdentity: Hashable, Sendable {
+package enum AutoChartValueIdentity: Hashable, Sendable {
     case missing
     case boolean(Bool)
     case integer(Int64)
@@ -937,7 +937,7 @@ enum AutoChartValueIdentity: Hashable, Sendable {
     case text(String)
     case date(UInt64)
 
-    var stringValue: String? {
+    package var stringValue: String? {
         switch self {
         case .missing:
             nil

@@ -1,6 +1,6 @@
 # Getting Started
 
-Build a typed dataset, retain an async analysis, and render its eager primary chart.
+Build a typed dataset, create an identity-bearing request, and analyze it through a shared cache.
 
 ## Overview
 
@@ -14,14 +14,13 @@ let dataset = try AutoChartDataset<Int>(
     columns: [
         AutoChartColumn(
             id: "propertyType", name: "Property Type",
-            hints: .init(semanticType: .nominal, role: .dimension)),
+            semantics: .dimension(semanticType: .nominal)),
         AutoChartColumn(
             id: "marketValue", name: "Market Value",
-            hints: .init(
+            semantics: .measure(
                 semanticType: .quantitative,
-                role: .measure,
                 unit: .currency(code: "USD"),
-                measureSemantics: .init(
+                semantics: .init(
                     source: .aggregated(.sum),
                     rollup: .additive,
                     preferredTransform: .sum))),
@@ -31,70 +30,50 @@ let dataset = try AutoChartDataset<Int>(
         [.text("Industrial"), .double(14_500_000)],
     ],
     metadata: .init(grain: "property type"),
-    key: .init(identity: "portfolio-summary", revision: "2026-08-20"))
+    key: .trusted(identity: "portfolio-summary", revision: "2026-08-20"))
 ```
 
 Use the explicit-row-ID initializer for UUIDs, database keys, or other domain
 identities. Dataset initialization throws ``AutoChartDatasetError`` rather than
 silently fixing malformed matrices or duplicate IDs.
 
-### Analyze once
+### Analyze through shared package state
 
-Keep one analyzer at the application or feature scope that should share reuse.
-Store the result in async state:
-
-```swift
-@MainActor
-final class ChartState: ObservableObject {
-    let analyzer: AutoChartAnalyzer
-    @Published var analysis: AutoChartAnalysis<Int>?
-    @Published var error: Error?
-    private var analysisTask: Task<Void, Never>?
-
-    init(analyzer: AutoChartAnalyzer) {
-        self.analyzer = analyzer
-    }
-
-    func load(_ dataset: AutoChartDataset<Int>) {
-        analysisTask?.cancel()
-        analysisTask = Task {
-            do {
-                let nextAnalysis = try await self.analyzer.analyze(
-                    dataset,
-                    context: .init(goal: .comparison),
-                    options: .init(includesDecisionTrace: true))
-                try Task.checkCancellation()
-                self.analysis = nextAnalysis
-                self.error = nil
-            } catch is CancellationError {
-                // A newer load owns the state now.
-            } catch {
-                self.error = error
-            }
-        }
-    }
-}
-```
-
-Analysis includes summarized public column profiles, typed diagnostics, an
-optional full decision trace, a typed outcome, and the eagerly prepared primary.
-
-### Render the primary or a fallback
+Keep one ``AutoChartCache`` at the application or feature scope where analyzers
+and UI sessions should share reuse. Create a request whose identity includes the
+data contract, context, options, constraints, and recommendation policy version:
 
 ```swift
-if let analysis = state.analysis {
-    AutoChartView(
-        analysis: analysis,
-        selection: $selection,
-        presentation: .preview(plotHeight: 156))
-} else {
-    ExistingTableView()
-}
+let cache = AutoChartCache()
+let analyzer = AutoChartAnalyzer(cache: cache)
+let request = try AutoChartRequest(
+    table: dataset,
+    context: .init(goal: .comparison),
+    options: .init(includesDecisionTrace: true))
+let analysis = try await analyzer.analyze(
+    request,
+    preference: .automatic,
+    preparation: .preferredOrPrimary)
 ```
 
-`AutoChartView(analysis:)` presents the primary or the package fallback. Many
-applications instead switch on `analysis.outcome` and keep their existing table
-UI for `.tableFallback`.
+Analysis includes a process-scoped identity and request identity, exact retained
+cost, summarized public column profiles, typed diagnostics, an optional full
+decision trace, a bounded recommendation catalog, preference resolution, and
+the charts selected by the preparation strategy.
+
+### Adopt the UI product
+
+```swift
+import AutoTableChartsUI
+
+let session = AutoChartSession<Int>(cache: cache)
+session.load(request, preference: .automatic)
+```
+
+`AutoChartSession` owns supersession, cancellation, preference-aware
+preparation, warm-cache adoption, retries, and alternative selection. Use
+`AutoChartSessionView` for package defaults or switch on session state to retain
+an existing table and failure UI.
 
 ### Prepare an alternative
 
@@ -106,16 +85,15 @@ UI for `.tableFallback`.
 }
 ```
 
-The task should be cancellable and keyed by recommendation ID. Render the
-returned immutable chart synchronously with `AutoChartView(preparedChart:)`.
+The UI session performs this cancellable work with `session.select(id)`.
 
-See <doc:SafetySemanticsAndCompleteness> for measure contracts and
-<doc:RenderingAndInteraction> for formatting and semantic selection.
+See <doc:SafetySemanticsAndCompleteness> for measure contracts. The
+`AutoTableChartsUI` documentation covers presentation and interaction.
 
-### Migrate from v1
+### Migrate to v3
 
-Version 2 removes the synchronous engine, global render cache, string row ID,
-table-based rendering initializers, table pseudo-family, aggregation-safety
-enum, and combined interaction preset. Adopt ``AutoChartAnalyzer``, a typed
-`RowID`, ``AutoChartMeasureSemantics``, prepared-only rendering, typed outcomes,
-and ``AutoChartPresentation``. There are no compatibility wrappers.
+Version 3 replaces optional cache keys with explicit trusted or
+content-addressed modes, recommendation arrays with catalogs, mutable family
+encodings with associated-value specifications, contradictory hints with
+``AutoChartColumnSemantics``, and scattered lifecycle errors with
+``AutoChartFailure``. It is intentionally source breaking and has no v2 facade.

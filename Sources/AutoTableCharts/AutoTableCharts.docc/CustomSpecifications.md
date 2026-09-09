@@ -29,7 +29,7 @@ guard validation.isValid else {
 }
 
 let prepared = try await analysis.prepare(specification)
-AutoChartView(preparedChart: prepared)
+present(prepared)
 ```
 
 Validation checks referenced columns, channel compatibility, completeness,

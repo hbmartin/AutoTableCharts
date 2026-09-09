@@ -3,9 +3,9 @@
 [![DocC](https://github.com/hbmartin/AutoTableCharts/actions/workflows/docc.yml/badge.svg)](https://github.com/hbmartin/AutoTableCharts/actions/workflows/docc.yml)
 
 AutoTableCharts turns typed tabular data into deterministic, semantically safe
-native Swift Charts. Version 2 uses an instance-owned asynchronous analyzer: one
-analysis contains inspectable recommendations and an eagerly prepared primary
-chart, while alternatives are prepared explicitly.
+chart recommendations. Version 3 separates the Foundation-only analysis and
+preparation core from the `AutoTableChartsUI` SwiftUI/Charts product, and adds a
+shared cache plus observable sessions for application lifecycle orchestration.
 
 The package is offline, does not sample rows, and never mutates caller storage.
 
@@ -31,100 +31,61 @@ dependencies: [
 
 ## Quickstart
 
-Create an immutable dataset, retain an analyzer at application scope, and load
-the analysis into async view state:
+Create an immutable dataset, retain one package cache at application scope, and
+load an identity-bearing request through an observable session:
 
 ```swift
-import AutoTableCharts
+import AutoTableChartsUI
 import SwiftUI
 
-@MainActor
-final class ChartModel: ObservableObject {
-    let analyzer = AutoChartAnalyzer()
-    @Published var analysis: AutoChartAnalysis<Int>?
-
-    func load() async throws {
-        let dataset = try AutoChartDataset<Int>(
-            columns: [
-                AutoChartColumn(
-                    id: "region", name: "Region",
-                    hints: .init(semanticType: .nominal, role: .dimension)),
-                AutoChartColumn(
-                    id: "revenue", name: "Revenue",
-                    hints: .init(
-                        semanticType: .quantitative,
-                        role: .measure,
-                        unit: .currency(code: "USD"),
-                        measureSemantics: .init(
-                            source: .aggregated(.sum),
-                            rollup: .additive,
-                            preferredTransform: .sum))),
-            ],
-            rows: [
-                [.text("North"), .double(12_000)],
-                [.text("South"), .double(9_500)],
-            ],
-            key: AutoChartDataKey(identity: "quarterly-revenue", revision: "2026-Q3"))
-
-        analysis = try await analyzer.analyze(
-            dataset,
-            context: AutoChartContext(goal: .comparison))
-    }
-}
-
 struct ResultChart: View {
-    @ObservedObject var model: ChartModel
-    @State private var selection: AutoChartSelection<Int>?
+    let request: AutoChartRequest<Int>
+    @State private var session: AutoChartSession<Int>
+
+    init(request: AutoChartRequest<Int>, cache: AutoChartCache) {
+        self.request = request
+        _session = State(initialValue: AutoChartSession(cache: cache))
+    }
 
     var body: some View {
-        if let analysis = model.analysis {
-            AutoChartView(
-                analysis: analysis,
-                selection: $selection,
-                presentation: .explorer(plotHeight: 320))
-        } else {
-            ProgressView()
-        }
+        AutoChartSessionView(session: session)
+            .task { session.load(request, preference: .automatic) }
     }
 }
 ```
 
-`analysis.primaryChart` is already prepared. To render another recommendation,
-call `try await analysis.prepare(recommendation.id)` and pass the returned value
-to `AutoChartView(preparedChart:)`.
+Construct SQL-style data with `AutoChartDataset` and
+`.trusted(identity:revision:)` or `.contentAddressed(identity:)`. Domain models
+can use the `Dimension`, `Measure`, `Identifier`, and paired `Interval` result
+builder declarations.
 
-## v2 behavior
+## v3 behavior
 
 - `RowID` is a caller-defined `Hashable & Sendable` type and is preserved by
   prepared marks and `AutoChartSelection<RowID>`.
 - `AutoChartDataset` validates widths and unique row/column IDs; arbitrary table
   conformances are validated before analysis as well.
-- Measure hints describe source provenance and rollup policy. Unknown and
+- Coherent column semantics describe source provenance and rollup policy. Unknown and
   non-additive values cannot be implicitly aggregated. Composition additionally
   requires complete, positive, additive values.
-- `AutoChartRecommendationOutcome` distinguishes chart recommendations from a
-  typed table fallback. Persist `AutoChartRecommendationID`, which combines the
-  recommendation policy with a structural specification ID.
-- Rendering accepts only `AutoChartPreparedChart`. `AutoChartPlot` contains the
-  plot and gestures; `AutoChartView` adds configurable chrome.
+- `AutoChartRecommendationCatalog` exposes at most five featured choices and
+  fifty cataloged choices, while preserving a valid off-list preference.
+- `AutoChartPreference` separates automatic, table, recommended chart, and
+  specific-chart choices from request identity.
+- `AutoChartSession` owns supersession, cancellation, preparation, retries,
+  selection provenance, and warm adoption from a shared `AutoChartCache`.
 - Formatting, localization, accessibility, and semantic selection presentation
   happen at presentation time and do not affect preparation cache keys.
-- Cache ownership belongs to each `AutoChartAnalyzer`. Use `trim(to:)`,
-  `removeAll()`, and `cacheStatistics` to manage and inspect retained state.
+- Cache ownership belongs to `AutoChartCache`. Use `trim(to:)`, `removeAll()`,
+  synchronous completed-analysis lookup, and `statistics()` to inspect it.
 
-## Breaking migration from v1
+## Breaking migration to v3
 
-Version 2 intentionally has no source-compatibility layer. Replace
-`AutoChartEngine` with an owned `AutoChartAnalyzer`; replace table-based view
-initializers with `AutoChartPreparedChart`; replace `AutoChartRowID` with your
-own `RowID`; replace `aggregation`/`aggregationSafety` hints with
-`AutoChartMeasureSemantics`; and switch on `AutoChartRecommendationOutcome`
-instead of treating a table as a chart family. The global render cache and
-`AutoChartInteraction` are removed. Persist `AutoChartRecommendationID` and use
-`AutoChartPresentation` for independent chrome, interaction, and plot sizing.
-`AutoChartPresentation.plotHeight` now defaults to `280`, while
-`AutoChartPlot.plotHeight` defaults to `180`. Existing hosts that already supply
-a bounded plot height can pass `nil` to preserve SwiftUI-managed sizing.
+Version 3 intentionally has no v2 compatibility facade. Adopt
+`AutoChartRequest`, `AutoChartCache`, `AutoChartPreference`, catalog outcomes,
+associated-value family specifications, `AutoChartColumnSemantics`, and the
+separate `AutoTableChartsUI` product. Package failures now use
+`AutoChartFailure`; cancellation remains cancellation.
 
 ## Documentation and development
 
@@ -133,16 +94,18 @@ a bounded plot height can pass `nil` to preserve SwiftUI-managed sizing.
 ```sh
 swift test
 
-# Build the consumer configuration and verify that neither its object symbols
-# nor its serialized module metadata contains test-only hooks.
+# Build the consumer configuration in a clean scratch directory and verify that
+# neither its object symbols nor serialized module metadata contains test hooks.
 Scripts/verify-release-library.sh
 
-# Verify that every hook-dependent test is reported as skipped rather than
-# silently omitted from the consumer-configuration test run.
-Scripts/verify-release-test-skips.sh
+# Verify both halves of the hook-dependent test contract from one manifest:
+# explicit skips without hooks and actual execution with hooks.
+Scripts/verify-release-tests.sh without-hooks
+Scripts/verify-release-tests.sh with-hooks
 
-# Re-enable the test-only hooks to execute the complete release test suite.
-swift test -c release -Xswiftc -DATC_TEST_HOOKS
+# After an Xcode Release build, audit the consumer object and every architecture's
+# serialized module metadata from that build as well.
+Scripts/verify-release-library.sh --xcode-derived-data /path/to/DerivedData
 
 swift package --allow-writing-to-directory .build/docc generate-documentation \
   --target AutoTableCharts \

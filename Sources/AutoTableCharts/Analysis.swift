@@ -105,6 +105,12 @@ public struct AutoChartCacheStatistics: Hashable, Codable, Sendable {
     public var analyses: AutoChartCacheLayerStatistics
     public var preparedCharts: AutoChartCacheLayerStatistics
     public var inFlightRequests: Int
+    public var retainedCost: Int {
+        let first = tables.retainedCost.addingReportingOverflow(analyses.retainedCost)
+        guard !first.overflow else { return Int.max }
+        let total = first.partialValue.addingReportingOverflow(preparedCharts.retainedCost)
+        return total.overflow ? Int.max : total.partialValue
+    }
 
     public init(
         tables: AutoChartCacheLayerStatistics = .init(),
@@ -126,7 +132,7 @@ public enum AutoChartPreparationError: Error, Sendable {
 
 /// Failures caused by analyzer lifecycle operations rather than by chart data.
 public enum AutoChartAnalyzerError: Error, Hashable, Sendable {
-    /// ``AutoChartAnalyzer/removeAll()`` invalidated one analysis attempt and
+    /// ``AutoChartCache/removeAll()`` invalidated one analysis attempt and
     /// every permitted transparent retry.
     case resetRetryLimitExceeded(maximumRetries: Int)
 }
@@ -173,8 +179,11 @@ final class AutoChartPreparedSource<RowID: Hashable & Sendable>: Sendable {
     }
 }
 
-/// Immutable mark preparation consumed by ``AutoChartPlot`` and ``AutoChartView``.
+/// Immutable mark preparation consumed by renderers such as the
+/// `AutoTableChartsUI` product.
 public struct AutoChartPreparedChart<RowID: Hashable & Sendable>: Sendable {
+    public let id: AutoChartPreparedChartID
+    public let estimatedRetainedCost: Int
     public let recommendation: AutoChartRecommendation
     public let validation: AutoChartValidationResult
     public let marks: [AutoChartPreparedMark<RowID>]
@@ -187,14 +196,17 @@ public struct AutoChartPreparedChart<RowID: Hashable & Sendable>: Sendable {
         return result
     }
 
-    let sourceRowIDs: [RowID]
-    let core: AutoChartRenderCore
+    package let sourceRowIDs: [RowID]
+    package let core: AutoChartRenderCore
 
     init(
         source: AutoChartPreparedSource<RowID>,
         recommendation: AutoChartRecommendation,
-        core: AutoChartRenderCore
+        core: AutoChartRenderCore,
+        estimatedRetainedCost: Int
     ) {
+        self.id = AutoChartPreparedChartID()
+        self.estimatedRetainedCost = estimatedRetainedCost
         self.recommendation = recommendation
         self.validation = core.validation
         self.sourceRowIDs = source.rowIDs
@@ -218,6 +230,8 @@ public struct AutoChartPreparedChart<RowID: Hashable & Sendable>: Sendable {
         precondition(
             cached.recommendation.specification.id == recommendation.specification.id,
             "Prepared charts can only adapt to the same structural specification.")
+        self.id = cached.id
+        self.estimatedRetainedCost = cached.estimatedRetainedCost
         self.recommendation = recommendation
         self.validation = cached.validation
         self.marks = cached.marks
@@ -225,7 +239,7 @@ public struct AutoChartPreparedChart<RowID: Hashable & Sendable>: Sendable {
         self.core = cached.core
     }
 
-    func rowIDs(for offsets: Set<Int>) -> Set<RowID> {
+    package func rowIDs(for offsets: Set<Int>) -> Set<RowID> {
         Set(offsets.compactMap { sourceRowIDs.indices.contains($0) ? sourceRowIDs[$0] : nil })
     }
 }
@@ -277,38 +291,53 @@ final class AutoChartAnalysisPreparationProvider<RowID: Hashable & Sendable>: Se
 
 /// Retainable result of one analyzer request.
 public struct AutoChartAnalysis<RowID: Hashable & Sendable>: Sendable {
+    public let id: AutoChartAnalysisID
+    public let request: AutoChartRequestID
+    public let estimatedRetainedCost: Int
     public let outcome: AutoChartRecommendationOutcome
     public let columnProfiles: [AutoChartColumnProfile]
     public let diagnostics: [AutoChartDiagnostic]
     public let decisionTrace: AutoChartDecisionTrace?
     public let primaryChart: AutoChartPreparedChart<RowID>?
+    public let preparedCharts: [AutoChartRecommendationID: AutoChartPreparedChart<RowID>]
+    public let preferenceResolution: AutoChartPreferenceResolution?
 
     private let provider: AutoChartAnalysisPreparationProvider<RowID>
 
     init(
+        id: AutoChartAnalysisID,
+        request: AutoChartRequestID,
+        estimatedRetainedCost: Int,
         outcome: AutoChartRecommendationOutcome,
         profiles: [AutoChartColumnProfile],
         diagnostics: [AutoChartDiagnostic],
         decisionTrace: AutoChartDecisionTrace?,
         primaryChart: AutoChartPreparedChart<RowID>?,
+        preparedCharts: [AutoChartRecommendationID: AutoChartPreparedChart<RowID>] = [:],
+        preferenceResolution: AutoChartPreferenceResolution? = nil,
         provider: AutoChartAnalysisPreparationProvider<RowID>
     ) {
+        self.id = id
+        self.request = request
+        self.estimatedRetainedCost = estimatedRetainedCost
         self.outcome = outcome
         self.columnProfiles = profiles
         self.diagnostics = diagnostics
         self.decisionTrace = decisionTrace
         self.primaryChart = primaryChart
+        self.preparedCharts = preparedCharts
+        self.preferenceResolution = preferenceResolution
         self.provider = provider
     }
 
-    public func resolve(
+    func resolve(
         _ persistedID: AutoChartRecommendationID?
     ) -> AutoChartRecommendationResolution {
         switch outcome {
         case .tableFallback(let fallback):
             return .unavailable(fallback)
-        case .charts(let recommendations):
-            guard let primary = recommendations.first else {
+        case .charts(let catalog):
+            guard let primary = catalog.primary else {
                 let fallback = AutoChartFallback(
                     message: AutoChartMessage(
                         category: .fallback,
@@ -326,11 +355,100 @@ public struct AutoChartAnalysis<RowID: Hashable & Sendable>: Sendable {
                         previous: persistedID.policyVersion,
                         current: AutoTableCharts.recommendationPolicyVersion))
             }
-            if let exact = recommendations.first(where: { $0.id == persistedID }) {
+            if let exact = recommendation(for: persistedID) {
                 return .exact(exact)
             }
             return .defaulted(primary, reason: .specificationUnavailable)
         }
+    }
+
+    /// Resolves the v3 preference independently from preparation strategy.
+    public func resolve(
+        _ preference: AutoChartPreference
+    ) -> AutoChartPreferenceResolution {
+        if case .table = preference {
+            return AutoChartPreferenceResolution(
+                recommendation: nil, usesTable: true)
+        }
+        guard case .charts(let catalog) = outcome, let primary = catalog.primary else {
+            return AutoChartPreferenceResolution(
+                recommendation: nil,
+                defaultReason: .noSafeChart,
+                replacementPreference: preference == .automatic ? nil : .automatic,
+                usesTable: true)
+        }
+        switch preference {
+        case .automatic:
+            return AutoChartPreferenceResolution(
+                recommendation: primary, defaultReason: .automatic)
+        case .table:
+            preconditionFailure("Handled above.")
+        case .chart(.recommended):
+            return AutoChartPreferenceResolution(
+                recommendation: primary, defaultReason: .recommended)
+        case .chart(.specific(let id)):
+            guard id.policyVersion == AutoTableCharts.recommendationPolicyVersion else {
+                return AutoChartPreferenceResolution(
+                    recommendation: primary,
+                    defaultReason: .policyVersionChanged(
+                        previous: id.policyVersion,
+                        current: AutoTableCharts.recommendationPolicyVersion),
+                    replacementPreference: .chart(.recommended))
+            }
+            if let exact = recommendation(for: id) {
+                return AutoChartPreferenceResolution(recommendation: exact)
+            }
+            return AutoChartPreferenceResolution(
+                recommendation: primary,
+                defaultReason: .specificationUnavailable,
+                replacementPreference: .chart(.recommended))
+        }
+    }
+
+    func replacingPresentation(
+        request: AutoChartRequestID? = nil,
+        preparedCharts: [AutoChartRecommendationID: AutoChartPreparedChart<RowID>],
+        resolution: AutoChartPreferenceResolution?
+    ) -> Self {
+        let primary = resolution?.recommendation.flatMap { preparedCharts[$0.id] }
+            ?? preparedCharts.values.first
+        let presentedOutcome: AutoChartRecommendationOutcome
+        if case .charts(let catalog) = outcome,
+            let resolved = resolution?.recommendation,
+            catalog.recommendation(for: resolved.id) == nil
+        {
+            presentedOutcome = .charts(
+                AutoChartRecommendationCatalog(
+                    featured: catalog.featured,
+                    cataloged: catalog.cataloged,
+                    preferred: resolved))
+        } else {
+            presentedOutcome = outcome
+        }
+        return Self(
+            id: id,
+            request: request ?? self.request,
+            estimatedRetainedCost: estimatedRetainedCost,
+            outcome: presentedOutcome,
+            profiles: columnProfiles,
+            diagnostics: diagnostics,
+            decisionTrace: decisionTrace,
+            primaryChart: primary,
+            preparedCharts: preparedCharts,
+            preferenceResolution: resolution,
+            provider: provider)
+    }
+
+    private func recommendation(
+        for id: AutoChartRecommendationID
+    ) -> AutoChartRecommendation? {
+        guard id.policyVersion == AutoTableCharts.recommendationPolicyVersion else { return nil }
+        if case .charts(let catalog) = outcome,
+            let cataloged = catalog.recommendation(for: id)
+        {
+            return cataloged
+        }
+        return provider.recommendations.first { $0.id == id }
     }
 
     /// Validates `specification` against this analysis.
@@ -339,7 +457,8 @@ public struct AutoChartAnalysis<RowID: Hashable & Sendable>: Sendable {
     ///   stacked, normalized, or composition specification it prepares every
     ///   mark to check the aggregated numeric domain — work proportional to the
     ///   row count. Calling it from a SwiftUI `body` or a main-actor action on
-    ///   a large table will hitch. Prefer ``validation(for:)``, which does the
+    ///   a large table will hitch. Prefer
+    ///   ``validation(for:)-(AutoChartSpecification)``, which does the
     ///   same work off the caller's thread and shares the analyzer's
     ///   prepared-chart cache with ``prepare(_:)-(AutoChartSpecification)``.
     public func validate(
@@ -365,7 +484,7 @@ public struct AutoChartAnalysis<RowID: Hashable & Sendable>: Sendable {
     ///   ``AutoChartAnalyzerConfiguration/maximumRetainedCost``, so a wide
     ///   sweep can push out entries the host still wants. Validate the few
     ///   specifications actually under consideration, or call
-    ///   ``AutoChartAnalyzer/trim(to:)`` afterwards. An invalid specification
+    ///   ``AutoChartCache/trim(to:)`` afterwards. An invalid specification
     ///   is never cached.
     ///
     /// - Throws: `CancellationError` if the calling task is cancelled. An
@@ -442,13 +561,18 @@ private final class AutoChartAnyRowIDs: @unchecked Sendable {
 }
 
 private struct AutoChartCachedAnalysis<RowID: Hashable & Sendable>: Sendable {
+    let id: AutoChartAnalysisID
+    let request: AutoChartRequestID
     let source: AutoChartPreparedSource<RowID>
     let outcome: AutoChartRecommendationOutcome
     let profiles: [AutoChartColumnProfile]
     let diagnostics: [AutoChartDiagnostic]
     let trace: AutoChartDecisionTrace?
-    let primary: AutoChartPreparedChart<RowID>?
     let recommendations: [AutoChartRecommendation]
+
+    var estimatedRetainedCost: Int {
+        source.cost + 256 + recommendations.count * 512 + profiles.count * 32
+    }
 }
 
 #if ATC_TEST_HOOKS
@@ -510,6 +634,7 @@ public actor AutoChartAnalyzer {
         var table: TableKey
         var context: AutoChartContext
         var options: AutoChartOptions
+        var constraints: AutoChartRecommendationConstraints
         var policyVersion: Int
     }
 
@@ -526,6 +651,7 @@ public actor AutoChartAnalyzer {
         var table: TableKey
         var context: AutoChartContext
         var options: AutoChartOptions
+        var constraints: AutoChartRecommendationConstraints
         var policyVersion: Int
     }
 
@@ -622,6 +748,7 @@ public actor AutoChartAnalyzer {
     }
 
     private let configuration: AutoChartAnalyzerConfiguration
+    private nonisolated let sharedCache: AutoChartCache?
     #if ATC_TEST_HOOKS
     private let testHooks: AutoChartAnalyzerTestHooks
     #endif
@@ -641,8 +768,18 @@ public actor AutoChartAnalyzer {
     /// invalidates the requests themselves.
     private var cacheEpoch: UInt64 = 0
 
-    public init(configuration: AutoChartAnalyzerConfiguration = .standard) {
+    init(configuration: AutoChartAnalyzerConfiguration = .standard) {
         self.configuration = configuration
+        self.sharedCache = nil
+        #if ATC_TEST_HOOKS
+        self.testHooks = .disabled
+        #endif
+    }
+
+    /// Creates an analyzer that shares all retained work with other analyzers and sessions.
+    public init(cache: AutoChartCache) {
+        self.configuration = cache.configuration
+        self.sharedCache = cache
         #if ATC_TEST_HOOKS
         self.testHooks = .disabled
         #endif
@@ -654,11 +791,12 @@ public actor AutoChartAnalyzer {
         testHooks: AutoChartAnalyzerTestHooks
     ) {
         self.configuration = configuration
+        self.sharedCache = nil
         self.testHooks = testHooks
     }
     #endif
 
-    public var cacheStatistics: AutoChartCacheStatistics {
+    var cacheStatistics: AutoChartCacheStatistics {
         var value = statistics
         value.tables.entries = tableEntries.count
         value.analyses.entries = analysisEntries.count
@@ -679,13 +817,171 @@ public actor AutoChartAnalyzer {
     ///   ``AutoChartDatasetError`` when a table violates structural invariants, or
     ///   ``AutoChartAnalyzerError/resetRetryLimitExceeded(maximumRetries:)``
     ///   when the initial attempt and all three retries are invalidated.
-    public nonisolated func analyze<Table: AutoChartTable>(
+    nonisolated func analyze<Table: AutoChartTable>(
         _ table: Table,
         context: AutoChartContext = .init(),
-        options: AutoChartOptions = .init()
+        options: AutoChartOptions = .init(),
+        constraints: AutoChartRecommendationConstraints = .init()
     ) async throws -> AutoChartAnalysis<Table.RowID> {
         try await Self.retryingGenerationInvalidations {
-            try await self.analyzeOnce(table, context: context, options: options)
+            let outerToken = await self.beginRequest()
+            do {
+                let analysis = try await self.analyzeOnce(
+                    table,
+                    context: context,
+                    options: options,
+                    constraints: constraints)
+                let presented: AutoChartAnalysis<Table.RowID>
+                if case .charts(let catalog) = analysis.outcome,
+                    let primary = catalog.primary
+                {
+                    let prepared = try await analysis.prepare(primary.id)
+                    presented = analysis.replacingPresentation(
+                        preparedCharts: [primary.id: prepared],
+                        resolution: analysis.resolve(.automatic))
+                } else {
+                    presented = analysis
+                }
+                guard await self.finishRequestIfCurrent(outerToken) else {
+                    throw GenerationInvalidatedError()
+                }
+                return presented
+            } catch {
+                await self.finishRequest(outerToken)
+                throw error
+            }
+        }
+    }
+
+    /// Analyzes a type-erased v3 request and applies preference-aware preparation.
+    public nonisolated func analyze<RowID: Hashable & Sendable>(
+        _ request: AutoChartRequest<RowID>,
+        preference: AutoChartPreference = .automatic,
+        preparation strategy: AutoChartPreparationStrategy = .preferredOrPrimary,
+        progress: (@Sendable (AutoChartProgress) -> Void)? = nil
+    ) async throws -> AutoChartAnalysis<RowID> {
+        guard request.policyVersion == AutoTableCharts.recommendationPolicyVersion else {
+            throw AutoChartFailure(
+                stage: .recommendation,
+                kind: .invalidData,
+                isRetryable: false,
+                diagnosticID: "ATC.recommendation.unsupportedPolicyVersion",
+                message: "Recommendation policy v\(request.policyVersion) is not supported by this package build.")
+        }
+
+        let cache = sharedCache
+        let progressToken = cache?.registerProgress(
+            for: request.id, callback: progress)
+        defer { cache?.unregisterProgress(for: request.id, token: progressToken) }
+        let reportProgress: @Sendable (AutoChartProgress) -> Void = { value in
+            if let cache {
+                cache.reportProgress(value, for: request.id, fallback: progress)
+            } else {
+                progress?(value)
+            }
+        }
+        let engine = cache?.engine ?? self
+        let base: AutoChartAnalysis<RowID>
+        if let cached: AutoChartAnalysis<RowID> = cache?.completedAnalysis(for: request.id) {
+            base = cached
+        } else {
+            let dataset: AutoChartDataset<RowID>
+            do {
+                reportProgress(AutoChartProgress(phase: .materialization))
+                dataset = try request.materialize()
+                try Task.checkCancellation()
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                throw cache?.coalescedFailure(
+                    for: request.id,
+                    error: error,
+                    stage: .materialization)
+                    ?? AutoChartFailure.wrapping(error, stage: .materialization)
+            }
+
+            do {
+                reportProgress(AutoChartProgress(phase: .profiling))
+                reportProgress(AutoChartProgress(phase: .recommendation))
+                let analyzed = try await Self.retryingGenerationInvalidations {
+                    try await engine.analyzeOnce(
+                        dataset,
+                        context: request.context,
+                        options: request.options,
+                        constraints: request.constraints)
+                }
+                base = analyzed.replacingPresentation(
+                    request: request.id,
+                    preparedCharts: [:],
+                    resolution: nil)
+                cache?.store(base)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                throw cache?.coalescedFailure(
+                    for: request.id,
+                    error: error,
+                    stage: .recommendation)
+                    ?? AutoChartFailure.wrapping(error, stage: .recommendation)
+            }
+        }
+
+        let resolution = base.resolve(preference)
+        guard !resolution.usesTable, strategy != .none else {
+            return base.replacingPresentation(
+                request: request.id,
+                preparedCharts: [:],
+                resolution: resolution)
+        }
+
+        let recommendations: [AutoChartRecommendation]
+        switch strategy {
+        case .none:
+            recommendations = []
+        case .primary:
+            if case .charts(let catalog) = base.outcome, let primary = catalog.primary {
+                recommendations = [primary]
+            } else {
+                recommendations = []
+            }
+        case .preferredOrPrimary:
+            recommendations = resolution.recommendation.map { [$0] } ?? []
+        case .allCataloged:
+            if case .charts(let catalog) = base.outcome {
+                recommendations = catalog.cataloged
+            } else {
+                recommendations = []
+            }
+        }
+
+        do {
+            var prepared: [AutoChartRecommendationID: AutoChartPreparedChart<RowID>] = [:]
+            for (index, recommendation) in recommendations.enumerated() {
+                try Task.checkCancellation()
+                reportProgress(
+                    AutoChartProgress(
+                        phase: .chartPreparation,
+                        completedUnitCount: index,
+                        totalUnitCount: recommendations.count))
+                prepared[recommendation.id] = try await base.prepare(recommendation.id)
+            }
+            reportProgress(
+                AutoChartProgress(
+                    phase: .chartPreparation,
+                    completedUnitCount: recommendations.count,
+                    totalUnitCount: recommendations.count))
+            return base.replacingPresentation(
+                request: request.id,
+                preparedCharts: prepared,
+                resolution: resolution)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            throw cache?.coalescedFailure(
+                for: request.id,
+                error: error,
+                stage: .chartPreparation)
+                ?? AutoChartFailure.wrapping(error, stage: .chartPreparation)
         }
     }
 
@@ -711,7 +1007,8 @@ public actor AutoChartAnalyzer {
     private nonisolated func analyzeOnce<Table: AutoChartTable>(
         _ table: Table,
         context: AutoChartContext,
-        options: AutoChartOptions
+        options: AutoChartOptions,
+        constraints: AutoChartRecommendationConstraints
     ) async throws -> AutoChartAnalysis<Table.RowID> {
         let requestToken = await beginRequest()
         do {
@@ -722,10 +1019,12 @@ public actor AutoChartAnalyzer {
             }
             let contentIdentity: String
             switch preparation {
-            case .keyed(let dataKey, _):
+            case .keyed(.trusted(let identity, let revision), _):
                 contentIdentity =
-                    "key:\(dataKey.identity.utf8.count):\(dataKey.identity)|"
-                    + "\(dataKey.revision.utf8.count):\(dataKey.revision)"
+                    "key:\(identity.utf8.count):\(identity)|"
+                    + "\(revision.utf8.count):\(revision)"
+            case .keyed(.contentAddressed, _):
+                preconditionFailure("Content-addressed requests must be fingerprinted.")
             case .fingerprinted(_, _, let contentFingerprint):
                 contentIdentity = "fingerprint:\(contentFingerprint)"
             }
@@ -736,10 +1035,12 @@ public actor AutoChartAnalyzer {
                     contentIdentity: contentIdentity),
                 context: context,
                 options: options,
+                constraints: constraints,
                 policyVersion: AutoTableCharts.recommendationPolicyVersion)
             let registration = try await registerRequest(
                 context: context,
                 options: options,
+                constraints: constraints,
                 preparation: preparation,
                 baseRequestKey: baseRequestKey,
                 requestToken: requestToken)
@@ -793,9 +1094,9 @@ public actor AutoChartAnalyzer {
         _ table: Table
     ) throws -> RequestPreparation<Table.RowID> {
         try Task.checkCancellation()
-        if let dataKey = table.chartDataKey {
+        if case .trusted = table.chartDataKey {
             return .keyed(
-                dataKey: dataKey,
+                dataKey: table.chartDataKey,
                 materialize: {
                     let chartRows = Array(table.chartRows)
                     return KeyedRequestMaterialization(
@@ -819,6 +1120,7 @@ public actor AutoChartAnalyzer {
     private nonisolated func registerRequest<RowID: Hashable & Sendable>(
         context: AutoChartContext,
         options: AutoChartOptions,
+        constraints: AutoChartRecommendationConstraints,
         preparation: RequestPreparation<RowID>,
         baseRequestKey: RequestKey,
         requestToken: RequestToken
@@ -843,6 +1145,7 @@ public actor AutoChartAnalyzer {
             if let registration = await registerInFlight(
                 context: context,
                 options: options,
+                constraints: constraints,
                 preparation: preparation,
                 baseRequestKey: baseRequestKey,
                 observed: Set(candidates.map(\.identity)),
@@ -857,6 +1160,7 @@ public actor AutoChartAnalyzer {
     private nonisolated func analyzeUncoalesced<RowID: Hashable & Sendable>(
         context: AutoChartContext,
         options: AutoChartOptions,
+        constraints: AutoChartRecommendationConstraints,
         preparation: RequestPreparation<RowID>,
         requestTableKey: TableKey,
         requestToken: RequestToken
@@ -869,6 +1173,7 @@ public actor AutoChartAnalyzer {
                 table: requestTableKey,
                 context: context,
                 options: options,
+                constraints: constraints,
                 policyVersion: AutoTableCharts.recommendationPolicyVersion)
             let resolution: KeyedCacheResolution<RowID> = await cachedKeyedValue(
                 for: requestTableKey,
@@ -956,6 +1261,7 @@ public actor AutoChartAnalyzer {
             table: source.key,
             context: context,
             options: options,
+            constraints: constraints,
             policyVersion: AutoTableCharts.recommendationPolicyVersion)
         if let cached: AutoChartCachedAnalysis<RowID> = await cachedAnalysis(
             for: analysisKey)
@@ -964,10 +1270,15 @@ public actor AutoChartAnalyzer {
         }
 
         try Task.checkCancellation()
+        var catalogOptions = options
+        // Rank every bounded candidate before truncating the public catalog so a
+        // persisted safe recommendation can still be honored off-list.
+        catalogOptions.maximumRecommendations = Int.max
         let set = AutoChartRecommendationEngine.recommendations(
             snapshot: source.snapshot,
             context: context,
-            options: options)
+            options: catalogOptions,
+            constraints: constraints)
         try Task.checkCancellation()
         let recommendations = set.chartRecommendations
         let outcome: AutoChartRecommendationOutcome
@@ -982,13 +1293,10 @@ public actor AutoChartAnalyzer {
                         code: code,
                         defaultText: reason)))
         } else {
-            outcome = .charts(recommendations)
-        }
-        let primary: AutoChartPreparedChart<RowID>?
-        if let first = recommendations.first {
-            primary = try await prepare(first, source: source, requestToken: requestToken)
-        } else {
-            primary = nil
+            outcome = .charts(
+                AutoChartRecommendationCatalog(
+                    featured: Array(recommendations.prefix(options.maximumRecommendations)),
+                    cataloged: recommendations))
         }
         try Task.checkCancellation()
         let diagnostics = recommendations.flatMap(\.diagnostics)
@@ -1003,15 +1311,23 @@ public actor AutoChartAnalyzer {
                             measureSemantics: column.hints.measureSemantics)
                     }
                 },
-                candidates: set.decisions)
+                candidates: set.decisions.map { decision in
+                    guard case .recommended(let rank, _) = decision.disposition,
+                        rank >= options.maximumRecommendations
+                    else { return decision }
+                    var pruned = decision
+                    pruned.disposition = .pruned(.candidateLimit)
+                    return pruned
+                })
             : nil
         let cached = AutoChartCachedAnalysis(
+            id: AutoChartAnalysisID(),
+            request: requestID(for: analysisKey),
             source: source,
             outcome: outcome,
             profiles: source.snapshot.columns.compactMap { source.profiles[$0.id] },
             diagnostics: diagnostics,
             trace: trace,
-            primary: primary,
             recommendations: recommendations)
         await insertAnalysisIfCurrent(
             cached,
@@ -1075,6 +1391,7 @@ public actor AutoChartAnalyzer {
         inFlightAnalyses.compactMap { key, flight in
             guard key.context == base.context,
                 key.options == base.options,
+                key.constraints == base.constraints,
                 key.policyVersion == base.policyVersion,
                 isCollisionFamily(key.table, of: base.table)
             else { return nil }
@@ -1088,6 +1405,7 @@ public actor AutoChartAnalyzer {
     private func registerInFlight<RowID: Hashable & Sendable>(
         context: AutoChartContext,
         options: AutoChartOptions,
+        constraints: AutoChartRecommendationConstraints,
         preparation: RequestPreparation<RowID>,
         baseRequestKey: RequestKey,
         observed: Set<InFlightIdentity>,
@@ -1116,11 +1434,12 @@ public actor AutoChartAnalyzer {
         }
         let identity = InFlightIdentity(key: requestKey, id: UUID())
         let task = Task {
-            [context, options, preparation, requestKey, requestToken] in
+            [context, options, constraints, preparation, requestKey, requestToken] in
             await Task.yield()
             let analysis = try await self.analyzeUncoalesced(
                 context: context,
                 options: options,
+                constraints: constraints,
                 preparation: preparation,
                 requestTableKey: requestKey.table,
                 requestToken: requestToken)
@@ -1434,15 +1753,17 @@ public actor AutoChartAnalyzer {
                 estimatedStorageCost: source.estimatedStorageCost,
                 recommendation: recommendation)
             try Task.checkCancellation()
+            let retainedCost = self.estimatedChartCost(core)
             let prepared = AutoChartPreparedChart(
                 source: source,
                 recommendation: recommendation,
-                core: core)
+                core: core,
+                estimatedRetainedCost: retainedCost)
             try Task.checkCancellation()
             let stored = await self.storePreparedChart(
                 prepared,
                 key: key,
-                cost: self.estimatedChartCost(core),
+                cost: retainedCost,
                 source: source,
                 cacheEpoch: preparedEpoch)
             return AutoChartAnyCacheBox(stored, cost: 0)
@@ -1547,7 +1868,7 @@ public actor AutoChartAnalyzer {
             recommendation: recommendation)
     }
 
-    public func trim(to target: AutoChartCacheTrimTarget) {
+    func trim(to target: AutoChartCacheTrimTarget) {
         switch target {
         case .minimum:
             cacheEpoch &+= 1
@@ -1565,7 +1886,7 @@ public actor AutoChartAnalyzer {
         }
     }
 
-    public func removeAll() {
+    func removeAll() {
         generation &+= 1
         cacheEpoch &+= 1
         for flight in inFlightAnalyses.values { flight.task.cancel() }
@@ -1590,15 +1911,24 @@ public actor AutoChartAnalyzer {
         _ cached: AutoChartCachedAnalysis<RowID>
     ) -> AutoChartAnalysis<RowID> {
         AutoChartAnalysis(
+            id: cached.id,
+            request: cached.request,
+            estimatedRetainedCost: cached.estimatedRetainedCost,
             outcome: cached.outcome,
             profiles: cached.profiles,
             diagnostics: cached.diagnostics,
             decisionTrace: cached.trace,
-            primaryChart: cached.primary,
+            primaryChart: nil,
             provider: AutoChartAnalysisPreparationProvider(
                 analyzer: self,
                 source: cached.source,
                 recommendations: cached.recommendations))
+    }
+
+    private nonisolated func requestID(for key: AnalysisKey) -> AutoChartRequestID {
+        var hasher = Hasher()
+        hasher.combine(key)
+        return AutoChartRequestID(value: hasher.finalize())
     }
 
     private func insertTable<RowID>(_ source: AutoChartPreparedSource<RowID>) {
@@ -1621,7 +1951,6 @@ public actor AutoChartAnalyzer {
     ) {
         let cost = 256 + analysis.recommendations.count * 512
             + analysis.profiles.count * 32
-            + (analysis.primary.map { estimatedChartCost($0.core) } ?? 0)
         // Admitting an entry that cannot coexist with its shared source would
         // make the cost trim evict every other resident entry before finally
         // evicting this one, draining the cache on every oversized analysis.

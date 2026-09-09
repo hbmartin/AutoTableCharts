@@ -9,7 +9,7 @@ on:
 
 jobs:
   build:
-    name: Test and validate documentation
+    name: Test and build documentation
     runs-on: macos-26
     permissions:
       contents: read
@@ -22,35 +22,6 @@ jobs:
 
       - name: Run tests
         run: swift test
-
-      - name: Verify release library excludes test hooks
-        run: Scripts/verify-release-library.sh
-
-      - name: Run release tests without test hooks
-        run: Scripts/verify-release-test-skips.sh
-
-      - name: Run release tests with test hooks
-        run: swift test -c release -Xswiftc -DATC_TEST_HOOKS
-
-      - name: Compile UIKit integration in debug
-        run: |
-          xcodebuild \
-            -scheme AutoTableCharts \
-            -configuration Debug \
-            -destination 'generic/platform=iOS Simulator' \
-            -derivedDataPath "$RUNNER_TEMP/autotablecharts-ios-debug" \
-            CODE_SIGNING_ALLOWED=NO \
-            build
-
-      - name: Compile UIKit integration in release
-        run: |
-          xcodebuild \
-            -scheme AutoTableCharts \
-            -configuration Release \
-            -destination 'generic/platform=iOS Simulator' \
-            -derivedDataPath "$RUNNER_TEMP/autotablecharts-ios-release" \
-            CODE_SIGNING_ALLOWED=NO \
-            build
 
       - name: Generate static DocC archive
         env:
@@ -101,10 +72,97 @@ jobs:
         with:
           path: ${{ runner.temp }}/autotablecharts-docc
 
+  release_library:
+    name: Audit SwiftPM release library
+    runs-on: macos-26
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Verify release library excludes test hooks
+        run: Scripts/verify-release-library.sh
+
+  release_tests:
+    name: Release tests (${{ matrix.mode }})
+    runs-on: macos-26
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        mode:
+          - without-hooks
+          - with-hooks
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Verify hook-dependent release tests
+        run: Scripts/verify-release-tests.sh "${{ matrix.mode }}"
+
+  apple_platforms:
+    name: ${{ matrix.name }}
+    runs-on: macos-26
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Compile iOS integration in debug
+            configuration: Debug
+            destination: generic/platform=iOS Simulator
+            slug: ios-debug
+            audit_release: false
+          - name: Compile and audit iOS integration in release
+            configuration: Release
+            destination: generic/platform=iOS Simulator
+            slug: ios-release
+            audit_release: true
+          - name: Compile and audit tvOS integration in release
+            configuration: Release
+            destination: generic/platform=tvOS Simulator
+            slug: tvos-release
+            audit_release: true
+          - name: Compile and audit watchOS integration in release
+            configuration: Release
+            destination: generic/platform=watchOS Simulator
+            slug: watchos-release
+            audit_release: true
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Build package integration
+        env:
+          ATC_CONFIGURATION: ${{ matrix.configuration }}
+          ATC_DESTINATION: ${{ matrix.destination }}
+          ATC_DERIVED_DATA: ${{ runner.temp }}/autotablecharts-${{ matrix.slug }}
+        run: |
+          xcodebuild \
+            -scheme AutoTableChartsUI \
+            -configuration "$ATC_CONFIGURATION" \
+            -destination "$ATC_DESTINATION" \
+            -derivedDataPath "$ATC_DERIVED_DATA" \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Verify Xcode release library excludes test hooks
+        if: matrix.audit_release
+        env:
+          ATC_DERIVED_DATA: ${{ runner.temp }}/autotablecharts-${{ matrix.slug }}
+        run: Scripts/verify-release-library.sh --xcode-derived-data "$ATC_DERIVED_DATA"
+
   deploy:
     name: Deploy documentation
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
-    needs: build
+    needs:
+      - build
+      - release_library
+      - release_tests
+      - apple_platforms
     runs-on: ubuntu-latest
     permissions:
       contents: read

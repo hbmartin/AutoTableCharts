@@ -43,7 +43,7 @@ public struct AutoChartDatasetError: Error, Hashable, Sendable, CustomStringConv
     }
 }
 
-final class AutoChartMatrixStorage: Sendable {
+package final class AutoChartMatrixStorage: Sendable {
     let columns: [AutoChartColumn]
     let values: [AutoChartValue]
     let rowCount: Int
@@ -97,7 +97,7 @@ public struct AutoChartDataset<RowID: Hashable & Sendable>: AutoChartTable, Send
 
     private let storage: AutoChartMatrixStorage
     private let rows: [Row]
-    public let chartDataKey: AutoChartDataKey?
+    public let chartDataKey: AutoChartDataKey
 
     public var chartColumns: [AutoChartColumn] { storage.columns }
     public var chartRows: [Row] { rows }
@@ -109,7 +109,7 @@ public struct AutoChartDataset<RowID: Hashable & Sendable>: AutoChartTable, Send
         rows matrix: [[AutoChartValue]],
         rowIDs: [RowID],
         metadata: AutoChartTableMetadata = .init(),
-        key: AutoChartDataKey? = nil
+        key: AutoChartDataKey = .contentAddressed()
     ) throws {
         guard rowIDs.count == matrix.count else {
             throw AutoChartDatasetError(
@@ -153,24 +153,24 @@ public struct AutoChartDataset<RowID: Hashable & Sendable>: AutoChartTable, Send
         self.chartDataKey = key
     }
 
-    /// Creates columns from source names while keeping host hint logic outside the package.
+    /// Creates columns from source names while keeping host semantics outside the package.
     public init(
         columnNames: [String],
         rows: [[AutoChartValue]],
         rowIDs: [RowID],
         metadata: AutoChartTableMetadata = .init(),
-        key: AutoChartDataKey? = nil,
+        key: AutoChartDataKey = .contentAddressed(),
         columnID: (Int, String) -> AutoChartColumnID = { index, _ in
             AutoChartColumnID(rawValue: "column-\(index)")
         },
-        hints: (Int, String) -> AutoChartColumnHints = { _, _ in .init() }
+        semantics: (Int, String) -> AutoChartColumnSemantics = { _, _ in .inferred() }
     ) throws {
         try self.init(
             columns: columnNames.enumerated().map { index, name in
                 AutoChartColumn(
                     id: columnID(index, name),
                     name: name,
-                    hints: hints(index, name))
+                    semantics: semantics(index, name))
             },
             rows: rows,
             rowIDs: rowIDs,
@@ -185,7 +185,7 @@ extension AutoChartDataset where RowID == Int {
         columns: [AutoChartColumn],
         rows: [[AutoChartValue]],
         metadata: AutoChartTableMetadata = .init(),
-        key: AutoChartDataKey? = nil
+        key: AutoChartDataKey = .contentAddressed()
     ) throws {
         try self.init(
             columns: columns,
@@ -200,11 +200,11 @@ extension AutoChartDataset where RowID == Int {
         columnNames: [String],
         rows: [[AutoChartValue]],
         metadata: AutoChartTableMetadata = .init(),
-        key: AutoChartDataKey? = nil,
+        key: AutoChartDataKey = .contentAddressed(),
         columnID: (Int, String) -> AutoChartColumnID = { index, _ in
             AutoChartColumnID(rawValue: "column-\(index)")
         },
-        hints: (Int, String) -> AutoChartColumnHints = { _, _ in .init() }
+        semantics: (Int, String) -> AutoChartColumnSemantics = { _, _ in .inferred() }
     ) throws {
         try self.init(
             columnNames: columnNames,
@@ -213,7 +213,7 @@ extension AutoChartDataset where RowID == Int {
             metadata: metadata,
             key: key,
             columnID: columnID,
-            hints: hints)
+            semantics: semantics)
     }
 }
 
@@ -236,7 +236,8 @@ extension AutoChartDataset: Codable where RowID: Codable {
             rows: values.decode([[AutoChartValue]].self, forKey: .rows),
             rowIDs: values.decode([RowID].self, forKey: .rowIDs),
             metadata: values.decode(AutoChartTableMetadata.self, forKey: .metadata),
-            key: values.decodeIfPresent(AutoChartDataKey.self, forKey: .key))
+            key: try values.decodeIfPresent(AutoChartDataKey.self, forKey: .key)
+                ?? .contentAddressed())
     }
 
     public func encode(to encoder: any Encoder) throws {
@@ -255,6 +256,6 @@ extension AutoChartDataset: Codable where RowID: Codable {
         try values.encode(matrix, forKey: .rows)
         try values.encode(rows.map(\.chartRowID), forKey: .rowIDs)
         try values.encode(storage.metadata, forKey: .metadata)
-        try values.encodeIfPresent(chartDataKey, forKey: .key)
+        try values.encode(chartDataKey, forKey: .key)
     }
 }
