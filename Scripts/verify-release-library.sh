@@ -57,29 +57,43 @@ if (( $# == 0 )); then
       --show-bin-path
   )"
   shopt -s nullglob
-  audit_symbol_files=("$release_bin_path"/AutoTableCharts.build/*.o)
+  for target_name in AutoTableCharts AutoTableChartsUI; do
+    target_symbol_files=("$release_bin_path/$target_name.build"/*.o)
+    if (( ${#target_symbol_files[@]} == 0 )); then
+      echo "Could not find release-library objects for $target_name." >&2
+      exit 1
+    fi
+    audit_symbol_files+=("${target_symbol_files[@]}")
+  done
   shopt -u nullglob
 
-  release_module_path="$release_bin_path/Modules/AutoTableCharts.swiftmodule"
-  if [[ -f "$release_module_path" ]]; then
-    audit_module_files+=("$release_module_path")
-  elif [[ -d "$release_module_path" ]]; then
-    while IFS= read -r -d '' artifact; do
-      audit_module_files+=("$artifact")
-    done < <(
-      find "$release_module_path" \
-        -type f \
-        \( -name '*.swiftmodule' -o -name '*.swiftinterface' \) \
+  for module_name in AutoTableCharts AutoTableChartsUI; do
+    module_file_count_before=${#audit_module_files[@]}
+    release_module_path="$release_bin_path/Modules/$module_name.swiftmodule"
+    if [[ -f "$release_module_path" ]]; then
+      audit_module_files+=("$release_module_path")
+    elif [[ -d "$release_module_path" ]]; then
+      while IFS= read -r -d '' artifact; do
+        audit_module_files+=("$artifact")
+      done < <(
+        find "$release_module_path" \
+          -type f \
+          \( -name '*.swiftmodule' -o -name '*.swiftinterface' \) \
         -print0
-    )
-  fi
+      )
+    fi
+    if (( ${#audit_module_files[@]} == module_file_count_before )); then
+      echo "Could not find the release module for $module_name." >&2
+      exit 1
+    fi
+  done
 
   if (( ${#audit_symbol_files[@]} == 0 )); then
-    echo "Could not find release-library objects under $release_bin_path/AutoTableCharts.build." >&2
+    echo "Could not find release-library objects for the package products." >&2
     exit 1
   fi
   if (( ${#audit_module_files[@]} == 0 )); then
-    echo "Could not find the release module under $release_bin_path/Modules." >&2
+    echo "Could not find the release modules under $release_bin_path/Modules." >&2
     exit 1
   fi
 
@@ -91,29 +105,42 @@ elif (( $# == 2 )) && [[ "$1" == "--xcode-derived-data" ]]; then
     exit 1
   fi
 
-  while IFS= read -r -d '' artifact; do
-    audit_symbol_files+=("$artifact")
-  done < <(
-    find "$products_root" \
-      -type f \
-      -path '*/Release-*/AutoTableCharts.o' \
-      -print0
-  )
-  while IFS= read -r -d '' artifact; do
-    audit_module_files+=("$artifact")
-  done < <(
-    find "$products_root" \
-      -type f \
-      -path '*/Release-*/AutoTableCharts.swiftmodule/*.swiftmodule' \
-      -print0
-  )
+  for target_name in AutoTableCharts AutoTableChartsUI; do
+    symbol_file_count_before=${#audit_symbol_files[@]}
+    while IFS= read -r -d '' artifact; do
+      audit_symbol_files+=("$artifact")
+    done < <(
+      find "$products_root" \
+        -type f \
+        -path "*/Release-*/$target_name.o" \
+        -print0
+    )
+    if (( ${#audit_symbol_files[@]} == symbol_file_count_before )); then
+      echo "Could not find an Xcode Release $target_name.o under $products_root." >&2
+      exit 1
+    fi
+
+    module_file_count_before=${#audit_module_files[@]}
+    while IFS= read -r -d '' artifact; do
+      audit_module_files+=("$artifact")
+    done < <(
+      find "$products_root" \
+        -type f \
+        -path "*/Release-*/$target_name.swiftmodule/*.swiftmodule" \
+        -print0
+    )
+    if (( ${#audit_module_files[@]} == module_file_count_before )); then
+      echo "Could not find Xcode Release modules for $target_name under $products_root." >&2
+      exit 1
+    fi
+  done
 
   if (( ${#audit_symbol_files[@]} == 0 )); then
-    echo "Could not find an Xcode Release AutoTableCharts.o under $products_root." >&2
+    echo "Could not find Xcode Release package objects under $products_root." >&2
     exit 1
   fi
   if (( ${#audit_module_files[@]} == 0 )); then
-    echo "Could not find Xcode Release Swift modules under $products_root." >&2
+    echo "Could not find Xcode Release package modules under $products_root." >&2
     exit 1
   fi
 

@@ -6,6 +6,11 @@ script_directory="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repository_root="$(cd "$script_directory/.." && pwd)"
 cd "$repository_root"
 
+if ! command -v rg >/dev/null 2>&1; then
+  echo "verify-release-tests requires ripgrep (rg) for its multiline source audit." >&2
+  exit 1
+fi
+
 if (( $# != 1 )); then
   echo "Usage: $0 <with-hooks|without-hooks>" >&2
   exit 2

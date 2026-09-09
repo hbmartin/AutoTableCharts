@@ -10,9 +10,10 @@ sessions can share one core cache while retaining independent preferences and
 selections.
 
 ``AutoChartPresenter`` performs localization, formatting, ordering, and
-histogram label resolution before SwiftUI evaluates a chart body. Its memoized
-result is an ``AutoChartPresentedChart`` keyed by prepared-chart identity and
-``AutoChartPresentationContext``.
+histogram label resolution before SwiftUI evaluates a chart body. Its bounded
+memo is keyed by prepared-chart identity, ``AutoChartPresentationContext``, the
+effective locale and time zone, and host callback identity. Change the context
+identity when the behavior captured by an existing callback changes.
 
 `AutoChartSelectionSet` is ordered and provenance-safe. A click replaces its
 selection; Command-click toggles marks. Every selected mark carries its analysis
@@ -22,3 +23,5 @@ filtering. External binding updates are reflected by chart highlighting.
 Use the environment modifiers `autoChartPresentationContext(_:)`,
 `autoChartFormatters(_:)`, `autoChartTextResolver(_:)`,
 `autoChartPalette(_:)`, and `autoChartTheme(_:)` to configure a subtree.
+Only explicitly supplied environment values override presentation settings
+passed to ``AutoChartSession/load(_:preference:preparation:presentationContext:formatters:textResolver:)``.

@@ -2,11 +2,15 @@ import Foundation
 
 private final class AutoChartCompletedAnalysisBox: @unchecked Sendable {
     let value: Any
-    let cost: Int
+    let exclusiveCost: Int
+    let sharedSourceIdentifier: ObjectIdentifier
+    let sharedSourceCost: Int
 
     init<RowID>(_ analysis: AutoChartAnalysis<RowID>) {
         value = analysis
-        cost = analysis.estimatedRetainedCost
+        exclusiveCost = analysis.exclusiveRetainedCost
+        sharedSourceIdentifier = analysis.sharedSourceIdentifier
+        sharedSourceCost = analysis.sharedSourceRetainedCost
     }
 }
 
@@ -27,6 +31,7 @@ public final class AutoChartCache: @unchecked Sendable {
     private var completed: [AutoChartRequestID: AutoChartCompletedAnalysisBox] = [:]
     private var recency: [AutoChartRequestID] = []
     private var failures: [AutoChartRequestID: AutoChartFailure] = [:]
+    private var failureRecency: [AutoChartRequestID] = []
     private var progressEntries: [AutoChartRequestID: AutoChartProgressEntry] = [:]
 
     let engine: AutoChartAnalyzer
@@ -60,6 +65,7 @@ public final class AutoChartCache: @unchecked Sendable {
         else { return }
         completed[analysis.request] = AutoChartCompletedAnalysisBox(analysis)
         failures.removeValue(forKey: analysis.request)
+        failureRecency.removeAll { $0 == analysis.request }
         recency.removeAll { $0 == analysis.request }
         recency.append(analysis.request)
         trimCompletedLocked()
@@ -75,9 +81,14 @@ public final class AutoChartCache: @unchecked Sendable {
             if let existing = failures[requestID],
                 existing.diagnosticID == proposed.diagnosticID
             {
+                failureRecency.removeAll { $0 == requestID }
+                failureRecency.append(requestID)
                 return existing
             }
             failures[requestID] = proposed
+            failureRecency.removeAll { $0 == requestID }
+            failureRecency.append(requestID)
+            trimFailuresLocked()
             return proposed
         }
     }
@@ -131,7 +142,10 @@ public final class AutoChartCache: @unchecked Sendable {
 
     /// Ends the previous failure episode before an explicit retry attempt.
     public func beginRetry(for requestID: AutoChartRequestID) {
-        _ = lock.withLock { failures.removeValue(forKey: requestID) }
+        lock.withLock {
+            failures.removeValue(forKey: requestID)
+            failureRecency.removeAll { $0 == requestID }
+        }
     }
 
     /// Exact statistics for the underlying three cache layers.
@@ -145,9 +159,10 @@ public final class AutoChartCache: @unchecked Sendable {
                 completed.removeAll(keepingCapacity: false)
                 recency.removeAll(keepingCapacity: false)
                 failures.removeAll(keepingCapacity: false)
-                progressEntries.removeAll(keepingCapacity: false)
+                failureRecency.removeAll(keepingCapacity: false)
             } else {
                 trimCompletedLocked()
+                trimFailuresLocked()
             }
         }
         await engine.trim(to: target)
@@ -158,17 +173,26 @@ public final class AutoChartCache: @unchecked Sendable {
             completed.removeAll(keepingCapacity: false)
             recency.removeAll(keepingCapacity: false)
             failures.removeAll(keepingCapacity: false)
-            progressEntries.removeAll(keepingCapacity: false)
+            failureRecency.removeAll(keepingCapacity: false)
         }
         await engine.removeAll()
     }
 
     private func trimCompletedLocked() {
         func totalCost() -> Int {
-            completed.values.reduce(0) { partial, box in
-                let (sum, overflow) = partial.addingReportingOverflow(box.cost)
-                return overflow ? Int.max : sum
+            var result = 0
+            var sharedSources: Set<ObjectIdentifier> = []
+            for box in completed.values {
+                let (exclusiveTotal, exclusiveOverflow) = result.addingReportingOverflow(
+                    box.exclusiveCost)
+                result = exclusiveOverflow ? Int.max : exclusiveTotal
+                if sharedSources.insert(box.sharedSourceIdentifier).inserted {
+                    let (sharedTotal, sharedOverflow) = result.addingReportingOverflow(
+                        box.sharedSourceCost)
+                    result = sharedOverflow ? Int.max : sharedTotal
+                }
             }
+            return result
         }
         while completed.count > configuration.analyses.maximumEntries
             || totalCost() > configuration.maximumRetainedCost
@@ -176,6 +200,14 @@ public final class AutoChartCache: @unchecked Sendable {
             guard let oldest = recency.first else { break }
             recency.removeFirst()
             completed.removeValue(forKey: oldest)
+        }
+    }
+
+    private func trimFailuresLocked() {
+        let maximumFailures = max(1, configuration.analyses.maximumEntries)
+        while failures.count > maximumFailures, let oldest = failureRecency.first {
+            failureRecency.removeFirst()
+            failures.removeValue(forKey: oldest)
         }
     }
 }

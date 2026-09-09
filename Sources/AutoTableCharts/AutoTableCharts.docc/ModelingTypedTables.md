@@ -9,8 +9,10 @@ Supply stable identities and explicit semantics so preparation preserves meaning
 ``AutoChartRow`` and ``AutoChartTable`` carry a caller-defined `RowID`. Use the
 identifier needed by linked filtering—an integer result offset, UUID, database
 key, or composite value. IDs must be unique within one table. Conditional
-`Codable` conformance is available for datasets and selections when `RowID` is
-`Codable`.
+`Codable` conformance is available for datasets when `RowID` is `Codable`.
+Selections carry process-local analysis and prepared-chart provenance and are
+therefore not persistence values. Persist source row IDs or a recommendation ID,
+then derive a fresh selection from the new prepared chart.
 
 ### Preserve physical types
 

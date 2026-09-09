@@ -11,17 +11,22 @@ public struct AutoChartSelectionSet<RowID: Hashable & Sendable>: Hashable, Senda
 
     public init() { storage = [] }
 
+    /// Creates a set anchored to the first selection's provenance.
+    ///
+    /// Selections from another analysis or prepared chart are ignored rather
+    /// than trapping a host process that is reconciling stale external state.
     public init(_ selections: [AutoChartSelection<RowID>]) {
+        let compatibleSelections: [AutoChartSelection<RowID>]
         if let first = selections.first {
-            precondition(
-                selections.allSatisfy {
-                    $0.analysisID == first.analysisID
-                        && $0.preparedChartID == first.preparedChartID
-                },
-                "A selection set can contain selections from only one prepared chart.")
+            compatibleSelections = selections.filter {
+                $0.analysisID == first.analysisID
+                    && $0.preparedChartID == first.preparedChartID
+            }
+        } else {
+            compatibleSelections = []
         }
         var seen: Set<String> = []
-        storage = selections.filter { seen.insert($0.markID).inserted }
+        storage = compatibleSelections.filter { seen.insert($0.markID).inserted }
     }
 
     public var startIndex: Int { storage.startIndex }

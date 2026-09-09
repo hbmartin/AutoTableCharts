@@ -29,7 +29,14 @@ private struct AutoChartRequestIdentityMaterial: Hashable, @unchecked Sendable {
 
 private final class AutoChartRequestIDStorage: @unchecked Sendable {
     let material: AutoChartRequestIdentityMaterial
-    init(material: AutoChartRequestIdentityMaterial) { self.material = material }
+    let digest: Int
+
+    init(material: AutoChartRequestIdentityMaterial) {
+        self.material = material
+        var hasher = Hasher()
+        hasher.combine(material)
+        self.digest = hasher.finalize()
+    }
 }
 
 /// Opaque, collision-checked identity for a recommendation request in this process.
@@ -51,11 +58,13 @@ public struct AutoChartRequestID: Hashable, Sendable {
     }
 
     public static func == (lhs: Self, rhs: Self) -> Bool {
-        lhs.storage === rhs.storage || lhs.storage.material == rhs.storage.material
+        lhs.storage === rhs.storage
+            || (lhs.storage.digest == rhs.storage.digest
+                && lhs.storage.material == rhs.storage.material)
     }
 
     public func hash(into hasher: inout Hasher) {
-        hasher.combine(storage.material)
+        hasher.combine(storage.digest)
     }
 }
 
@@ -161,6 +170,11 @@ public struct AutoChartPickerOption: Identifiable, Hashable, Sendable {
 public struct AutoChartRecommendationCatalog: Hashable, Codable, Sendable,
     RandomAccessCollection
 {
+    /// Maximum number of recommendations exposed by the collection view.
+    public static let maximumFeaturedCount = 5
+    /// Maximum number of validated recommendations retained for explicit selection.
+    public static let maximumCatalogedCount = 50
+
     public typealias Index = Int
     public typealias Element = AutoChartRecommendation
 
@@ -173,9 +187,12 @@ public struct AutoChartRecommendationCatalog: Hashable, Codable, Sendable,
         cataloged: [AutoChartRecommendation],
         preferred: AutoChartRecommendation? = nil
     ) {
-        let safe = Array(cataloged.prefix(50))
+        let safe = Array(cataloged.prefix(Self.maximumCatalogedCount))
         self.cataloged = safe
-        self.featured = Array(featured.filter { item in safe.contains { $0.id == item.id } }.prefix(5))
+        self.featured = Array(
+            featured
+                .filter { item in safe.contains { $0.id == item.id } }
+                .prefix(Self.maximumFeaturedCount))
         self.preferred = preferred.flatMap { item in
             safe.contains(where: { $0.id == item.id }) ? nil : item
         }
@@ -333,14 +350,23 @@ public struct AutoChartRequest<RowID: Hashable & Sendable>: Sendable {
         policyVersion: Int = AutoTableCharts.recommendationPolicyVersion
     ) throws where Table.RowID == RowID {
         let key = table.chartDataKey
+        let columns = table.chartColumns
         let copy: @Sendable (AutoChartDataKey) throws -> AutoChartDataset<RowID> = {
             materializedKey in
+            try Task.checkCancellation()
+            if let dataset = table as? AutoChartDataset<RowID> {
+                return dataset.replacingDataKey(with: materializedKey)
+            }
             let rows = Array(table.chartRows)
+            var matrix: [[AutoChartValue]] = []
+            matrix.reserveCapacity(rows.count)
+            for (offset, row) in rows.enumerated() {
+                if offset.isMultiple(of: 256) { try Task.checkCancellation() }
+                matrix.append(columns.map { row.chartValue(for: $0.id) })
+            }
             return try AutoChartDataset(
-                columns: table.chartColumns,
-                rows: rows.map { row in
-                    table.chartColumns.map { row.chartValue(for: $0.id) }
-                },
+                columns: columns,
+                rows: matrix,
                 rowIDs: rows.map(\.chartRowID),
                 metadata: table.chartMetadata,
                 key: materializedKey)
@@ -358,7 +384,7 @@ public struct AutoChartRequest<RowID: Hashable & Sendable>: Sendable {
             // inexpensive structural verification when the row collection is a
             // practical size; callers remain responsible for value revisions.
             let debugRows = table.chartRows
-            debugColumns = table.chartColumns
+            debugColumns = columns
             debugRowCount = debugRows.count
             if debugRows.count <= 10_000 {
                 debugRowIDs = debugRows.map { AutoChartErasedRowID($0.chartRowID) }

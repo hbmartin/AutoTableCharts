@@ -49,6 +49,60 @@ public enum AutoChartDataKey: Hashable, Codable, Sendable {
         guard case .trusted(_, let revision) = self else { return nil }
         return revision
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case trusted, contentAddressed
+        // Version 2 encoded `AutoChartDataKey` as a keyed struct.
+        case identity, revision
+    }
+
+    private struct TrustedPayload: Codable {
+        var identity: String
+        var revision: String
+    }
+
+    private struct ContentAddressedPayload: Codable {
+        var identity: String?
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        if container.contains(.trusted) {
+            let payload = try container.decode(TrustedPayload.self, forKey: .trusted)
+            self = .trusted(identity: payload.identity, revision: payload.revision)
+            return
+        }
+        if container.contains(.contentAddressed) {
+            let payload = try container.decode(
+                ContentAddressedPayload.self, forKey: .contentAddressed)
+            self = .contentAddressed(identity: payload.identity)
+            return
+        }
+        if container.contains(.identity) || container.contains(.revision) {
+            self = .trusted(
+                identity: try container.decode(String.self, forKey: .identity),
+                revision: try container.decode(String.self, forKey: .revision))
+            return
+        }
+        throw DecodingError.dataCorrupted(
+            .init(
+                codingPath: decoder.codingPath,
+                debugDescription: "Expected a trusted or content-addressed data key."))
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .trusted(let identity, let revision):
+            try container.encode(
+                TrustedPayload(identity: identity, revision: revision),
+                forKey: .trusted)
+        case .contentAddressed(let identity):
+            try container.encode(
+                ContentAddressedPayload(identity: identity),
+                forKey: .contentAddressed)
+        }
+    }
 }
 
 /// A typed cell value supplied by an ``AutoChartRow``.
@@ -612,10 +666,9 @@ public struct AutoChartColumn: Identifiable, Hashable, Codable, Sendable {
     public var displayName: String?
     /// Semantic metadata that overrides or supplements profiling.
     public var semantics: AutoChartColumnSemantics
-    private var normalizedHints: AutoChartColumnHints
 
     /// Normalized hints consumed by profiling and validation.
-    public var hints: AutoChartColumnHints { normalizedHints }
+    public var hints: AutoChartColumnHints { semantics.hints }
 
     /// Creates a column description.
     ///
@@ -634,7 +687,6 @@ public struct AutoChartColumn: Identifiable, Hashable, Codable, Sendable {
         self.name = name
         self.displayName = displayName
         self.semantics = semantics
-        self.normalizedHints = semantics.hints
     }
 
     // Package implementation and tests use this bridge while candidate generation
@@ -649,7 +701,6 @@ public struct AutoChartColumn: Identifiable, Hashable, Codable, Sendable {
         self.name = name
         self.displayName = displayName
         self.semantics = AutoChartColumnSemantics(hints: hints)
-        self.normalizedHints = hints
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -666,12 +717,10 @@ public struct AutoChartColumn: Identifiable, Hashable, Codable, Sendable {
             AutoChartColumnSemantics.self, forKey: .semantics)
         {
             semantics = decoded
-            normalizedHints = decoded.hints
         } else {
             let legacy = try container.decodeIfPresent(
                 AutoChartColumnHints.self, forKey: .hints) ?? .init()
             semantics = AutoChartColumnSemantics(hints: legacy)
-            normalizedHints = legacy
         }
     }
 
@@ -799,7 +848,10 @@ public struct AutoChartContext: Hashable, Codable, Sendable {
 public struct AutoChartOptions: Hashable, Codable, Sendable {
     /// Whether candidate acceptance and rejection decisions are retained.
     public var includesDecisionTrace: Bool
-    /// The maximum number of diverse recommendations returned. Defaults to five.
+    /// The requested number of featured recommendations. Defaults to five and
+    /// is capped by ``AutoChartRecommendationCatalog/maximumFeaturedCount``.
+    /// The full catalog may contain up to
+    /// ``AutoChartRecommendationCatalog/maximumCatalogedCount`` alternatives.
     public var maximumRecommendations: Int {
         didSet { maximumRecommendations = max(1, maximumRecommendations) }
     }
@@ -839,7 +891,7 @@ public struct AutoChartOptions: Hashable, Codable, Sendable {
     /// Creates recommendation and density limits.
     ///
     /// - Parameters:
-    ///   - maximumRecommendations: Maximum returned alternatives.
+    ///   - maximumRecommendations: Requested featured alternatives.
     ///   - maximumCategories: Maximum category-axis cardinality.
     ///   - maximumDonutSectors: Maximum donut cardinality.
     ///   - maximumSeries: Maximum series cardinality.
@@ -1831,7 +1883,11 @@ enum AutoChartCategoryDisambiguationKind: String, Sendable {
 }
 
 /// Reference identity used to recognize recursion through one host callback.
-final class AutoChartHostCallbackToken: Sendable {}
+final class AutoChartHostCallbackToken: Sendable {
+    /// Remains unique even after the token itself is released, so bounded caches
+    /// do not confuse a later allocation that happens to reuse its address.
+    let identity = UUID()
+}
 
 /// Keeps a host callback body and its recursion identity paired so invalid
 /// body-without-token states are unrepresentable. Copies share the token and
@@ -2024,6 +2080,13 @@ public struct AutoChartTextResolver: Sendable {
 
     public func callAsFunction(_ message: AutoChartMessage) -> String {
         resolve(message) ?? message.defaultText
+    }
+
+    /// Stable for copies of the same resolver and distinct for newly supplied
+    /// host callbacks. Presentation caches use this alongside the caller's
+    /// explicit context identity.
+    package var callbackIdentity: UUID? {
+        hostCallback?.token.identity
     }
 
     func resolve(_ message: AutoChartMessage) -> String? {
