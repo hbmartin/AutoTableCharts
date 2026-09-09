@@ -15,6 +15,13 @@ private struct V3Record: Sendable {
     let end: Date
 }
 
+private struct LegacyV3Column: Encodable {
+    let id: AutoChartColumnID
+    let name: String
+    let displayName: String?
+    let hints: AutoChartColumnHints
+}
+
 private func v3Records() -> [V3Record] {
     [
         V3Record(
@@ -56,6 +63,35 @@ private func domainDataset(
             grain: "hour",
             start: { $0.start }, end: { $0.end })
     }
+}
+
+private func wideDomainDataset() throws -> AutoChartDataset<Int> {
+    let dimensionCount = 8
+    let measureCount = 8
+    let dimensions = (0..<dimensionCount).map { index in
+        AutoChartColumn(
+            id: .init(rawValue: "dimension-\(index)"),
+            name: "Dimension \(index)",
+            semantics: .dimension(semanticType: .nominal))
+    }
+    let measures = (0..<measureCount).map { index in
+        AutoChartColumn(
+            id: .init(rawValue: "measure-\(index)"),
+            name: "Measure \(index)",
+            semantics: .measure(semantics: .init(rollup: .additive)))
+    }
+    let rows: [[AutoChartValue]] = (0..<4).map { row in
+        dimensions.indices.map { column in
+            .text("D\(column)-R\(row)")
+        } + measures.indices.map { column in
+            .double(Double((column + 1) * (row + 1)))
+        }
+    }
+    return try AutoChartDataset(
+        columns: dimensions + measures,
+        rows: rows,
+        rowIDs: Array(0..<rows.count),
+        key: .trusted(identity: "wide-v3-fixture", revision: "1"))
 }
 
 private func recommendation(
@@ -127,6 +163,33 @@ private final class ProgressRecorder: @unchecked Sendable {
         #expect(try JSONDecoder().decode(
             AutoChartColumn.self,
             from: JSONEncoder().encode(column)) == column)
+    }
+
+    @Test func legacyAndPackageBridgeHintsRemainExactUntilSemanticsChange() throws {
+        let legacyHints = AutoChartColumnHints(
+            semanticType: .quantitative,
+            role: .dimension,
+            unit: .currency(code: "USD"),
+            measureSemantics: .init(rollup: .additive),
+            grain: "account")
+        var bridged = AutoChartColumn(
+            id: "legacy-value", name: "Legacy Value", hints: legacyHints)
+        #expect(bridged.hints == legacyHints)
+
+        let encodedLegacy = try JSONEncoder().encode(
+            LegacyV3Column(
+                id: bridged.id,
+                name: bridged.name,
+                displayName: bridged.displayName,
+                hints: legacyHints))
+        let decoded = try JSONDecoder().decode(
+            AutoChartColumn.self, from: encodedLegacy)
+        #expect(decoded.hints == legacyHints)
+
+        bridged.semantics = .identifier(semanticType: .nominal)
+        #expect(bridged.hints.role == .identifier)
+        #expect(bridged.hints.semanticType == .nominal)
+        #expect(bridged.hints.measureSemantics == nil)
     }
 
     @Test func datasetDecodesVersionTwoDataKeys() throws {
@@ -294,6 +357,76 @@ private final class ProgressRecorder: @unchecked Sendable {
         #expect(!catalog.cataloged.isEmpty)
         #expect(catalog.cataloged.allSatisfy { constraints.allows($0.specification) })
     }
+
+    @Test func decisionTraceKeepsCatalogedRecommendationsClassifiedAsRecommended()
+        async throws
+    {
+        let request = try AutoChartRequest(
+            table: domainDataset(),
+            options: .init(maximumRecommendations: 1, includesDecisionTrace: true))
+        let analysis = try await AutoChartAnalyzer().analyze(
+            request, preparation: .none)
+        let catalog = try #require(analysis.outcome.catalog)
+        let trace = try #require(analysis.decisionTrace)
+        #expect(catalog.featured.count == 1)
+        #expect(catalog.cataloged.count > catalog.featured.count)
+
+        let decisions = Dictionary(
+            uniqueKeysWithValues: trace.candidates.map { ($0.specificationID, $0.disposition) })
+        for (rank, recommendation) in catalog.cataloged.enumerated() {
+            guard let disposition = decisions[recommendation.specification.id],
+                case .recommended(let tracedRank, _) = disposition
+            else {
+                Issue.record("A retained catalog recommendation was not classified as recommended.")
+                continue
+            }
+            #expect(tracedRank == rank)
+        }
+    }
+
+    @Test func analysisRetainsAValidOffListPreferenceWithTargetedValidation()
+        async throws
+    {
+        let dataset = try wideDomainDataset()
+        let request = try AutoChartRequest(table: dataset)
+        let analyzer = AutoChartAnalyzer()
+        let analysis = try await analyzer.analyze(request, preparation: .none)
+        let catalog = try #require(analysis.outcome.catalog)
+        #expect(catalog.cataloged.count == AutoChartRecommendationCatalog.maximumCatalogedCount)
+
+        var catalogOptions = request.options
+        catalogOptions.maximumRecommendations =
+            AutoChartRecommendationCatalog.maximumCatalogedCount
+        let candidates = AutoChartRecommendationEngine.recommendations(
+            for: dataset,
+            context: request.context,
+            options: catalogOptions,
+            constraints: request.constraints).candidates
+        let catalogIDs = Set(catalog.cataloged.map(\.id))
+        let offList = try #require(candidates.first { recommendation in
+            !catalogIDs.contains(recommendation.id)
+                && AutoChartRecommendationEngine.validate(
+                    specification: recommendation.specification,
+                    for: dataset).isValid
+        })
+
+        let resolution = analysis.resolve(.chart(.specific(offList.id)))
+        #expect(resolution.recommendation?.id == offList.id)
+        #expect(resolution.defaultReason == nil)
+
+        let prepared = try await analyzer.analyze(
+            request,
+            preference: .chart(.specific(offList.id)),
+            preparation: .allCataloged)
+        #expect(prepared.primaryChart?.recommendation.id == offList.id)
+        #expect(prepared.outcome.catalog?.preferred?.id == offList.id)
+        #expect(prepared.preparedCharts.count == catalog.cataloged.count + 1)
+
+        let rankedFallback = prepared.replacingPresentation(
+            preparedCharts: prepared.preparedCharts,
+            resolution: nil)
+        #expect(rankedFallback.primaryChart?.recommendation.id == catalog.primary?.id)
+    }
 }
 
 @Suite struct V3PreparationCacheAndFailureTests {
@@ -459,6 +592,36 @@ private final class ProgressRecorder: @unchecked Sendable {
         cache.unregisterProgress(for: firstID, token: token)
     }
 
+    @Test func cacheResetKeepsProgressSubscribersWithoutReplayingOldProgress() async {
+        let cache = AutoChartCache()
+        let requestID = AutoChartRequestID(value: 99)
+        let existingCalls = V3Counter()
+        let existingToken = cache.registerProgress(for: requestID) { _ in
+            existingCalls.increment()
+        }
+        cache.reportProgress(
+            AutoChartProgress(phase: .chartPreparation),
+            for: requestID,
+            fallback: nil)
+        #expect(existingCalls.value == 1)
+
+        await cache.removeAll()
+        let newCalls = V3Counter()
+        let newToken = cache.registerProgress(for: requestID) { _ in
+            newCalls.increment()
+        }
+        #expect(newCalls.value == 0)
+
+        cache.reportProgress(
+            AutoChartProgress(phase: .materialization),
+            for: requestID,
+            fallback: nil)
+        #expect(existingCalls.value == 2)
+        #expect(newCalls.value == 1)
+        cache.unregisterProgress(for: requestID, token: existingToken)
+        cache.unregisterProgress(for: requestID, token: newToken)
+    }
+
     @Test func progressReportsEveryAnalysisAndPreparationPhase() async throws {
         let request = try AutoChartRequest(table: domainDataset())
         let recorder = ProgressRecorder()
@@ -558,6 +721,23 @@ private final class ProgressRecorder: @unchecked Sendable {
         let reconciled = AutoChartSelectionSet([firstSelection, stale, secondSelection])
         #expect(reconciled.count == 2)
         #expect(!reconciled.contains(markID: "stale"))
+
+        let leadingStale = AutoChartSelectionSet([stale, firstSelection, secondSelection])
+        #expect(leadingStale.count == 2)
+        #expect(!leadingStale.contains(markID: "stale"))
+        let duplicatedStale = AutoChartSelectionSet([
+            stale, stale, firstSelection, secondSelection,
+        ])
+        #expect(duplicatedStale.count == 2)
+        #expect(!duplicatedStale.contains(markID: "stale"))
+
+        var partialGroup = AutoChartSelectionSet([firstSelection])
+        partialGroup.select(
+            [firstSelection, secondSelection], togglingAsGroup: true)
+        #expect(partialGroup.count == 2)
+        partialGroup.select(
+            [firstSelection, secondSelection], togglingAsGroup: true)
+        #expect(partialGroup.isEmpty)
     }
 
     @Test func preferenceCodableRoundTrip() throws {
@@ -655,10 +835,93 @@ private final class ProgressRecorder: @unchecked Sendable {
 
         #expect(calls.value > afterSecond)
     }
+
+    @MainActor
+    @Test func convenienceViewContextCanInvalidatePresentationMemo() async throws {
+        let request = try AutoChartRequest(table: domainDataset())
+        let analysis = try await AutoChartAnalyzer().analyze(request, preparation: .primary)
+        let chart = try #require(analysis.primaryChart)
+        let calls = V3Counter()
+        let formatters = AutoChartFormatters(request: { _, _, _ in
+            calls.increment()
+            return nil
+        })
+
+        _ = AutoChartView(
+            preparedChart: chart,
+            analysisID: analysis.id,
+            presentationContext: .init(identity: "convenience-v1"),
+            formatters: formatters)
+        let afterFirst = calls.value
+        _ = AutoChartView(
+            preparedChart: chart,
+            analysisID: analysis.id,
+            presentationContext: .init(identity: "convenience-v1"),
+            formatters: formatters)
+        #expect(calls.value == afterFirst)
+
+        _ = AutoChartView(
+            preparedChart: chart,
+            analysisID: analysis.id,
+            presentationContext: .init(identity: "convenience-v2"),
+            formatters: formatters)
+        #expect(calls.value > afterFirst)
+
+        _ = AutoChartPlot(
+            preparedChart: chart,
+            analysisID: analysis.id,
+            presentationContext: .init(identity: "plot-v1"),
+            formatters: formatters)
+    }
 }
 
 @MainActor
 @Suite struct V3SessionTests {
+    @Test func loadedPresentationUpdatesRemainUnderActiveEnvironmentOverrides()
+        async throws
+    {
+        let session = AutoChartSession<Int>(cache: AutoChartCache())
+        let request = try AutoChartRequest(table: domainDataset())
+        let loadedFormatters = AutoChartFormatters(request: { _, _, _ in nil })
+        let loadedResolver = AutoChartTextResolver { "loaded:\($0.defaultText)" }
+        let environmentFormatters = AutoChartFormatters(request: { _, _, _ in nil })
+        let environmentResolver = AutoChartTextResolver { "environment:\($0.defaultText)" }
+
+        session.load(
+            request,
+            presentationContext: .init(identity: "loaded-v1"),
+            formatters: loadedFormatters,
+            textResolver: loadedResolver)
+        _ = try await readyAnalysis(from: session)
+        session.applyPresentationEnvironment(
+            context: .init(identity: "environment"),
+            formatters: environmentFormatters,
+            textResolver: environmentResolver)
+
+        session.setPresentationContext(.init(identity: "loaded-v2"))
+        guard case .ready(_, let overridden?) = session.state else {
+            Issue.record("The environment-overridden presentation must remain ready.")
+            return
+        }
+        #expect(overridden.context.identity == "environment")
+        #expect(
+            overridden.formatters.callbackIdentity
+                == environmentFormatters.callbackIdentity)
+        #expect(
+            overridden.textResolver.callbackIdentity
+                == environmentResolver.callbackIdentity)
+
+        session.applyPresentationEnvironment(
+            context: nil, formatters: nil, textResolver: nil)
+        guard case .ready(_, let restored?) = session.state else {
+            Issue.record("Removing environment values must restore loaded presentation.")
+            return
+        }
+        #expect(restored.context.identity == "loaded-v2")
+        #expect(restored.formatters.callbackIdentity == loadedFormatters.callbackIdentity)
+        #expect(restored.textResolver.callbackIdentity == loadedResolver.callbackIdentity)
+    }
+
     @Test func contextOnlyUpdatesPreserveLoadedPresentationCallbacks() async throws {
         let session = AutoChartSession<Int>(cache: AutoChartCache())
         let request = try AutoChartRequest(table: domainDataset())

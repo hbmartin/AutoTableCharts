@@ -111,37 +111,6 @@ struct AutoChartKPIContent: View {
         accessibilityText = presented.accessibilityText
     }
 
-    init<RowID: Hashable & Sendable>(
-        preparedChart: AutoChartPreparedChart<RowID>,
-        typography: AutoChartTypography,
-        formatters: AutoChartFormatters,
-        textResolver: AutoChartTextResolver
-    ) {
-        let core = preparedChart.core
-        let semantics = core.measureSemantics
-        let column = semantics.columnID.flatMap { core.table.profiles[$0]?.column }
-        let resolvedValueText: String
-        if let value = core.data.first?.ySourceValue {
-            resolvedValueText = formatters.format(
-                AutoChartFormattingRequest(
-                    column: column,
-                    value: value,
-                    context: .kpi,
-                    purpose: semantics.formattingPurpose))
-        } else {
-            assertionFailure("Prepared KPI charts require one source measure value.")
-            resolvedValueText = AutoChartValue.unrepresentableValuePlaceholder
-        }
-        let resolvedTitle = core.presentation.resolvedYTitle(using: textResolver)
-        valueText = resolvedValueText
-        title = resolvedTitle
-        isCompact = typography == .compact
-        accessibilityText = AutoChartAccessibility.kpiLabel(
-            title: resolvedTitle,
-            valueDescription: resolvedValueText,
-            textResolver: textResolver)
-    }
-
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text(valueText)
@@ -193,14 +162,16 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         analysisID: AutoChartAnalysisID,
         selection: Binding<AutoChartSelectionSet<RowID>> = .constant(.init()),
         presentation: AutoChartPresentation = .explorer(),
+        presentationContext: AutoChartPresentationContext? = nil,
         formatters: AutoChartFormatters = .init(),
         textResolver: AutoChartTextResolver = .default
     ) {
         let presented = autoChartConveniencePresenter.present(
             preparedChart,
-            context: AutoChartPresentationContext(
-                locale: formatters.locale,
-                timeZone: formatters.timeZone),
+            context: presentationContext
+                ?? AutoChartPresentationContext(
+                    locale: formatters.locale,
+                    timeZone: formatters.timeZone),
             formatters: formatters,
             textResolver: textResolver)
         content = .chart(preparedChart, presented.resolvedPresentation)
@@ -244,15 +215,17 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         analysis: AutoChartAnalysis<RowID>,
         selection: Binding<AutoChartSelectionSet<RowID>> = .constant(.init()),
         presentation: AutoChartPresentation = .explorer(),
+        presentationContext: AutoChartPresentationContext? = nil,
         formatters: AutoChartFormatters = .init(),
         textResolver: AutoChartTextResolver = .default
     ) {
         if let primary = analysis.primaryChart {
             let presented = autoChartConveniencePresenter.present(
                 primary,
-                context: AutoChartPresentationContext(
-                    locale: formatters.locale,
-                    timeZone: formatters.timeZone),
+                context: presentationContext
+                    ?? AutoChartPresentationContext(
+                        locale: formatters.locale,
+                        timeZone: formatters.timeZone),
                 formatters: formatters,
                 textResolver: textResolver)
             content = .chart(primary, presented.resolvedPresentation)
@@ -493,12 +466,6 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
                 AutoChartKPIContent(
                     presented: presentedKPI,
                     typography: presentation.typography)
-            } else {
-                AutoChartKPIContent(
-                    preparedChart: preparedChart,
-                    typography: presentation.typography,
-                    formatters: formatters,
-                    textResolver: textResolver)
             }
         }
     }
@@ -1704,9 +1671,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         }
         #if os(macOS)
         if NSEvent.modifierFlags.contains(.command) {
-            for selectedMark in selectedMarks {
-                selection.select(selectedMark, toggling: true)
-            }
+            selection.select(selectedMarks, togglingAsGroup: true)
             return
         }
         #endif
@@ -1714,10 +1679,8 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     }
 
     private func clearSelection() {
-        selectedCategory = nil
-        selectedDate = nil
-        selectedNumber = nil
-        selectedAngle = nil
+        synchronizeInteractionBindings(
+            category: nil, date: nil, number: nil, angle: nil)
         selection.removeAll()
     }
 
@@ -1737,15 +1700,16 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
                 category: nil, date: nil, number: nil, angle: nil)
             return
         }
-        guard let datum = data.first(where: { $0.id == selectedMark.markID }) else {
+        guard let datumIndex = data.firstIndex(where: { $0.id == selectedMark.markID })
+        else {
             synchronizeInteractionBindings(
                 category: nil, date: nil, number: nil, angle: nil)
             return
         }
+        let datum = data[datumIndex]
         switch specification.family {
         case .donut:
-            guard let index = data.firstIndex(where: { $0.id == datum.id }) else { return }
-            let preceding = data[..<index].compactMap(\.yNumber).reduce(0, +)
+            let preceding = data[..<datumIndex].compactMap(\.yNumber).reduce(0, +)
             angle = preceding + (datum.yNumber ?? 0) / 2
         case .line, .pointLine, .area, .scatter, .bubble:
             if let value = datum.xDate { date = value }
@@ -1839,6 +1803,7 @@ public struct AutoChartPlot<RowID: Hashable & Sendable>: View {
     private let selection: Binding<AutoChartSelectionSet<RowID>>
     private let plotHeight: CGFloat?
     private let interactions: AutoChartInteractions
+    private let presentationContext: AutoChartPresentationContext?
     private let formatters: AutoChartFormatters
     private let textResolver: AutoChartTextResolver
 
@@ -1848,6 +1813,7 @@ public struct AutoChartPlot<RowID: Hashable & Sendable>: View {
         selection: Binding<AutoChartSelectionSet<RowID>> = .constant(.init()),
         plotHeight: CGFloat? = AutoChartDefaultPlotHeight.plotOnly,
         interactions: AutoChartInteractions = .all,
+        presentationContext: AutoChartPresentationContext? = nil,
         formatters: AutoChartFormatters = .init(),
         textResolver: AutoChartTextResolver = .default
     ) {
@@ -1856,6 +1822,7 @@ public struct AutoChartPlot<RowID: Hashable & Sendable>: View {
         self.selection = selection
         self.plotHeight = plotHeight
         self.interactions = interactions
+        self.presentationContext = presentationContext
         self.formatters = formatters
         self.textResolver = textResolver
     }
@@ -1869,6 +1836,7 @@ public struct AutoChartPlot<RowID: Hashable & Sendable>: View {
                 plotHeight: plotHeight,
                 chrome: [],
                 interactions: interactions),
+            presentationContext: presentationContext,
             formatters: formatters,
             textResolver: textResolver)
     }

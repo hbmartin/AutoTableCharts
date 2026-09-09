@@ -244,30 +244,54 @@ public struct AutoChartPreparedChart<RowID: Hashable & Sendable>: Sendable {
     }
 }
 
-final class AutoChartAnalysisPreparationProvider<RowID: Hashable & Sendable>: Sendable {
+final class AutoChartAnalysisPreparationProvider<RowID: Hashable & Sendable>: @unchecked Sendable {
     let analyzer: AutoChartAnalyzer
     let source: AutoChartPreparedSource<RowID>
     let recommendations: [AutoChartRecommendation]
+    private let validationLock = NSLock()
+    private var validationByID: [AutoChartRecommendationID: Bool]
 
     init(
         analyzer: AutoChartAnalyzer,
         source: AutoChartPreparedSource<RowID>,
-        recommendations: [AutoChartRecommendation]
+        recommendations: [AutoChartRecommendation],
+        validatedRecommendationIDs: Set<AutoChartRecommendationID>
     ) {
         self.analyzer = analyzer
         self.source = source
         self.recommendations = recommendations
+        self.validationByID = Dictionary(
+            uniqueKeysWithValues: validatedRecommendationIDs.map { ($0, true) })
     }
 
     func prepare(_ recommendationID: AutoChartRecommendationID) async throws
         -> AutoChartPreparedChart<RowID>
     {
         try Task.checkCancellation()
-        guard let recommendation = recommendations.first(where: { $0.id == recommendationID })
+        guard let recommendation = recommendation(for: recommendationID)
         else { throw AutoChartPreparationError.recommendationUnavailable(recommendationID) }
         return try await AutoChartAnalyzer.retryingGenerationInvalidations {
             try await self.analyzer.prepare(recommendation, source: self.source)
         }
+    }
+
+    func recommendation(
+        for recommendationID: AutoChartRecommendationID
+    ) -> AutoChartRecommendation? {
+        guard let recommendation = recommendations.first(where: {
+            $0.id == recommendationID
+        }) else { return nil }
+        if let isValid = validationLock.withLock({ validationByID[recommendationID] }) {
+            return isValid ? recommendation : nil
+        }
+        let validation = AutoChartRecommendationEngine.validate(
+            specification: recommendation.specification,
+            snapshot: source.snapshot,
+            profiles: source.profiles)
+        validationLock.withLock {
+            validationByID[recommendationID] = validation.isValid
+        }
+        return validation.isValid ? recommendation : nil
     }
 
     func prepare(_ specification: AutoChartSpecification) async throws
@@ -421,7 +445,7 @@ public struct AutoChartAnalysis<RowID: Hashable & Sendable>: Sendable {
         resolution: AutoChartPreferenceResolution?
     ) -> Self {
         let primary = resolution?.recommendation.flatMap { preparedCharts[$0.id] }
-            ?? preparedCharts.sorted { $0.key < $1.key }.first?.value
+            ?? highestRankedPreparedChart(in: preparedCharts)
         let presentedOutcome: AutoChartRecommendationOutcome
         if case .charts(let catalog) = outcome,
             let resolved = resolution?.recommendation,
@@ -458,7 +482,28 @@ public struct AutoChartAnalysis<RowID: Hashable & Sendable>: Sendable {
         {
             return cataloged
         }
-        return provider.recommendations.first { $0.id == id }
+        return provider.recommendation(for: id)
+    }
+
+    private func highestRankedPreparedChart(
+        in preparedCharts: [AutoChartRecommendationID: AutoChartPreparedChart<RowID>]
+    ) -> AutoChartPreparedChart<RowID>? {
+        if case .charts(let catalog) = outcome {
+            for recommendation in catalog.cataloged {
+                if let chart = preparedCharts[recommendation.id] { return chart }
+            }
+            if let preferred = catalog.preferred,
+                let chart = preparedCharts[preferred.id]
+            {
+                return chart
+            }
+        }
+        return preparedCharts.values.sorted { lhs, rhs in
+            if lhs.recommendation.score != rhs.recommendation.score {
+                return lhs.recommendation.score > rhs.recommendation.score
+            }
+            return lhs.recommendation.id < rhs.recommendation.id
+        }.first
     }
 
     /// Validates `specification` against this analysis.
@@ -579,6 +624,7 @@ private struct AutoChartCachedAnalysis<RowID: Hashable & Sendable>: Sendable {
     let diagnostics: [AutoChartDiagnostic]
     let trace: AutoChartDecisionTrace?
     let recommendations: [AutoChartRecommendation]
+    let validatedRecommendationIDs: Set<AutoChartRecommendationID>
 
     var estimatedRetainedCost: Int {
         source.cost + 256 + recommendations.count * 512 + profiles.count * 32
@@ -1331,7 +1377,7 @@ public actor AutoChartAnalyzer {
                 },
                 candidates: set.decisions.map { decision in
                     guard case .recommended(let rank, _) = decision.disposition,
-                        rank >= options.maximumRecommendations
+                        rank >= catalogOptions.maximumRecommendations
                     else { return decision }
                     var pruned = decision
                     pruned.disposition = .pruned(.candidateLimit)
@@ -1346,7 +1392,8 @@ public actor AutoChartAnalyzer {
             profiles: source.snapshot.columns.compactMap { source.profiles[$0.id] },
             diagnostics: diagnostics,
             trace: trace,
-            recommendations: recommendations)
+            recommendations: set.candidates,
+            validatedRecommendationIDs: Set(recommendations.map(\.id)))
         await insertAnalysisIfCurrent(
             cached,
             for: analysisKey,
@@ -1940,7 +1987,8 @@ public actor AutoChartAnalyzer {
             provider: AutoChartAnalysisPreparationProvider(
                 analyzer: self,
                 source: cached.source,
-                recommendations: cached.recommendations))
+                recommendations: cached.recommendations,
+                validatedRecommendationIDs: cached.validatedRecommendationIDs))
     }
 
     private nonisolated func requestID(for key: AnalysisKey) -> AutoChartRequestID {

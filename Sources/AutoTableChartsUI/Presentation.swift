@@ -171,14 +171,18 @@ public final class AutoChartPresenter: @unchecked Sendable {
         if specification.family == .kpi {
             let semantics = core.measureSemantics
             let column = semantics.columnID.flatMap { core.table.profiles[$0]?.column }
-            let valueText = core.data.first?.ySourceValue.map {
-                formatters.format(
+            let valueText: String
+            if let sourceValue = core.data.first?.ySourceValue {
+                valueText = formatters.format(
                     AutoChartFormattingRequest(
                         column: column,
-                        value: $0,
+                        value: sourceValue,
                         context: .kpi,
                         purpose: semantics.formattingPurpose))
-            } ?? AutoChartValue.unrepresentableValuePlaceholder
+            } else {
+                assertionFailure("Prepared KPI charts require one source measure value.")
+                valueText = AutoChartValue.unrepresentableValuePlaceholder
+            }
             let kpiTitle = core.presentation.resolvedYTitle(using: textResolver)
             kpi = AutoChartPresentedKPI(
                 valueText: valueText,

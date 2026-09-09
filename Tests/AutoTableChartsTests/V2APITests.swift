@@ -521,7 +521,7 @@ private struct CountingChartRowsTable: AutoChartTable {
         #expect(specificationsByFamily[.heatmap]?.aggregation == .count)
     }
 
-    @Test func fullTraceIncludesInferredSemanticsRanksAndExclusions() async throws {
+    @Test func fullTraceIncludesInferredSemanticsAndCatalogRanks() async throws {
         let dataset = try AutoChartDataset<Int>(
             columns: [v2Category, v2Measure],
             rows: [[.text("A"), .double(1)], [.text("B"), .double(2)]])
@@ -529,13 +529,24 @@ private struct CountingChartRowsTable: AutoChartTable {
             dataset,
             options: .init(maximumRecommendations: 1, includesDecisionTrace: true))
         let trace = try #require(analysis.decisionTrace)
+        guard case .charts(let catalog) = analysis.outcome else {
+            Issue.record("Expected a recommendation catalog.")
+            return
+        }
         #expect(trace.inferredSemantics.map(\.columnID) == [v2Category.id, v2Measure.id])
-        #expect(trace.candidates.contains {
-            if case .recommended = $0.disposition { true } else { false }
-        })
-        #expect(trace.candidates.contains {
-            if case .pruned = $0.disposition { true } else { false }
-        })
+        let decisions = Dictionary(
+            uniqueKeysWithValues: trace.candidates.map {
+                ($0.specificationID, $0.disposition)
+            })
+        for (rank, recommendation) in catalog.cataloged.enumerated() {
+            guard let disposition = decisions[recommendation.specification.id],
+                case .recommended(let tracedRank, _) = disposition
+            else {
+                Issue.record("A cataloged recommendation was not ranked in the trace.")
+                continue
+            }
+            #expect(tracedRank == rank)
+        }
     }
 
     @Test func columnProfilesExposeSummariesWithoutRetainedValues() async throws {
@@ -1223,30 +1234,36 @@ private struct CountingChartRowsTable: AutoChartTable {
                 == "axisTick:sum:\(v2Measure.id.rawValue)")
 
         #expect(kpi.core.data.first?.ySourceValue == .double(42))
+        let presenter = AutoChartPresenter(maximumEntries: 0)
+        let presentedKPI = try #require(
+            presenter.present(kpi, formatters: formatter).kpi)
         let kpiContent = AutoChartKPIContent(
-            preparedChart: kpi,
-            typography: .standard,
-            formatters: formatter,
-            textResolver: .default)
+            presented: presentedKPI,
+            typography: .standard)
         #expect(kpiContent.valueText == "kpi:value:\(kpiMeasure.id.rawValue):42")
         #expect(kpiContent.title == "Revenue")
         #expect(!kpiContent.isCompact)
         #expect(
             kpiContent.accessibilityText
                 == "Revenue, kpi:value:\(kpiMeasure.id.rawValue):42")
+        let localizedResolver = AutoChartTextResolver { message in
+            guard message.category == .accessibility,
+                message.code == .kpiAccessibility,
+                message.arguments["title"] == .string("Revenue"),
+                message.arguments["value"]
+                    == .string("kpi:value:\(kpiMeasure.id.rawValue):42")
+            else { return nil }
+            return "Localized KPI"
+        }
+        let localizedPresentedKPI = try #require(
+            presenter.present(
+                kpi,
+                context: .init(identity: "localized-kpi"),
+                formatters: formatter,
+                textResolver: localizedResolver).kpi)
         let localizedKPIContent = AutoChartKPIContent(
-            preparedChart: kpi,
-            typography: .standard,
-            formatters: formatter,
-            textResolver: AutoChartTextResolver { message in
-                guard message.category == .accessibility,
-                    message.code == .kpiAccessibility,
-                    message.arguments["title"] == .string("Revenue"),
-                    message.arguments["value"]
-                        == .string("kpi:value:\(kpiMeasure.id.rawValue):42")
-                else { return nil }
-                return "Localized KPI"
-            })
+            presented: localizedPresentedKPI,
+            typography: .standard)
         #expect(localizedKPIContent.accessibilityText == "Localized KPI")
     }
 

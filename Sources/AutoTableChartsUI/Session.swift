@@ -30,6 +30,9 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
     private var loadedPresentationContext = AutoChartPresentationContext()
     private var loadedFormatters: AutoChartFormatters?
     private var loadedTextResolver = AutoChartTextResolver.default
+    private var environmentPresentationContext: AutoChartPresentationContext?
+    private var environmentFormatters: AutoChartFormatters?
+    private var environmentTextResolver: AutoChartTextResolver?
     private var generation: UInt64 = 0
     @ObservationIgnored private var task: Task<Void, Never>?
 
@@ -60,9 +63,9 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
             request,
             preference: preference,
             preparation: preparation,
-            presentationContext: presentationContext,
-            formatters: formatters,
-            textResolver: textResolver,
+            presentationContext: effectivePresentationContext,
+            formatters: effectiveFormatters,
+            textResolver: effectiveTextResolver,
             clearsVisibleState: self.request?.id != request.id)
     }
 
@@ -91,10 +94,7 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
     /// formatter or text-resolver configuration.
     public func setPresentationContext(_ context: AutoChartPresentationContext) {
         loadedPresentationContext = context
-        rebuildPresentation(
-            context: context,
-            formatters: loadedFormatters,
-            textResolver: loadedTextResolver)
+        rebuildEffectivePresentation()
     }
 
     /// Replaces the context and formatter configuration while preserving the
@@ -105,10 +105,7 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
     ) {
         loadedPresentationContext = context
         loadedFormatters = formatters
-        rebuildPresentation(
-            context: context,
-            formatters: formatters,
-            textResolver: loadedTextResolver)
+        rebuildEffectivePresentation()
     }
 
     /// Replaces the context and text resolver while preserving the formatter
@@ -119,10 +116,7 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
     ) {
         loadedPresentationContext = context
         loadedTextResolver = textResolver
-        rebuildPresentation(
-            context: context,
-            formatters: loadedFormatters,
-            textResolver: textResolver)
+        rebuildEffectivePresentation()
     }
 
     /// Replaces the complete presentation configuration without repeating analysis.
@@ -134,10 +128,7 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         loadedPresentationContext = context
         loadedFormatters = formatters
         loadedTextResolver = textResolver
-        rebuildPresentation(
-            context: context,
-            formatters: formatters,
-            textResolver: textResolver)
+        rebuildEffectivePresentation()
     }
 
     /// Applies optional SwiftUI environment overrides on top of the values
@@ -147,10 +138,29 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         formatters: AutoChartFormatters?,
         textResolver: AutoChartTextResolver?
     ) {
+        environmentPresentationContext = context
+        environmentFormatters = formatters
+        environmentTextResolver = textResolver
+        rebuildEffectivePresentation()
+    }
+
+    private var effectivePresentationContext: AutoChartPresentationContext {
+        environmentPresentationContext ?? loadedPresentationContext
+    }
+
+    private var effectiveFormatters: AutoChartFormatters? {
+        environmentFormatters ?? loadedFormatters
+    }
+
+    private var effectiveTextResolver: AutoChartTextResolver {
+        environmentTextResolver ?? loadedTextResolver
+    }
+
+    private func rebuildEffectivePresentation() {
         rebuildPresentation(
-            context: context ?? loadedPresentationContext,
-            formatters: formatters ?? loadedFormatters,
-            textResolver: textResolver ?? loadedTextResolver)
+            context: effectivePresentationContext,
+            formatters: effectiveFormatters,
+            textResolver: effectiveTextResolver)
     }
 
     private func rebuildPresentation(

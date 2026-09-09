@@ -760,10 +760,14 @@ enum AutoChartRecommendationEngine {
             let reason = "No safe chart can represent this result without changing its meaning."
             return AutoChartCandidateResults(
                 recommendations: [],
+                candidates: ranked,
                 fallbackReason: reason,
                 decisions: decisions)
         }
-        return AutoChartCandidateResults(recommendations: diverse, decisions: decisions)
+        return AutoChartCandidateResults(
+            recommendations: diverse,
+            candidates: ranked,
+            decisions: decisions)
     }
 
     static func validate(

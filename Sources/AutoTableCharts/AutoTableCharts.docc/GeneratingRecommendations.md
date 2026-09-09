@@ -49,6 +49,8 @@ persisted ``AutoChartPreference``. Resolution distinguishes an exact match, an
 automatic or recommended default, a changed policy, an unavailable
 specification, and a table-only outcome. Its replacement preference can be
 persisted by the host using its own ordering or compare-and-swap policy.
+An otherwise safe preference outside the bounded catalog is validated on demand
+and retained as the catalog's preferred recommendation.
 
 Preparation follows ``AutoChartPreparationStrategy``. A table preference
 prepares no chart, a valid saved preference prepares that exact chart, and an
