@@ -1,5 +1,10 @@
 import Foundation
 
+private struct AutoChartSelectionProvenance: Hashable {
+    var analysisID: AutoChartAnalysisID
+    var preparedChartID: AutoChartPreparedChartID
+}
+
 /// An ordered, provenance-safe collection of selections from one prepared chart.
 public struct AutoChartSelectionSet<RowID: Hashable & Sendable>: Hashable, Sendable,
     RandomAccessCollection
@@ -11,19 +16,30 @@ public struct AutoChartSelectionSet<RowID: Hashable & Sendable>: Hashable, Senda
 
     public init() { storage = [] }
 
-    /// Creates a set anchored to the first selection's provenance.
+    /// Creates a set from the largest compatible provenance cohort.
     ///
     /// Selections from another analysis or prepared chart are ignored rather
     /// than trapping a host process that is reconciling stale external state.
+    /// The earliest cohort wins when multiple cohorts contain the same number
+    /// of selections.
     public init(_ selections: [AutoChartSelection<RowID>]) {
-        let compatibleSelections: [AutoChartSelection<RowID>]
-        if let first = selections.first {
-            compatibleSelections = selections.filter {
-                $0.analysisID == first.analysisID
-                    && $0.preparedChartID == first.preparedChartID
+        var selectedProvenance: AutoChartSelectionProvenance?
+        var selectedCount = 0
+        var markIDsByProvenance: [AutoChartSelectionProvenance: Set<String>] = [:]
+        for selection in selections {
+            let provenance = AutoChartSelectionProvenance(
+                analysisID: selection.analysisID,
+                preparedChartID: selection.preparedChartID)
+            markIDsByProvenance[provenance, default: []].insert(selection.markID)
+            if markIDsByProvenance[provenance, default: []].count > selectedCount {
+                selectedProvenance = provenance
+                selectedCount = markIDsByProvenance[provenance, default: []].count
             }
-        } else {
-            compatibleSelections = []
+        }
+        let compatibleSelections = selections.filter {
+            AutoChartSelectionProvenance(
+                analysisID: $0.analysisID,
+                preparedChartID: $0.preparedChartID) == selectedProvenance
         }
         var seen: Set<String> = []
         storage = compatibleSelections.filter { seen.insert($0.markID).inserted }
@@ -81,6 +97,33 @@ public struct AutoChartSelectionSet<RowID: Hashable & Sendable>: Hashable, Senda
             storage.remove(at: index)
         } else {
             storage.append(selection)
+        }
+    }
+
+    /// Replaces the set, or toggles a group as one interaction target.
+    package mutating func select(
+        _ selections: [AutoChartSelection<RowID>],
+        togglingAsGroup: Bool
+    ) {
+        let group = Self(selections)
+        guard !group.isEmpty else { return }
+        guard togglingAsGroup else {
+            storage = group.storage
+            return
+        }
+        guard storage.isEmpty
+            || (analysisID == group.analysisID && preparedChartID == group.preparedChartID)
+        else {
+            storage = group.storage
+            return
+        }
+        let groupMarkIDs = Set(group.map(\.markID))
+        if groupMarkIDs.allSatisfy({ contains(markID: $0) }) {
+            storage.removeAll { groupMarkIDs.contains($0.markID) }
+        } else {
+            for selection in group where !contains(markID: selection.markID) {
+                storage.append(selection)
+            }
         }
     }
 

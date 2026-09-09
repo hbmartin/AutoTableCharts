@@ -174,32 +174,68 @@ public final class AutoChartCache: @unchecked Sendable {
             recency.removeAll(keepingCapacity: false)
             failures.removeAll(keepingCapacity: false)
             failureRecency.removeAll(keepingCapacity: false)
+            progressEntries = progressEntries.mapValues { entry in
+                var entry = entry
+                entry.current = nil
+                return entry
+            }
         }
         await engine.removeAll()
     }
 
     private func trimCompletedLocked() {
-        func totalCost() -> Int {
+        func retainedCostState() -> (
+            total: Int,
+            sourceReferenceCounts: [ObjectIdentifier: Int],
+            overflowed: Bool
+        ) {
             var result = 0
-            var sharedSources: Set<ObjectIdentifier> = []
+            var overflowed = false
+            var sourceReferenceCounts: [ObjectIdentifier: Int] = [:]
             for box in completed.values {
                 let (exclusiveTotal, exclusiveOverflow) = result.addingReportingOverflow(
                     box.exclusiveCost)
-                result = exclusiveOverflow ? Int.max : exclusiveTotal
-                if sharedSources.insert(box.sharedSourceIdentifier).inserted {
+                if exclusiveOverflow {
+                    result = Int.max
+                    overflowed = true
+                } else if !overflowed {
+                    result = exclusiveTotal
+                }
+                sourceReferenceCounts[box.sharedSourceIdentifier, default: 0] += 1
+                if sourceReferenceCounts[box.sharedSourceIdentifier] == 1 {
                     let (sharedTotal, sharedOverflow) = result.addingReportingOverflow(
                         box.sharedSourceCost)
-                    result = sharedOverflow ? Int.max : sharedTotal
+                    if sharedOverflow {
+                        result = Int.max
+                        overflowed = true
+                    } else if !overflowed {
+                        result = sharedTotal
+                    }
                 }
             }
-            return result
+            return (result, sourceReferenceCounts, overflowed)
         }
+
+        var costState = retainedCostState()
         while completed.count > configuration.analyses.maximumEntries
-            || totalCost() > configuration.maximumRetainedCost
+            || costState.overflowed
+            || costState.total > configuration.maximumRetainedCost
         {
             guard let oldest = recency.first else { break }
             recency.removeFirst()
-            completed.removeValue(forKey: oldest)
+            guard let removed = completed.removeValue(forKey: oldest) else { continue }
+            if costState.overflowed {
+                costState = retainedCostState()
+                continue
+            }
+            costState.total -= removed.exclusiveCost
+            if costState.sourceReferenceCounts[removed.sharedSourceIdentifier] == 1 {
+                costState.total -= removed.sharedSourceCost
+                costState.sourceReferenceCounts.removeValue(
+                    forKey: removed.sharedSourceIdentifier)
+            } else {
+                costState.sourceReferenceCounts[removed.sharedSourceIdentifier, default: 1] -= 1
+            }
         }
     }
 

@@ -665,10 +665,13 @@ public struct AutoChartColumn: Identifiable, Hashable, Codable, Sendable {
     /// An optional presentation label used verbatim in generated titles and axes.
     public var displayName: String?
     /// Semantic metadata that overrides or supplements profiling.
-    public var semantics: AutoChartColumnSemantics
+    public var semantics: AutoChartColumnSemantics {
+        didSet { normalizedHints = semantics.hints }
+    }
+    private var normalizedHints: AutoChartColumnHints
 
     /// Normalized hints consumed by profiling and validation.
-    public var hints: AutoChartColumnHints { semantics.hints }
+    public var hints: AutoChartColumnHints { normalizedHints }
 
     /// Creates a column description.
     ///
@@ -687,6 +690,7 @@ public struct AutoChartColumn: Identifiable, Hashable, Codable, Sendable {
         self.name = name
         self.displayName = displayName
         self.semantics = semantics
+        self.normalizedHints = semantics.hints
     }
 
     // Package implementation and tests use this bridge while candidate generation
@@ -701,6 +705,7 @@ public struct AutoChartColumn: Identifiable, Hashable, Codable, Sendable {
         self.name = name
         self.displayName = displayName
         self.semantics = AutoChartColumnSemantics(hints: hints)
+        self.normalizedHints = hints
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -717,10 +722,12 @@ public struct AutoChartColumn: Identifiable, Hashable, Codable, Sendable {
             AutoChartColumnSemantics.self, forKey: .semantics)
         {
             semantics = decoded
+            normalizedHints = decoded.hints
         } else {
             let legacy = try container.decodeIfPresent(
                 AutoChartColumnHints.self, forKey: .hints) ?? .init()
             semantics = AutoChartColumnSemantics(hints: legacy)
+            normalizedHints = legacy
         }
     }
 
@@ -2199,6 +2206,7 @@ extension AutoChartRecommendation {
 
 struct AutoChartCandidateResults: Sendable {
     public var recommendations: [AutoChartRecommendation]
+    var candidates: [AutoChartRecommendation]
     public var fallbackReason: String?
     var decisions: [AutoChartCandidateDecision]
 
@@ -2209,10 +2217,12 @@ struct AutoChartCandidateResults: Sendable {
     ///   - fallbackReason: The reason only a table can safely represent the data.
     public init(
         recommendations: [AutoChartRecommendation],
+        candidates: [AutoChartRecommendation]? = nil,
         fallbackReason: String? = nil,
         decisions: [AutoChartCandidateDecision] = []
     ) {
         self.recommendations = recommendations
+        self.candidates = candidates ?? recommendations
         self.fallbackReason = fallbackReason
         self.decisions = decisions
     }

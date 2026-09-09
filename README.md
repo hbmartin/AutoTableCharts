@@ -69,7 +69,8 @@ builder declarations.
   non-additive values cannot be implicitly aggregated. Composition additionally
   requires complete, positive, additive values.
 - `AutoChartRecommendationCatalog` exposes at most five featured choices and
-  fifty validated cataloged choices. Persist recommendation IDs from that catalog.
+  fifty validated cataloged choices while preserving a valid off-list preference
+  through targeted validation.
 - `AutoChartPreference` separates automatic, table, recommended chart, and
   specific-chart choices from request identity.
 - `AutoChartSession` owns supersession, cancellation, preparation, retries,
