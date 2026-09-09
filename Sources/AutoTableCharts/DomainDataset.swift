@@ -19,7 +19,10 @@ public struct AutoChartDomainColumn<Record: Sendable>: Sendable {
 }
 
 /// Declares a categorical or temporal dimension from a domain record.
-public struct Dimension<Record: Sendable>: Sendable {
+///
+/// The `AutoChart` prefix avoids a collision with `Foundation.Dimension` in
+/// client code that imports both Foundation and AutoTableCharts.
+public struct AutoChartDimension<Record: Sendable>: Sendable {
     let columns: [AutoChartDomainColumn<Record>]
 
     public init<Value: AutoChartValueConvertible>(
@@ -135,7 +138,7 @@ public enum AutoChartDatasetBuilder<Record: Sendable> {
     ) -> [AutoChartDomainColumn<Record>] { [expression] }
 
     public static func buildExpression(
-        _ expression: Dimension<Record>
+        _ expression: AutoChartDimension<Record>
     ) -> [AutoChartDomainColumn<Record>] { expression.columns }
 
     public static func buildExpression(

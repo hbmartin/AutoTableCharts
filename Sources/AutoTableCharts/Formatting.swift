@@ -305,6 +305,12 @@ public struct AutoChartFormatters: Sendable {
                 context: context))
     }
 
+    /// Stable for copies of the same formatter bundle and distinct for newly
+    /// supplied host callbacks.
+    package var callbackIdentity: UUID? {
+        hostOverride?.token.identity
+    }
+
     /// Formats a complete semantic request.
     public func format(_ request: AutoChartFormattingRequest) -> String {
         if let formatted = formatOverride(request) {

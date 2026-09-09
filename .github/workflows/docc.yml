@@ -31,6 +31,8 @@ jobs:
             --allow-writing-to-directory "$DOCC_OUTPUT" \
             generate-documentation \
             --target AutoTableCharts \
+            --target AutoTableChartsUI \
+            --enable-experimental-combined-documentation \
             --disable-indexing \
             --transform-for-static-hosting \
             --hosting-base-path AutoTableCharts \
@@ -51,7 +53,9 @@ jobs:
           test -f "$DOCC_OUTPUT/metadata.json"
           test -f "$DOCC_OUTPUT/documentation-coverage.json"
           test -f "$DOCC_OUTPUT/documentation/autotablecharts/index.html"
+          test -f "$DOCC_OUTPUT/documentation/autotablechartsui/index.html"
           test -f "$DOCC_OUTPUT/data/documentation/autotablecharts.json"
+          test -f "$DOCC_OUTPUT/data/documentation/autotablechartsui.json"
           grep -F 'var baseUrl = "/AutoTableCharts/"' "$DOCC_OUTPUT/index.html" >/dev/null
 
       - name: Add GitHub Pages landing redirect

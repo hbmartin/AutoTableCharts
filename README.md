@@ -56,7 +56,7 @@ struct ResultChart: View {
 
 Construct SQL-style data with `AutoChartDataset` and
 `.trusted(identity:revision:)` or `.contentAddressed(identity:)`. Domain models
-can use the `Dimension`, `Measure`, `Identifier`, and paired `Interval` result
+can use the `AutoChartDimension`, `Measure`, `Identifier`, and paired `Interval` result
 builder declarations.
 
 ## v3 behavior
@@ -69,7 +69,7 @@ builder declarations.
   non-additive values cannot be implicitly aggregated. Composition additionally
   requires complete, positive, additive values.
 - `AutoChartRecommendationCatalog` exposes at most five featured choices and
-  fifty cataloged choices, while preserving a valid off-list preference.
+  fifty validated cataloged choices. Persist recommendation IDs from that catalog.
 - `AutoChartPreference` separates automatic, table, recommended chart, and
   specific-chart choices from request identity.
 - `AutoChartSession` owns supersession, cancellation, preparation, retries,
@@ -85,7 +85,10 @@ Version 3 intentionally has no v2 compatibility facade. Adopt
 `AutoChartRequest`, `AutoChartCache`, `AutoChartPreference`, catalog outcomes,
 associated-value family specifications, `AutoChartColumnSemantics`, and the
 separate `AutoTableChartsUI` product. Package failures now use
-`AutoChartFailure`; cancellation remains cancellation.
+`AutoChartFailure`; cancellation remains cancellation. Dataset decoding accepts
+the version 2 keyed `AutoChartDataKey` representation. Selections now carry
+process-local provenance and are intentionally not `Codable`; persist source row
+IDs and derive a fresh selection after preparation.
 
 ## Documentation and development
 
@@ -109,6 +112,8 @@ Scripts/verify-release-library.sh --xcode-derived-data /path/to/DerivedData
 
 swift package --allow-writing-to-directory .build/docc generate-documentation \
   --target AutoTableCharts \
+  --target AutoTableChartsUI \
+  --enable-experimental-combined-documentation \
   --disable-indexing \
   --transform-for-static-hosting \
   --hosting-base-path AutoTableCharts \

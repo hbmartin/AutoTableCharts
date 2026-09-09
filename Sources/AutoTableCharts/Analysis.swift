@@ -304,6 +304,16 @@ public struct AutoChartAnalysis<RowID: Hashable & Sendable>: Sendable {
 
     private let provider: AutoChartAnalysisPreparationProvider<RowID>
 
+    package var sharedSourceIdentifier: ObjectIdentifier {
+        ObjectIdentifier(provider.source)
+    }
+
+    package var sharedSourceRetainedCost: Int { provider.source.cost }
+
+    package var exclusiveRetainedCost: Int {
+        max(0, estimatedRetainedCost - provider.source.cost)
+    }
+
     init(
         id: AutoChartAnalysisID,
         request: AutoChartRequestID,
@@ -411,7 +421,7 @@ public struct AutoChartAnalysis<RowID: Hashable & Sendable>: Sendable {
         resolution: AutoChartPreferenceResolution?
     ) -> Self {
         let primary = resolution?.recommendation.flatMap { preparedCharts[$0.id] }
-            ?? preparedCharts.values.first
+            ?? preparedCharts.sorted { $0.key < $1.key }.first?.value
         let presentedOutcome: AutoChartRecommendationOutcome
         if case .charts(let catalog) = outcome,
             let resolved = resolution?.recommendation,
@@ -949,6 +959,10 @@ public actor AutoChartAnalyzer {
         case .allCataloged:
             if case .charts(let catalog) = base.outcome {
                 recommendations = catalog.cataloged
+                    + (resolution.recommendation.map { recommendation in
+                        catalog.cataloged.contains { $0.id == recommendation.id }
+                            ? [] : [recommendation]
+                    } ?? [])
             } else {
                 recommendations = []
             }
@@ -1271,9 +1285,10 @@ public actor AutoChartAnalyzer {
 
         try Task.checkCancellation()
         var catalogOptions = options
-        // Rank every bounded candidate before truncating the public catalog so a
-        // persisted safe recommendation can still be honored off-list.
-        catalogOptions.maximumRecommendations = Int.max
+        // Validate only as many recommendations as the public catalog can retain.
+        // Prepared-domain validation may scan every row for each candidate.
+        catalogOptions.maximumRecommendations =
+            AutoChartRecommendationCatalog.maximumCatalogedCount
         let set = AutoChartRecommendationEngine.recommendations(
             snapshot: source.snapshot,
             context: context,
@@ -1293,9 +1308,12 @@ public actor AutoChartAnalyzer {
                         code: code,
                         defaultText: reason)))
         } else {
+            let featuredLimit = min(
+                options.maximumRecommendations,
+                AutoChartRecommendationCatalog.maximumFeaturedCount)
             outcome = .charts(
                 AutoChartRecommendationCatalog(
-                    featured: Array(recommendations.prefix(options.maximumRecommendations)),
+                    featured: Array(recommendations.prefix(featuredLimit)),
                     cataloged: recommendations))
         }
         try Task.checkCancellation()

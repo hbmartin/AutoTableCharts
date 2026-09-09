@@ -27,6 +27,9 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
     private var presentationContext = AutoChartPresentationContext()
     private var formatters: AutoChartFormatters?
     private var textResolver = AutoChartTextResolver.default
+    private var loadedPresentationContext = AutoChartPresentationContext()
+    private var loadedFormatters: AutoChartFormatters?
+    private var loadedTextResolver = AutoChartTextResolver.default
     private var generation: UInt64 = 0
     @ObservationIgnored private var task: Task<Void, Never>?
 
@@ -50,6 +53,9 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         formatters: AutoChartFormatters? = nil,
         textResolver: AutoChartTextResolver = .default
     ) {
+        loadedPresentationContext = presentationContext
+        loadedFormatters = formatters
+        loadedTextResolver = textResolver
         start(
             request,
             preference: preference,
@@ -74,19 +80,83 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         start(
             request,
             preference: preference,
-            preparation: .preferredOrPrimary,
+            preparation: strategy,
             presentationContext: presentationContext,
             formatters: formatters,
             textResolver: textResolver,
             clearsVisibleState: false)
     }
 
-    /// Rebuilds presentation for the current prepared chart without repeating analysis.
-    /// Change `context.identity` whenever formatter or resolver behavior changes.
+    /// Rebuilds presentation for the current prepared chart without replacing
+    /// formatter or text-resolver configuration.
+    public func setPresentationContext(_ context: AutoChartPresentationContext) {
+        loadedPresentationContext = context
+        rebuildPresentation(
+            context: context,
+            formatters: loadedFormatters,
+            textResolver: loadedTextResolver)
+    }
+
+    /// Replaces the context and formatter configuration while preserving the
+    /// text resolver supplied by `load` or a prior presentation update.
     public func setPresentationContext(
         _ context: AutoChartPresentationContext,
-        formatters: AutoChartFormatters? = nil,
-        textResolver: AutoChartTextResolver = .default
+        formatters: AutoChartFormatters?
+    ) {
+        loadedPresentationContext = context
+        loadedFormatters = formatters
+        rebuildPresentation(
+            context: context,
+            formatters: formatters,
+            textResolver: loadedTextResolver)
+    }
+
+    /// Replaces the context and text resolver while preserving the formatter
+    /// configuration supplied by `load` or a prior presentation update.
+    public func setPresentationContext(
+        _ context: AutoChartPresentationContext,
+        textResolver: AutoChartTextResolver
+    ) {
+        loadedPresentationContext = context
+        loadedTextResolver = textResolver
+        rebuildPresentation(
+            context: context,
+            formatters: loadedFormatters,
+            textResolver: textResolver)
+    }
+
+    /// Replaces the complete presentation configuration without repeating analysis.
+    public func setPresentationContext(
+        _ context: AutoChartPresentationContext,
+        formatters: AutoChartFormatters?,
+        textResolver: AutoChartTextResolver
+    ) {
+        loadedPresentationContext = context
+        loadedFormatters = formatters
+        loadedTextResolver = textResolver
+        rebuildPresentation(
+            context: context,
+            formatters: formatters,
+            textResolver: textResolver)
+    }
+
+    /// Applies optional SwiftUI environment overrides on top of the values
+    /// supplied by `load`, restoring those values when an override disappears.
+    package func applyPresentationEnvironment(
+        context: AutoChartPresentationContext?,
+        formatters: AutoChartFormatters?,
+        textResolver: AutoChartTextResolver?
+    ) {
+        rebuildPresentation(
+            context: context ?? loadedPresentationContext,
+            formatters: formatters ?? loadedFormatters,
+            textResolver: textResolver ?? loadedTextResolver)
+    }
+
+    private func rebuildPresentation(
+        context: AutoChartPresentationContext,
+        formatters: AutoChartFormatters?,
+        textResolver: AutoChartTextResolver
     ) {
         presentationContext = context
         self.formatters = formatters
@@ -145,8 +215,6 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         self.textResolver = textResolver
         if clearsVisibleState {
             selection.removeAll()
-        } else if !selection.isEmpty, selection.analysisID == nil {
-            selection.removeAll()
         }
         if preparation != .none,
             let completed: AutoChartAnalysis<RowID> = cache.completedAnalysis(
@@ -157,8 +225,9 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         } else {
             state = .analyzing(nil)
         }
-        task = Task { [weak self] in
-            guard let self else { return }
+        let analyzer = self.analyzer
+        let presenter = self.presenter
+        task = Task { [weak self, analyzer, presenter] in
             do {
                 let analysis = try await analyzer.analyze(
                     request,
@@ -178,7 +247,7 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
                         }
                     })
                 try Task.checkCancellation()
-                guard generation == token else { return }
+                guard let self, self.generation == token else { return }
                 if !selection.belongs(to: analysis) { selection.removeAll() }
                 if case .tableFallback(let fallback) = analysis.outcome {
                     state = .fallback(analysis, fallback)
@@ -193,19 +262,19 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
                     AutoChartProgress(phase: .presentationPreparation))
                 let presented = presenter.present(
                     chart,
-                    context: presentationContext,
-                    formatters: formatters,
-                    textResolver: textResolver)
+                    context: self.presentationContext,
+                    formatters: self.formatters,
+                    textResolver: self.textResolver)
                 guard generation == token, !Task.isCancelled else { return }
                 if !selection.belongs(to: chart) { selection.removeAll() }
                 state = .ready(analysis, presented)
             } catch is CancellationError {
                 // Supersession and explicit cancellation intentionally publish no failure.
             } catch let failure as AutoChartFailure {
-                guard generation == token else { return }
+                guard let self, self.generation == token else { return }
                 state = .failed(failure)
             } catch {
-                guard generation == token else { return }
+                guard let self, self.generation == token else { return }
                 state = .failed(
                     AutoChartFailure(
                         stage: .recommendation,

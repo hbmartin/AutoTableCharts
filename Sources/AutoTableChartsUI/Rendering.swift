@@ -4,6 +4,10 @@ import SwiftUI
 import Charts
 import AutoTableCharts
 
+/// Bounded, source-snapshot-free memoization for the synchronous convenience
+/// initializers. Sessions may still inject their own presenter.
+private let autoChartConveniencePresenter = AutoChartPresenter()
+
 #if os(macOS)
 import AppKit
 #endif
@@ -159,14 +163,8 @@ struct AutoChartKPIContent: View {
 
 /// Convenience composition of a prepared plot and optional package chrome.
 public struct AutoChartView<RowID: Hashable & Sendable>: View {
-    private struct PreparedViewState {
-        let content: AutoChartViewContent<RowID>
-        let renderedData: [AutoChartDatum]
-        let facetPanels: [AutoChartFacetPanel]
-        let sharedXCategoryDomain: [String]
-    }
-
     private let content: AutoChartViewContent<RowID>
+    private let displayTitle: String
     private let presentation: AutoChartPresentation
     private let formatters: AutoChartFormatters
     private let textResolver: AutoChartTextResolver
@@ -181,57 +179,14 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     @State private var selectedDate: Date?
     @State private var selectedNumber: Double?
     @State private var selectedAngle: Double?
+    @State private var pendingCategorySynchronization: String?? = nil
+    @State private var pendingDateSynchronization: Date?? = nil
+    @State private var pendingNumberSynchronization: Double?? = nil
+    @State private var pendingAngleSynchronization: Double?? = nil
     @State private var zoomScale = 1.0
     @State private var zoomAnchor = 1.0
     @Environment(\.autoChartPalette) private var palette
     @Environment(\.autoChartTheme) private var theme
-
-    private static func preparedViewState(
-        for preparedChart: AutoChartPreparedChart<RowID>,
-        formatters: AutoChartFormatters,
-        textResolver: AutoChartTextResolver
-    ) -> PreparedViewState {
-        let core = preparedChart.core
-        let specification = preparedChart.recommendation.specification
-        let resolvedPresentation = core.presentation.resolvedPresentation(
-            data: core.data,
-            using: textResolver,
-            formatters: formatters)
-        let renderedData: [AutoChartDatum]
-        if specification.family == .boxPlot {
-            renderedData = orderedBoxPlotData(
-                core.data,
-                labels: resolvedPresentation.xDisplayLabels,
-                fallback: resolvedPresentation.missingValue,
-                locale: formatters.locale)
-        } else {
-            renderedData = orderedPresentedData(
-                core.data,
-                specification: specification,
-                xLabels: resolvedPresentation.xDisplayLabels,
-                yLabels: resolvedPresentation.yDisplayLabels,
-                missingValue: resolvedPresentation.missingValue,
-                locale: formatters.locale)
-        }
-        let sharedXCategoryDomain =
-            core.presentation.usesSharedXCategoryDomain
-            ? resolvedXCategoryDomain(
-                in: renderedData,
-                labels: resolvedPresentation.xDisplayLabels,
-                fallback: resolvedPresentation.missingValue)
-            : []
-        return PreparedViewState(
-            content: .chart(preparedChart, resolvedPresentation),
-            renderedData: renderedData,
-            facetPanels:
-                specification.family == .faceted
-                ? orderedFacetPanels(
-                    in: renderedData,
-                    labels: resolvedPresentation.facetDisplayLabels,
-                    fallback: resolvedPresentation.missingFacet,
-                    locale: formatters.locale) : [],
-            sharedXCategoryDomain: sharedXCategoryDomain)
-    }
 
     public init(
         preparedChart: AutoChartPreparedChart<RowID>,
@@ -241,15 +196,19 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         formatters: AutoChartFormatters = .init(),
         textResolver: AutoChartTextResolver = .default
     ) {
-        let state = Self.preparedViewState(
-            for: preparedChart,
+        let presented = autoChartConveniencePresenter.present(
+            preparedChart,
+            context: AutoChartPresentationContext(
+                locale: formatters.locale,
+                timeZone: formatters.timeZone),
             formatters: formatters,
             textResolver: textResolver)
-        content = state.content
-        renderedData = state.renderedData
-        facetPanels = state.facetPanels
-        sharedXCategoryDomain = state.sharedXCategoryDomain
-        presentedKPI = nil
+        content = .chart(preparedChart, presented.resolvedPresentation)
+        displayTitle = presented.title
+        renderedData = presented.renderedData
+        facetPanels = presented.facetPanels
+        sharedXCategoryDomain = presented.sharedXCategoryDomain
+        presentedKPI = presented.kpi
         self.analysisID = analysisID
         self._selection = selection
         self.presentation = presentation
@@ -263,12 +222,13 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         analysisID: AutoChartAnalysisID,
         selection: Binding<AutoChartSelectionSet<RowID>> = .constant(.init()),
         presentation: AutoChartPresentation = .explorer(),
-        formatters: AutoChartFormatters = .init(),
-        textResolver: AutoChartTextResolver = .default
+        formatters: AutoChartFormatters? = nil,
+        textResolver: AutoChartTextResolver? = nil
     ) {
         content = .chart(
             presentedChart.preparedChart,
             presentedChart.resolvedPresentation)
+        displayTitle = presentedChart.title
         renderedData = presentedChart.renderedData
         facetPanels = presentedChart.facetPanels
         sharedXCategoryDomain = presentedChart.sharedXCategoryDomain
@@ -276,8 +236,8 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         self.analysisID = analysisID
         self._selection = selection
         self.presentation = presentation
-        self.formatters = formatters
-        self.textResolver = textResolver
+        self.formatters = formatters ?? presentedChart.formatters
+        self.textResolver = textResolver ?? presentedChart.textResolver
     }
 
     public init(
@@ -288,17 +248,22 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         textResolver: AutoChartTextResolver = .default
     ) {
         if let primary = analysis.primaryChart {
-            let state = Self.preparedViewState(
-                for: primary,
+            let presented = autoChartConveniencePresenter.present(
+                primary,
+                context: AutoChartPresentationContext(
+                    locale: formatters.locale,
+                    timeZone: formatters.timeZone),
                 formatters: formatters,
                 textResolver: textResolver)
-            content = state.content
-            renderedData = state.renderedData
-            facetPanels = state.facetPanels
-            sharedXCategoryDomain = state.sharedXCategoryDomain
-            presentedKPI = nil
+            content = .chart(primary, presented.resolvedPresentation)
+            displayTitle = presented.title
+            renderedData = presented.renderedData
+            facetPanels = presented.facetPanels
+            sharedXCategoryDomain = presented.sharedXCategoryDomain
+            presentedKPI = presented.kpi
         } else if case .tableFallback(let fallback) = analysis.outcome {
             content = .fallback(fallback)
+            displayTitle = ""
             renderedData = []
             facetPanels = []
             sharedXCategoryDomain = []
@@ -310,6 +275,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
                         category: .fallback,
                         code: .noSafeChart,
                         defaultText: "No prepared chart is available.")))
+            displayTitle = ""
             renderedData = []
             facetPanels = []
             sharedXCategoryDomain = []
@@ -407,8 +373,8 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             }
         case .chart:
             VStack(alignment: .leading, spacing: 10) {
-            if presentation.chrome.contains(.title), !specification.title.isEmpty {
-                Text(specification.title)
+            if presentation.chrome.contains(.title), !displayTitle.isEmpty {
+                Text(displayTitle)
                     .font(isCompact ? theme.labelFont.weight(.semibold) : theme.titleFont)
                     .lineLimit(isCompact ? 2 : nil)
             }
@@ -474,9 +440,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             }
         .accessibilityElement(children: .contain)
         .accessibilityLabel(
-            specification.title.isEmpty
-                ? textResolver(specification.family.localizationMessage)
-                : specification.title
+            displayTitle
         )
         .accessibilityIdentifier("auto-chart-\(specification.family.rawValue)")
         .foregroundStyle(theme.legendColor)
@@ -1292,9 +1256,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             selection.preparedChartID == preparedChart.id
         else { return [] }
         return Set(
-            selection.flatMap { selected in
-                selected.markID.split(separator: "|").map(String.init)
-            })
+            selection.map(\.markID))
     }
 
     private func selectionOpacity(for datum: AutoChartDatum) -> Double {
@@ -1392,7 +1354,9 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         if interactions.contains(.selection) {
             content
                 .chartXSelection(value: $selectedCategory)
-                .onChange(of: selectedCategory) { _, value in select(category: value) }
+                .onChange(of: selectedCategory) { _, value in
+                    handleCategorySelectionChange(value)
+                }
         } else {
             content
         }
@@ -1403,7 +1367,9 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         if interactions.contains(.selection) {
             content
                 .chartYSelection(value: $selectedCategory)
-                .onChange(of: selectedCategory) { _, value in select(category: value) }
+                .onChange(of: selectedCategory) { _, value in
+                    handleCategorySelectionChange(value)
+                }
         } else {
             content
         }
@@ -1411,6 +1377,9 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
 
     @ViewBuilder
     private func selectableHeatmap<Content: View>(_ content: Content) -> some View {
+        #if os(tvOS)
+        content
+        #else
         if interactions.contains(.selection) {
             content.chartOverlay { proxy in
                 GeometryReader { geometry in
@@ -1441,6 +1410,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         } else {
             content
         }
+        #endif
     }
 
     @ViewBuilder
@@ -1450,6 +1420,9 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         as _: Value.Type,
         onSelect: @escaping (Value) -> Void
     ) -> some View {
+        #if os(tvOS)
+        content
+        #else
         if interactions.contains(.selection) {
             content.chartOverlay { proxy in
                 GeometryReader { geometry in
@@ -1482,6 +1455,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         } else {
             content
         }
+        #endif
     }
 
     @ViewBuilder
@@ -1489,7 +1463,9 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         if interactions.contains(.selection) {
             content
                 .chartXSelection(value: $selectedDate)
-                .onChange(of: selectedDate) { _, value in select(date: value) }
+                .onChange(of: selectedDate) { _, value in
+                    handleDateSelectionChange(value)
+                }
         } else {
             content
         }
@@ -1500,7 +1476,9 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         if interactions.contains(.selection) {
             content
                 .chartXSelection(value: $selectedNumber)
-                .onChange(of: selectedNumber) { _, value in select(number: value) }
+                .onChange(of: selectedNumber) { _, value in
+                    handleNumberSelectionChange(value)
+                }
         } else {
             content
         }
@@ -1511,7 +1489,9 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         if interactions.contains(.selection) {
             content
                 .chartAngleSelection(value: $selectedAngle)
-                .onChange(of: selectedAngle) { _, value in select(angle: value) }
+                .onChange(of: selectedAngle) { _, value in
+                    handleAngleSelectionChange(value)
+                }
         } else {
             content
         }
@@ -1699,32 +1679,38 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     }
 
     private func applySelection(_ matches: [AutoChartDatum]) {
-        guard let sourceRowOffsets = AutoChartSelectionPreparation.sourceRowOffsets(
-            for: matches)
-        else {
+        let selectedMarks = matches.compactMap { match -> AutoChartSelection<RowID>? in
+            guard let sourceRowOffsets = AutoChartSelectionPreparation.sourceRowOffsets(
+                for: [match])
+            else { return nil }
+            let semanticValues = AutoChartSelectionPreparation.semanticValues(
+                for: [match],
+                specification: specification,
+                measureSemantics: renderedMeasureSemantics)
+            return AutoChartSelection(
+                analysisID: analysisID,
+                preparedChartID: preparedChart.id,
+                sourceRowIDs: preparedChart.rowIDs(for: sourceRowOffsets),
+                dimensions: semanticValues.dimensions,
+                rangeDimensions: semanticValues.rangeDimensions,
+                measure: semanticValues.measure,
+                family: specification.family,
+                specificationID: specification.id,
+                markID: match.id)
+        }
+        guard !selectedMarks.isEmpty else {
             selection.removeAll()
             return
         }
-        let semanticValues = AutoChartSelectionPreparation.semanticValues(
-            for: matches,
-            specification: specification,
-            measureSemantics: renderedMeasureSemantics)
-        let selectedMark = AutoChartSelection(
-            analysisID: analysisID,
-            preparedChartID: preparedChart.id,
-            sourceRowIDs: preparedChart.rowIDs(for: sourceRowOffsets),
-            dimensions: semanticValues.dimensions,
-            rangeDimensions: semanticValues.rangeDimensions,
-            measure: semanticValues.measure,
-            family: specification.family,
-            specificationID: specification.id,
-            markID: matches.map(\.id).joined(separator: "|"))
         #if os(macOS)
-        let toggling = NSEvent.modifierFlags.contains(.command)
-        #else
-        let toggling = false
+        if NSEvent.modifierFlags.contains(.command) {
+            for selectedMark in selectedMarks {
+                selection.select(selectedMark, toggling: true)
+            }
+            return
+        }
         #endif
-        selection.select(selectedMark, toggling: toggling)
+        selection = AutoChartSelectionSet(selectedMarks)
     }
 
     private func clearSelection() {
@@ -1739,36 +1725,99 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     private func synchronizeInteractionState(
         from selection: AutoChartSelectionSet<RowID>
     ) {
+        var category: String?
+        var date: Date?
+        var number: Double?
+        var angle: Double?
         guard let selectedMark = selection.first,
             selection.analysisID == analysisID,
             selection.preparedChartID == preparedChart.id
         else {
-            selectedCategory = nil
-            selectedDate = nil
-            selectedNumber = nil
-            selectedAngle = nil
+            synchronizeInteractionBindings(
+                category: nil, date: nil, number: nil, angle: nil)
             return
         }
-        let markIDs = Set(selectedMark.markID.split(separator: "|").map(String.init))
-        guard let datum = data.first(where: { markIDs.contains($0.id) }) else { return }
-        selectedCategory = nil
-        selectedDate = nil
-        selectedNumber = nil
-        selectedAngle = nil
+        guard let datum = data.first(where: { $0.id == selectedMark.markID }) else {
+            synchronizeInteractionBindings(
+                category: nil, date: nil, number: nil, angle: nil)
+            return
+        }
         switch specification.family {
         case .donut:
             guard let index = data.firstIndex(where: { $0.id == datum.id }) else { return }
             let preceding = data[..<index].compactMap(\.yNumber).reduce(0, +)
-            selectedAngle = preceding + (datum.yNumber ?? 0) / 2
+            angle = preceding + (datum.yNumber ?? 0) / 2
         case .line, .pointLine, .area, .scatter, .bubble:
-            if let date = datum.xDate { selectedDate = date }
-            else if let number = datum.xNumber { selectedNumber = number }
-            else { selectedCategory = xCategoryValue(for: datum) }
+            if let value = datum.xDate { date = value }
+            else if let value = datum.xNumber { number = value }
+            else { category = xCategoryValue(for: datum) }
         case .histogram:
-            selectedNumber = datum.xNumber
+            number = datum.xNumber
                 ?? datum.lower.flatMap { lower in datum.upper.map { (lower + $0) / 2 } }
         default:
-            selectedCategory = xCategoryValue(for: datum)
+            category = xCategoryValue(for: datum)
+        }
+        synchronizeInteractionBindings(
+            category: category, date: date, number: number, angle: angle)
+    }
+
+    private func handleCategorySelectionChange(_ value: String?) {
+        if let expected = pendingCategorySynchronization, expected == value {
+            pendingCategorySynchronization = nil
+            return
+        }
+        pendingCategorySynchronization = nil
+        select(category: value)
+    }
+
+    private func handleDateSelectionChange(_ value: Date?) {
+        if let expected = pendingDateSynchronization, expected == value {
+            pendingDateSynchronization = nil
+            return
+        }
+        pendingDateSynchronization = nil
+        select(date: value)
+    }
+
+    private func handleNumberSelectionChange(_ value: Double?) {
+        if let expected = pendingNumberSynchronization, expected == value {
+            pendingNumberSynchronization = nil
+            return
+        }
+        pendingNumberSynchronization = nil
+        select(number: value)
+    }
+
+    private func handleAngleSelectionChange(_ value: Double?) {
+        if let expected = pendingAngleSynchronization, expected == value {
+            pendingAngleSynchronization = nil
+            return
+        }
+        pendingAngleSynchronization = nil
+        select(angle: value)
+    }
+
+    private func synchronizeInteractionBindings(
+        category: String?,
+        date: Date?,
+        number: Double?,
+        angle: Double?
+    ) {
+        if selectedCategory != category {
+            pendingCategorySynchronization = .some(category)
+            selectedCategory = category
+        }
+        if selectedDate != date {
+            pendingDateSynchronization = .some(date)
+            selectedDate = date
+        }
+        if selectedNumber != number {
+            pendingNumberSynchronization = .some(number)
+            selectedNumber = number
+        }
+        if selectedAngle != angle {
+            pendingAngleSynchronization = .some(angle)
+            selectedAngle = angle
         }
     }
 

@@ -5,7 +5,7 @@ import AutoTableCharts
 
 public struct AutoChartPalette: @unchecked Sendable {
     public var marks: [Color]
-    public init(marks: [Color] = [.blue, .orange, .green, .purple, .pink]) {
+    public init(marks: [Color] = []) {
         self.marks = marks
     }
 }
@@ -38,15 +38,15 @@ public struct AutoChartTheme: @unchecked Sendable {
 }
 
 private struct AutoChartPresentationContextKey: EnvironmentKey {
-    static let defaultValue = AutoChartPresentationContext()
+    static let defaultValue: AutoChartPresentationContext? = nil
 }
 
 private struct AutoChartFormattersKey: EnvironmentKey {
-    static let defaultValue = AutoChartFormatters()
+    static let defaultValue: AutoChartFormatters? = nil
 }
 
 private struct AutoChartTextResolverKey: EnvironmentKey {
-    static let defaultValue = AutoChartTextResolver.default
+    static let defaultValue: AutoChartTextResolver? = nil
 }
 
 private struct AutoChartPaletteKey: EnvironmentKey {
@@ -58,17 +58,17 @@ private struct AutoChartThemeKey: EnvironmentKey {
 }
 
 extension EnvironmentValues {
-    public var autoChartPresentationContext: AutoChartPresentationContext {
+    public var autoChartPresentationContext: AutoChartPresentationContext? {
         get { self[AutoChartPresentationContextKey.self] }
         set { self[AutoChartPresentationContextKey.self] = newValue }
     }
 
-    public var autoChartFormatters: AutoChartFormatters {
+    public var autoChartFormatters: AutoChartFormatters? {
         get { self[AutoChartFormattersKey.self] }
         set { self[AutoChartFormattersKey.self] = newValue }
     }
 
-    public var autoChartTextResolver: AutoChartTextResolver {
+    public var autoChartTextResolver: AutoChartTextResolver? {
         get { self[AutoChartTextResolverKey.self] }
         set { self[AutoChartTextResolverKey.self] = newValue }
     }
@@ -169,6 +169,14 @@ public struct AutoChartSessionView<
     @Environment(\.autoChartPresentationContext) private var presentationContext
     @Environment(\.autoChartTheme) private var theme
 
+    private struct EnvironmentPresentationIdentity: Hashable {
+        var context: AutoChartPresentationContext?
+        var formatterLocaleIdentifier: String?
+        var formatterTimeZoneIdentifier: String?
+        var formatterCallback: UUID?
+        var resolverCallback: UUID?
+    }
+
     public init(
         session: AutoChartSession<RowID>,
         @ViewBuilder loading: @escaping (AutoChartProgress?) -> Loading,
@@ -200,9 +208,7 @@ public struct AutoChartSessionView<
                     AutoChartView(
                         presentedChart: presented,
                         analysisID: analysis.id,
-                        selection: $session.selection,
-                        formatters: formatters,
-                        textResolver: textResolver)
+                        selection: $session.selection)
                         .foregroundStyle(theme.legendColor)
                 } else {
                     loading(nil)
@@ -213,7 +219,7 @@ public struct AutoChartSessionView<
                 failure(error)
             }
         }
-        .task(id: presentationContext) {
+        .task(id: environmentPresentationIdentity) {
             applyEnvironmentPresentation()
         }
         .onChange(of: readyPreparedChartID) { _, id in
@@ -227,9 +233,18 @@ public struct AutoChartSessionView<
         return analysis.primaryChart?.id
     }
 
+    private var environmentPresentationIdentity: EnvironmentPresentationIdentity {
+        EnvironmentPresentationIdentity(
+            context: presentationContext,
+            formatterLocaleIdentifier: formatters?.locale.identifier,
+            formatterTimeZoneIdentifier: formatters?.timeZone.identifier,
+            formatterCallback: formatters?.callbackIdentity,
+            resolverCallback: textResolver?.callbackIdentity)
+    }
+
     private func applyEnvironmentPresentation() {
-        session.setPresentationContext(
-            presentationContext,
+        session.applyPresentationEnvironment(
+            context: presentationContext,
             formatters: formatters,
             textResolver: textResolver)
     }

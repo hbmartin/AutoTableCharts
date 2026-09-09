@@ -103,6 +103,21 @@ public struct AutoChartDataset<RowID: Hashable & Sendable>: AutoChartTable, Send
     public var chartRows: [Row] { rows }
     public var chartMetadata: AutoChartTableMetadata { storage.metadata }
 
+    /// Reuses immutable matrix and row storage while changing only the request key.
+    package func replacingDataKey(with key: AutoChartDataKey) -> Self {
+        Self(storage: storage, rows: rows, chartDataKey: key)
+    }
+
+    private init(
+        storage: AutoChartMatrixStorage,
+        rows: [Row],
+        chartDataKey: AutoChartDataKey
+    ) {
+        self.storage = storage
+        self.rows = rows
+        self.chartDataKey = chartDataKey
+    }
+
     /// Creates a dataset from fully described columns and explicit row IDs.
     public init(
         columns: [AutoChartColumn],
