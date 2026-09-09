@@ -22,6 +22,12 @@ private struct LegacyV3Column: Encodable {
     let hints: AutoChartColumnHints
 }
 
+private struct V3CatalogPayload: Encodable {
+    let featured: [AutoChartRecommendation]
+    let cataloged: [AutoChartRecommendation]
+    let preferred: AutoChartRecommendation?
+}
+
 private func v3Records() -> [V3Record] {
     [
         V3Record(
@@ -117,6 +123,25 @@ private final class V3Counter: @unchecked Sendable {
     var value: Int { lock.withLock { stored } }
 }
 
+private actor V3AsyncTestGate {
+    private var isPaused = false
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func pause() async {
+        isPaused = true
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func waitUntilPaused() async {
+        while !isPaused { await Task.yield() }
+    }
+
+    func release() {
+        continuation?.resume()
+        continuation = nil
+    }
+}
+
 private struct CountingRow: AutoChartRow {
     let chartRowID: Int
     let category: String
@@ -185,6 +210,19 @@ private final class ProgressRecorder: @unchecked Sendable {
         let decoded = try JSONDecoder().decode(
             AutoChartColumn.self, from: encodedLegacy)
         #expect(decoded.hints == legacyHints)
+
+        let roundTripped = try JSONDecoder().decode(
+            AutoChartColumn.self, from: JSONEncoder().encode(decoded))
+        #expect(roundTripped.hints == legacyHints)
+        #expect(roundTripped == decoded)
+
+        let canonical = AutoChartColumn(
+            id: bridged.id,
+            name: bridged.name,
+            displayName: bridged.displayName,
+            semantics: bridged.semantics)
+        #expect(bridged == canonical)
+        #expect(Set([bridged, canonical]).count == 1)
 
         bridged.semantics = .identifier(semanticType: .nominal)
         #expect(bridged.hints.role == .identifier)
@@ -343,6 +381,39 @@ private final class ProgressRecorder: @unchecked Sendable {
             })
         #expect(options.count == 50)
         #expect(options.allSatisfy { $0.label.hasPrefix("localized:") })
+    }
+
+    @Test func catalogDecodingReappliesAllCollectionInvariants() throws {
+        let all = (0..<60).map { index in
+            recommendation(
+                .bar(
+                    category: AutoChartColumnID(rawValue: "category-\(index)"),
+                    measure: "value"),
+                score: Double(60 - index))
+        }
+        let invalid = V3CatalogPayload(
+            featured: [all[55]] + Array(all.prefix(7)),
+            cataloged: Array(all.prefix(55)),
+            preferred: all[0])
+        let decoded = try JSONDecoder().decode(
+            AutoChartRecommendationCatalog.self,
+            from: JSONEncoder().encode(invalid))
+
+        #expect(decoded.cataloged.count == 50)
+        #expect(decoded.featured.count == 5)
+        #expect(decoded.featured.allSatisfy { featured in
+            decoded.cataloged.contains { $0.id == featured.id }
+        })
+        #expect(decoded.preferred == nil)
+
+        let offList = V3CatalogPayload(
+            featured: [],
+            cataloged: Array(all.prefix(55)),
+            preferred: all[59])
+        let decodedOffList = try JSONDecoder().decode(
+            AutoChartRecommendationCatalog.self,
+            from: JSONEncoder().encode(offList))
+        #expect(decodedOffList.preferred?.id == all[59].id)
     }
 
     @Test func constraintsFilterFamiliesAndColumnsBeforeCataloging() async throws {
@@ -506,6 +577,30 @@ private final class ProgressRecorder: @unchecked Sendable {
         #expect(cache.completedAnalysis(for: request.id, as: Int.self) == nil)
         let trimmed = await cache.statistics()
         #expect(trimmed.retainedCost == 0)
+    }
+
+    @Test func completedAnalysisLookupRefreshesLeastRecentlyUsedOrder() async throws {
+        let cache = AutoChartCache(
+            configuration: .init(analyses: .init(maximumEntries: 2)))
+        let analyzer = AutoChartAnalyzer(cache: cache)
+        let firstRequest = try AutoChartRequest(
+            table: domainDataset(
+                key: .trusted(identity: "completed-lru", revision: "1")))
+        let secondRequest = try AutoChartRequest(
+            table: domainDataset(
+                key: .trusted(identity: "completed-lru", revision: "2")))
+        let thirdRequest = try AutoChartRequest(
+            table: domainDataset(
+                key: .trusted(identity: "completed-lru", revision: "3")))
+
+        _ = try await analyzer.analyze(firstRequest, preparation: .none)
+        _ = try await analyzer.analyze(secondRequest, preparation: .none)
+        #expect(cache.completedAnalysis(for: firstRequest.id, as: Int.self) != nil)
+        _ = try await analyzer.analyze(thirdRequest, preparation: .none)
+
+        #expect(cache.completedAnalysis(for: firstRequest.id, as: Int.self) != nil)
+        #expect(cache.completedAnalysis(for: secondRequest.id, as: Int.self) == nil)
+        #expect(cache.completedAnalysis(for: thirdRequest.id, as: Int.self) != nil)
     }
 
     @Test func coalescedFailuresShareAnEpisodeAndExplicitRetryStartsANewOne()
@@ -731,6 +826,32 @@ private final class ProgressRecorder: @unchecked Sendable {
         #expect(duplicatedStale.count == 2)
         #expect(!duplicatedStale.contains(markID: "stale"))
 
+        let secondStale = AutoChartSelection(
+            analysisID: stale.analysisID,
+            preparedChartID: stale.preparedChartID,
+            sourceRowIDs: [998],
+            family: stale.family,
+            specificationID: stale.specificationID,
+            markID: "second-stale")
+        let interleavedTie = AutoChartSelectionSet([
+            firstSelection, stale, secondStale, secondSelection,
+        ])
+        #expect(interleavedTie.count == 2)
+        #expect(interleavedTie.analysisID == analysis.id)
+
+        let aggregate = try await analysis.prepare(
+            AutoChartSpecification(
+                .bar(
+                    category: "category",
+                    measure: "value",
+                    aggregation: .sum,
+                    orientation: .vertical,
+                    sort: .source,
+                    title: "")))
+        let partialAggregateSelection = aggregate.selections(
+            for: [10], analysisID: analysis.id)
+        #expect(partialAggregateSelection.unionedSourceRows == [10])
+
         var partialGroup = AutoChartSelectionSet([firstSelection])
         partialGroup.select(
             [firstSelection, secondSelection], togglingAsGroup: true)
@@ -836,8 +957,30 @@ private final class ProgressRecorder: @unchecked Sendable {
         #expect(calls.value > afterSecond)
     }
 
+    @Test func presentationContextPreservesAutoupdatingFoundationValues() throws {
+        let context = AutoChartPresentationContext(
+            locale: .autoupdatingCurrent,
+            timeZone: .autoupdatingCurrent)
+        #expect(context.locale == Locale.autoupdatingCurrent)
+        #expect(context.timeZone == TimeZone.autoupdatingCurrent)
+        #expect(context.locale != Locale(identifier: context.localeIdentifier))
+        #expect(context.timeZone != TimeZone(identifier: context.timeZoneIdentifier))
+
+        let roundTripped = try JSONDecoder().decode(
+            AutoChartPresentationContext.self,
+            from: JSONEncoder().encode(context))
+        #expect(roundTripped == context)
+
+        let legacy = Data(
+            #"{"identity":"legacy","localeIdentifier":"en_US","timeZoneIdentifier":"UTC"}"#.utf8)
+        let decodedLegacy = try JSONDecoder().decode(
+            AutoChartPresentationContext.self, from: legacy)
+        #expect(decodedLegacy.locale.identifier == "en_US")
+        #expect(decodedLegacy.timeZone.identifier == "GMT")
+    }
+
     @MainActor
-    @Test func convenienceViewContextCanInvalidatePresentationMemo() async throws {
+    @Test func convenienceViewInitializersDeferPresentationWork() async throws {
         let request = try AutoChartRequest(table: domainDataset())
         let analysis = try await AutoChartAnalyzer().analyze(request, preparation: .primary)
         let chart = try #require(analysis.primaryChart)
@@ -847,36 +990,78 @@ private final class ProgressRecorder: @unchecked Sendable {
             return nil
         })
 
+        AutoChartConveniencePresentationCache.removeAll()
         _ = AutoChartView(
             preparedChart: chart,
             analysisID: analysis.id,
             presentationContext: .init(identity: "convenience-v1"),
             formatters: formatters)
-        let afterFirst = calls.value
         _ = AutoChartView(
-            preparedChart: chart,
-            analysisID: analysis.id,
-            presentationContext: .init(identity: "convenience-v1"),
+            analysis: analysis,
+            presentationContext: .init(identity: "analysis-v1"),
             formatters: formatters)
-        #expect(calls.value == afterFirst)
-
-        _ = AutoChartView(
-            preparedChart: chart,
-            analysisID: analysis.id,
-            presentationContext: .init(identity: "convenience-v2"),
-            formatters: formatters)
-        #expect(calls.value > afterFirst)
-
         _ = AutoChartPlot(
             preparedChart: chart,
             analysisID: analysis.id,
             presentationContext: .init(identity: "plot-v1"),
             formatters: formatters)
+        #expect(calls.value == 0)
     }
 }
 
 @MainActor
 @Suite struct V3SessionTests {
+    @Test(
+        .disabled(if: !testHooksAvailable, testHooksUnavailable),
+        .timeLimit(.minutes(1)))
+    func sessionProgressPreservesAttemptModeAndReportsColdPreparation() async throws {
+        #if ATC_TEST_HOOKS
+        let coldGate = V3AsyncTestGate()
+        let coldCache = AutoChartCache(
+            testHooks: .chartPreparation { await coldGate.pause() })
+        let coldRequest = try AutoChartRequest(table: domainDataset())
+        let coldSession = AutoChartSession<Int>(cache: coldCache)
+        coldSession.load(coldRequest, preparation: .primary)
+        await coldGate.waitUntilPaused()
+        for _ in 0..<10 { await Task.yield() }
+        guard case .analyzing(let coldProgress) = coldSession.state else {
+            await coldGate.release()
+            Issue.record("Cold chart preparation must remain in analyzing mode.")
+            return
+        }
+        #expect(coldProgress?.phase == .chartPreparation)
+        await coldGate.release()
+        _ = try await readyAnalysis(from: coldSession)
+
+        let warmGate = V3AsyncTestGate()
+        let warmCache = AutoChartCache(
+            testHooks: .chartPreparation { await warmGate.pause() })
+        let warmRequest = try AutoChartRequest(table: domainDataset())
+        _ = try await AutoChartAnalyzer(cache: warmCache).analyze(
+            warmRequest, preparation: .none)
+        let progressToken = warmCache.registerProgress(for: warmRequest.id) { _ in }
+        warmCache.reportProgress(
+            AutoChartProgress(phase: .recommendation),
+            for: warmRequest.id,
+            fallback: nil)
+
+        let warmSession = AutoChartSession<Int>(cache: warmCache)
+        warmSession.load(warmRequest, preparation: .primary)
+        await warmGate.waitUntilPaused()
+        for _ in 0..<10 { await Task.yield() }
+        guard case .preparing(_, let warmProgress) = warmSession.state else {
+            await warmGate.release()
+            warmCache.unregisterProgress(for: warmRequest.id, token: progressToken)
+            Issue.record("Replayed analysis progress must not regress warm preparation.")
+            return
+        }
+        #expect(warmProgress?.phase == .chartPreparation)
+        await warmGate.release()
+        warmCache.unregisterProgress(for: warmRequest.id, token: progressToken)
+        _ = try await readyAnalysis(from: warmSession)
+        #endif
+    }
+
     @Test func loadedPresentationUpdatesRemainUnderActiveEnvironmentOverrides()
         async throws
     {

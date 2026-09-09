@@ -226,13 +226,16 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         if clearsVisibleState {
             selection.removeAll()
         }
+        let completedForPreparation: AutoChartAnalysis<RowID>?
         if preparation != .none,
             let completed: AutoChartAnalysis<RowID> = cache.completedAnalysis(
                 for: request.id),
-            !completed.resolve(preference).usesTable
+            Self.canPrepareChart(for: preference, in: completed)
         {
+            completedForPreparation = completed
             state = .preparing(completed, nil)
         } else {
+            completedForPreparation = nil
             state = .analyzing(nil)
         }
         let analyzer = self.analyzer
@@ -246,12 +249,14 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
                     progress: { [weak self] progress in
                         Task { @MainActor [weak self] in
                             guard let self, self.generation == token else { return }
-                            switch progress.phase {
-                            case .chartPreparation, .presentationPreparation:
-                                if case .preparing(let analysis, _) = self.state {
-                                    self.state = .preparing(analysis, progress)
-                                }
-                            default:
+                            if let completedForPreparation {
+                                guard progress.phase == .chartPreparation
+                                        || progress.phase == .presentationPreparation,
+                                    case .preparing(let current, _) = self.state,
+                                    current.id == completedForPreparation.id
+                                else { return }
+                                self.state = .preparing(completedForPreparation, progress)
+                            } else if case .analyzing = self.state {
                                 self.state = .analyzing(progress)
                             }
                         }
@@ -294,5 +299,14 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
                         message: String(describing: error)))
             }
         }
+    }
+
+    private static func canPrepareChart(
+        for preference: AutoChartPreference,
+        in analysis: AutoChartAnalysis<RowID>
+    ) -> Bool {
+        if case .table = preference { return false }
+        guard case .charts(let catalog) = analysis.outcome else { return false }
+        return catalog.primary != nil
     }
 }

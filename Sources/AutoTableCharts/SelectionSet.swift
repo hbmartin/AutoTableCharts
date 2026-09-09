@@ -26,14 +26,21 @@ public struct AutoChartSelectionSet<RowID: Hashable & Sendable>: Hashable, Senda
         var selectedProvenance: AutoChartSelectionProvenance?
         var selectedCount = 0
         var markIDsByProvenance: [AutoChartSelectionProvenance: Set<String>] = [:]
+        var provenanceOrder: [AutoChartSelectionProvenance] = []
         for selection in selections {
             let provenance = AutoChartSelectionProvenance(
                 analysisID: selection.analysisID,
                 preparedChartID: selection.preparedChartID)
+            if markIDsByProvenance[provenance] == nil {
+                provenanceOrder.append(provenance)
+            }
             markIDsByProvenance[provenance, default: []].insert(selection.markID)
-            if markIDsByProvenance[provenance, default: []].count > selectedCount {
+        }
+        for provenance in provenanceOrder {
+            let count = markIDsByProvenance[provenance, default: []].count
+            if count > selectedCount {
                 selectedProvenance = provenance
-                selectedCount = markIDsByProvenance[provenance, default: []].count
+                selectedCount = count
             }
         }
         let compatibleSelections = selections.filter {
@@ -143,7 +150,7 @@ extension AutoChartPreparedChart {
                 return AutoChartSelection(
                     analysisID: analysisID,
                     preparedChartID: id,
-                    sourceRowIDs: mark.sourceRowIDs,
+                    sourceRowIDs: matchingRows,
                     family: recommendation.specification.family,
                     specificationID: recommendation.specification.id,
                     markID: mark.identity)

@@ -4,8 +4,17 @@ import AutoTableCharts
 /// Hashable presentation inputs used to memoize work outside SwiftUI initializers.
 public struct AutoChartPresentationContext: Hashable, Codable, Sendable {
     public var identity: String
-    public var localeIdentifier: String
-    public var timeZoneIdentifier: String
+    private var localeValue: Locale
+    private var timeZoneValue: TimeZone
+
+    public var localeIdentifier: String {
+        get { localeValue.identifier }
+        set { localeValue = Locale(identifier: newValue) }
+    }
+    public var timeZoneIdentifier: String {
+        get { timeZoneValue.identifier }
+        set { timeZoneValue = TimeZone(identifier: newValue) ?? .gmt }
+    }
 
     public init(
         identity: String = "default",
@@ -13,12 +22,44 @@ public struct AutoChartPresentationContext: Hashable, Codable, Sendable {
         timeZone: TimeZone = .autoupdatingCurrent
     ) {
         self.identity = identity
-        self.localeIdentifier = locale.identifier
-        self.timeZoneIdentifier = timeZone.identifier
+        self.localeValue = locale
+        self.timeZoneValue = timeZone
     }
 
-    public var locale: Locale { Locale(identifier: localeIdentifier) }
-    public var timeZone: TimeZone { TimeZone(identifier: timeZoneIdentifier) ?? .gmt }
+    public var locale: Locale { localeValue }
+    public var timeZone: TimeZone { timeZoneValue }
+
+    private enum CodingKeys: String, CodingKey {
+        case identity, localeIdentifier, timeZoneIdentifier
+        case locale, timeZone
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        identity = try container.decode(String.self, forKey: .identity)
+        if let locale = try container.decodeIfPresent(Locale.self, forKey: .locale) {
+            localeValue = locale
+        } else {
+            localeValue = Locale(
+                identifier: try container.decode(String.self, forKey: .localeIdentifier))
+        }
+        if let timeZone = try container.decodeIfPresent(TimeZone.self, forKey: .timeZone) {
+            timeZoneValue = timeZone
+        } else {
+            timeZoneValue = TimeZone(
+                identifier: try container.decode(String.self, forKey: .timeZoneIdentifier))
+                ?? .gmt
+        }
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(identity, forKey: .identity)
+        try container.encode(localeIdentifier, forKey: .localeIdentifier)
+        try container.encode(timeZoneIdentifier, forKey: .timeZoneIdentifier)
+        try container.encode(localeValue, forKey: .locale)
+        try container.encode(timeZoneValue, forKey: .timeZone)
+    }
 }
 
 /// A chart whose presentation metadata has been resolved and can be rendered synchronously.
@@ -77,8 +118,8 @@ package struct AutoChartPresentedKPI: Sendable {
 private struct AutoChartPresentationKey: Hashable {
     var preparedChart: AutoChartPreparedChartID
     var context: AutoChartPresentationContext
-    var formatterLocaleIdentifier: String
-    var formatterTimeZoneIdentifier: String
+    var formatterLocale: Locale
+    var formatterTimeZone: TimeZone
     var formatterCallback: UUID?
     var resolverCallback: UUID?
 }
@@ -117,8 +158,8 @@ public final class AutoChartPresenter: @unchecked Sendable {
         let key = AutoChartPresentationKey(
             preparedChart: chart.id,
             context: context,
-            formatterLocaleIdentifier: formatters.locale.identifier,
-            formatterTimeZoneIdentifier: formatters.timeZone.identifier,
+            formatterLocale: formatters.locale,
+            formatterTimeZone: formatters.timeZone,
             formatterCallback: formatters.callbackIdentity,
             resolverCallback: textResolver.callbackIdentity)
         if let cached = lock.withLock({ cachedPayload(for: key) }) {

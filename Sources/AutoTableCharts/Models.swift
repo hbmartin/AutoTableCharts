@@ -673,6 +673,20 @@ public struct AutoChartColumn: Identifiable, Hashable, Codable, Sendable {
     /// Normalized hints consumed by profiling and validation.
     public var hints: AutoChartColumnHints { normalizedHints }
 
+    public static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.id == rhs.id
+            && lhs.name == rhs.name
+            && lhs.displayName == rhs.displayName
+            && lhs.semantics == rhs.semantics
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+        hasher.combine(name)
+        hasher.combine(displayName)
+        hasher.combine(semantics)
+    }
+
     /// Creates a column description.
     ///
     /// - Parameters:
@@ -722,7 +736,8 @@ public struct AutoChartColumn: Identifiable, Hashable, Codable, Sendable {
             AutoChartColumnSemantics.self, forKey: .semantics)
         {
             semantics = decoded
-            normalizedHints = decoded.hints
+            normalizedHints = try container.decodeIfPresent(
+                AutoChartColumnHints.self, forKey: .hints) ?? decoded.hints
         } else {
             let legacy = try container.decodeIfPresent(
                 AutoChartColumnHints.self, forKey: .hints) ?? .init()
@@ -737,6 +752,9 @@ public struct AutoChartColumn: Identifiable, Hashable, Codable, Sendable {
         try container.encode(name, forKey: .name)
         try container.encodeIfPresent(displayName, forKey: .displayName)
         try container.encode(semantics, forKey: .semantics)
+        if normalizedHints != semantics.hints {
+            try container.encode(normalizedHints, forKey: .hints)
+        }
     }
 }
 

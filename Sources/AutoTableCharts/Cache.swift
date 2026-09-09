@@ -19,6 +19,54 @@ private struct AutoChartProgressEntry {
     var callbacks: [UUID: @Sendable (AutoChartProgress) -> Void] = [:]
 }
 
+private struct AutoChartRecencyOrder<Key: Hashable> {
+    private struct Links {
+        var older: Key?
+        var newer: Key?
+    }
+
+    private var linksByKey: [Key: Links] = [:]
+    private var oldest: Key?
+    private var newest: Key?
+
+    mutating func touch(_ key: Key) {
+        remove(key)
+        linksByKey[key] = Links(older: newest, newer: nil)
+        if let newest {
+            linksByKey[newest]?.newer = key
+        } else {
+            oldest = key
+        }
+        newest = key
+    }
+
+    mutating func popOldest() -> Key? {
+        guard let oldest else { return nil }
+        remove(oldest)
+        return oldest
+    }
+
+    mutating func removeAll() {
+        linksByKey.removeAll(keepingCapacity: false)
+        oldest = nil
+        newest = nil
+    }
+
+    private mutating func remove(_ key: Key) {
+        guard let links = linksByKey.removeValue(forKey: key) else { return }
+        if let older = links.older {
+            linksByKey[older]?.newer = links.newer
+        } else {
+            oldest = links.newer
+        }
+        if let newer = links.newer {
+            linksByKey[newer]?.older = links.older
+        } else {
+            newest = links.older
+        }
+    }
+}
+
 /// A thread-safe cache shared by analyzers and UI sessions.
 ///
 /// Synchronous lookup exposes completed work only. New work and lifecycle
@@ -29,7 +77,7 @@ public final class AutoChartCache: @unchecked Sendable {
 
     private let lock = NSLock()
     private var completed: [AutoChartRequestID: AutoChartCompletedAnalysisBox] = [:]
-    private var recency: [AutoChartRequestID] = []
+    private var recency = AutoChartRecencyOrder<AutoChartRequestID>()
     private var failures: [AutoChartRequestID: AutoChartFailure] = [:]
     private var failureRecency: [AutoChartRequestID] = []
     private var progressEntries: [AutoChartRequestID: AutoChartProgressEntry] = [:]
@@ -41,6 +89,18 @@ public final class AutoChartCache: @unchecked Sendable {
         self.engine = AutoChartAnalyzer(configuration: configuration)
     }
 
+    #if ATC_TEST_HOOKS
+    init(
+        configuration: AutoChartAnalyzerConfiguration = .standard,
+        testHooks: AutoChartAnalyzerTestHooks
+    ) {
+        self.configuration = configuration
+        self.engine = AutoChartAnalyzer(
+            configuration: configuration,
+            testHooks: testHooks)
+    }
+    #endif
+
     /// Returns a completed typed analysis without starting work or crossing an actor.
     public func completedAnalysis<RowID: Hashable & Sendable>(
         for requestID: AutoChartRequestID,
@@ -51,8 +111,7 @@ public final class AutoChartCache: @unchecked Sendable {
         guard let value = completed[requestID]?.value as? AutoChartAnalysis<RowID> else {
             return nil
         }
-        recency.removeAll { $0 == requestID }
-        recency.append(requestID)
+        recency.touch(requestID)
         return value
     }
 
@@ -66,8 +125,7 @@ public final class AutoChartCache: @unchecked Sendable {
         completed[analysis.request] = AutoChartCompletedAnalysisBox(analysis)
         failures.removeValue(forKey: analysis.request)
         failureRecency.removeAll { $0 == analysis.request }
-        recency.removeAll { $0 == analysis.request }
-        recency.append(analysis.request)
+        recency.touch(analysis.request)
         trimCompletedLocked()
     }
 
@@ -157,7 +215,7 @@ public final class AutoChartCache: @unchecked Sendable {
         lock.withLock {
             if target == .minimum {
                 completed.removeAll(keepingCapacity: false)
-                recency.removeAll(keepingCapacity: false)
+                recency.removeAll()
                 failures.removeAll(keepingCapacity: false)
                 failureRecency.removeAll(keepingCapacity: false)
             } else {
@@ -171,7 +229,7 @@ public final class AutoChartCache: @unchecked Sendable {
     public func removeAll() async {
         lock.withLock {
             completed.removeAll(keepingCapacity: false)
-            recency.removeAll(keepingCapacity: false)
+            recency.removeAll()
             failures.removeAll(keepingCapacity: false)
             failureRecency.removeAll(keepingCapacity: false)
             progressEntries = progressEntries.mapValues { entry in
@@ -221,8 +279,7 @@ public final class AutoChartCache: @unchecked Sendable {
             || costState.overflowed
             || costState.total > configuration.maximumRetainedCost
         {
-            guard let oldest = recency.first else { break }
-            recency.removeFirst()
+            guard let oldest = recency.popOldest() else { break }
             guard let removed = completed.removeValue(forKey: oldest) else { continue }
             if costState.overflowed {
                 costState = retainedCostState()

@@ -4,9 +4,28 @@ import SwiftUI
 import Charts
 import AutoTableCharts
 
-/// Bounded, source-snapshot-free memoization for the synchronous convenience
-/// initializers. Sessions may still inject their own presenter.
+/// Bounded, source-snapshot-free memoization for convenience presentation tasks.
+/// Sessions may still inject their own presenter.
 private let autoChartConveniencePresenter = AutoChartPresenter()
+
+/// Process-wide memo used by deferred convenience presentation tasks.
+///
+/// Release its bounded presentation payloads in response to memory pressure or
+/// when the host no longer displays convenience-created charts.
+public enum AutoChartConveniencePresentationCache {
+    public static func removeAll() {
+        autoChartConveniencePresenter.removeAll()
+    }
+}
+
+private struct AutoChartConveniencePresentationID: Hashable {
+    var preparedChart: AutoChartPreparedChartID
+    var context: AutoChartPresentationContext
+    var formatterLocale: Locale
+    var formatterTimeZone: TimeZone
+    var formatterCallback: UUID?
+    var resolverCallback: UUID?
+}
 
 #if os(macOS)
 import AppKit
@@ -94,8 +113,64 @@ public struct AutoChartPresentation: Hashable, Sendable {
 }
 
 private enum AutoChartViewContent<RowID: Hashable & Sendable>: Sendable {
+    case deferred(AutoChartPreparedChart<RowID>, AutoChartPresentationContext)
     case chart(AutoChartPreparedChart<RowID>, AutoChartResolvedPresentation)
     case fallback(AutoChartFallback)
+}
+
+private struct AutoChartDeferredPresentationView<RowID: Hashable & Sendable>: View {
+    let preparedChart: AutoChartPreparedChart<RowID>
+    let context: AutoChartPresentationContext
+    let analysisID: AutoChartAnalysisID
+    let selection: Binding<AutoChartSelectionSet<RowID>>
+    let presentation: AutoChartPresentation
+    let formatters: AutoChartFormatters
+    let textResolver: AutoChartTextResolver
+
+    @State private var presentedChart: AutoChartPresentedChart<RowID>?
+    @State private var presentedID: AutoChartConveniencePresentationID?
+
+    private var requestID: AutoChartConveniencePresentationID {
+        AutoChartConveniencePresentationID(
+            preparedChart: preparedChart.id,
+            context: context,
+            formatterLocale: formatters.locale,
+            formatterTimeZone: formatters.timeZone,
+            formatterCallback: formatters.callbackIdentity,
+            resolverCallback: textResolver.callbackIdentity)
+    }
+
+    @ViewBuilder
+    var body: some View {
+        let requestID = requestID
+        if presentedID == requestID, let presentedChart {
+            AutoChartView(
+                presentedChart: presentedChart,
+                analysisID: analysisID,
+                selection: selection,
+                presentation: presentation,
+                formatters: formatters,
+                textResolver: textResolver)
+        } else {
+            ProgressView()
+                .frame(maxWidth: .infinity)
+                .frame(height: presentation.plotHeight)
+                .task(id: requestID) {
+                    presentedChart = nil
+                    presentedID = nil
+                    let presented = await Task.detached(priority: .userInitiated) {
+                        autoChartConveniencePresenter.present(
+                            preparedChart,
+                            context: context,
+                            formatters: formatters,
+                            textResolver: textResolver)
+                    }.value
+                    guard !Task.isCancelled else { return }
+                    presentedChart = presented
+                    presentedID = requestID
+                }
+        }
+    }
 }
 
 struct AutoChartKPIContent: View {
@@ -166,20 +241,17 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         formatters: AutoChartFormatters = .init(),
         textResolver: AutoChartTextResolver = .default
     ) {
-        let presented = autoChartConveniencePresenter.present(
+        content = .deferred(
             preparedChart,
-            context: presentationContext
+            presentationContext
                 ?? AutoChartPresentationContext(
                     locale: formatters.locale,
-                    timeZone: formatters.timeZone),
-            formatters: formatters,
-            textResolver: textResolver)
-        content = .chart(preparedChart, presented.resolvedPresentation)
-        displayTitle = presented.title
-        renderedData = presented.renderedData
-        facetPanels = presented.facetPanels
-        sharedXCategoryDomain = presented.sharedXCategoryDomain
-        presentedKPI = presented.kpi
+                    timeZone: formatters.timeZone))
+        displayTitle = ""
+        renderedData = []
+        facetPanels = []
+        sharedXCategoryDomain = []
+        presentedKPI = nil
         self.analysisID = analysisID
         self._selection = selection
         self.presentation = presentation
@@ -220,20 +292,17 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         textResolver: AutoChartTextResolver = .default
     ) {
         if let primary = analysis.primaryChart {
-            let presented = autoChartConveniencePresenter.present(
+            content = .deferred(
                 primary,
-                context: presentationContext
+                presentationContext
                     ?? AutoChartPresentationContext(
                         locale: formatters.locale,
-                        timeZone: formatters.timeZone),
-                formatters: formatters,
-                textResolver: textResolver)
-            content = .chart(primary, presented.resolvedPresentation)
-            displayTitle = presented.title
-            renderedData = presented.renderedData
-            facetPanels = presented.facetPanels
-            sharedXCategoryDomain = presented.sharedXCategoryDomain
-            presentedKPI = presented.kpi
+                        timeZone: formatters.timeZone))
+            displayTitle = ""
+            renderedData = []
+            facetPanels = []
+            sharedXCategoryDomain = []
+            presentedKPI = nil
         } else if case .tableFallback(let fallback) = analysis.outcome {
             content = .fallback(fallback)
             displayTitle = ""
@@ -262,10 +331,12 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     }
 
     private var preparedChart: AutoChartPreparedChart<RowID> {
-        guard case .chart(let chart, _) = content else {
+        switch content {
+        case .deferred(let chart, _), .chart(let chart, _):
+            return chart
+        case .fallback:
             preconditionFailure("No chart content")
         }
-        return chart
     }
     private var resolvedPresentation: AutoChartResolvedPresentation {
         guard case .chart(_, let presentation) = content else {
@@ -324,6 +395,15 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     @ViewBuilder
     public var body: some View {
         switch content {
+        case .deferred(let preparedChart, let context):
+            AutoChartDeferredPresentationView(
+                preparedChart: preparedChart,
+                context: context,
+                analysisID: analysisID,
+                selection: $selection,
+                presentation: presentation,
+                formatters: formatters,
+                textResolver: textResolver)
         case .fallback(let fallback):
             VStack(alignment: .leading, spacing: 10) {
                 ContentUnavailableView(

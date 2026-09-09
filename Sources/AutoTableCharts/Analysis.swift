@@ -498,12 +498,12 @@ public struct AutoChartAnalysis<RowID: Hashable & Sendable>: Sendable {
                 return chart
             }
         }
-        return preparedCharts.values.sorted { lhs, rhs in
+        return preparedCharts.values.min { lhs, rhs in
             if lhs.recommendation.score != rhs.recommendation.score {
                 return lhs.recommendation.score > rhs.recommendation.score
             }
             return lhs.recommendation.id < rhs.recommendation.id
-        }.first
+        }
     }
 
     /// Validates `specification` against this analysis.
@@ -1375,14 +1375,7 @@ public actor AutoChartAnalyzer {
                             measureSemantics: column.hints.measureSemantics)
                     }
                 },
-                candidates: set.decisions.map { decision in
-                    guard case .recommended(let rank, _) = decision.disposition,
-                        rank >= catalogOptions.maximumRecommendations
-                    else { return decision }
-                    var pruned = decision
-                    pruned.disposition = .pruned(.candidateLimit)
-                    return pruned
-                })
+                candidates: set.decisions)
             : nil
         let cached = AutoChartCachedAnalysis(
             id: AutoChartAnalysisID(),
