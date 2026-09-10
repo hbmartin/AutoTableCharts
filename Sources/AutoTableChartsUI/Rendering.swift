@@ -119,7 +119,6 @@ private struct AutoChartDeferredPresentationView<RowID: Hashable & Sendable>: Vi
     let textResolver: AutoChartTextResolver
 
     @State private var presentedChart: AutoChartPresentedChart<RowID>?
-    @State private var presentedID: AutoChartPresentationRequestID?
 
     private var requestID: AutoChartPresentationRequestID {
         AutoChartPresentationRequestID(
@@ -133,7 +132,9 @@ private struct AutoChartDeferredPresentationView<RowID: Hashable & Sendable>: Vi
     var body: some View {
         let requestID = requestID
         ZStack(alignment: .topTrailing) {
-            if let presentedChart {
+            if let presentedChart,
+                presentedChart.requestID.preparedChart == requestID.preparedChart
+            {
                 AutoChartView(
                     presentedChart: presentedChart,
                     analysisID: analysisID,
@@ -144,17 +145,21 @@ private struct AutoChartDeferredPresentationView<RowID: Hashable & Sendable>: Vi
                     .frame(maxWidth: .infinity)
                     .frame(height: presentation.plotHeight)
             }
-            if presentedChart != nil, presentedID != requestID {
+            if let presentedChart,
+                presentedChart.requestID.preparedChart == requestID.preparedChart,
+                presentedChart.requestID != requestID
+            {
                 ProgressView()
                     .controlSize(.small)
                     .padding(8)
             }
         }
         .task(id: requestID) {
-            guard presentedID != requestID else { return }
-            if let presentedID, presentedID.preparedChart != requestID.preparedChart {
-                presentedChart = nil
-                self.presentedID = nil
+            guard presentedChart?.requestID != requestID else { return }
+            if let presentedChart,
+                presentedChart.requestID.preparedChart != requestID.preparedChart
+            {
+                self.presentedChart = nil
             }
             do {
                 let presented = try await autoChartConveniencePresenter.presentCancellable(
@@ -164,7 +169,6 @@ private struct AutoChartDeferredPresentationView<RowID: Hashable & Sendable>: Vi
                     textResolver: textResolver)
                 try Task.checkCancellation()
                 presentedChart = presented
-                presentedID = requestID
             } catch is CancellationError {
                 return
             } catch {

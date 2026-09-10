@@ -204,11 +204,18 @@ public struct AutoChartSessionView<
                     selection: session.selection)
             case .ready(let analysis, let presented):
                 if let presented {
-                    AutoChartView(
-                        presentedChart: presented,
-                        analysisID: analysis.id,
-                        selection: $session.selection)
-                        .foregroundStyle(theme.legendColor)
+                    ZStack(alignment: .topTrailing) {
+                        AutoChartView(
+                            presentedChart: presented,
+                            analysisID: analysis.id,
+                            selection: $session.selection)
+                            .foregroundStyle(theme.legendColor)
+                        if session.isPresentationPending {
+                            ProgressView()
+                                .controlSize(.small)
+                                .padding(8)
+                        }
+                    }
                 } else {
                     loading(nil)
                 }

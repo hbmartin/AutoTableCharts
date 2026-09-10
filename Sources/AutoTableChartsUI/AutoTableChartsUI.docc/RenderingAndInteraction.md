@@ -7,7 +7,9 @@ Render memoized presentation data and link chart marks to source rows.
 ``AutoChartSession`` publishes analyzing, preparing, ready, fallback, and failed
 states while preventing superseded work from replacing newer state. Two
 sessions can share one core cache while retaining independent preferences and
-selections.
+selections. When a ready chart remains visible during presentation-only work,
+``AutoChartSession/isPresentationPending`` reports that the visible payload is
+being replaced and `AutoChartSessionView` displays a compact progress indicator.
 
 ``AutoChartPresenter`` performs localization, formatting, ordering, and
 histogram label resolution before a resolved chart body is evaluated. Its bounded
@@ -19,6 +21,10 @@ identity when the behavior captured by an existing callback changes. The
 a cancellable presentation task. Call
 ``AutoChartConveniencePresentationCache/removeAll()`` to release the process-wide
 convenience memo in response to memory pressure.
+
+`presentCancellable` runs formatter and text-resolver callbacks outside the
+main actor as part of its detached presentation work. Hosts whose callbacks
+require caller-context execution can use the synchronous `present` method.
 
 Deferred convenience views require a mounted SwiftUI lifecycle to run their
 presentation task. Synchronous renderers such as snapshot exporters should call

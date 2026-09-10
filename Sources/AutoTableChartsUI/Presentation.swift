@@ -44,6 +44,7 @@ public struct AutoChartPresentationContext: Hashable, Codable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case identity, localeIdentifier, timeZoneIdentifier
         case locale, timeZone
+        case usesAutoupdatingLocale, usesAutoupdatingTimeZone
     }
 
     public init(from decoder: any Decoder) throws {
@@ -51,7 +52,14 @@ public struct AutoChartPresentationContext: Hashable, Codable, Sendable {
         identity = try container.decode(String.self, forKey: .identity)
         let decodedLocaleIdentifier = try container.decodeIfPresent(
             String.self, forKey: .localeIdentifier)
-        if let locale = try container.decodeIfPresent(Locale.self, forKey: .locale) {
+        if try container.decodeIfPresent(
+            Bool.self, forKey: .usesAutoupdatingLocale) == true
+        {
+            localeValue = .autoupdatingCurrent
+            explicitLocaleIdentifier = nil
+        } else if let locale = try container.decodeIfPresent(
+            Locale.self, forKey: .locale)
+        {
             localeValue = locale
             explicitLocaleIdentifier = locale == .autoupdatingCurrent
                 ? nil : decodedLocaleIdentifier ?? locale.identifier
@@ -62,7 +70,14 @@ public struct AutoChartPresentationContext: Hashable, Codable, Sendable {
         }
         let decodedTimeZoneIdentifier = try container.decodeIfPresent(
             String.self, forKey: .timeZoneIdentifier)
-        if let timeZone = try container.decodeIfPresent(TimeZone.self, forKey: .timeZone) {
+        if try container.decodeIfPresent(
+            Bool.self, forKey: .usesAutoupdatingTimeZone) == true
+        {
+            timeZoneValue = .autoupdatingCurrent
+            explicitTimeZoneIdentifier = nil
+        } else if let timeZone = try container.decodeIfPresent(
+            TimeZone.self, forKey: .timeZone)
+        {
             timeZoneValue = timeZone
             explicitTimeZoneIdentifier = timeZone == .autoupdatingCurrent
                 ? nil : decodedTimeZoneIdentifier ?? timeZone.identifier
@@ -80,6 +95,12 @@ public struct AutoChartPresentationContext: Hashable, Codable, Sendable {
         try container.encode(timeZoneIdentifier, forKey: .timeZoneIdentifier)
         try container.encode(localeValue, forKey: .locale)
         try container.encode(timeZoneValue, forKey: .timeZone)
+        try container.encode(
+            localeValue == .autoupdatingCurrent,
+            forKey: .usesAutoupdatingLocale)
+        try container.encode(
+            timeZoneValue == .autoupdatingCurrent,
+            forKey: .usesAutoupdatingTimeZone)
     }
 }
 
@@ -259,12 +280,15 @@ public final class AutoChartPresenter: @unchecked Sendable {
         textResolver: AutoChartTextResolver = .default,
         priority: TaskPriority = .userInitiated
     ) async throws -> AutoChartPresentedChart<RowID> {
+        let hostCallbackContext = AutoChartHostCallbackActivity.currentContext
         let work = Task.detached(priority: priority) {
-            try self.presentCheckingCancellation(
-                chart,
-                context: context,
-                formatters: formatters,
-                textResolver: textResolver)
+            try AutoChartHostCallbackActivity.withContext(hostCallbackContext) {
+                try self.presentCheckingCancellation(
+                    chart,
+                    context: context,
+                    formatters: formatters,
+                    textResolver: textResolver)
+            }
         }
         return try await withTaskCancellationHandler {
             try await work.value
@@ -369,7 +393,6 @@ public final class AutoChartPresenter: @unchecked Sendable {
         let title = chart.recommendation.specification.title.isEmpty
             ? textResolver(chart.recommendation.specification.family.localizationMessage)
             : chart.recommendation.specification.title
-        try checkingCancellation()
         let proposed = AutoChartPresentationPayload(
             title: title,
             diagnostics: chart.diagnostics,
@@ -379,7 +402,6 @@ public final class AutoChartPresenter: @unchecked Sendable {
             facetPanels: facetPanels,
             sharedXCategoryDomain: sharedXCategoryDomain,
             kpi: kpi)
-        try checkingCancellation()
         let payload = lock.withLock {
             if let cached = cachedPayload(for: requestID) { return cached }
             guard maximumEntries > 0 else { return proposed }

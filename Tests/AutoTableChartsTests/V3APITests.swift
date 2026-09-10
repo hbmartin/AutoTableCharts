@@ -124,28 +124,66 @@ private final class V3Counter: @unchecked Sendable {
     var value: Int { lock.withLock { stored } }
 }
 
+private final class V3LockedBox<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: Value?
+
+    func store(_ value: Value) {
+        lock.withLock { storage = value }
+    }
+
+    var value: Value? {
+        lock.withLock { storage }
+    }
+}
+
 private final class V3OneShotBlockingCallback: @unchecked Sendable {
     private let lock = NSLock()
     private let released = DispatchSemaphore(value: 0)
-    private var hasBlocked = false
+    private let blockedInvocation: Int
+    private var invocationCount = 0
+    private var completedInvocationCount = 0
     private var blocked = false
 
-    var isBlocked: Bool { lock.withLock { blocked } }
+    init(blockedInvocation: Int = 1) {
+        self.blockedInvocation = blockedInvocation
+    }
 
-    func blockOnce() {
+    var isBlocked: Bool { lock.withLock { blocked } }
+    var completedInvocations: Int { lock.withLock { completedInvocationCount } }
+
+    func invoke() {
         let shouldBlock = lock.withLock {
-            guard !hasBlocked else { return false }
-            hasBlocked = true
-            return true
+            invocationCount += 1
+            return invocationCount == blockedInvocation
         }
-        guard shouldBlock else { return }
-        lock.withLock { blocked = true }
-        released.wait()
-        lock.withLock { blocked = false }
+        if shouldBlock {
+            lock.withLock { blocked = true }
+            _ = released.wait(timeout: .now() + 5)
+            lock.withLock { blocked = false }
+        }
+        lock.withLock { completedInvocationCount += 1 }
     }
 
     func release() {
         released.signal()
+    }
+}
+
+private final class V3ThreadRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var callbackCount = 0
+    private var observedMainThread = false
+
+    func recordCurrentThread() {
+        lock.withLock {
+            callbackCount += 1
+            observedMainThread = observedMainThread || Thread.isMainThread
+        }
+    }
+
+    var result: (count: Int, observedMainThread: Bool) {
+        lock.withLock { (callbackCount, observedMainThread) }
     }
 }
 
@@ -155,13 +193,13 @@ private actor V3AsyncTestGate {
 
     func pause() async {
         let token = UUID()
-        pauseCount += 1
         await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
                 if Task.isCancelled {
                     continuation.resume()
                 } else {
                     releaseContinuations[token] = continuation
+                    pauseCount += 1
                 }
             }
         } onCancel: {
@@ -295,6 +333,11 @@ private final class ProgressRecorder: @unchecked Sendable {
         #expect(
             try AutoChartRequest(table: bridgedDataset).id
                 != AutoChartRequest(table: canonicalDataset).id)
+
+        let unchanged = bridged
+        let sameSemantics = bridged.semantics
+        bridged.semantics = sameSemantics
+        #expect(bridged == unchanged)
 
         bridged.semantics = .identifier(semanticType: .nominal)
         #expect(bridged.hints.role == .identifier)
@@ -924,9 +967,31 @@ private final class ProgressRecorder: @unchecked Sendable {
             for: [10], analysisID: analysis.id)
         let matchingAggregateMark = try #require(
             aggregate.marks.first { $0.sourceRowIDs.contains(10) })
+        let matchingAggregateDatum = try #require(
+            aggregate.core.data.first { $0.id == matchingAggregateMark.identity })
+        let semanticValues = AutoChartSelectionPreparation.semanticValues(
+            for: [matchingAggregateDatum],
+            specification: aggregate.recommendation.specification,
+            measureSemantics: aggregate.core.measureSemantics)
+        let derivedAggregateSelection = try #require(partialAggregateSelection.first)
         #expect(
             partialAggregateSelection.unionedSourceRows
                 == matchingAggregateMark.sourceRowIDs)
+        #expect(derivedAggregateSelection.dimensions == semanticValues.dimensions)
+        #expect(derivedAggregateSelection.rangeDimensions == semanticValues.rangeDimensions)
+        #expect(derivedAggregateSelection.measure == semanticValues.measure)
+        #expect(
+            derivedAggregateSelection
+                == AutoChartSelection(
+                    analysisID: analysis.id,
+                    preparedChartID: aggregate.id,
+                    sourceRowIDs: matchingAggregateMark.sourceRowIDs,
+                    dimensions: semanticValues.dimensions,
+                    rangeDimensions: semanticValues.rangeDimensions,
+                    measure: semanticValues.measure,
+                    family: aggregate.recommendation.specification.family,
+                    specificationID: aggregate.recommendation.specification.id,
+                    markID: matchingAggregateMark.identity))
 
         var partialGroup = AutoChartSelectionSet([firstSelection])
         partialGroup.select(
@@ -1011,6 +1076,35 @@ private final class ProgressRecorder: @unchecked Sendable {
         #expect(reentrantCalls.value == 1)
     }
 
+    @Test(.timeLimit(.minutes(1)))
+    func capturedHostCallbackContextSurvivesDetachedPresentationWork() async {
+        let token = AutoChartHostCallbackToken()
+        let result = V3LockedBox<Bool>()
+        let completed = DispatchSemaphore(value: 0)
+        let inheritedContextWasActive: Bool = await withCheckedContinuation {
+            continuation in
+            DispatchQueue(label: "AutoTableChartsTests.callback-context").async {
+                AutoChartHostCallbackActivity.invoke(
+                    token,
+                    {
+                        let context = AutoChartHostCallbackActivity.currentContext
+                        Task.detached {
+                            result.store(
+                                AutoChartHostCallbackActivity.withContext(context) {
+                                    AutoChartHostCallbackActivity.hasActiveCallback
+                                })
+                            completed.signal()
+                        }
+                        completed.wait()
+                    },
+                    fallback: ())
+                continuation.resume(returning: result.value ?? false)
+            }
+        }
+
+        #expect(inheritedContextWasActive)
+    }
+
     @Test func presenterEvictsLeastRecentlyUsedPresentationPayloads() async throws {
         let request = try AutoChartRequest(table: domainDataset())
         let analysis = try await AutoChartAnalyzer().analyze(request, preparation: .primary)
@@ -1046,6 +1140,28 @@ private final class ProgressRecorder: @unchecked Sendable {
             AutoChartPresentationContext.self,
             from: JSONEncoder().encode(context))
         #expect(roundTripped == context)
+
+        let encoded = try #require(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(context))
+                as? [String: Any])
+        #expect(encoded["usesAutoupdatingLocale"] as? Bool == true)
+        #expect(encoded["usesAutoupdatingTimeZone"] as? Bool == true)
+
+        let utc = try #require(TimeZone(identifier: "UTC"))
+        var flaggedAutoupdating = try #require(
+            JSONSerialization.jsonObject(
+                with: JSONEncoder().encode(
+                    AutoChartPresentationContext(
+                        locale: Locale(identifier: "en_US"),
+                        timeZone: utc)))
+                as? [String: Any])
+        flaggedAutoupdating["usesAutoupdatingLocale"] = true
+        flaggedAutoupdating["usesAutoupdatingTimeZone"] = true
+        let restoredAutoupdating = try JSONDecoder().decode(
+            AutoChartPresentationContext.self,
+            from: JSONSerialization.data(withJSONObject: flaggedAutoupdating))
+        #expect(restoredAutoupdating.locale == .autoupdatingCurrent)
+        #expect(restoredAutoupdating.timeZone == .autoupdatingCurrent)
 
         let legacy = Data(
             #"{"identity":"legacy","localeIdentifier":"en_US","timeZoneIdentifier":"UTC"}"#.utf8)
@@ -1129,37 +1245,75 @@ private final class ProgressRecorder: @unchecked Sendable {
 
 @MainActor
 @Suite struct V3SessionTests {
-    @Test func sessionPresentationIsOffMainActorAndSupersededSafely() async throws {
-        let callback = V3OneShotBlockingCallback()
-        defer { callback.release() }
+    @Test func asyncTestGateRegistersAndReleasesEveryWaiter() async {
+        let gate = V3AsyncTestGate()
+        let first = Task { await gate.pause() }
+        let second = Task { await gate.pause() }
+
+        await gate.waitUntilPaused(2)
+        await gate.release()
+        await first.value
+        await second.value
+    }
+
+    @Test func sessionPresentationRunsOffMainActor() async throws {
+        let recorder = V3ThreadRecorder()
         let formatters = AutoChartFormatters(request: { _, _, _ in
-            callback.blockOnce()
+            recorder.recordCurrentThread()
             return nil
         })
+        let session = AutoChartSession<Int>(cache: AutoChartCache())
+        session.load(
+            try AutoChartRequest(table: domainDataset()),
+            formatters: formatters)
+        _ = try await readyAnalysis(from: session)
+
+        #expect(recorder.result.count > 0)
+        #expect(!recorder.result.observedMainThread)
+    }
+
+    @Test func revertingToReadyPresentationCancelsPendingReplacement() async throws {
+        let callback = V3OneShotBlockingCallback()
+        defer { callback.release() }
         let session = AutoChartSession<Int>(cache: AutoChartCache())
         let request = try AutoChartRequest(table: domainDataset())
         session.load(
             request,
-            presentationContext: .init(identity: "blocked-v1"),
-            formatters: formatters)
-        #expect(await waitForV3Condition(timeout: .seconds(5)) { callback.isBlocked })
-
-        session.setPresentationContext(
-            .init(identity: "unblocked-v2"),
-            formatters: formatters)
-        let replacementFinished = await waitForV3Condition(timeout: .seconds(5)) {
-            guard case .ready(_, let presented) = session.state else { return false }
-            return presented?.context.identity == "unblocked-v2"
+            presentationContext: .init(identity: "ready-a"))
+        _ = try await readyPresentation(from: session) {
+            $0.context.identity == "ready-a"
         }
-        #expect(replacementFinished)
 
-        callback.release()
-        try? await Task.sleep(for: .milliseconds(10))
-        guard case .ready(_, let presented) = session.state else {
-            Issue.record("The replacement presentation must remain ready.")
+        let blockingFormatters = AutoChartFormatters(request: { _, _, _ in
+            callback.invoke()
+            return nil
+        })
+        session.setPresentationContext(
+            .init(identity: "pending-b"),
+            formatters: blockingFormatters)
+        #expect(await waitForV3Condition(timeout: .seconds(5)) { callback.isBlocked })
+        #expect(session.isPresentationPending)
+        guard case .ready(_, let visible?) = session.state else {
+            Issue.record("The existing presentation must remain visible.")
             return
         }
-        #expect(presented?.context.identity == "unblocked-v2")
+        #expect(visible.context.identity == "ready-a")
+
+        session.setPresentationContext(
+            .init(identity: "ready-a"),
+            formatters: nil)
+        #expect(!session.isPresentationPending)
+
+        callback.release()
+        #expect(
+            await waitForV3Condition(timeout: .seconds(5)) {
+                callback.completedInvocations > 0
+            })
+        guard case .ready(_, let presented) = session.state else {
+            Issue.record("The restored presentation must remain ready.")
+            return
+        }
+        #expect(presented?.context.identity == "ready-a")
     }
 
     @Test(

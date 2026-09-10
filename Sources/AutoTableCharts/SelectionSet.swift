@@ -144,16 +144,25 @@ extension AutoChartPreparedChart {
         for sourceRows: Set<RowID>,
         analysisID: AutoChartAnalysisID
     ) -> AutoChartSelectionSet<RowID> {
-        AutoChartSelectionSet(
-            marks.compactMap { mark in
+        let specification = recommendation.specification
+        return AutoChartSelectionSet<RowID>(
+            zip(marks, core.data).compactMap { mark, datum in
+                guard mark.identity == datum.id else { return nil }
                 let matchingRows = mark.sourceRowIDs.intersection(sourceRows)
                 guard !matchingRows.isEmpty else { return nil }
+                let semanticValues = AutoChartSelectionPreparation.semanticValues(
+                    for: [datum],
+                    specification: specification,
+                    measureSemantics: core.measureSemantics)
                 return AutoChartSelection(
                     analysisID: analysisID,
                     preparedChartID: id,
                     sourceRowIDs: mark.sourceRowIDs,
-                    family: recommendation.specification.family,
-                    specificationID: recommendation.specification.id,
+                    dimensions: semanticValues.dimensions,
+                    rangeDimensions: semanticValues.rangeDimensions,
+                    measure: semanticValues.measure,
+                    family: specification.family,
+                    specificationID: specification.id,
                     markID: mark.identity)
             })
     }

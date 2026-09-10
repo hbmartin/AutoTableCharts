@@ -19,6 +19,12 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
     public private(set) var preference: AutoChartPreference = .automatic
     public var selection = AutoChartSelectionSet<RowID>()
 
+    /// True while the session is resolving a new presentation payload. A ready
+    /// chart may remain visible while this is true.
+    public var isPresentationPending: Bool {
+        presentationRequestID != nil
+    }
+
     private let cache: AutoChartCache
     private let analyzer: AutoChartAnalyzer
     private let presenter: AutoChartPresenter
@@ -37,7 +43,7 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
     private var presentationGeneration: UInt64 = 0
     @ObservationIgnored private var task: Task<Void, Never>?
     @ObservationIgnored private var presentationTask: Task<Void, Never>?
-    @ObservationIgnored private var presentationRequestID: AutoChartPresentationRequestID?
+    private var presentationRequestID: AutoChartPresentationRequestID?
 
     public init(
         cache: AutoChartCache = AutoChartCache(),
@@ -296,9 +302,6 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
                     state = .fallback(analysis, nil)
                     return
                 }
-                state = .preparing(
-                    analysis,
-                    AutoChartProgress(phase: .presentationPreparation))
                 schedulePresentation(
                     for: analysis,
                     chart: chart,
@@ -339,6 +342,12 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         if case .ready(_, let presented) = state,
             presented?.requestID == requestID
         {
+            if presentationRequestID != nil {
+                presentationGeneration &+= 1
+                presentationTask?.cancel()
+                presentationTask = nil
+                presentationRequestID = nil
+            }
             return
         }
         guard presentationRequestID != requestID else { return }
