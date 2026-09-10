@@ -18,15 +18,6 @@ public enum AutoChartConveniencePresentationCache {
     }
 }
 
-private struct AutoChartConveniencePresentationID: Hashable {
-    var preparedChart: AutoChartPreparedChartID
-    var context: AutoChartPresentationContext
-    var formatterLocale: Locale
-    var formatterTimeZone: TimeZone
-    var formatterCallback: UUID?
-    var resolverCallback: UUID?
-}
-
 #if os(macOS)
 import AppKit
 #endif
@@ -128,47 +119,57 @@ private struct AutoChartDeferredPresentationView<RowID: Hashable & Sendable>: Vi
     let textResolver: AutoChartTextResolver
 
     @State private var presentedChart: AutoChartPresentedChart<RowID>?
-    @State private var presentedID: AutoChartConveniencePresentationID?
+    @State private var presentedID: AutoChartPresentationRequestID?
 
-    private var requestID: AutoChartConveniencePresentationID {
-        AutoChartConveniencePresentationID(
+    private var requestID: AutoChartPresentationRequestID {
+        AutoChartPresentationRequestID(
             preparedChart: preparedChart.id,
             context: context,
-            formatterLocale: formatters.locale,
-            formatterTimeZone: formatters.timeZone,
-            formatterCallback: formatters.callbackIdentity,
-            resolverCallback: textResolver.callbackIdentity)
+            formatters: formatters,
+            textResolver: textResolver)
     }
 
     @ViewBuilder
     var body: some View {
         let requestID = requestID
-        if presentedID == requestID, let presentedChart {
-            AutoChartView(
-                presentedChart: presentedChart,
-                analysisID: analysisID,
-                selection: selection,
-                presentation: presentation,
-                formatters: formatters,
-                textResolver: textResolver)
-        } else {
-            ProgressView()
-                .frame(maxWidth: .infinity)
-                .frame(height: presentation.plotHeight)
-                .task(id: requestID) {
-                    presentedChart = nil
-                    presentedID = nil
-                    let presented = await Task.detached(priority: .userInitiated) {
-                        autoChartConveniencePresenter.present(
-                            preparedChart,
-                            context: context,
-                            formatters: formatters,
-                            textResolver: textResolver)
-                    }.value
-                    guard !Task.isCancelled else { return }
-                    presentedChart = presented
-                    presentedID = requestID
-                }
+        ZStack(alignment: .topTrailing) {
+            if let presentedChart {
+                AutoChartView(
+                    presentedChart: presentedChart,
+                    analysisID: analysisID,
+                    selection: selection,
+                    presentation: presentation)
+            } else {
+                ProgressView()
+                    .frame(maxWidth: .infinity)
+                    .frame(height: presentation.plotHeight)
+            }
+            if presentedChart != nil, presentedID != requestID {
+                ProgressView()
+                    .controlSize(.small)
+                    .padding(8)
+            }
+        }
+        .task(id: requestID) {
+            guard presentedID != requestID else { return }
+            if let presentedID, presentedID.preparedChart != requestID.preparedChart {
+                presentedChart = nil
+                self.presentedID = nil
+            }
+            do {
+                let presented = try await autoChartConveniencePresenter.presentCancellable(
+                    preparedChart,
+                    context: context,
+                    formatters: formatters,
+                    textResolver: textResolver)
+                try Task.checkCancellation()
+                presentedChart = presented
+                presentedID = requestID
+            } catch is CancellationError {
+                return
+            } catch {
+                assertionFailure("Unexpected deferred presentation error: \(error)")
+            }
         }
     }
 }
@@ -232,6 +233,9 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     @Environment(\.autoChartPalette) private var palette
     @Environment(\.autoChartTheme) private var theme
 
+    /// Defers presentation until the view participates in a SwiftUI lifecycle.
+    /// For synchronous renderers, resolve the chart with ``AutoChartPresenter``
+    /// and use ``init(presentedChart:analysisID:selection:presentation:formatters:textResolver:)``.
     public init(
         preparedChart: AutoChartPreparedChart<RowID>,
         analysisID: AutoChartAnalysisID,
@@ -283,6 +287,9 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         self.textResolver = textResolver ?? presentedChart.textResolver
     }
 
+    /// Defers presentation until the view participates in a SwiftUI lifecycle.
+    /// For synchronous renderers, resolve the primary chart with
+    /// ``AutoChartPresenter`` and use the presented-chart initializer.
     public init(
         analysis: AutoChartAnalysis<RowID>,
         selection: Binding<AutoChartSelectionSet<RowID>> = .constant(.init()),

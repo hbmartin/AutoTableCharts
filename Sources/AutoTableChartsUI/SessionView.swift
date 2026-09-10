@@ -170,9 +170,8 @@ public struct AutoChartSessionView<
     @Environment(\.autoChartTheme) private var theme
 
     private struct EnvironmentPresentationIdentity: Hashable {
-        var context: AutoChartPresentationContext?
-        var formatterLocale: Locale?
-        var formatterTimeZone: TimeZone?
+        var context: AutoChartPresentationContextIdentity?
+        var formatterFoundation: AutoChartFoundationPresentationIdentity?
         var formatterCallback: UUID?
         var resolverCallback: UUID?
     }
@@ -235,9 +234,12 @@ public struct AutoChartSessionView<
 
     private var environmentPresentationIdentity: EnvironmentPresentationIdentity {
         EnvironmentPresentationIdentity(
-            context: presentationContext,
-            formatterLocale: formatters?.locale,
-            formatterTimeZone: formatters?.timeZone,
+            context: presentationContext.map(AutoChartPresentationContextIdentity.init),
+            formatterFoundation: formatters.map {
+                AutoChartFoundationPresentationIdentity(
+                    locale: $0.locale,
+                    timeZone: $0.timeZone)
+            },
             formatterCallback: formatters?.callbackIdentity,
             resolverCallback: textResolver?.callbackIdentity)
     }

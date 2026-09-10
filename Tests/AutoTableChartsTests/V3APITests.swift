@@ -1,3 +1,4 @@
+import Dispatch
 import Foundation
 import SwiftUI
 import Testing
@@ -123,23 +124,80 @@ private final class V3Counter: @unchecked Sendable {
     var value: Int { lock.withLock { stored } }
 }
 
-private actor V3AsyncTestGate {
-    private var isPaused = false
-    private var continuation: CheckedContinuation<Void, Never>?
+private final class V3OneShotBlockingCallback: @unchecked Sendable {
+    private let lock = NSLock()
+    private let released = DispatchSemaphore(value: 0)
+    private var hasBlocked = false
+    private var blocked = false
 
-    func pause() async {
-        isPaused = true
-        await withCheckedContinuation { continuation = $0 }
-    }
+    var isBlocked: Bool { lock.withLock { blocked } }
 
-    func waitUntilPaused() async {
-        while !isPaused { await Task.yield() }
+    func blockOnce() {
+        let shouldBlock = lock.withLock {
+            guard !hasBlocked else { return false }
+            hasBlocked = true
+            return true
+        }
+        guard shouldBlock else { return }
+        lock.withLock { blocked = true }
+        released.wait()
+        lock.withLock { blocked = false }
     }
 
     func release() {
-        continuation?.resume()
-        continuation = nil
+        released.signal()
     }
+}
+
+private actor V3AsyncTestGate {
+    private var pauseCount = 0
+    private var releaseContinuations: [UUID: CheckedContinuation<Void, Never>] = [:]
+
+    func pause() async {
+        let token = UUID()
+        pauseCount += 1
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                if Task.isCancelled {
+                    continuation.resume()
+                } else {
+                    releaseContinuations[token] = continuation
+                }
+            }
+        } onCancel: {
+            Task { await self.cancelPause(token) }
+        }
+    }
+
+    func waitUntilPaused(_ expectedCount: Int = 1) async {
+        while pauseCount < expectedCount, !Task.isCancelled {
+            await Task.yield()
+        }
+    }
+
+    func release() {
+        let continuations = Array(releaseContinuations.values)
+        releaseContinuations.removeAll()
+        continuations.forEach { $0.resume() }
+    }
+
+    private func cancelPause(_ token: UUID) {
+        releaseContinuations.removeValue(forKey: token)?.resume()
+    }
+}
+
+@MainActor
+private func waitForV3Condition(
+    timeout: Duration = .seconds(2),
+    _ condition: @MainActor () -> Bool
+) async -> Bool {
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: timeout)
+    while !condition() {
+        guard !Task.isCancelled, clock.now < deadline else { return false }
+        try? await Task.sleep(for: .milliseconds(1))
+    }
+    return true
 }
 
 private struct CountingRow: AutoChartRow {
@@ -221,8 +279,22 @@ private final class ProgressRecorder: @unchecked Sendable {
             name: bridged.name,
             displayName: bridged.displayName,
             semantics: bridged.semantics)
-        #expect(bridged == canonical)
-        #expect(Set([bridged, canonical]).count == 1)
+        #expect(bridged != canonical)
+        #expect(Set([bridged, canonical]).count == 2)
+
+        let bridgedDataset = try AutoChartDataset(
+            columns: [bridged],
+            rows: [[.double(1)]],
+            rowIDs: [1],
+            key: .contentAddressed(identity: "effective-hints"))
+        let canonicalDataset = try AutoChartDataset(
+            columns: [canonical],
+            rows: [[.double(1)]],
+            rowIDs: [1],
+            key: .contentAddressed(identity: "effective-hints"))
+        #expect(
+            try AutoChartRequest(table: bridgedDataset).id
+                != AutoChartRequest(table: canonicalDataset).id)
 
         bridged.semantics = .identifier(semanticType: .nominal)
         #expect(bridged.hints.role == .identifier)
@@ -850,7 +922,11 @@ private final class ProgressRecorder: @unchecked Sendable {
                     title: "")))
         let partialAggregateSelection = aggregate.selections(
             for: [10], analysisID: analysis.id)
-        #expect(partialAggregateSelection.unionedSourceRows == [10])
+        let matchingAggregateMark = try #require(
+            aggregate.marks.first { $0.sourceRowIDs.contains(10) })
+        #expect(
+            partialAggregateSelection.unionedSourceRows
+                == matchingAggregateMark.sourceRowIDs)
 
         var partialGroup = AutoChartSelectionSet([firstSelection])
         partialGroup.select(
@@ -977,6 +1053,24 @@ private final class ProgressRecorder: @unchecked Sendable {
             AutoChartPresentationContext.self, from: legacy)
         #expect(decodedLegacy.locale.identifier == "en_US")
         #expect(decodedLegacy.timeZone.identifier == "GMT")
+        #expect(decodedLegacy.localeIdentifier == "en_US")
+        #expect(decodedLegacy.timeZoneIdentifier == "UTC")
+
+        var lexical = AutoChartPresentationContext(
+            locale: Locale(identifier: "en_US"),
+            timeZone: .gmt)
+        lexical.localeIdentifier = "iw_IL"
+        lexical.timeZoneIdentifier = "UTC"
+        #expect(lexical.locale.identifier == "he_IL")
+        #expect(lexical.timeZone.identifier == "GMT")
+        #expect(lexical.localeIdentifier == "iw_IL")
+        #expect(lexical.timeZoneIdentifier == "UTC")
+        let lexicalRoundTrip = try JSONDecoder().decode(
+            AutoChartPresentationContext.self,
+            from: JSONEncoder().encode(lexical))
+        #expect(lexicalRoundTrip == lexical)
+        #expect(lexicalRoundTrip.localeIdentifier == "iw_IL")
+        #expect(lexicalRoundTrip.timeZoneIdentifier == "UTC")
     }
 
     @MainActor
@@ -991,6 +1085,30 @@ private final class ProgressRecorder: @unchecked Sendable {
         })
 
         AutoChartConveniencePresentationCache.removeAll()
+        let firstID = AutoChartPresentationRequestID(
+            preparedChart: chart.id,
+            context: .init(identity: "convenience-v1"),
+            formatters: formatters,
+            textResolver: .default)
+        let identicalID = AutoChartPresentationRequestID(
+            preparedChart: chart.id,
+            context: .init(identity: "convenience-v1"),
+            formatters: formatters,
+            textResolver: .default)
+        let invalidatedID = AutoChartPresentationRequestID(
+            preparedChart: chart.id,
+            context: .init(identity: "convenience-v2"),
+            formatters: formatters,
+            textResolver: .default)
+        #expect(firstID == identicalID)
+        #expect(firstID != invalidatedID)
+        #expect(firstID.context.foundation.localeIdentifier == firstID.context.localeIdentifier)
+        #expect(firstID.context.foundation.usesAutoupdatingLocale)
+        #expect(firstID.context.foundation.fixedLocale == nil)
+        #expect(
+            firstID.formatterFoundation.timeZoneIdentifier
+                == formatters.timeZone.identifier)
+
         _ = AutoChartView(
             preparedChart: chart,
             analysisID: analysis.id,
@@ -1011,6 +1129,39 @@ private final class ProgressRecorder: @unchecked Sendable {
 
 @MainActor
 @Suite struct V3SessionTests {
+    @Test func sessionPresentationIsOffMainActorAndSupersededSafely() async throws {
+        let callback = V3OneShotBlockingCallback()
+        defer { callback.release() }
+        let formatters = AutoChartFormatters(request: { _, _, _ in
+            callback.blockOnce()
+            return nil
+        })
+        let session = AutoChartSession<Int>(cache: AutoChartCache())
+        let request = try AutoChartRequest(table: domainDataset())
+        session.load(
+            request,
+            presentationContext: .init(identity: "blocked-v1"),
+            formatters: formatters)
+        #expect(await waitForV3Condition(timeout: .seconds(5)) { callback.isBlocked })
+
+        session.setPresentationContext(
+            .init(identity: "unblocked-v2"),
+            formatters: formatters)
+        let replacementFinished = await waitForV3Condition(timeout: .seconds(5)) {
+            guard case .ready(_, let presented) = session.state else { return false }
+            return presented?.context.identity == "unblocked-v2"
+        }
+        #expect(replacementFinished)
+
+        callback.release()
+        try? await Task.sleep(for: .milliseconds(10))
+        guard case .ready(_, let presented) = session.state else {
+            Issue.record("The replacement presentation must remain ready.")
+            return
+        }
+        #expect(presented?.context.identity == "unblocked-v2")
+    }
+
     @Test(
         .disabled(if: !testHooksAvailable, testHooksUnavailable),
         .timeLimit(.minutes(1)))
@@ -1023,8 +1174,13 @@ private final class ProgressRecorder: @unchecked Sendable {
         let coldSession = AutoChartSession<Int>(cache: coldCache)
         coldSession.load(coldRequest, preparation: .primary)
         await coldGate.waitUntilPaused()
-        for _ in 0..<10 { await Task.yield() }
-        guard case .analyzing(let coldProgress) = coldSession.state else {
+        let observedColdProgress = await waitForV3Condition {
+            guard case .analyzing(let progress) = coldSession.state else { return false }
+            return progress?.phase == .chartPreparation
+        }
+        guard observedColdProgress,
+            case .analyzing(let coldProgress) = coldSession.state
+        else {
             await coldGate.release()
             Issue.record("Cold chart preparation must remain in analyzing mode.")
             return
@@ -1048,8 +1204,13 @@ private final class ProgressRecorder: @unchecked Sendable {
         let warmSession = AutoChartSession<Int>(cache: warmCache)
         warmSession.load(warmRequest, preparation: .primary)
         await warmGate.waitUntilPaused()
-        for _ in 0..<10 { await Task.yield() }
-        guard case .preparing(_, let warmProgress) = warmSession.state else {
+        let observedWarmProgress = await waitForV3Condition {
+            guard case .preparing(_, let progress) = warmSession.state else { return false }
+            return progress?.phase == .chartPreparation
+        }
+        guard observedWarmProgress,
+            case .preparing(_, let warmProgress) = warmSession.state
+        else {
             await warmGate.release()
             warmCache.unregisterProgress(for: warmRequest.id, token: progressToken)
             Issue.record("Replayed analysis progress must not regress warm preparation.")
@@ -1084,9 +1245,8 @@ private final class ProgressRecorder: @unchecked Sendable {
             textResolver: environmentResolver)
 
         session.setPresentationContext(.init(identity: "loaded-v2"))
-        guard case .ready(_, let overridden?) = session.state else {
-            Issue.record("The environment-overridden presentation must remain ready.")
-            return
+        let overridden = try await readyPresentation(from: session) {
+            $0.context.identity == "environment"
         }
         #expect(overridden.context.identity == "environment")
         #expect(
@@ -1098,9 +1258,8 @@ private final class ProgressRecorder: @unchecked Sendable {
 
         session.applyPresentationEnvironment(
             context: nil, formatters: nil, textResolver: nil)
-        guard case .ready(_, let restored?) = session.state else {
-            Issue.record("Removing environment values must restore loaded presentation.")
-            return
+        let restored = try await readyPresentation(from: session) {
+            $0.context.identity == "loaded-v2"
         }
         #expect(restored.context.identity == "loaded-v2")
         #expect(restored.formatters.callbackIdentity == loadedFormatters.callbackIdentity)
@@ -1118,9 +1277,8 @@ private final class ProgressRecorder: @unchecked Sendable {
         _ = try await readyAnalysis(from: session)
 
         session.setPresentationContext(.init(identity: "compact"))
-        guard case .ready(_, let presented?) = session.state else {
-            Issue.record("A context-only update must retain ready presentation.")
-            return
+        let presented = try await readyPresentation(from: session) {
+            $0.context.identity == "compact"
         }
         #expect(presented.formatters.callbackIdentity == formatters.callbackIdentity)
         #expect(presented.textResolver.callbackIdentity == resolver.callbackIdentity)
@@ -1128,9 +1286,8 @@ private final class ProgressRecorder: @unchecked Sendable {
         let replacementFormatters = AutoChartFormatters(request: { _, _, _ in nil })
         session.setPresentationContext(
             .init(identity: "regular"), formatters: replacementFormatters)
-        guard case .ready(_, let reformatted?) = session.state else {
-            Issue.record("A formatter-only update must retain ready presentation.")
-            return
+        let reformatted = try await readyPresentation(from: session) {
+            $0.context.identity == "regular"
         }
         #expect(
             reformatted.formatters.callbackIdentity
@@ -1140,9 +1297,8 @@ private final class ProgressRecorder: @unchecked Sendable {
         let replacementResolver = AutoChartTextResolver { $0.defaultText }
         session.setPresentationContext(
             .init(identity: "accessible"), textResolver: replacementResolver)
-        guard case .ready(_, let relocalized?) = session.state else {
-            Issue.record("A resolver-only update must retain ready presentation.")
-            return
+        let relocalized = try await readyPresentation(from: session) {
+            $0.context.identity == "accessible"
         }
         #expect(
             relocalized.formatters.callbackIdentity
@@ -1192,9 +1348,8 @@ private final class ProgressRecorder: @unchecked Sendable {
         session.load(request)
         _ = try await readyAnalysis(from: session)
         session.setPresentationContext(.init(identity: "environment-v1"))
-        guard case .ready(_, let presented?) = session.state else {
-            Issue.record("A ready session must support presentation-only updates.")
-            return
+        let presented = try await readyPresentation(from: session) {
+            $0.context.identity == "environment-v1"
         }
         #expect(presented.context.identity == "environment-v1")
     }
@@ -1328,11 +1483,33 @@ private func captureResult<Value: Sendable>(
 private func readyAnalysis(
     from session: AutoChartSession<Int>
 ) async throws -> AutoChartAnalysis<Int> {
-    for _ in 0..<2_000 {
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: .seconds(10))
+    while clock.now < deadline {
         switch session.state {
         case .ready(let analysis, _): return analysis
         case .failed(let failure): throw failure
-        default: await Task.yield()
+        default: try await Task.sleep(for: .milliseconds(1))
+        }
+    }
+    throw V3TestError.timedOut
+}
+
+@MainActor
+private func readyPresentation(
+    from session: AutoChartSession<Int>,
+    matching predicate: (AutoChartPresentedChart<Int>) -> Bool
+) async throws -> AutoChartPresentedChart<Int> {
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: .seconds(10))
+    while clock.now < deadline {
+        switch session.state {
+        case .ready(_, let presented?) where predicate(presented):
+            return presented
+        case .failed(let failure):
+            throw failure
+        default:
+            try await Task.sleep(for: .milliseconds(1))
         }
     }
     throw V3TestError.timedOut
@@ -1342,11 +1519,13 @@ private func readyAnalysis(
 private func fallbackAnalysis(
     from session: AutoChartSession<Int>
 ) async throws -> AutoChartAnalysis<Int> {
-    for _ in 0..<2_000 {
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: .seconds(10))
+    while clock.now < deadline {
         switch session.state {
         case .fallback(let analysis, _): return analysis
         case .failed(let failure): throw failure
-        default: await Task.yield()
+        default: try await Task.sleep(for: .milliseconds(1))
         }
     }
     throw V3TestError.timedOut
@@ -1356,9 +1535,11 @@ private func fallbackAnalysis(
 private func sessionFailure(
     from session: AutoChartSession<Int>
 ) async throws -> AutoChartFailure {
-    for _ in 0..<2_000 {
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: .seconds(10))
+    while clock.now < deadline {
         if case .failed(let failure) = session.state { return failure }
-        await Task.yield()
+        try await Task.sleep(for: .milliseconds(1))
     }
     throw V3TestError.timedOut
 }

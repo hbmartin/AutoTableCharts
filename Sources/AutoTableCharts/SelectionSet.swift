@@ -138,7 +138,8 @@ public struct AutoChartSelectionSet<RowID: Hashable & Sendable>: Hashable, Senda
 }
 
 extension AutoChartPreparedChart {
-    /// Derives chart-mark selections from caller-owned source row identifiers.
+    /// Derives complete chart-mark selections that intersect caller-owned source
+    /// row identifiers. Each result retains the full lineage of its selected mark.
     public func selections(
         for sourceRows: Set<RowID>,
         analysisID: AutoChartAnalysisID
@@ -150,7 +151,7 @@ extension AutoChartPreparedChart {
                 return AutoChartSelection(
                     analysisID: analysisID,
                     preparedChartID: id,
-                    sourceRowIDs: matchingRows,
+                    sourceRowIDs: mark.sourceRowIDs,
                     family: recommendation.specification.family,
                     specificationID: recommendation.specification.id,
                     markID: mark.identity)

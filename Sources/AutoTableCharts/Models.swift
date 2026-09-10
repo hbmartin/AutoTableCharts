@@ -678,6 +678,7 @@ public struct AutoChartColumn: Identifiable, Hashable, Codable, Sendable {
             && lhs.name == rhs.name
             && lhs.displayName == rhs.displayName
             && lhs.semantics == rhs.semantics
+            && lhs.normalizedHints == rhs.normalizedHints
     }
 
     public func hash(into hasher: inout Hasher) {
@@ -685,6 +686,7 @@ public struct AutoChartColumn: Identifiable, Hashable, Codable, Sendable {
         hasher.combine(name)
         hasher.combine(displayName)
         hasher.combine(semantics)
+        hasher.combine(normalizedHints)
     }
 
     /// Creates a column description.
