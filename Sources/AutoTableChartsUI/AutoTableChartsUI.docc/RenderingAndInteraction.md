@@ -10,12 +10,15 @@ sessions can share one core cache while retaining independent preferences and
 selections.
 
 ``AutoChartPresenter`` performs localization, formatting, ordering, and
-histogram label resolution before SwiftUI evaluates a chart body. Its bounded
+histogram label resolution before a resolved chart body is evaluated. Its bounded
 memo is keyed by prepared-chart identity, ``AutoChartPresentationContext``, the
 effective locale and time zone, and host callback identity. Change the context
 identity when the behavior captured by an existing callback changes. The
-synchronous `AutoChartView` and `AutoChartPlot` convenience initializers accept
-`presentationContext` for the same invalidation control.
+`AutoChartView` and `AutoChartPlot` convenience initializers accept
+`presentationContext` for the same invalidation control and defer memo misses to
+a cancellable presentation task. Call
+``AutoChartConveniencePresentationCache/removeAll()`` to release the process-wide
+convenience memo in response to memory pressure.
 
 `AutoChartSelectionSet` is ordered and provenance-safe. A click replaces its
 selection; Command-click removes a matched group when all its marks are selected

@@ -182,6 +182,10 @@ public struct AutoChartRecommendationCatalog: Hashable, Codable, Sendable,
     public let cataloged: [AutoChartRecommendation]
     public let preferred: AutoChartRecommendation?
 
+    private enum CodingKeys: String, CodingKey {
+        case featured, cataloged, preferred
+    }
+
     public init(
         featured: [AutoChartRecommendation],
         cataloged: [AutoChartRecommendation],
@@ -196,6 +200,24 @@ public struct AutoChartRecommendationCatalog: Hashable, Codable, Sendable,
         self.preferred = preferred.flatMap { item in
             safe.contains(where: { $0.id == item.id }) ? nil : item
         }
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            featured: try container.decode(
+                [AutoChartRecommendation].self, forKey: .featured),
+            cataloged: try container.decode(
+                [AutoChartRecommendation].self, forKey: .cataloged),
+            preferred: try container.decodeIfPresent(
+                AutoChartRecommendation.self, forKey: .preferred))
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(featured, forKey: .featured)
+        try container.encode(cataloged, forKey: .cataloged)
+        try container.encodeIfPresent(preferred, forKey: .preferred)
     }
 
     public var startIndex: Int { featured.startIndex }
