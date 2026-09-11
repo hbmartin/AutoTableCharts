@@ -19,6 +19,12 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
     public private(set) var preference: AutoChartPreference = .automatic
     public var selection = AutoChartSelectionSet<RowID>()
 
+    /// True while the session is resolving a new presentation payload. A ready
+    /// chart may remain visible while this is true.
+    public var isPresentationPending: Bool {
+        presentationRequestID != nil
+    }
+
     private let cache: AutoChartCache
     private let analyzer: AutoChartAnalyzer
     private let presenter: AutoChartPresenter
@@ -34,7 +40,10 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
     private var environmentFormatters: AutoChartFormatters?
     private var environmentTextResolver: AutoChartTextResolver?
     private var generation: UInt64 = 0
+    private var presentationGeneration: UInt64 = 0
     @ObservationIgnored private var task: Task<Void, Never>?
+    @ObservationIgnored private var presentationTask: Task<Void, Never>?
+    private var presentationRequestID: AutoChartPresentationRequestID?
 
     public init(
         cache: AutoChartCache = AutoChartCache(),
@@ -45,7 +54,10 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         self.presenter = presenter
     }
 
-    deinit { task?.cancel() }
+    deinit {
+        task?.cancel()
+        presentationTask?.cancel()
+    }
 
     /// Starts or supersedes a request. Replacement requests clear visible state immediately.
     public func load(
@@ -90,8 +102,9 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
             clearsVisibleState: false)
     }
 
-    /// Rebuilds presentation for the current prepared chart without replacing
-    /// formatter or text-resolver configuration.
+    /// Schedules presentation rebuilding for the current prepared chart without
+    /// replacing formatter or text-resolver configuration. The current ready
+    /// presentation remains visible until its replacement is available.
     public func setPresentationContext(_ context: AutoChartPresentationContext) {
         loadedPresentationContext = context
         rebuildEffectivePresentation()
@@ -171,16 +184,26 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         presentationContext = context
         self.formatters = formatters
         self.textResolver = textResolver
-        guard case .ready(let analysis, _) = state,
-            let chart = analysis.primaryChart
-        else { return }
-        state = .ready(
-            analysis,
-            presenter.present(
-                chart,
-                context: context,
-                formatters: formatters,
-                textResolver: textResolver))
+        switch state {
+        case .ready(let analysis, _):
+            guard let chart = analysis.primaryChart else { return }
+            schedulePresentation(
+                for: analysis,
+                chart: chart,
+                keepsVisiblePresentation: true)
+        case .preparing(let analysis, let progress)
+            where progress?.phase == .presentationPreparation:
+            guard let chart = analysis.primaryChart else { return }
+            schedulePresentation(
+                for: analysis,
+                chart: chart,
+                keepsVisiblePresentation: false)
+        default:
+            presentationGeneration &+= 1
+            presentationTask?.cancel()
+            presentationTask = nil
+            presentationRequestID = nil
+        }
     }
 
     /// Starts a fresh attempt after a retryable failure.
@@ -200,8 +223,12 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
     /// Cancels the current attempt. Cancellation never becomes a failure state.
     public func cancel() {
         generation &+= 1
+        presentationGeneration &+= 1
         task?.cancel()
+        presentationTask?.cancel()
         task = nil
+        presentationTask = nil
+        presentationRequestID = nil
         state = .idle
     }
 
@@ -217,6 +244,10 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         generation &+= 1
         let token = generation
         task?.cancel()
+        presentationGeneration &+= 1
+        presentationTask?.cancel()
+        presentationTask = nil
+        presentationRequestID = nil
         self.request = request
         self.preference = preference
         self.strategy = preparation
@@ -239,8 +270,7 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
             state = .analyzing(nil)
         }
         let analyzer = self.analyzer
-        let presenter = self.presenter
-        task = Task { [weak self, analyzer, presenter] in
+        task = Task { [weak self, analyzer] in
             do {
                 let analysis = try await analyzer.analyze(
                     request,
@@ -255,7 +285,7 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
                                     case .preparing(let current, _) = self.state,
                                     current.id == completedForPreparation.id
                                 else { return }
-                                self.state = .preparing(completedForPreparation, progress)
+                                self.state = .preparing(current, progress)
                             } else if case .analyzing = self.state {
                                 self.state = .analyzing(progress)
                             }
@@ -272,17 +302,10 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
                     state = .fallback(analysis, nil)
                     return
                 }
-                state = .preparing(
-                    analysis,
-                    AutoChartProgress(phase: .presentationPreparation))
-                let presented = presenter.present(
-                    chart,
-                    context: self.presentationContext,
-                    formatters: self.formatters,
-                    textResolver: self.textResolver)
-                guard generation == token, !Task.isCancelled else { return }
-                if !selection.belongs(to: chart) { selection.removeAll() }
-                state = .ready(analysis, presented)
+                schedulePresentation(
+                    for: analysis,
+                    chart: chart,
+                    keepsVisiblePresentation: false)
             } catch is CancellationError {
                 // Supersession and explicit cancellation intentionally publish no failure.
             } catch let failure as AutoChartFailure {
@@ -296,6 +319,85 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
                         kind: .internalFailure,
                         isRetryable: true,
                         diagnosticID: "ATC.session.internalFailure",
+                        message: String(describing: error)))
+            }
+        }
+    }
+
+    private func schedulePresentation(
+        for analysis: AutoChartAnalysis<RowID>,
+        chart: AutoChartPreparedChart<RowID>,
+        keepsVisiblePresentation: Bool
+    ) {
+        let context = presentationContext
+        let formatters = self.formatters ?? AutoChartFormatters(
+            locale: context.locale,
+            timeZone: context.timeZone)
+        let textResolver = self.textResolver
+        let requestID = AutoChartPresentationRequestID(
+            preparedChart: chart.id,
+            context: context,
+            formatters: formatters,
+            textResolver: textResolver)
+        if case .ready(_, let presented) = state,
+            presented?.requestID == requestID
+        {
+            if presentationRequestID != nil {
+                presentationGeneration &+= 1
+                presentationTask?.cancel()
+                presentationTask = nil
+                presentationRequestID = nil
+            }
+            return
+        }
+        guard presentationRequestID != requestID else { return }
+
+        presentationGeneration &+= 1
+        let presentationToken = presentationGeneration
+        let requestToken = generation
+        presentationTask?.cancel()
+        presentationRequestID = requestID
+        if !keepsVisiblePresentation {
+            state = .preparing(
+                analysis,
+                AutoChartProgress(phase: .presentationPreparation))
+        }
+        let presenter = presenter
+        presentationTask = Task { [weak self, presenter] in
+            do {
+                let presented = try await presenter.presentCancellable(
+                    chart,
+                    context: context,
+                    formatters: formatters,
+                    textResolver: textResolver)
+                try Task.checkCancellation()
+                guard let self,
+                    self.generation == requestToken,
+                    self.presentationGeneration == presentationToken
+                else { return }
+                self.presentationTask = nil
+                self.presentationRequestID = nil
+                if !self.selection.belongs(to: chart) { self.selection.removeAll() }
+                self.state = .ready(analysis, presented)
+            } catch is CancellationError {
+                guard let self, self.presentationGeneration == presentationToken else {
+                    return
+                }
+                self.presentationTask = nil
+                self.presentationRequestID = nil
+            } catch {
+                guard let self,
+                    self.generation == requestToken,
+                    self.presentationGeneration == presentationToken
+                else { return }
+                self.presentationTask = nil
+                self.presentationRequestID = nil
+                self.state = .failed(
+                    AutoChartFailure(
+                        stage: .presentationPreparation,
+                        kind: .internalFailure,
+                        isRetryable: true,
+                        diagnosticID: "ATC.session.presentationFailure",
                         message: String(describing: error)))
             }
         }

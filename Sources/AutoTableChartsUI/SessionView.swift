@@ -170,9 +170,8 @@ public struct AutoChartSessionView<
     @Environment(\.autoChartTheme) private var theme
 
     private struct EnvironmentPresentationIdentity: Hashable {
-        var context: AutoChartPresentationContext?
-        var formatterLocale: Locale?
-        var formatterTimeZone: TimeZone?
+        var context: AutoChartPresentationContextIdentity?
+        var formatterFoundation: AutoChartFoundationPresentationIdentity?
         var formatterCallback: UUID?
         var resolverCallback: UUID?
     }
@@ -205,11 +204,18 @@ public struct AutoChartSessionView<
                     selection: session.selection)
             case .ready(let analysis, let presented):
                 if let presented {
-                    AutoChartView(
-                        presentedChart: presented,
-                        analysisID: analysis.id,
-                        selection: $session.selection)
-                        .foregroundStyle(theme.legendColor)
+                    ZStack(alignment: .topTrailing) {
+                        AutoChartView(
+                            presentedChart: presented,
+                            analysisID: analysis.id,
+                            selection: $session.selection)
+                            .foregroundStyle(theme.legendColor)
+                        if session.isPresentationPending {
+                            ProgressView()
+                                .controlSize(.small)
+                                .padding(8)
+                        }
+                    }
                 } else {
                     loading(nil)
                 }
@@ -235,9 +241,12 @@ public struct AutoChartSessionView<
 
     private var environmentPresentationIdentity: EnvironmentPresentationIdentity {
         EnvironmentPresentationIdentity(
-            context: presentationContext,
-            formatterLocale: formatters?.locale,
-            formatterTimeZone: formatters?.timeZone,
+            context: presentationContext.map(AutoChartPresentationContextIdentity.init),
+            formatterFoundation: formatters.map {
+                AutoChartFoundationPresentationIdentity(
+                    locale: $0.locale,
+                    timeZone: $0.timeZone)
+            },
             formatterCallback: formatters?.callbackIdentity,
             resolverCallback: textResolver?.callbackIdentity)
     }

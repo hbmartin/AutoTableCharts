@@ -138,21 +138,31 @@ public struct AutoChartSelectionSet<RowID: Hashable & Sendable>: Hashable, Senda
 }
 
 extension AutoChartPreparedChart {
-    /// Derives chart-mark selections from caller-owned source row identifiers.
+    /// Derives complete chart-mark selections that intersect caller-owned source
+    /// row identifiers. Each result retains the full lineage of its selected mark.
     public func selections(
         for sourceRows: Set<RowID>,
         analysisID: AutoChartAnalysisID
     ) -> AutoChartSelectionSet<RowID> {
-        AutoChartSelectionSet(
-            marks.compactMap { mark in
+        let specification = recommendation.specification
+        return AutoChartSelectionSet<RowID>(
+            zip(marks, core.data).compactMap { mark, datum in
+                guard mark.identity == datum.id else { return nil }
                 let matchingRows = mark.sourceRowIDs.intersection(sourceRows)
                 guard !matchingRows.isEmpty else { return nil }
+                let semanticValues = AutoChartSelectionPreparation.semanticValues(
+                    for: [datum],
+                    specification: specification,
+                    measureSemantics: core.measureSemantics)
                 return AutoChartSelection(
                     analysisID: analysisID,
                     preparedChartID: id,
-                    sourceRowIDs: matchingRows,
-                    family: recommendation.specification.family,
-                    specificationID: recommendation.specification.id,
+                    sourceRowIDs: mark.sourceRowIDs,
+                    dimensions: semanticValues.dimensions,
+                    rangeDimensions: semanticValues.rangeDimensions,
+                    measure: semanticValues.measure,
+                    family: specification.family,
+                    specificationID: specification.id,
                     markID: mark.identity)
             })
     }

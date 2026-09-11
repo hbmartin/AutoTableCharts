@@ -666,7 +666,10 @@ public struct AutoChartColumn: Identifiable, Hashable, Codable, Sendable {
     public var displayName: String?
     /// Semantic metadata that overrides or supplements profiling.
     public var semantics: AutoChartColumnSemantics {
-        didSet { normalizedHints = semantics.hints }
+        didSet {
+            guard semantics != oldValue else { return }
+            normalizedHints = semantics.hints
+        }
     }
     private var normalizedHints: AutoChartColumnHints
 
@@ -678,6 +681,7 @@ public struct AutoChartColumn: Identifiable, Hashable, Codable, Sendable {
             && lhs.name == rhs.name
             && lhs.displayName == rhs.displayName
             && lhs.semantics == rhs.semantics
+            && lhs.normalizedHints == rhs.normalizedHints
     }
 
     public func hash(into hasher: inout Hasher) {
@@ -685,6 +689,7 @@ public struct AutoChartColumn: Identifiable, Hashable, Codable, Sendable {
         hasher.combine(name)
         hasher.combine(displayName)
         hasher.combine(semantics)
+        hasher.combine(normalizedHints)
     }
 
     /// Creates a column description.
@@ -1927,7 +1932,7 @@ struct AutoChartHostCallback<Body: Sendable>: Sendable {
     }
 }
 
-enum AutoChartHostCallbackActivity {
+package enum AutoChartHostCallbackActivity {
     private static let logger = Logger(
         subsystem: "io.github.hbmartin.AutoTableCharts",
         category: "HostCallbacks")
@@ -1944,7 +1949,7 @@ enum AutoChartHostCallbackActivity {
     /// Child tasks inherit task-local values at creation. Keep the inherited
     /// scope as a reference whose activity ends with the callback, rather than a
     /// Boolean snapshot that would remain true for the child's entire lifetime.
-    private final class Scope: Sendable {
+    fileprivate final class Scope: Sendable {
         private struct State: Sendable {
             var isActive: Bool
             var parent: Scope?
@@ -2044,6 +2049,28 @@ enum AutoChartHostCallbackActivity {
     }
 
     @TaskLocal private static var inheritedScope: Scope?
+
+    /// A transferable reference to the caller's current callback scope.
+    /// Detached presentation work restores it so re-entrant callbacks retain
+    /// the same bounded fallback behavior as their originating task.
+    package struct Context: Sendable {
+        fileprivate let scope: Scope?
+
+        fileprivate init(scope: Scope?) {
+            self.scope = scope
+        }
+    }
+
+    package static var currentContext: Context {
+        Context(scope: inheritedScope)
+    }
+
+    package static func withContext<Value>(
+        _ context: Context,
+        operation: () throws -> Value
+    ) rethrows -> Value {
+        try $inheritedScope.withValue(context.scope, operation: operation)
+    }
 
     #if ATC_TEST_HOOKS
     static var inheritedScopeDepthForTesting: Int {
