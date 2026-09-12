@@ -38,10 +38,20 @@ if (( ${#hook_test_specifiers[@]} == 0 )); then
   exit 1
 fi
 
+swift_test_sources=()
+while IFS= read -r -d '' swift_test_source; do
+  swift_test_sources+=("$swift_test_source")
+done < <(find Tests/AutoTableChartsTests -type f -name '*.swift' -print0)
+
+if (( ${#swift_test_sources[@]} == 0 )); then
+  echo "No Swift test sources were found for the release audit." >&2
+  exit 1
+fi
+
 if perl -0ne '
   $found ||= /#if ATC_TEST_HOOKS\s+\@Test/;
   END { exit($found ? 0 : 1) }
-' Tests/AutoTableChartsTests/*.swift
+' "${swift_test_sources[@]}"
 then
   echo "Hook-dependent tests must use a conditional trait, not a conditional @Test attribute." >&2
   exit 1

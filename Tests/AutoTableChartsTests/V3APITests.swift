@@ -23,6 +23,29 @@ private struct LegacyV3Column: Encodable {
     let hints: AutoChartColumnHints
 }
 
+/// Mirrors the synthesized Codable shape shipped in 0.1.0. These fixtures
+/// intentionally remain separate from the current hints model so compatibility
+/// tests fail if a required released field disappears again.
+private enum ReleasedV1AggregationSafety: String, Decodable {
+    case unknown, rowLevel, safe, alreadyAggregated, unsafe
+}
+
+private struct ReleasedV1ColumnHints: Decodable {
+    let semanticType: AutoChartSemanticType?
+    let role: AutoChartAnalyticRole?
+    let unit: AutoChartUnit?
+    let aggregation: AutoChartAggregation?
+    let aggregationSafety: ReleasedV1AggregationSafety
+    let grain: String?
+}
+
+private struct ReleasedV1Column: Decodable {
+    let id: AutoChartColumnID
+    let name: String
+    let displayName: String?
+    let hints: ReleasedV1ColumnHints
+}
+
 private struct V3CatalogPayload: Encodable {
     let featured: [AutoChartRecommendation]
     let cataloged: [AutoChartRecommendation]
@@ -144,6 +167,7 @@ private final class V3OneShotBlockingCallback: @unchecked Sendable {
     private var invocationCount = 0
     private var completedInvocationCount = 0
     private var blocked = false
+    private var timedOut = false
 
     init(blockedInvocation: Int = 1) {
         self.blockedInvocation = blockedInvocation
@@ -151,6 +175,7 @@ private final class V3OneShotBlockingCallback: @unchecked Sendable {
 
     var isBlocked: Bool { lock.withLock { blocked } }
     var completedInvocations: Int { lock.withLock { completedInvocationCount } }
+    var didTimeOut: Bool { lock.withLock { timedOut } }
 
     func invoke() {
         let shouldBlock = lock.withLock {
@@ -159,8 +184,11 @@ private final class V3OneShotBlockingCallback: @unchecked Sendable {
         }
         if shouldBlock {
             lock.withLock { blocked = true }
-            _ = released.wait(timeout: .now() + 5)
-            lock.withLock { blocked = false }
+            let outcome = released.wait(timeout: .now() + 5)
+            lock.withLock {
+                blocked = false
+                timedOut = timedOut || outcome == .timedOut
+            }
         }
         lock.withLock { completedInvocationCount += 1 }
     }
@@ -188,8 +216,9 @@ private final class V3ThreadRecorder: @unchecked Sendable {
 }
 
 private actor V3AsyncTestGate {
-    private var pauseCount = 0
     private var releaseContinuations: [UUID: CheckedContinuation<Void, Never>] = [:]
+
+    var activePauseCount: Int { releaseContinuations.count }
 
     func pause() async {
         let token = UUID()
@@ -199,7 +228,6 @@ private actor V3AsyncTestGate {
                     continuation.resume()
                 } else {
                     releaseContinuations[token] = continuation
-                    pauseCount += 1
                 }
             }
         } onCancel: {
@@ -208,7 +236,7 @@ private actor V3AsyncTestGate {
     }
 
     func waitUntilPaused(_ expectedCount: Int = 1) async {
-        while pauseCount < expectedCount, !Task.isCancelled {
+        while releaseContinuations.count < expectedCount, !Task.isCancelled {
             await Task.yield()
         }
     }
@@ -393,7 +421,7 @@ private final class ProgressRecorder: @unchecked Sendable {
         #expect(dataset.chartRows[1].chartValue(for: "value") == .double(20))
     }
 
-    @Test func columnCodingWritesOnlyTheCoherentSemanticShape() throws {
+    @Test func columnCodingWritesCurrentSemanticsAndReleasedHintsShape() throws {
         let column = AutoChartColumn(
             id: "value", name: "Value",
             semantics: .measure(
@@ -404,8 +432,19 @@ private final class ProgressRecorder: @unchecked Sendable {
             JSONSerialization.jsonObject(with: data) as? [String: Any])
         #expect(object["semantics"] != nil)
         #expect(object["normalizedHints"] == nil)
-        #expect(object["hints"] == nil)
+        #expect(object["hints"] != nil)
         #expect(try JSONDecoder().decode(AutoChartColumn.self, from: data) == column)
+
+        let released = try JSONDecoder().decode(ReleasedV1Column.self, from: data)
+        #expect(released.id == column.id)
+        #expect(released.name == column.name)
+        #expect(released.displayName == column.displayName)
+        #expect(released.hints.semanticType == .quantitative)
+        #expect(released.hints.role == .measure)
+        #expect(released.hints.unit == .percent(fractional: true))
+        #expect(released.hints.aggregation == nil)
+        #expect(released.hints.aggregationSafety == .unsafe)
+        #expect(released.hints.grain == nil)
     }
 }
 
@@ -1254,6 +1293,13 @@ private final class ProgressRecorder: @unchecked Sendable {
         await gate.release()
         await first.value
         await second.value
+        let activePauseCount = await gate.activePauseCount
+        #expect(activePauseCount == 0)
+
+        let third = Task { await gate.pause() }
+        await gate.waitUntilPaused()
+        await gate.release()
+        await third.value
     }
 
     @Test func sessionPresentationRunsOffMainActor() async throws {
@@ -1266,7 +1312,7 @@ private final class ProgressRecorder: @unchecked Sendable {
         session.load(
             try AutoChartRequest(table: domainDataset()),
             formatters: formatters)
-        _ = try await readyAnalysis(from: session)
+        _ = try await readyPresentation(from: session) { _ in true }
 
         #expect(recorder.result.count > 0)
         #expect(!recorder.result.observedMainThread)
@@ -1309,6 +1355,7 @@ private final class ProgressRecorder: @unchecked Sendable {
             await waitForV3Condition(timeout: .seconds(5)) {
                 callback.completedInvocations > 0
             })
+        #expect(!callback.didTimeOut)
         guard case .ready(_, let presented) = session.state else {
             Issue.record("The restored presentation must remain ready.")
             return

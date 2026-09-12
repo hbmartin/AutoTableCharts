@@ -144,6 +144,10 @@ private struct AutoChartDeferredPresentationView<RowID: Hashable & Sendable>: Vi
                 ProgressView()
                     .frame(maxWidth: .infinity)
                     .frame(height: presentation.plotHeight)
+                    .accessibilityLabel(textResolver(.init(
+                        category: .accessibility,
+                        code: .presentationPending,
+                        defaultText: "Preparing chart")))
             }
             if let presentedChart,
                 presentedChart.requestID.preparedChart == requestID.preparedChart,
@@ -152,6 +156,7 @@ private struct AutoChartDeferredPresentationView<RowID: Hashable & Sendable>: Vi
                 ProgressView()
                     .controlSize(.small)
                     .padding(8)
+                    .accessibilityHidden(true)
             }
         }
         .task(id: requestID) {
