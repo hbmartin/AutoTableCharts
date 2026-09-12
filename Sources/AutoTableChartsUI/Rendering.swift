@@ -240,6 +240,11 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     @State private var zoomAnchor = 1.0
     @Environment(\.autoChartPalette) private var palette
     @Environment(\.autoChartTheme) private var theme
+    @Environment(\.autoChartTextResolver) private var environmentTextResolver
+
+    private var effectiveTextResolver: AutoChartTextResolver {
+        environmentTextResolver ?? textResolver
+    }
 
     /// Defers presentation until the view participates in a SwiftUI lifecycle.
     /// For synchronous renderers, resolve the chart with ``AutoChartPresenter``
@@ -418,21 +423,21 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
                 selection: $selection,
                 presentation: presentation,
                 formatters: formatters,
-                textResolver: textResolver)
+                textResolver: effectiveTextResolver)
         case .fallback(let fallback):
             VStack(alignment: .leading, spacing: 10) {
                 ContentUnavailableView(
-                    textResolver(.init(
+                    effectiveTextResolver(.init(
                         category: .interface,
                         code: .chartUnavailable,
                         defaultText: "Chart unavailable")),
                     systemImage: "tablecells",
-                    description: Text(textResolver(fallback.message)))
+                    description: Text(effectiveTextResolver(fallback.message)))
                 if presentation.chrome.contains(.diagnostics) {
                     ForEach(Array(fallback.diagnostics.enumerated()), id: \.offset) {
                         _, diagnostic in
                         Label(
-                            textResolver(diagnostic.messageValue),
+                            effectiveTextResolver(diagnostic.messageValue),
                             systemImage: "exclamationmark.triangle.fill")
                             .font(.caption)
                             .foregroundStyle(.orange)
@@ -453,7 +458,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
                     let summary = first.presentation(
                         columns: snapshot.columns,
                         formatters: formatters,
-                        textResolver: textResolver,
+                        textResolver: effectiveTextResolver,
                         resolvedDimensionLabel: resolvedSelectionDimensionLabel)
                     HStack(alignment: .firstTextBaseline) {
                         VStack(alignment: .leading, spacing: 2) {
@@ -462,7 +467,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
                                 .secondary)
                         }
                         Spacer()
-                        Button(textResolver(.init(
+                        Button(effectiveTextResolver(.init(
                             category: .interface,
                             code: .clearSelection,
                             defaultText: "Clear"))) { clearSelection() }
@@ -473,7 +478,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
                     .accessibilityLabel(summary.accessibilityDescription)
                 }
                 if presentation.chrome.contains(.zoomControls), zoomScale > 1.01 {
-                    Button(textResolver(.init(
+                    Button(effectiveTextResolver(.init(
                         category: .interface,
                         code: .resetZoom,
                         defaultText: "Reset Zoom")), systemImage: "arrow.counterclockwise") {
@@ -488,19 +493,21 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
                 // `messageValue`, so route them through the resolver rather
                 // than concatenating raw `defaultText` the host cannot localize.
                 ContentUnavailableView(
-                    textResolver(.init(
+                    effectiveTextResolver(.init(
                         category: .interface,
                         code: .chartUnavailable,
                         defaultText: "Chart unavailable")),
                     systemImage: "chart.xyaxis.line",
                     description: Text(
                         validation.issues
-                            .map { textResolver($0.messageValue) }
+                            .map { effectiveTextResolver($0.messageValue) }
                             .joined(separator: " ")))
             }
             if presentation.chrome.contains(.diagnostics) {
                 ForEach(Array(preparedChart.diagnostics.enumerated()), id: \.offset) { _, diagnostic in
-                Label(textResolver(diagnostic.messageValue), systemImage: "exclamationmark.triangle.fill")
+                Label(
+                    effectiveTextResolver(diagnostic.messageValue),
+                    systemImage: "exclamationmark.triangle.fill")
                     .font(.caption)
                     .foregroundStyle(.orange)
                 }
@@ -1254,7 +1261,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
                     measureSemantics: renderedMeasureSemantics,
                     profiles: preparedChart.core.table.profiles,
                     formatters: formatters,
-                    textResolver: textResolver)
+                    textResolver: effectiveTextResolver)
             {
                 return description
             }
@@ -1271,7 +1278,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             facetValue: specification.encoding.facet == nil
                 ? nil : accessibilityFacetValue(for: datum),
             valueDescription: valueDescription,
-            textResolver: textResolver)
+            textResolver: effectiveTextResolver)
     }
 
     private func heatmapAccessibilityLabel(for datum: AutoChartDatum) -> String {
@@ -1292,7 +1299,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             category: xName,
             secondaryCategory: yName,
             valueDescription: count,
-            textResolver: textResolver)
+            textResolver: effectiveTextResolver)
     }
 
     private func symbolSize(for value: Double?) -> Double {

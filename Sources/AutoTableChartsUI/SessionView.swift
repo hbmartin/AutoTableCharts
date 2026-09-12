@@ -117,6 +117,66 @@ enum AutoChartProgressAccessibility {
         defaultText: "Updating chart")
 }
 
+private actor AutoChartTextResolutionRelay {
+    private var continuation: CheckedContinuation<String?, Never>?
+    private var completedValue: String?
+    private var isCompleted = false
+    private var isCancelled = false
+
+    func value() async -> String? {
+        if isCancelled { return nil }
+        if isCompleted { return completedValue }
+        return await withCheckedContinuation { continuation in
+            if isCancelled {
+                continuation.resume(returning: nil)
+            } else if isCompleted {
+                continuation.resume(returning: completedValue)
+            } else {
+                self.continuation = continuation
+            }
+        }
+    }
+
+    func complete(with value: String) {
+        guard !isCancelled, !isCompleted else { return }
+        isCompleted = true
+        completedValue = value
+        continuation?.resume(returning: value)
+        continuation = nil
+    }
+
+    func cancel() {
+        guard !isCancelled, !isCompleted else { return }
+        isCancelled = true
+        continuation?.resume(returning: nil)
+        continuation = nil
+    }
+}
+
+enum AutoChartProgressTextResolution {
+    static func resolve(
+        _ message: AutoChartMessage,
+        using resolver: AutoChartTextResolver
+    ) async -> String? {
+        guard resolver.callbackIdentity != nil else { return message.defaultText }
+
+        let callbackContext = AutoChartHostCallbackActivity.currentContext
+        let relay = AutoChartTextResolutionRelay()
+        let work = Task.detached(priority: .userInitiated) {
+            let resolved = AutoChartHostCallbackActivity.withContext(callbackContext) {
+                resolver(message)
+            }
+            await relay.complete(with: resolved)
+        }
+        return await withTaskCancellationHandler {
+            await relay.value()
+        } onCancel: {
+            work.cancel()
+            Task { await relay.cancel() }
+        }
+    }
+}
+
 struct AutoChartAccessibleProgressView: View {
     let message: AutoChartMessage
     let textResolver: AutoChartTextResolver?
@@ -139,20 +199,24 @@ struct AutoChartAccessibleProgressView: View {
     }
 
     var body: some View {
-        let resolver = textResolver ?? environmentTextResolver
+        let resolver = environmentTextResolver ?? textResolver
         ProgressView()
             .accessibilityLabel(accessibilityText)
             .task(id: ResolutionID(
                 message: message,
                 resolverCallback: resolver?.callbackIdentity)
             ) {
-                accessibilityText = message.defaultText
+                if accessibilityText != message.defaultText {
+                    accessibilityText = message.defaultText
+                }
                 guard let resolver else { return }
-                let resolved = await Task.detached(priority: .userInitiated) {
-                    resolver(message)
-                }.value
-                guard !Task.isCancelled else { return }
-                accessibilityText = resolved
+                let resolved = await AutoChartProgressTextResolution.resolve(
+                    message,
+                    using: resolver)
+                guard let resolved, !Task.isCancelled else { return }
+                if accessibilityText != resolved {
+                    accessibilityText = resolved
+                }
             }
     }
 }
@@ -162,6 +226,7 @@ public struct AutoChartPreparationPlaceholder<RowID: Hashable & Sendable>: View 
     public let analysis: AutoChartAnalysis<RowID>
     public let progress: AutoChartProgress?
     public let selection: AutoChartSelectionSet<RowID>
+    package let textResolver: AutoChartTextResolver?
 
     public init(
         analysis: AutoChartAnalysis<RowID>,
@@ -171,6 +236,19 @@ public struct AutoChartPreparationPlaceholder<RowID: Hashable & Sendable>: View 
         self.analysis = analysis
         self.progress = progress
         self.selection = selection
+        self.textResolver = nil
+    }
+
+    package init(
+        analysis: AutoChartAnalysis<RowID>,
+        progress: AutoChartProgress?,
+        selection: AutoChartSelectionSet<RowID>,
+        textResolver: AutoChartTextResolver
+    ) {
+        self.analysis = analysis
+        self.progress = progress
+        self.selection = selection
+        self.textResolver = textResolver
     }
 
     public var body: some View {
@@ -178,7 +256,8 @@ public struct AutoChartPreparationPlaceholder<RowID: Hashable & Sendable>: View 
             Text(analysis.preferenceResolution?.recommendation?.specification.title ?? "Chart")
                 .font(.headline)
             AutoChartAccessibleProgressView(
-                message: AutoChartProgressAccessibility.preparing)
+                message: AutoChartProgressAccessibility.preparing,
+                textResolver: textResolver)
             if let progress {
                 Text(progress.phase.rawValue)
                     .font(.caption)
@@ -253,7 +332,8 @@ public struct AutoChartSessionView<
                 AutoChartPreparationPlaceholder(
                     analysis: analysis,
                     progress: progress,
-                    selection: session.selection)
+                    selection: session.selection,
+                    textResolver: session.presentationTextResolver)
             case .ready(let analysis, let presented):
                 if let presented {
                     ZStack(alignment: .topTrailing) {
@@ -264,7 +344,8 @@ public struct AutoChartSessionView<
                             .foregroundStyle(theme.legendColor)
                         if session.isPresentationPending {
                             AutoChartAccessibleProgressView(
-                                message: AutoChartProgressAccessibility.updating)
+                                message: AutoChartProgressAccessibility.updating,
+                                textResolver: session.presentationTextResolver)
                                 .controlSize(.small)
                                 .padding(8)
                         }
@@ -323,7 +404,8 @@ extension AutoChartSessionView where
                 AnyView(
                     VStack(spacing: 8) {
                         AutoChartAccessibleProgressView(
-                            message: AutoChartProgressAccessibility.preparing)
+                            message: AutoChartProgressAccessibility.preparing,
+                            textResolver: session.presentationTextResolver)
                         if let progress { Text(progress.phase.rawValue).font(.caption) }
                     })
             },

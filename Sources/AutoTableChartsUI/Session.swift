@@ -25,6 +25,12 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         presentationRequestID != nil
     }
 
+    /// The resolver currently governing presentation work, including any
+    /// environment override applied by ``AutoChartSessionView``.
+    package var presentationTextResolver: AutoChartTextResolver {
+        textResolver
+    }
+
     private let cache: AutoChartCache
     private let analyzer: AutoChartAnalyzer
     private let presenter: AutoChartPresenter
