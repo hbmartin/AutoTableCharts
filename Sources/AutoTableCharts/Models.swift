@@ -732,6 +732,57 @@ public struct AutoChartColumn: Identifiable, Hashable, Codable, Sendable {
         case hints
     }
 
+    /// The 0.1.0 hints payload used `aggregation` and a required
+    /// `aggregationSafety` value. Keep those fields beside the current measure
+    /// semantics so both released and current decoders can consume new output.
+    private struct CompatibleEncodedHints: Encodable {
+        enum LegacyAggregationSafety: String, Encodable {
+            case unknown, rowLevel, safe, alreadyAggregated, unsafe
+        }
+
+        let semanticType: AutoChartSemanticType?
+        let role: AutoChartAnalyticRole?
+        let unit: AutoChartUnit?
+        let measureSemantics: AutoChartMeasureSemantics?
+        let aggregation: AutoChartAggregation?
+        let aggregationSafety: LegacyAggregationSafety
+        let grain: String?
+
+        init(_ hints: AutoChartColumnHints) {
+            semanticType = hints.semanticType
+            role = hints.role
+            unit = hints.unit
+            measureSemantics = hints.measureSemantics
+            grain = hints.grain
+
+            guard let measure = hints.measureSemantics else {
+                aggregation = nil
+                aggregationSafety = .unknown
+                return
+            }
+            switch measure.rollup {
+            case .unknown:
+                aggregation = measure.preferredTransform
+                aggregationSafety = .unknown
+            case .nonAdditive:
+                aggregation = measure.preferredTransform
+                aggregationSafety = .unsafe
+            case .safe(let operation):
+                aggregation = measure.preferredTransform ?? operation
+                aggregationSafety = .safe
+            case .additive:
+                switch measure.source {
+                case .aggregated(let operation):
+                    aggregation = operation
+                    aggregationSafety = .alreadyAggregated
+                case .rowLevel, .derived:
+                    aggregation = measure.preferredTransform
+                    aggregationSafety = .safe
+                }
+            }
+        }
+    }
+
     public init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         id = try container.decode(AutoChartColumnID.self, forKey: .id)
@@ -757,9 +808,7 @@ public struct AutoChartColumn: Identifiable, Hashable, Codable, Sendable {
         try container.encode(name, forKey: .name)
         try container.encodeIfPresent(displayName, forKey: .displayName)
         try container.encode(semantics, forKey: .semantics)
-        if normalizedHints != semantics.hints {
-            try container.encode(normalizedHints, forKey: .hints)
-        }
+        try container.encode(CompatibleEncodedHints(normalizedHints), forKey: .hints)
     }
 }
 
@@ -1700,6 +1749,7 @@ public struct AutoChartMessage: Hashable, Codable, Sendable {
         public static let duplicateMark = Self(rawValue: "duplicateMark")
         public static let invalidTemporalRange = Self(rawValue: "invalidTemporalRange")
         public static let chartUnavailable = Self(rawValue: "chartUnavailable")
+        public static let presentationPending = Self(rawValue: "presentationPending")
         public static let clearSelection = Self(rawValue: "clearSelection")
         public static let resetZoom = Self(rawValue: "resetZoom")
         public static let selectionSummary = Self(rawValue: "selectionSummary")

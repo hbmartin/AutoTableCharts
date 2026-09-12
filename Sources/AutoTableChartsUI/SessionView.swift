@@ -214,6 +214,7 @@ public struct AutoChartSessionView<
                             ProgressView()
                                 .controlSize(.small)
                                 .padding(8)
+                                .accessibilityHidden(true)
                         }
                     }
                 } else {
