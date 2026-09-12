@@ -574,7 +574,6 @@ public struct AutoChartColumnHints: Hashable, Codable, Sendable {
             String.self, forKey: .aggregationSafety
         ).flatMap(LegacyAggregationSafety.init(rawValue:))
         measureSemantics = Self.measureSemantics(
-            role: role,
             aggregation: aggregation,
             safety: safety)
     }
@@ -593,17 +592,16 @@ public struct AutoChartColumnHints: Hashable, Codable, Sendable {
     }
 
     private static func measureSemantics(
-        role: AutoChartAnalyticRole?,
         aggregation: AutoChartAggregation?,
         safety: LegacyAggregationSafety?
     ) -> AutoChartMeasureSemantics? {
-        guard role == .measure || aggregation != nil || safety.map({ $0 != .unknown }) == true
+        guard aggregation != nil || (safety != nil && safety != .unknown)
         else { return nil }
 
         switch safety ?? .unknown {
         case .unknown:
             return AutoChartMeasureSemantics(
-                source: aggregation.map(AutoChartMeasureSource.aggregated) ?? .rowLevel,
+                source: .rowLevel,
                 rollup: .unknown,
                 preferredTransform: aggregation)
         case .rowLevel:
@@ -637,7 +635,17 @@ public struct AutoChartColumnHints: Hashable, Codable, Sendable {
         guard let measure else { return (nil, .unknown) }
         switch measure.rollup {
         case .unknown:
-            return (sourceAggregation(measure.source) ?? measure.preferredTransform, .unknown)
+            guard let sourceOperation = sourceAggregation(measure.source) else {
+                return (measure.preferredTransform, .unknown)
+            }
+            // In the released schema, alreadyAggregated is both provenance and
+            // permission to sum upstream sums and counts. Preserve provenance
+            // when that flag grants no extra rollup permission, but keep an
+            // unknown policy conservative for additive upstream operations.
+            let safety: LegacyAggregationSafety =
+                sourceOperation == .sum || sourceOperation == .count
+                ? .unknown : .alreadyAggregated
+            return (sourceOperation, safety)
         case .nonAdditive:
             return (sourceAggregation(measure.source) ?? measure.preferredTransform, .unsafe)
         case .safe(let operation):

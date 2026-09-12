@@ -74,21 +74,56 @@ then
   exit 1
 fi
 
-hook_guard_count="$(perl -0ne '
-  $count += () = /\.disabled\(\s*if:\s*!testHooksAvailable,\s*testHooksUnavailable\s*\)/g;
-  END { print $count || 0 }
-' "${swift_test_sources[@]}")"
-hook_body_count="$(perl -0ne '
-  $count += () = /^[ \t]+#if[ \t]+ATC_TEST_HOOKS[ \t]*$/mg;
-  END { print $count || 0 }
-' "${swift_test_sources[@]}")"
 manifest_count="${#hook_test_specifiers[@]}"
+
+for test_specifier in "${hook_test_specifiers[@]}"; do
+  test_name="${test_specifier##*/}"
+  test_name="${test_name%%(*}"
+  if HOOK_TEST_NAME="$test_name" perl -0ne '
+    while (/(\@Test\b(?:(?!\@Test\b).)*?\bfunc\s+\Q$ENV{HOOK_TEST_NAME}\E\s*\([^)]*\)(?:(?!\@Test\b).)*?)(?=\@Test\b|\z)/sg) {
+      $block = $1;
+      $matches++;
+      $guards++
+        if $block =~ /\.disabled\(\s*if:\s*!testHooksAvailable,\s*testHooksUnavailable\s*\)/s;
+      $bodies++
+        if $block =~ /\bfunc\s+\Q$ENV{HOOK_TEST_NAME}\E\s*\([^)]*\).*?\{\s*#if\s+ATC_TEST_HOOKS\b/s;
+    }
+    END {
+      exit 2 if ($matches || 0) != 1;
+      exit 3 if ($guards || 0) != 1;
+      exit 4 if ($bodies || 0) != 1;
+    }
+  ' "${swift_test_sources[@]}"
+  then
+    :
+  else
+    audit_status=$?
+    case "$audit_status" in
+      2) audit_problem="does not identify exactly one source test" ;;
+      3) audit_problem="does not carry the required unavailable-hook guard" ;;
+      4) audit_problem="does not wrap its body in #if ATC_TEST_HOOKS" ;;
+      *) audit_problem="could not be audited" ;;
+    esac
+    echo "Hook-dependent test $test_specifier $audit_problem." >&2
+    exit 1
+  fi
+done
+
+read -r hook_guard_count hook_body_count < <(perl -0ne '
+  while (/(\@Test\b(?:(?!\@Test\b).)*?\bfunc\s+[A-Za-z_][A-Za-z0-9_]*\s*\([^)]*\)(?:(?!\@Test\b).)*?)(?=\@Test\b|\z)/sg) {
+    $block = $1;
+    $guards++
+      if $block =~ /\.disabled\(\s*if:\s*!testHooksAvailable,\s*testHooksUnavailable\s*\)/s;
+    $bodies++ if $block =~ /^\s*#if\s+ATC_TEST_HOOKS\b/m;
+  }
+  END { print(($guards || 0) . " " . ($bodies || 0) . "\n") }
+' "${swift_test_sources[@]}")
 
 if [[ "$hook_guard_count" -ne "$manifest_count" \
   || "$hook_body_count" -ne "$manifest_count" ]]
 then
   echo \
-    "Hook-test manifest has $manifest_count entries, but found $hook_guard_count guards and $hook_body_count hook bodies." \
+    "Hook-test manifest has $manifest_count entries, but found $hook_guard_count guarded tests and $hook_body_count hook-dependent test bodies." \
     >&2
   exit 1
 fi

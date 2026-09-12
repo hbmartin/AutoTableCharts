@@ -256,7 +256,7 @@ private actor V3AsyncTestGate {
         let deadline = clock.now.advanced(by: timeout)
         while releaseContinuations.count < expectedCount, !Task.isCancelled {
             guard clock.now < deadline else { return false }
-            await Task.yield()
+            try? await Task.sleep(for: .milliseconds(1))
         }
         return !Task.isCancelled
     }
@@ -481,7 +481,7 @@ private final class ProgressRecorder: @unchecked Sendable {
                     rollup: .unknown,
                     preferredTransform: .maximum),
                 .mean,
-                .unknown
+                .alreadyAggregated
             ),
             (
                 "nonadditive upstream distinct count",
@@ -567,10 +567,10 @@ private final class ProgressRecorder: @unchecked Sendable {
             AutoChartMeasureSemantics
         )] = [
             (
-                "unknown upstream mean",
+                "unknown preferred mean",
                 releasedV1MeasureHints(aggregation: .mean, safety: .unknown),
                 .init(
-                    source: .aggregated(.mean),
+                    source: .rowLevel,
                     rollup: .unknown,
                     preferredTransform: .mean)
             ),
@@ -625,6 +625,58 @@ private final class ProgressRecorder: @unchecked Sendable {
             #expect(decoded.hints.measureSemantics == expected, Comment(rawValue: name))
             #expect(decoded.semantics.hints.measureSemantics == expected, Comment(rawValue: name))
         }
+    }
+
+    @Test func releasedUnknownAggregationDoesNotInventUpstreamProvenance() throws {
+        let current = AutoChartColumn(
+            id: "value",
+            name: "Value",
+            semantics: .measure(
+                semantics: .init(
+                    source: .rowLevel,
+                    rollup: .unknown,
+                    preferredTransform: .mean)))
+
+        let released = try JSONDecoder().decode(
+            ReleasedV1Column.self,
+            from: JSONEncoder().encode(current))
+        #expect(released.hints.aggregation == .mean)
+        #expect(released.hints.aggregationSafety == .unknown)
+
+        let roundTripped = try JSONDecoder().decode(
+            AutoChartColumn.self,
+            from: JSONEncoder().encode(released))
+        #expect(roundTripped == current)
+    }
+
+    @Test func releasedNonadditiveProvenanceSurvivesACompatibilityHop() throws {
+        let released = ReleasedV1Column(
+            id: "value",
+            name: "Value",
+            displayName: nil,
+            hints: releasedV1MeasureHints(
+                aggregation: .mean,
+                safety: .alreadyAggregated))
+
+        let current = try JSONDecoder().decode(
+            AutoChartColumn.self,
+            from: JSONEncoder().encode(released))
+        let reencoded = try JSONDecoder().decode(
+            ReleasedV1Column.self,
+            from: JSONEncoder().encode(current))
+        #expect(reencoded.hints.aggregation == .mean)
+        #expect(reencoded.hints.aggregationSafety == .alreadyAggregated)
+    }
+
+    @Test func absentMeasureSemanticsRemainAbsentAcrossCoding() throws {
+        let hints = AutoChartColumnHints(
+            semanticType: .quantitative,
+            role: .measure)
+        let decoded = try JSONDecoder().decode(
+            AutoChartColumnHints.self,
+            from: JSONEncoder().encode(hints))
+        #expect(decoded == hints)
+        #expect(decoded.measureSemantics == nil)
     }
 }
 
@@ -1464,12 +1516,76 @@ private final class ProgressRecorder: @unchecked Sendable {
 
 @MainActor
 @Suite struct V3SessionTests {
+    @Test func progressTextResolutionReturnsPromptlyWhenCancelled() async {
+        let callback = V3OneShotBlockingCallback()
+        defer { callback.release() }
+        let resolver = AutoChartTextResolver { _ in
+            callback.invoke()
+            return "Resolved"
+        }
+        let resolution = Task {
+            await AutoChartProgressTextResolution.resolve(
+                AutoChartProgressAccessibility.preparing,
+                using: resolver)
+        }
+
+        guard await waitForV3Condition({ callback.isBlocked }) else {
+            resolution.cancel()
+            Issue.record("The progress text resolver did not begin.")
+            return
+        }
+        let clock = ContinuousClock()
+        let cancellationStarted = clock.now
+        resolution.cancel()
+        let resolved = await resolution.value
+
+        #expect(resolved == nil)
+        #expect(cancellationStarted.duration(to: clock.now) < .seconds(1))
+    }
+
+    @Test func progressTextResolutionRetainsActiveCallbackContext() async {
+        let resolverReached = DispatchSemaphore(value: 0)
+        let resolver = AutoChartTextResolver { _ in
+            let result = AutoChartHostCallbackActivity.hasActiveCallback
+                ? "active" : "inactive"
+            resolverReached.signal()
+            return result
+        }
+        let outerToken = AutoChartHostCallbackToken()
+
+        let (resolution, resolverStarted) = await Task.detached {
+            AutoChartHostCallbackActivity.invoke(
+                outerToken,
+                {
+                    let resolution = Task {
+                        await AutoChartProgressTextResolution.resolve(
+                            AutoChartProgressAccessibility.preparing,
+                            using: resolver)
+                    }
+                    let started = resolverReached.wait(timeout: .now() + 2) == .success
+                    return (resolution, started)
+                },
+                fallback: (Task { nil }, false))
+        }.value
+
+        #expect(resolverStarted)
+        #expect(await resolution.value == "active")
+    }
+
     @Test func asyncTestGateRegistersAndReleasesEveryWaiter() async {
         let gate = V3AsyncTestGate()
         let first = Task { await gate.pause() }
         let second = Task { await gate.pause() }
 
-        #expect(await gate.waitUntilPaused(2))
+        guard await gate.waitUntilPaused(2) else {
+            first.cancel()
+            second.cancel()
+            await gate.release()
+            await first.value
+            await second.value
+            Issue.record("Both test-gate waiters must pause before release.")
+            return
+        }
         await gate.release()
         await first.value
         await second.value
@@ -1477,7 +1593,13 @@ private final class ProgressRecorder: @unchecked Sendable {
         #expect(activePauseCount == 0)
 
         let third = Task { await gate.pause() }
-        #expect(await gate.waitUntilPaused())
+        guard await gate.waitUntilPaused() else {
+            third.cancel()
+            await gate.release()
+            await third.value
+            Issue.record("The reused test gate must register its waiter.")
+            return
+        }
         await gate.release()
         await third.value
     }
@@ -1555,6 +1677,8 @@ private final class ProgressRecorder: @unchecked Sendable {
         let coldSession = AutoChartSession<Int>(cache: coldCache)
         coldSession.load(coldRequest, preparation: .primary)
         guard await coldGate.waitUntilPaused() else {
+            coldSession.cancel()
+            await coldGate.release()
             Issue.record("Cold chart preparation did not reach its test gate.")
             return
         }
@@ -1588,6 +1712,8 @@ private final class ProgressRecorder: @unchecked Sendable {
         let warmSession = AutoChartSession<Int>(cache: warmCache)
         warmSession.load(warmRequest, preparation: .primary)
         guard await warmGate.waitUntilPaused() else {
+            warmSession.cancel()
+            await warmGate.release()
             warmCache.unregisterProgress(for: warmRequest.id, token: progressToken)
             Issue.record("Warm chart preparation did not reach its test gate.")
             return
@@ -1819,9 +1945,14 @@ private final class ProgressRecorder: @unchecked Sendable {
         let session = AutoChartSession<Int>(cache: AutoChartCache())
         session.load(request)
         let first = try await sessionFailure(from: session)
-        session.retry(preference: .chart(.recommended))
+        session.retry()
         let second = try await sessionFailure(from: session)
         #expect(second.episodeID != first.episodeID)
+        #expect(session.preference == .automatic)
+
+        session.retry(preference: .chart(.recommended))
+        let third = try await sessionFailure(from: session)
+        #expect(third.episodeID != second.episodeID)
         #expect(session.preference == .chart(.recommended))
 
         session.load(try AutoChartRequest(table: domainDataset()))
