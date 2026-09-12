@@ -38,10 +38,20 @@ if (( ${#hook_test_specifiers[@]} == 0 )); then
   exit 1
 fi
 
+swift_test_source_list="$(mktemp "${TMPDIR:-/tmp}/autotablecharts-swift-sources.XXXXXX")"
+trap 'rm -f "$swift_test_source_list"' EXIT
+
+if ! find Tests/AutoTableChartsTests -type f -name '*.swift' -print0 \
+  > "$swift_test_source_list"
+then
+  echo "Could not enumerate Swift test sources for the release audit." >&2
+  exit 1
+fi
+
 swift_test_sources=()
 while IFS= read -r -d '' swift_test_source; do
   swift_test_sources+=("$swift_test_source")
-done < <(find Tests/AutoTableChartsTests -type f -name '*.swift' -print0)
+done < "$swift_test_source_list"
 
 if (( ${#swift_test_sources[@]} == 0 )); then
   echo "No Swift test sources were found for the release audit." >&2
@@ -58,7 +68,7 @@ then
 fi
 
 test_output="$(mktemp "${TMPDIR:-/tmp}/autotablecharts-release-tests.XXXXXX")"
-trap 'rm -f "$test_output"' EXIT
+trap 'rm -f "$swift_test_source_list" "$test_output"' EXIT
 
 if ! swift test "${swift_test_arguments[@]}" 2>&1 | tee "$test_output"; then
   echo "Release tests $1 failed." >&2
