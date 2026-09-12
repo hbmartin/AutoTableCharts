@@ -106,6 +106,57 @@ extension View {
     }
 }
 
+enum AutoChartProgressAccessibility {
+    static let preparing = AutoChartMessage(
+        category: .accessibility,
+        code: .presentationPending,
+        defaultText: "Preparing chart")
+    static let updating = AutoChartMessage(
+        category: .accessibility,
+        code: .presentationUpdating,
+        defaultText: "Updating chart")
+}
+
+struct AutoChartAccessibleProgressView: View {
+    let message: AutoChartMessage
+    let textResolver: AutoChartTextResolver?
+
+    @Environment(\.autoChartTextResolver) private var environmentTextResolver
+    @State private var accessibilityText: String
+
+    private struct ResolutionID: Hashable {
+        let message: AutoChartMessage
+        let resolverCallback: UUID?
+    }
+
+    init(
+        message: AutoChartMessage,
+        textResolver: AutoChartTextResolver? = nil
+    ) {
+        self.message = message
+        self.textResolver = textResolver
+        _accessibilityText = State(initialValue: message.defaultText)
+    }
+
+    var body: some View {
+        let resolver = textResolver ?? environmentTextResolver
+        ProgressView()
+            .accessibilityLabel(accessibilityText)
+            .task(id: ResolutionID(
+                message: message,
+                resolverCallback: resolver?.callbackIdentity)
+            ) {
+                accessibilityText = message.defaultText
+                guard let resolver else { return }
+                let resolved = await Task.detached(priority: .userInitiated) {
+                    resolver(message)
+                }.value
+                guard !Task.isCancelled else { return }
+                accessibilityText = resolved
+            }
+    }
+}
+
 /// Package default shown while an alternative is prepared.
 public struct AutoChartPreparationPlaceholder<RowID: Hashable & Sendable>: View {
     public let analysis: AutoChartAnalysis<RowID>
@@ -126,7 +177,8 @@ public struct AutoChartPreparationPlaceholder<RowID: Hashable & Sendable>: View 
         VStack(alignment: .leading, spacing: 8) {
             Text(analysis.preferenceResolution?.recommendation?.specification.title ?? "Chart")
                 .font(.headline)
-            ProgressView()
+            AutoChartAccessibleProgressView(
+                message: AutoChartProgressAccessibility.preparing)
             if let progress {
                 Text(progress.phase.rawValue)
                     .font(.caption)
@@ -211,10 +263,10 @@ public struct AutoChartSessionView<
                             selection: $session.selection)
                             .foregroundStyle(theme.legendColor)
                         if session.isPresentationPending {
-                            ProgressView()
+                            AutoChartAccessibleProgressView(
+                                message: AutoChartProgressAccessibility.updating)
                                 .controlSize(.small)
                                 .padding(8)
-                                .accessibilityHidden(true)
                         }
                     }
                 } else {
@@ -270,7 +322,8 @@ extension AutoChartSessionView where
             loading: { progress in
                 AnyView(
                     VStack(spacing: 8) {
-                        ProgressView()
+                        AutoChartAccessibleProgressView(
+                            message: AutoChartProgressAccessibility.preparing)
                         if let progress { Text(progress.phase.rawValue).font(.caption) }
                     })
             },

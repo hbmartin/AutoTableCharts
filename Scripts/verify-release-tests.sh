@@ -39,7 +39,14 @@ if (( ${#hook_test_specifiers[@]} == 0 )); then
 fi
 
 swift_test_source_list="$(mktemp "${TMPDIR:-/tmp}/autotablecharts-swift-sources.XXXXXX")"
-trap 'rm -f "$swift_test_source_list"' EXIT
+test_output=""
+cleanup() {
+  rm -f "$swift_test_source_list"
+  if [[ -n "$test_output" ]]; then
+    rm -f "$test_output"
+  fi
+}
+trap cleanup EXIT
 
 if ! find Tests/AutoTableChartsTests -type f -name '*.swift' -print0 \
   > "$swift_test_source_list"
@@ -67,8 +74,26 @@ then
   exit 1
 fi
 
+hook_guard_count="$(perl -0ne '
+  $count += () = /\.disabled\(\s*if:\s*!testHooksAvailable,\s*testHooksUnavailable\s*\)/g;
+  END { print $count || 0 }
+' "${swift_test_sources[@]}")"
+hook_body_count="$(perl -0ne '
+  $count += () = /^[ \t]+#if[ \t]+ATC_TEST_HOOKS[ \t]*$/mg;
+  END { print $count || 0 }
+' "${swift_test_sources[@]}")"
+manifest_count="${#hook_test_specifiers[@]}"
+
+if [[ "$hook_guard_count" -ne "$manifest_count" \
+  || "$hook_body_count" -ne "$manifest_count" ]]
+then
+  echo \
+    "Hook-test manifest has $manifest_count entries, but found $hook_guard_count guards and $hook_body_count hook bodies." \
+    >&2
+  exit 1
+fi
+
 test_output="$(mktemp "${TMPDIR:-/tmp}/autotablecharts-release-tests.XXXXXX")"
-trap 'rm -f "$swift_test_source_list" "$test_output"' EXIT
 
 if ! swift test "${swift_test_arguments[@]}" 2>&1 | tee "$test_output"; then
   echo "Release tests $1 failed." >&2

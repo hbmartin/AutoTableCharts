@@ -208,6 +208,11 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
 
     /// Starts a fresh attempt after a retryable failure.
     public func retry() {
+        retry(preference: preference)
+    }
+
+    /// Starts a fresh attempt with a new preference after a retryable failure.
+    public func retry(preference: AutoChartPreference) {
         guard let request else { return }
         cache.beginRetry(for: request.id)
         start(

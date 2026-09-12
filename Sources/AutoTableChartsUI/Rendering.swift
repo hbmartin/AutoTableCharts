@@ -141,22 +141,21 @@ private struct AutoChartDeferredPresentationView<RowID: Hashable & Sendable>: Vi
                     selection: selection,
                     presentation: presentation)
             } else {
-                ProgressView()
+                AutoChartAccessibleProgressView(
+                    message: AutoChartProgressAccessibility.preparing,
+                    textResolver: textResolver)
                     .frame(maxWidth: .infinity)
                     .frame(height: presentation.plotHeight)
-                    .accessibilityLabel(textResolver(.init(
-                        category: .accessibility,
-                        code: .presentationPending,
-                        defaultText: "Preparing chart")))
             }
             if let presentedChart,
                 presentedChart.requestID.preparedChart == requestID.preparedChart,
                 presentedChart.requestID != requestID
             {
-                ProgressView()
+                AutoChartAccessibleProgressView(
+                    message: AutoChartProgressAccessibility.updating,
+                    textResolver: textResolver)
                     .controlSize(.small)
                     .padding(8)
-                    .accessibilityHidden(true)
             }
         }
         .task(id: requestID) {
