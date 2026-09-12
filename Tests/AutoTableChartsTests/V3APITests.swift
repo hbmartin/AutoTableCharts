@@ -26,11 +26,11 @@ private struct LegacyV3Column: Encodable {
 /// Mirrors the synthesized Codable shape shipped in 0.1.0. These fixtures
 /// intentionally remain separate from the current hints model so compatibility
 /// tests fail if a required released field disappears again.
-private enum ReleasedV1AggregationSafety: String, Decodable {
+private enum ReleasedV1AggregationSafety: String, Codable {
     case unknown, rowLevel, safe, alreadyAggregated, unsafe
 }
 
-private struct ReleasedV1ColumnHints: Decodable {
+private struct ReleasedV1ColumnHints: Codable {
     let semanticType: AutoChartSemanticType?
     let role: AutoChartAnalyticRole?
     let unit: AutoChartUnit?
@@ -39,11 +39,24 @@ private struct ReleasedV1ColumnHints: Decodable {
     let grain: String?
 }
 
-private struct ReleasedV1Column: Decodable {
+private struct ReleasedV1Column: Codable {
     let id: AutoChartColumnID
     let name: String
     let displayName: String?
     let hints: ReleasedV1ColumnHints
+}
+
+private func releasedV1MeasureHints(
+    aggregation: AutoChartAggregation?,
+    safety: ReleasedV1AggregationSafety
+) -> ReleasedV1ColumnHints {
+    ReleasedV1ColumnHints(
+        semanticType: .quantitative,
+        role: .measure,
+        unit: nil,
+        aggregation: aggregation,
+        aggregationSafety: safety,
+        grain: nil)
 }
 
 private struct V3CatalogPayload: Encodable {
@@ -235,10 +248,17 @@ private actor V3AsyncTestGate {
         }
     }
 
-    func waitUntilPaused(_ expectedCount: Int = 1) async {
+    func waitUntilPaused(
+        _ expectedCount: Int = 1,
+        timeout: Duration = .seconds(2)
+    ) async -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
         while releaseContinuations.count < expectedCount, !Task.isCancelled {
+            guard clock.now < deadline else { return false }
             await Task.yield()
         }
+        return !Task.isCancelled
     }
 
     func release() {
@@ -445,6 +465,166 @@ private final class ProgressRecorder: @unchecked Sendable {
         #expect(released.hints.aggregation == nil)
         #expect(released.hints.aggregationSafety == .unsafe)
         #expect(released.hints.grain == nil)
+    }
+
+    @Test func currentMeasureSemanticsEncodeConservativeReleasedRollupContracts() throws {
+        let cases: [(
+            String,
+            AutoChartMeasureSemantics,
+            AutoChartAggregation?,
+            ReleasedV1AggregationSafety
+        )] = [
+            (
+                "unknown upstream mean",
+                .init(
+                    source: .aggregated(.mean),
+                    rollup: .unknown,
+                    preferredTransform: .maximum),
+                .mean,
+                .unknown
+            ),
+            (
+                "nonadditive upstream distinct count",
+                .init(
+                    source: .aggregated(.countDistinct),
+                    rollup: .nonAdditive,
+                    preferredTransform: .maximum),
+                .countDistinct,
+                .unsafe
+            ),
+            (
+                "named safe operation outranks preference",
+                .init(
+                    source: .rowLevel,
+                    rollup: .safe(.sum),
+                    preferredTransform: .mean),
+                .sum,
+                .safe
+            ),
+            (
+                "unsafe upstream summary still blocks a named sum",
+                .init(
+                    source: .aggregated(.mean),
+                    rollup: .safe(.sum),
+                    preferredTransform: .sum),
+                .mean,
+                .unsafe
+            ),
+            (
+                "additive upstream count permits a named sum",
+                .init(
+                    source: .aggregated(.count),
+                    rollup: .safe(.sum),
+                    preferredTransform: .sum),
+                .count,
+                .alreadyAggregated
+            ),
+            (
+                "row-level additive defaults to sum",
+                .init(
+                    source: .rowLevel,
+                    rollup: .additive,
+                    preferredTransform: .mean),
+                nil,
+                .safe
+            ),
+            (
+                "derived additive defaults to sum",
+                .init(
+                    source: .derived,
+                    rollup: .additive,
+                    preferredTransform: .maximum),
+                nil,
+                .safe
+            ),
+            (
+                "upstream additive count remains provenance",
+                .init(
+                    source: .aggregated(.count),
+                    rollup: .additive,
+                    preferredTransform: .mean),
+                .count,
+                .alreadyAggregated
+            ),
+        ]
+
+        for (name, semantics, aggregation, safety) in cases {
+            let column = AutoChartColumn(
+                id: "value", name: name,
+                semantics: .measure(semantics: semantics))
+            let released = try JSONDecoder().decode(
+                ReleasedV1Column.self,
+                from: JSONEncoder().encode(column))
+            #expect(released.hints.aggregation == aggregation, Comment(rawValue: name))
+            #expect(released.hints.aggregationSafety == safety, Comment(rawValue: name))
+        }
+    }
+
+    @Test func releasedMeasureHintsDecodeIntoCurrentSafetyAndProvenance() throws {
+        let cases: [(
+            String,
+            ReleasedV1ColumnHints,
+            AutoChartMeasureSemantics
+        )] = [
+            (
+                "unknown upstream mean",
+                releasedV1MeasureHints(aggregation: .mean, safety: .unknown),
+                .init(
+                    source: .aggregated(.mean),
+                    rollup: .unknown,
+                    preferredTransform: .mean)
+            ),
+            (
+                "explicit row-level preference",
+                releasedV1MeasureHints(aggregation: .mean, safety: .rowLevel),
+                .init(
+                    source: .rowLevel,
+                    rollup: .unknown,
+                    preferredTransform: .mean)
+            ),
+            (
+                "implicit safe sum",
+                releasedV1MeasureHints(aggregation: nil, safety: .safe),
+                .init(source: .rowLevel, rollup: .safe(.sum))
+            ),
+            (
+                "named safe mean",
+                releasedV1MeasureHints(aggregation: .mean, safety: .safe),
+                .init(
+                    source: .rowLevel,
+                    rollup: .safe(.mean),
+                    preferredTransform: .mean)
+            ),
+            (
+                "additive upstream sum",
+                releasedV1MeasureHints(aggregation: .sum, safety: .alreadyAggregated),
+                .init(source: .aggregated(.sum), rollup: .additive)
+            ),
+            (
+                "nonadditive upstream mean",
+                releasedV1MeasureHints(
+                    aggregation: .mean, safety: .alreadyAggregated),
+                .init(source: .aggregated(.mean), rollup: .unknown)
+            ),
+            (
+                "unsafe upstream distinct count",
+                releasedV1MeasureHints(aggregation: .countDistinct, safety: .unsafe),
+                .init(
+                    source: .aggregated(.countDistinct),
+                    rollup: .nonAdditive,
+                    preferredTransform: .countDistinct)
+            ),
+        ]
+
+        for (name, hints, expected) in cases {
+            let released = ReleasedV1Column(
+                id: "value", name: name, displayName: nil, hints: hints)
+            let decoded = try JSONDecoder().decode(
+                AutoChartColumn.self,
+                from: JSONEncoder().encode(released))
+            #expect(decoded.hints.measureSemantics == expected, Comment(rawValue: name))
+            #expect(decoded.semantics.hints.measureSemantics == expected, Comment(rawValue: name))
+        }
     }
 }
 
@@ -1289,7 +1469,7 @@ private final class ProgressRecorder: @unchecked Sendable {
         let first = Task { await gate.pause() }
         let second = Task { await gate.pause() }
 
-        await gate.waitUntilPaused(2)
+        #expect(await gate.waitUntilPaused(2))
         await gate.release()
         await first.value
         await second.value
@@ -1297,7 +1477,7 @@ private final class ProgressRecorder: @unchecked Sendable {
         #expect(activePauseCount == 0)
 
         let third = Task { await gate.pause() }
-        await gate.waitUntilPaused()
+        #expect(await gate.waitUntilPaused())
         await gate.release()
         await third.value
     }
@@ -1374,7 +1554,10 @@ private final class ProgressRecorder: @unchecked Sendable {
         let coldRequest = try AutoChartRequest(table: domainDataset())
         let coldSession = AutoChartSession<Int>(cache: coldCache)
         coldSession.load(coldRequest, preparation: .primary)
-        await coldGate.waitUntilPaused()
+        guard await coldGate.waitUntilPaused() else {
+            Issue.record("Cold chart preparation did not reach its test gate.")
+            return
+        }
         let observedColdProgress = await waitForV3Condition {
             guard case .analyzing(let progress) = coldSession.state else { return false }
             return progress?.phase == .chartPreparation
@@ -1404,7 +1587,11 @@ private final class ProgressRecorder: @unchecked Sendable {
 
         let warmSession = AutoChartSession<Int>(cache: warmCache)
         warmSession.load(warmRequest, preparation: .primary)
-        await warmGate.waitUntilPaused()
+        guard await warmGate.waitUntilPaused() else {
+            warmCache.unregisterProgress(for: warmRequest.id, token: progressToken)
+            Issue.record("Warm chart preparation did not reach its test gate.")
+            return
+        }
         let observedWarmProgress = await waitForV3Condition {
             guard case .preparing(_, let progress) = warmSession.state else { return false }
             return progress?.phase == .chartPreparation
@@ -1632,9 +1819,10 @@ private final class ProgressRecorder: @unchecked Sendable {
         let session = AutoChartSession<Int>(cache: AutoChartCache())
         session.load(request)
         let first = try await sessionFailure(from: session)
-        session.retry()
+        session.retry(preference: .chart(.recommended))
         let second = try await sessionFailure(from: session)
         #expect(second.episodeID != first.episodeID)
+        #expect(session.preference == .chart(.recommended))
 
         session.load(try AutoChartRequest(table: domainDataset()))
         session.cancel()
