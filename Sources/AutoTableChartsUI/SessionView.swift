@@ -1,4 +1,5 @@
 #if canImport(SwiftUI) && canImport(Charts)
+import Dispatch
 import SwiftUI
 import Charts
 import AutoTableCharts
@@ -117,62 +118,28 @@ enum AutoChartProgressAccessibility {
         defaultText: "Updating chart")
 }
 
-private actor AutoChartTextResolutionRelay {
-    private var continuation: CheckedContinuation<String?, Never>?
-    private var completedValue: String?
-    private var isCompleted = false
-    private var isCancelled = false
-
-    func value() async -> String? {
-        if isCancelled { return nil }
-        if isCompleted { return completedValue }
-        return await withCheckedContinuation { continuation in
-            if isCancelled {
-                continuation.resume(returning: nil)
-            } else if isCompleted {
-                continuation.resume(returning: completedValue)
-            } else {
-                self.continuation = continuation
-            }
-        }
-    }
-
-    func complete(with value: String) {
-        guard !isCancelled, !isCompleted else { return }
-        isCompleted = true
-        completedValue = value
-        continuation?.resume(returning: value)
-        continuation = nil
-    }
-
-    func cancel() {
-        guard !isCancelled, !isCompleted else { return }
-        isCancelled = true
-        continuation?.resume(returning: nil)
-        continuation = nil
-    }
-}
-
 enum AutoChartProgressTextResolution {
+    /// Keep progress callbacks off the cooperative executor and serialize them so
+    /// superseded, cancelled requests do not accumulate behind a slow host callback.
+    private static let queue = DispatchQueue(
+        label: "io.github.hbmartin.AutoTableCharts.ProgressTextResolution",
+        qos: .userInitiated)
+
     static func resolve(
         _ message: AutoChartMessage,
         using resolver: AutoChartTextResolver
     ) async -> String? {
         guard resolver.callbackIdentity != nil else { return message.defaultText }
-
-        let callbackContext = AutoChartHostCallbackActivity.currentContext
-        let relay = AutoChartTextResolutionRelay()
-        let work = Task.detached(priority: .userInitiated) {
-            let resolved = AutoChartHostCallbackActivity.withContext(callbackContext) {
-                resolver(message)
+        do {
+            return try await AutoChartCancellableWork.run(on: queue) { cancellation in
+                try cancellation.checkCancellation()
+                return resolver(message)
             }
-            await relay.complete(with: resolved)
-        }
-        return await withTaskCancellationHandler {
-            await relay.value()
-        } onCancel: {
-            work.cancel()
-            Task { await relay.cancel() }
+        } catch is CancellationError {
+            return nil
+        } catch {
+            assertionFailure("Progress text resolution failed: \(error)")
+            return nil
         }
     }
 }
@@ -199,7 +166,7 @@ struct AutoChartAccessibleProgressView: View {
     }
 
     var body: some View {
-        let resolver = environmentTextResolver ?? textResolver
+        let resolver = textResolver ?? environmentTextResolver
         ProgressView()
             .accessibilityLabel(accessibilityText)
             .task(id: ResolutionID(
@@ -233,10 +200,11 @@ public struct AutoChartPreparationPlaceholder<RowID: Hashable & Sendable>: View 
         progress: AutoChartProgress?,
         selection: AutoChartSelectionSet<RowID> = .init()
     ) {
-        self.analysis = analysis
-        self.progress = progress
-        self.selection = selection
-        self.textResolver = nil
+        self.init(
+            analysis: analysis,
+            progress: progress,
+            selection: selection,
+            resolvedTextResolver: nil)
     }
 
     package init(
@@ -245,10 +213,23 @@ public struct AutoChartPreparationPlaceholder<RowID: Hashable & Sendable>: View 
         selection: AutoChartSelectionSet<RowID>,
         textResolver: AutoChartTextResolver
     ) {
+        self.init(
+            analysis: analysis,
+            progress: progress,
+            selection: selection,
+            resolvedTextResolver: textResolver)
+    }
+
+    private init(
+        analysis: AutoChartAnalysis<RowID>,
+        progress: AutoChartProgress?,
+        selection: AutoChartSelectionSet<RowID>,
+        resolvedTextResolver: AutoChartTextResolver?
+    ) {
         self.analysis = analysis
         self.progress = progress
         self.selection = selection
-        self.textResolver = textResolver
+        self.textResolver = resolvedTextResolver
     }
 
     public var body: some View {
