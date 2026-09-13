@@ -37,10 +37,12 @@ case .tableFallback(let fallback):
 }
 ```
 
-Each recommendation carries a relative score, typed rationale messages, and
-typed diagnostics. Scores only order candidates from the same request; they are
-not confidence or probability. ``AutoChartColumnProfile`` exposes summarized
-counts and ranges without retaining raw public values. Enable the trace to
+Each recommendation carries a relative score, ``AutoChartScoreBreakdown``,
+typed rationale messages, and typed diagnostics. Scores only order candidates
+from the same request; the descriptive signal term is not confidence,
+probability, or statistical significance. ``AutoChartColumnProfile`` exposes
+summarized counts, ranges, distribution shape, and temporal regularity without
+retaining raw public values. Enable the trace to
 inspect inferred semantics, ranks, scores, exclusions, and stable rejection
 codes.
 

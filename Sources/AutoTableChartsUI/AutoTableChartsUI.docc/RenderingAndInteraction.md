@@ -49,3 +49,10 @@ formatter, or resolver inherits the corresponding environment value, while an
 initializer argument takes precedence. A view initialized from an already
 presented chart keeps that chart's formatter and resolver so its resolved labels,
 controls, and accessibility text remain consistent.
+
+Every supported quantitative chart exposes an Apple Audio Graph descriptor built
+from the same prepared marks, display labels, units, locale, and time zone used
+on screen. Series lines also use dash patterns, scatter series use symbols,
+grouped bars use position, and donut slices carry labels. When Differentiate
+Without Color is enabled, stacked-series bars and heatmap cells add compact text
+labels instead of relying on color alone.

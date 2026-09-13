@@ -3,8 +3,47 @@ import Foundation
 import SwiftUI
 import Testing
 
+#if canImport(Accessibility)
+import Accessibility
+#endif
+
 @testable import AutoTableCharts
 @testable import AutoTableChartsUI
+
+#if canImport(Accessibility)
+@Suite struct AudioGraphDescriptorTests {
+    @Test func descriptorPreservesSeriesCategoriesAndSpokenUnits() throws {
+        let input = AutoChartAudioGraphDescriptor(
+            title: "Value by type",
+            xAxis: .categorical(title: "Type", order: ["Office", "Retail"]),
+            yTitle: "Value",
+            yRange: 0...20,
+            yValueDescription: { "$\(Int($0))" },
+            additionalAxis: nil,
+            series: [
+                .init(
+                    name: "Portfolio",
+                    isContinuous: false,
+                    points: [
+                        .init(
+                            x: .category("Office"),
+                            y: 20,
+                            label: "Office, $20",
+                            additionalValue: nil)
+                    ])
+            ])
+        let descriptor = input.makeChartDescriptor()
+        let xAxis = try #require(
+            descriptor.xAxis as? AXCategoricalDataAxisDescriptor)
+        let yAxis = try #require(descriptor.yAxis)
+
+        #expect(descriptor.title == "Value by type")
+        #expect(xAxis.categoryOrder == ["Office", "Retail"])
+        #expect(yAxis.valueDescriptionProvider(20) == "$20")
+        #expect(descriptor.series.first?.dataPoints.first?.label == "Office, $20")
+    }
+}
+#endif
 
 private struct V3Record: Sendable {
     let id: Int
@@ -465,6 +504,30 @@ private final class ProgressRecorder: @unchecked Sendable {
         #expect(released.hints.aggregation == nil)
         #expect(released.hints.aggregationSafety == .unsafe)
         #expect(released.hints.grain == nil)
+    }
+
+    @Test func semanticOrderingAndProvenanceRoundTripThroughCurrentCoding() throws {
+        let column = AutoChartColumn(
+            id: "rating",
+            name: "credit_rating",
+            categoryOrder: ["AAA", "AA", "A"].map(AutoChartValue.text),
+            provenance: .init(
+                sourceColumns: [.init(entity: "tenant", name: "credit_rating")],
+                sourceGrain: .init(entity: "tenant")),
+            semantics: .dimension(semanticType: .ordinal))
+        let metadata = AutoChartTableMetadata(
+            rowGrain: .init(entity: "tenant"),
+            semanticModel: .init(
+                relationships: [.init(one: "property", many: "lease")]))
+
+        #expect(
+            try JSONDecoder().decode(
+                AutoChartColumn.self,
+                from: JSONEncoder().encode(column)) == column)
+        #expect(
+            try JSONDecoder().decode(
+                AutoChartTableMetadata.self,
+                from: JSONEncoder().encode(metadata)) == metadata)
     }
 
     @Test func currentMeasureSemanticsEncodeConservativeReleasedRollupContracts() throws {

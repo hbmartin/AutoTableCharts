@@ -1266,6 +1266,37 @@ package enum AutoChartDataPreparation {
                 }.map(\.element)
             }
         }
+        if specification.sort == .source,
+            let categoryOrder = specification.encoding.x.flatMap({
+                profiles[$0]?.column.categoryOrder
+            }),
+            !categoryOrder.isEmpty
+        {
+            let orderedIdentities = categoryOrder.compactMap {
+                AutoChartProfiler.identity(
+                    $0,
+                    semanticType: xSemanticType).stringValue
+            }
+            var ranks: [String: Int] = [:]
+            for (offset, identity) in orderedIdentities.enumerated()
+            where ranks[identity] == nil {
+                ranks[identity] = offset
+            }
+            return data.enumerated().sorted { lhs, rhs in
+                let leftRank = lhs.element.xIdentity.flatMap { ranks[$0] }
+                let rightRank = rhs.element.xIdentity.flatMap { ranks[$0] }
+                switch (leftRank, rightRank) {
+                case (.some(let left), .some(let right)):
+                    return left == right ? lhs.offset < rhs.offset : left < right
+                case (.some, nil):
+                    return true
+                case (nil, .some):
+                    return false
+                case (nil, nil):
+                    return lhs.offset < rhs.offset
+                }
+            }.map(\.element)
+        }
         return orderedByMeasure(data, sort: specification.sort) { offset, datum in
             AutoChartCategorySortKey(
                 displayValue: datum.xLabel ?? "",

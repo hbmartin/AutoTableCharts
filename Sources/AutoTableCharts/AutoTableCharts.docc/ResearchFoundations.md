@@ -21,14 +21,14 @@ demonstrates automatic presentation from selected fields;
 over a visualization design space; and
 [Voyager 2](https://doi.org/10.1145/3025453.3025768) couples recommendations with
 faceted browsing. AutoTableCharts implements a deliberately smaller native chart
-space, hard semantic checks, deterministic enumeration, and family
-diversification.
+space, hard semantic checks, deterministic enumeration, descriptive signal
+scoring, and a bounded set-selection objective.
 
 The separation of inviolable validation from weighted preference resembles the
 constraint model explored by [Draco](https://doi.org/10.1109/TVCG.2018.2865240).
-AutoTableCharts does not embed Draco or learn constraint weights: its
-policy-v1 scoring formula uses fixed family scores and an explicit task bonus,
-and the current policy version retains that formula. The goal vocabulary and its
+AutoTableCharts does not embed Draco or learn constraint weights. Its current
+policy keeps reviewed family and task priors, then adds bounded descriptive
+signals and readability costs. The goal vocabulary and its
 effectiveness motivation are informed by
 [task-based visualization effectiveness research](https://doi.org/10.1109/TVCG.2018.2829750),
 while task descriptions can also be understood through the why/what/how framing
@@ -48,15 +48,16 @@ AutoTableCharts does **not** implement the following research directions:
   [DeepEye](https://doi.org/10.1109/ICDE.2018.00019) and
   [VizML](https://doi.org/10.1145/3290605.3300358). There is no training corpus,
   model file, remote inference, or probability score.
-- Statistical interestingness and view search such as
+- Statistical significance and reference-population view search such as
   [SeeDB](https://doi.org/10.14778/2831360.2831371) and
-  [Foresight](https://arxiv.org/abs/1709.10513). The engine doesn't test
-  significance, detect correlations or outliers statistically, compare against
+  [Foresight](https://arxiv.org/abs/1709.10513). The engine computes local
+  descriptive statistics such as Pearson/Spearman association, group effect,
+  skewness, and outlier fraction, but doesn't test significance, compare against
   a reference population, or claim that a recommendation is “interesting.”
 - Natural-language or LLM interpretation. Column names influence only narrow,
   documented identifier/year inference and generated titles; prompts and free
   text aren't sent to a model.
-- User-personalized ranking. Goals adjust a fixed score, but the package doesn't
+- User-personalized ranking. Goals adjust a reviewed score, but the package doesn't
   learn from clicks, history, expertise, device, or organization preferences.
 - Coordinated dashboard or multi-view composition such as
   [MultiVision](https://doi.org/10.1109/TVCG.2021.3114826) and

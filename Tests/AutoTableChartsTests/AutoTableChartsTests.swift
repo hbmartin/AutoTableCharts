@@ -258,7 +258,8 @@ private struct VersionedCountingTable: AutoChartTable {
 private func table(
     columns: [AutoChartColumn],
     rows: [[AutoChartValue]],
-    truncated: Bool = false
+    truncated: Bool = false,
+    metadata: AutoChartTableMetadata? = nil
 ) -> TestTable {
     precondition(
         rows.allSatisfy { $0.count == columns.count },
@@ -271,7 +272,7 @@ private func table(
                 values: Dictionary(
                     uniqueKeysWithValues: zip(columns, values).map { ($0.id, $1) }))
         },
-        chartMetadata: AutoChartTableMetadata(isTruncated: truncated))
+        chartMetadata: metadata ?? AutoChartTableMetadata(isTruncated: truncated))
 }
 
 private let category = AutoChartColumn(
@@ -2408,6 +2409,43 @@ private let date = AutoChartColumn(
 }
 
 @Suite struct ProfilingTests {
+    @Test func secondOrderProfilesAreDeterministicAndBounded() throws {
+        let numeric = AutoChartColumn(
+            id: "numeric", name: "numeric",
+            semantics: .measure())
+        let category = AutoChartColumn(
+            id: "category", name: "category",
+            semantics: .dimension(semanticType: .nominal))
+        let start = try Date("2026-01-01T00:00:00Z", strategy: .iso8601)
+        let temporal = AutoChartColumn(
+            id: "date", name: "date",
+            semantics: .dimension(semanticType: .temporal))
+        let input = table(
+            columns: [numeric, category, temporal],
+            rows: [
+                [.double(-1), .text("A"), .date(start)],
+                [.double(0), .text("A"), .date(start.addingTimeInterval(86_400))],
+                [.double(1), .text("B"), .date(start.addingTimeInterval(172_800))],
+                [.double(2), .text("B"), .date(start.addingTimeInterval(345_600))],
+            ])
+        let profiles = AutoChartProfiler.profileIndex(AutoChartSnapshot(input))
+        let numericProfile = try #require(profiles[numeric.id])
+        let categoryProfile = try #require(profiles[category.id])
+        let temporalProfile = try #require(profiles[temporal.id])
+
+        #expect(numericProfile.numericMean == 0.5)
+        #expect(abs((numericProfile.numericStandardDeviation ?? 0) - sqrt(1.25)) < 1e-12)
+        #expect(numericProfile.numericQuartile1 == -0.25)
+        #expect(numericProfile.numericMedian == 0.5)
+        #expect(numericProfile.numericQuartile3 == 1.25)
+        #expect(abs(numericProfile.numericSkewness ?? 1) < 1e-12)
+        #expect(numericProfile.numericZeroFraction == 0.25)
+        #expect(numericProfile.numericNegativeFraction == 0.25)
+        #expect(categoryProfile.categoryEntropy == 1)
+        #expect(temporalProfile.temporalModalGap == 86_400)
+        #expect(temporalProfile.temporalIrregularGapCount == 1)
+    }
+
     @Test func explicitHintsOverrideValueInference() {
         let ordinal = AutoChartColumn(
             id: "year", name: "year",
@@ -2871,8 +2909,215 @@ private let date = AutoChartColumn(
         let recommendations = AutoChartRecommendationEngine.recommendations(for: input)
         #expect(
             recommendations.chartRecommendations.map(\.specification.family) == [
-                .bar, .rankedDot, .boxPlot, .histogram, .donut,
+                .bar, .histogram, .rankedDot, .donut, .boxPlot,
             ])
+    }
+
+    @Test func everyEligibleSeriesAndSizeFieldBecomesAScoredCandidate() {
+        let region = AutoChartColumn(
+            id: "region", name: "region",
+            hints: .init(semanticType: .nominal, role: .dimension))
+        let product = AutoChartColumn(
+            id: "product", name: "product",
+            hints: .init(semanticType: .nominal, role: .dimension))
+        let secondMeasure = AutoChartColumn(
+            id: "cost", name: "cost",
+            hints: .init(semanticType: .quantitative, role: .measure))
+        let sizeMeasure = AutoChartColumn(
+            id: "area", name: "area",
+            hints: .init(semanticType: .quantitative, role: .measure))
+        let rows: [[AutoChartValue]] = (0..<6).map { offset in
+            let dateValue = AutoChartValue.text("2026-0\(offset + 1)-01")
+            let regionValue = AutoChartValue.text(
+                offset.isMultiple(of: 2) ? "West" : "East")
+            let productValue = AutoChartValue.text(
+                offset.isMultiple(of: 3) ? "A" : "B")
+            let primaryValue = AutoChartValue.double(Double(offset + 1))
+            let secondaryValue = AutoChartValue.double(Double(offset + 2))
+            let sizeValue = AutoChartValue.double(Double(offset + 3))
+            return [
+                dateValue,
+                regionValue,
+                productValue,
+                primaryValue,
+                secondaryValue,
+                sizeValue,
+            ]
+        }
+        let result = AutoChartRecommendationEngine.recommendations(
+            for: table(
+                columns: [date, region, product, measure, secondMeasure, sizeMeasure],
+                rows: rows),
+            options: .init(maximumRecommendations: 5))
+
+        let lineSeries = Set(
+            result.candidates.compactMap { candidate -> AutoChartColumnID? in
+                guard candidate.specification.family == .line,
+                    candidate.specification.encoding.x == date.id,
+                    candidate.specification.encoding.y == measure.id
+                else { return nil }
+                return candidate.specification.encoding.series
+            })
+        #expect(lineSeries == [region.id, product.id])
+
+        let bubbleSizes = Set(
+            result.candidates.compactMap { candidate -> AutoChartColumnID? in
+                guard candidate.specification.family == .bubble,
+                    candidate.specification.encoding.x == measure.id,
+                    candidate.specification.encoding.y == secondMeasure.id
+                else { return nil }
+                return candidate.specification.encoding.size
+            })
+        #expect(bubbleSizes == [sizeMeasure.id])
+    }
+
+    @Test func grainAwareValidationRejectsFanOutRollupsButAllowsCoarserGroups() {
+        let fund: AutoChartEntityID = "fund"
+        let property: AutoChartEntityID = "property"
+        let lease: AutoChartEntityID = "lease"
+        let semanticModel = AutoChartSemanticModel(
+            relationships: [
+                .init(one: fund, many: property),
+                .init(one: property, many: lease),
+            ])
+        let leaseType = AutoChartColumn(
+            id: "lease-type",
+            name: "lease_type",
+            provenance: .init(
+                sourceColumns: [.init(entity: lease, name: "lease_type")],
+                sourceGrain: .init(entity: lease)),
+            semantics: .dimension(semanticType: .nominal))
+        let fundName = AutoChartColumn(
+            id: "fund",
+            name: "fund_name",
+            provenance: .init(
+                sourceColumns: [.init(entity: fund, name: "name")],
+                sourceGrain: .init(entity: fund)),
+            semantics: .dimension(semanticType: .nominal))
+        let propertyValue = AutoChartColumn(
+            id: "value",
+            name: "current_market_value",
+            provenance: .init(
+                sourceColumns: [.init(entity: property, name: "current_market_value")],
+                sourceGrain: .init(entity: property)),
+            semantics: .measure(
+                semantics: .init(source: .rowLevel, rollup: .additive)))
+        let metadata = AutoChartTableMetadata(semanticModel: semanticModel)
+
+        let risky = table(
+            columns: [leaseType, propertyValue],
+            rows: [[.text("Gross"), .double(10)], [.text("Gross"), .double(10)]],
+            metadata: metadata)
+        let riskySpecification = AutoChartSpecification.bar(
+            category: leaseType.id,
+            measure: propertyValue.id,
+            aggregation: .sum)
+        let riskyValidation = AutoChartRecommendationEngine.validate(
+            specification: riskySpecification,
+            for: risky)
+        #expect(!riskyValidation.isValid)
+        #expect(riskyValidation.issues.contains { $0.messageValue.code == .fanOutRisk })
+
+        let safe = table(
+            columns: [fundName, propertyValue],
+            rows: [[.text("Core"), .double(10)], [.text("Core"), .double(20)]],
+            metadata: metadata)
+        let safeSpecification = AutoChartSpecification.bar(
+            category: fundName.id,
+            measure: propertyValue.id,
+            aggregation: .sum)
+        #expect(
+            AutoChartRecommendationEngine.validate(
+                specification: safeSpecification,
+                for: safe).isValid)
+    }
+
+    @Test func grainAwareValidationRejectsChasmMeasurePairs() {
+        let property: AutoChartEntityID = "property"
+        let lease: AutoChartEntityID = "lease"
+        let loan: AutoChartEntityID = "loan"
+        let leaseRent = AutoChartColumn(
+            id: "rent",
+            name: "annual_base_rent",
+            provenance: .init(
+                sourceColumns: [.init(entity: lease, name: "annual_base_rent")],
+                sourceGrain: .init(entity: lease)),
+            semantics: .measure())
+        let loanBalance = AutoChartColumn(
+            id: "balance",
+            name: "current_balance",
+            provenance: .init(
+                sourceColumns: [.init(entity: loan, name: "current_balance")],
+                sourceGrain: .init(entity: loan)),
+            semantics: .measure())
+        let input = table(
+            columns: [leaseRent, loanBalance],
+            rows: [
+                [.double(1), .double(10)],
+                [.double(2), .double(20)],
+            ],
+            metadata: .init(
+                semanticModel: .init(
+                    relationships: [
+                        .init(one: property, many: lease),
+                        .init(one: property, many: loan),
+                    ])))
+        let validation = AutoChartRecommendationEngine.validate(
+            specification: .scatter(x: leaseRent.id, y: loanBalance.id),
+            for: input)
+
+        #expect(!validation.isValid)
+        #expect(validation.issues.contains { $0.messageValue.code == .chasmRisk })
+    }
+
+    @Test func signalScoreIsBoundedInspectableAndRowOrderStable() throws {
+        let rows: [[AutoChartValue]] = (1...8).map { value in
+            [
+                .text("2026-\(String(format: "%02d", value))-01"),
+                .double(Double(value * 10)),
+            ]
+        }
+        func primary(_ rows: [[AutoChartValue]]) throws -> AutoChartRecommendation {
+            try #require(
+                AutoChartRecommendationEngine.recommendations(
+                    for: table(columns: [date, measure], rows: rows),
+                    context: .init(goal: .trend)).chartRecommendations.first)
+        }
+
+        let original = try primary(rows)
+        let shuffled = try primary(Array(rows.reversed()))
+        let breakdown = try #require(original.scoreBreakdown)
+        #expect(original.specification.family == .line)
+        #expect(breakdown.signal > 0 && breakdown.signal <= 4)
+        #expect(original.score == breakdown.total)
+        #expect(shuffled.specification.family == original.specification.family)
+        #expect(shuffled.score == original.score)
+        #expect(original.rationale.contains { $0.code == .dataSignalRationale })
+    }
+
+    @Test func declaredOrdinalOrderPrecedesSourceOrder() {
+        let rating = AutoChartColumn(
+            id: "rating",
+            name: "credit_rating",
+            categoryOrder: ["A", "B", "C"].map(AutoChartValue.text),
+            semantics: .dimension(semanticType: .ordinal))
+        let input = table(
+            columns: [rating, measure],
+            rows: [
+                [.text("C"), .double(3)],
+                [.text("Unrated"), .double(0)],
+                [.text("A"), .double(1)],
+                [.text("B"), .double(2)],
+            ])
+        let specification = AutoChartSpecification.bar(
+            category: rating.id,
+            measure: measure.id,
+            sort: .source)
+        let prepared = preparedDatumValues(
+            snapshot: AutoChartSnapshot(input),
+            specification: specification)
+
+        #expect(prepared.compactMap(\.xLabel) == ["A", "B", "C", "Unrated"])
     }
 
     @Test func unknownAggregationBlocksDuplicateCategoryBars() {

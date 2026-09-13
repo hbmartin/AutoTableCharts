@@ -795,6 +795,10 @@ public struct AutoChartColumn: Identifiable, Hashable, Codable, Sendable {
     public var name: String
     /// An optional presentation label used verbatim in generated titles and axes.
     public var displayName: String?
+    /// An optional typed order for categorical values, before undeclared values.
+    public var categoryOrder: [AutoChartValue]?
+    /// Declared source-column lineage and entity grain.
+    public var provenance: AutoChartColumnProvenance?
     /// Semantic metadata that overrides or supplements profiling.
     public var semantics: AutoChartColumnSemantics {
         didSet {
@@ -811,6 +815,8 @@ public struct AutoChartColumn: Identifiable, Hashable, Codable, Sendable {
         lhs.id == rhs.id
             && lhs.name == rhs.name
             && lhs.displayName == rhs.displayName
+            && lhs.categoryOrder == rhs.categoryOrder
+            && lhs.provenance == rhs.provenance
             && lhs.semantics == rhs.semantics
             && lhs.normalizedHints == rhs.normalizedHints
     }
@@ -819,6 +825,8 @@ public struct AutoChartColumn: Identifiable, Hashable, Codable, Sendable {
         hasher.combine(id)
         hasher.combine(name)
         hasher.combine(displayName)
+        hasher.combine(categoryOrder)
+        hasher.combine(provenance)
         hasher.combine(semantics)
         hasher.combine(normalizedHints)
     }
@@ -829,16 +837,22 @@ public struct AutoChartColumn: Identifiable, Hashable, Codable, Sendable {
     ///   - id: The stable column identifier.
     ///   - name: A source or display name.
     ///   - displayName: An optional caller-authored presentation label.
+    ///   - categoryOrder: A typed semantic order for categorical values.
+    ///   - provenance: Optional source-column lineage and entity grain.
     ///   - semantics: A coherent semantic declaration.
     public init(
         id: AutoChartColumnID,
         name: String,
         displayName: String? = nil,
+        categoryOrder: [AutoChartValue]? = nil,
+        provenance: AutoChartColumnProvenance? = nil,
         semantics: AutoChartColumnSemantics = .inferred()
     ) {
         self.id = id
         self.name = name
         self.displayName = displayName
+        self.categoryOrder = categoryOrder
+        self.provenance = provenance
         self.semantics = semantics
         self.normalizedHints = semantics.hints
     }
@@ -849,17 +863,21 @@ public struct AutoChartColumn: Identifiable, Hashable, Codable, Sendable {
         id: AutoChartColumnID,
         name: String,
         displayName: String? = nil,
+        categoryOrder: [AutoChartValue]? = nil,
+        provenance: AutoChartColumnProvenance? = nil,
         hints: AutoChartColumnHints
     ) {
         self.id = id
         self.name = name
         self.displayName = displayName
+        self.categoryOrder = categoryOrder
+        self.provenance = provenance
         self.semantics = AutoChartColumnSemantics(hints: hints)
         self.normalizedHints = hints
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, name, displayName, semantics
+        case id, name, displayName, categoryOrder, provenance, semantics
         case hints
     }
 
@@ -868,6 +886,10 @@ public struct AutoChartColumn: Identifiable, Hashable, Codable, Sendable {
         id = try container.decode(AutoChartColumnID.self, forKey: .id)
         name = try container.decode(String.self, forKey: .name)
         displayName = try container.decodeIfPresent(String.self, forKey: .displayName)
+        categoryOrder = try container.decodeIfPresent(
+            [AutoChartValue].self, forKey: .categoryOrder)
+        provenance = try container.decodeIfPresent(
+            AutoChartColumnProvenance.self, forKey: .provenance)
         if let decoded = try container.decodeIfPresent(
             AutoChartColumnSemantics.self, forKey: .semantics)
         {
@@ -905,6 +927,8 @@ public struct AutoChartColumn: Identifiable, Hashable, Codable, Sendable {
         try container.encode(id, forKey: .id)
         try container.encode(name, forKey: .name)
         try container.encodeIfPresent(displayName, forKey: .displayName)
+        try container.encodeIfPresent(categoryOrder, forKey: .categoryOrder)
+        try container.encodeIfPresent(provenance, forKey: .provenance)
         try container.encode(semantics, forKey: .semantics)
         try container.encode(normalizedHints, forKey: .hints)
     }
@@ -919,6 +943,10 @@ public struct AutoChartTableMetadata: Hashable, Codable, Sendable {
     public var isTruncated: Bool
     /// A caller-defined description of the entity or grouping level of each row.
     public var grain: String?
+    /// Typed source-entity grain of each returned row, when known.
+    public var rowGrain: AutoChartGrain?
+    /// Declared source relationships used by grain-aware safety checks.
+    public var semanticModel: AutoChartSemanticModel?
     /// A caller-defined description of the result's source or transformation history.
     public var provenance: String?
 
@@ -927,14 +955,20 @@ public struct AutoChartTableMetadata: Hashable, Codable, Sendable {
     /// - Parameters:
     ///   - isTruncated: Whether the supplied rows are incomplete.
     ///   - grain: The result's row-level grain.
+    ///   - rowGrain: Typed source-entity grain of each returned row.
+    ///   - semanticModel: Source relationships used for grain-aware safety checks.
     ///   - provenance: A description of the result's source or lineage.
     public init(
         isTruncated: Bool = false,
         grain: String? = nil,
+        rowGrain: AutoChartGrain? = nil,
+        semanticModel: AutoChartSemanticModel? = nil,
         provenance: String? = nil
     ) {
         self.isTruncated = isTruncated
         self.grain = grain
+        self.rowGrain = rowGrain
+        self.semanticModel = semanticModel
         self.provenance = provenance
     }
 }
@@ -1832,6 +1866,8 @@ public struct AutoChartMessage: Hashable, Codable, Sendable {
         }
 
         public static let recommendationRationale = Self(rawValue: "recommendationRationale")
+        public static let dataSignalRationale = Self(rawValue: "dataSignalRationale")
+        public static let readabilityRationale = Self(rawValue: "readabilityRationale")
         public static let incompleteResult = Self(rawValue: "incompleteResult")
         public static let noChartableRows = Self(rawValue: "noChartableRows")
         public static let noSafeChart = Self(rawValue: "noSafeChart")
@@ -1842,6 +1878,8 @@ public struct AutoChartMessage: Hashable, Codable, Sendable {
         public static let boxPlotMissingCategoryGroup = Self(
             rawValue: "boxPlotMissingCategoryGroup")
         public static let unsafeAggregation = Self(rawValue: "unsafeAggregation")
+        public static let fanOutRisk = Self(rawValue: "fanOutRisk")
+        public static let chasmRisk = Self(rawValue: "chasmRisk")
         public static let nonAdditiveSourceSummation = Self(
             rawValue: "nonAdditiveSourceSummation")
         public static let duplicateMark = Self(rawValue: "duplicateMark")
@@ -2331,6 +2369,36 @@ public struct AutoChartDiagnostic: Hashable, Codable, Sendable {
     }
 }
 
+/// Inspectable components of one deterministic recommendation score.
+///
+/// Signal is descriptive rather than inferential. The values rank candidates
+/// within one policy version and are not probabilities or confidence estimates.
+public struct AutoChartScoreBreakdown: Hashable, Codable, Sendable {
+    public var familyPrior: Double
+    public var taskFit: Double
+    public var preferredTransform: Double
+    public var signal: Double
+    public var readabilityPenalty: Double
+
+    public init(
+        familyPrior: Double,
+        taskFit: Double = 0,
+        preferredTransform: Double = 0,
+        signal: Double = 0,
+        readabilityPenalty: Double = 0
+    ) {
+        self.familyPrior = familyPrior
+        self.taskFit = taskFit
+        self.preferredTransform = preferredTransform
+        self.signal = signal
+        self.readabilityPenalty = max(0, readabilityPenalty)
+    }
+
+    public var total: Double {
+        familyPrior + taskFit + preferredTransform + signal - readabilityPenalty
+    }
+}
+
 /// A validated chart specification plus its rank, explanation, and cautions.
 public struct AutoChartRecommendation: Identifiable, Hashable, Codable, Sendable {
     /// The specification that can be prepared and rendered by a compatible UI.
@@ -2340,6 +2408,8 @@ public struct AutoChartRecommendation: Identifiable, Hashable, Codable, Sendable
     /// Scores are useful for ordering but aren't probabilities and shouldn't be
     /// compared across policy versions.
     public var score: Double
+    /// Transparent score components when the recommendation policy supplies them.
+    public var scoreBreakdown: AutoChartScoreBreakdown?
     /// Typed reasons the candidate fits the data and task.
     public var rationale: [AutoChartMessage]
     /// Candidate-specific limitations and omissions.
@@ -2350,16 +2420,19 @@ public struct AutoChartRecommendation: Identifiable, Hashable, Codable, Sendable
     /// - Parameters:
     ///   - specification: A chart specification.
     ///   - score: Its relative policy score.
+    ///   - scoreBreakdown: The optional components that produced `score`.
     ///   - rationale: Reasons for the recommendation.
     ///   - diagnostics: Limitations and cautions associated with the candidate.
     public init(
         specification: AutoChartSpecification,
         score: Double,
+        scoreBreakdown: AutoChartScoreBreakdown? = nil,
         rationale: [AutoChartMessage],
         diagnostics: [AutoChartDiagnostic] = []
     ) {
         self.specification = specification
         self.score = score
+        self.scoreBreakdown = scoreBreakdown
         self.rationale = rationale
         self.diagnostics = diagnostics
     }
@@ -2376,12 +2449,14 @@ extension AutoChartRecommendation {
     init(
         specification: AutoChartSpecification,
         score: Double,
+        scoreBreakdown: AutoChartScoreBreakdown? = nil,
         rationale: [String],
         warnings: [String] = []
     ) {
         self.init(
             specification: specification,
             score: score,
+            scoreBreakdown: scoreBreakdown,
             rationale: rationale.map {
                 AutoChartMessage(
                     category: .rationale,

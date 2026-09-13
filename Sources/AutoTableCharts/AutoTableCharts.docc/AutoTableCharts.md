@@ -42,6 +42,9 @@ reuse. An ``AutoChartAnalysis`` remains usable after the cache is trimmed.
 - ``AutoChartColumn``
 - ``AutoChartColumnSemantics``
 - ``AutoChartMeasureSemantics``
+- ``AutoChartColumnProvenance``
+- ``AutoChartGrain``
+- ``AutoChartSemanticModel``
 - ``AutoChartTableMetadata``
 
 ### Analysis and Preparation
@@ -55,6 +58,7 @@ reuse. An ``AutoChartAnalysis`` remains usable after the cache is trimmed.
 - ``AutoChartRecommendationOutcome``
 - ``AutoChartRecommendationCatalog``
 - ``AutoChartRecommendation``
+- ``AutoChartScoreBreakdown``
 - ``AutoChartPreparedChart``
 - ``AutoChartColumnProfile``
 - ``AutoChartDecisionTrace``

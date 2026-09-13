@@ -30,6 +30,15 @@ then derive a fresh selection from the new prepared chart.
 Explicit ``AutoChartColumnSemantics`` cases take precedence over inference.
 Units control formatting but never authorize arithmetic.
 
+For ordered categorical domains, set ``AutoChartColumn/categoryOrder`` to typed
+values in semantic order. Declared values precede undeclared values when a
+specification uses source sorting. This keeps domains such as ratings, sizes,
+and lifecycle stages from falling back to alphabetical or accidental row order.
+
+Use ``AutoChartColumn/provenance`` for source columns and their entity grain,
+then provide ``AutoChartTableMetadata/semanticModel`` with reviewed one-to-many
+relationships. The domain-record builder accepts the same provenance metadata.
+
 ### Describe measure truth
 
 ``AutoChartMeasureSemantics`` has three independent parts:

@@ -68,6 +68,11 @@ builder declarations.
 - Coherent column semantics describe source provenance and rollup policy. Unknown and
   non-additive values cannot be implicitly aggregated. Composition additionally
   requires complete, positive, additive values.
+- Typed source grains and declared one-to-many relationships reject fan-out
+  rollups without rewriting caller results. Typed categorical orders preserve
+  domain order ahead of accidental source order.
+- Ranking combines reviewed family/task priors with bounded descriptive signals
+  and readability costs, then selects featured charts for field/task diversity.
 - `AutoChartRecommendationCatalog` exposes at most five featured choices and
   fifty validated cataloged choices while preserving a valid off-list preference
   through targeted validation.
@@ -77,6 +82,8 @@ builder declarations.
   selection provenance, and warm adoption from a shared `AutoChartCache`.
 - Formatting, localization, accessibility, and semantic selection presentation
   happen at presentation time and do not affect preparation cache keys.
+- SwiftUI charts expose Audio Graph descriptors and redundant series/value
+  encodings for users who differentiate without color.
 - Cache ownership belongs to `AutoChartCache`. Use `trim(to:)`, `removeAll()`,
   synchronous completed-analysis lookup, and `statistics()` to inspect it.
 
