@@ -2420,6 +2420,7 @@ public struct AutoChartRecommendation: Identifiable, Hashable, Codable, Sendable
     /// - Parameters:
     ///   - specification: A chart specification.
     ///   - score: Its relative policy score.
+    ///   - scoreBreakdown: The optional components that produced `score`.
     ///   - rationale: Reasons for the recommendation.
     ///   - diagnostics: Limitations and cautions associated with the candidate.
     public init(
