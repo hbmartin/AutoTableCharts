@@ -104,7 +104,7 @@ public struct AutoChartPresentation: Hashable, Sendable {
 }
 
 private enum AutoChartViewContent<RowID: Hashable & Sendable>: Sendable {
-    case deferred(AutoChartPreparedChart<RowID>, AutoChartPresentationContext)
+    case deferred(AutoChartPreparedChart<RowID>, AutoChartPresentationContext?)
     case chart(AutoChartPreparedChart<RowID>, AutoChartResolvedPresentation)
     case fallback(AutoChartFallback)
 }
@@ -219,8 +219,8 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     private let content: AutoChartViewContent<RowID>
     private let displayTitle: String
     private let presentation: AutoChartPresentation
-    private let formatters: AutoChartFormatters
-    private let textResolver: AutoChartTextResolver
+    private let formatters: AutoChartFormatters?
+    private let textResolver: AutoChartTextResolver?
     private let renderedData: [AutoChartDatum]
     private let facetPanels: [AutoChartFacetPanel]
     private let sharedXCategoryDomain: [String]
@@ -240,10 +240,26 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     @State private var zoomAnchor = 1.0
     @Environment(\.autoChartPalette) private var palette
     @Environment(\.autoChartTheme) private var theme
+    @Environment(\.autoChartPresentationContext) private var environmentPresentationContext
+    @Environment(\.autoChartFormatters) private var environmentFormatters
     @Environment(\.autoChartTextResolver) private var environmentTextResolver
 
+    private var effectiveFormatters: AutoChartFormatters {
+        formatters ?? environmentFormatters ?? .init()
+    }
+
     private var effectiveTextResolver: AutoChartTextResolver {
-        environmentTextResolver ?? textResolver
+        textResolver ?? environmentTextResolver ?? .default
+    }
+
+    private func effectivePresentationContext(
+        explicit: AutoChartPresentationContext?
+    ) -> AutoChartPresentationContext {
+        explicit
+            ?? environmentPresentationContext
+            ?? AutoChartPresentationContext(
+                locale: effectiveFormatters.locale,
+                timeZone: effectiveFormatters.timeZone)
     }
 
     /// Defers presentation until the view participates in a SwiftUI lifecycle.
@@ -255,15 +271,10 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         selection: Binding<AutoChartSelectionSet<RowID>> = .constant(.init()),
         presentation: AutoChartPresentation = .explorer(),
         presentationContext: AutoChartPresentationContext? = nil,
-        formatters: AutoChartFormatters = .init(),
-        textResolver: AutoChartTextResolver = .default
+        formatters: AutoChartFormatters? = nil,
+        textResolver: AutoChartTextResolver? = nil
     ) {
-        content = .deferred(
-            preparedChart,
-            presentationContext
-                ?? AutoChartPresentationContext(
-                    locale: formatters.locale,
-                    timeZone: formatters.timeZone))
+        content = .deferred(preparedChart, presentationContext)
         displayTitle = ""
         renderedData = []
         facetPanels = []
@@ -274,6 +285,27 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         self.presentation = presentation
         self.formatters = formatters
         self.textResolver = textResolver
+    }
+
+    /// Compatibility overload for the original nonoptional presentation inputs.
+    @_disfavoredOverload
+    public init(
+        preparedChart: AutoChartPreparedChart<RowID>,
+        analysisID: AutoChartAnalysisID,
+        selection: Binding<AutoChartSelectionSet<RowID>> = .constant(.init()),
+        presentation: AutoChartPresentation = .explorer(),
+        presentationContext: AutoChartPresentationContext? = nil,
+        formatters: AutoChartFormatters = .init(),
+        textResolver: AutoChartTextResolver = .default
+    ) {
+        self.init(
+            preparedChart: preparedChart,
+            analysisID: analysisID,
+            selection: selection,
+            presentation: presentation,
+            presentationContext: presentationContext,
+            formatters: Optional(formatters),
+            textResolver: Optional(textResolver))
     }
 
     /// Renders presentation work already memoized by ``AutoChartPresenter``.
@@ -308,16 +340,11 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         selection: Binding<AutoChartSelectionSet<RowID>> = .constant(.init()),
         presentation: AutoChartPresentation = .explorer(),
         presentationContext: AutoChartPresentationContext? = nil,
-        formatters: AutoChartFormatters = .init(),
-        textResolver: AutoChartTextResolver = .default
+        formatters: AutoChartFormatters? = nil,
+        textResolver: AutoChartTextResolver? = nil
     ) {
         if let primary = analysis.primaryChart {
-            content = .deferred(
-                primary,
-                presentationContext
-                    ?? AutoChartPresentationContext(
-                        locale: formatters.locale,
-                        timeZone: formatters.timeZone))
+            content = .deferred(primary, presentationContext)
             displayTitle = ""
             renderedData = []
             facetPanels = []
@@ -348,6 +375,25 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         self.presentation = presentation
         self.formatters = formatters
         self.textResolver = textResolver
+    }
+
+    /// Compatibility overload for the original nonoptional presentation inputs.
+    @_disfavoredOverload
+    public init(
+        analysis: AutoChartAnalysis<RowID>,
+        selection: Binding<AutoChartSelectionSet<RowID>> = .constant(.init()),
+        presentation: AutoChartPresentation = .explorer(),
+        presentationContext: AutoChartPresentationContext? = nil,
+        formatters: AutoChartFormatters = .init(),
+        textResolver: AutoChartTextResolver = .default
+    ) {
+        self.init(
+            analysis: analysis,
+            selection: selection,
+            presentation: presentation,
+            presentationContext: presentationContext,
+            formatters: Optional(formatters),
+            textResolver: Optional(textResolver))
     }
 
     private var preparedChart: AutoChartPreparedChart<RowID> {
@@ -415,14 +461,14 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     @ViewBuilder
     public var body: some View {
         switch content {
-        case .deferred(let preparedChart, let context):
+        case .deferred(let preparedChart, let explicitContext):
             AutoChartDeferredPresentationView(
                 preparedChart: preparedChart,
-                context: context,
+                context: effectivePresentationContext(explicit: explicitContext),
                 analysisID: analysisID,
                 selection: $selection,
                 presentation: presentation,
-                formatters: formatters,
+                formatters: effectiveFormatters,
                 textResolver: effectiveTextResolver)
         case .fallback(let fallback):
             VStack(alignment: .leading, spacing: 10) {
@@ -457,7 +503,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
                 if presentation.chrome.contains(.selectionSummary), let first = selection.first {
                     let summary = first.presentation(
                         columns: snapshot.columns,
-                        formatters: formatters,
+                        formatters: effectiveFormatters,
                         textResolver: effectiveTextResolver,
                         resolvedDimensionLabel: resolvedSelectionDimensionLabel)
                     HStack(alignment: .firstTextBaseline) {
@@ -636,7 +682,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             .chartYAxisLabel(yTitle)
             .chartXAxis { temporalAxis(columnID: specification.encoding.x) }
             .chartYAxis { yNumericAxis() }
-            .environment(\.timeZone, formatters.timeZone)
+            .environment(\.timeZone, effectiveFormatters.timeZone)
             selectableDateX(timeZoom(chart))
         } else if xSemanticType == .quantitative {
             let chart = Chart(data) { datum in
@@ -679,7 +725,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             .chartYAxisLabel(yTitle)
             .chartXAxis { temporalAxis(columnID: specification.encoding.x) }
             .chartYAxis { yNumericAxis() }
-            .environment(\.timeZone, formatters.timeZone)
+            .environment(\.timeZone, effectiveFormatters.timeZone)
             selectableDateX(timeZoom(chart))
         } else {
             let chart = Chart(data) { datum in
@@ -822,7 +868,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         .chartXAxisLabel(dateTitle)
         .chartYAxisLabel(xTitle)
         .chartXAxis { temporalAxis(columnID: specification.encoding.start) }
-        .environment(\.timeZone, formatters.timeZone)
+        .environment(\.timeZone, effectiveFormatters.timeZone)
         return selectableCategoryY(timeZoom(chart))
     }
 
@@ -1060,7 +1106,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
                             }
                             .chartXScale(domain: dateDomain)
                             .chartYScale(domain: yDomain)
-                            .environment(\.timeZone, formatters.timeZone)
+                            .environment(\.timeZone, effectiveFormatters.timeZone)
                             selectableFacet(chart, axis: .x, as: Date.self) { value in
                                 select(date: value, in: facetData)
                             }
@@ -1089,7 +1135,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
                             }
                             .chartXScale(domain: dateDomain)
                             .chartYScale(domain: yDomain)
-                            .environment(\.timeZone, formatters.timeZone)
+                            .environment(\.timeZone, effectiveFormatters.timeZone)
                             selectableFacet(chart, axis: .x, as: Date.self) { value in
                                 select(date: value, in: facetData)
                             }
@@ -1175,7 +1221,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             fallback: resolvedPresentation.missingValue,
             column: resolvedColumn(specification.encoding.x),
             context: .markAccessibility,
-            formatters: formatters)
+            formatters: effectiveFormatters)
     }
 
     private func accessibilitySeriesValue(for datum: AutoChartDatum) -> String {
@@ -1187,7 +1233,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             fallback: resolvedPresentation.missingSeries,
             column: resolvedColumn(specification.encoding.series),
             context: .markAccessibility,
-            formatters: formatters)
+            formatters: effectiveFormatters)
     }
 
     private func accessibilityFacetValue(for datum: AutoChartDatum) -> String {
@@ -1199,7 +1245,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             fallback: resolvedPresentation.missingFacet,
             column: resolvedColumn(specification.encoding.facet),
             context: .markAccessibility,
-            formatters: formatters)
+            formatters: effectiveFormatters)
     }
 
     private func resolvedSelectionDimensionLabel(
@@ -1246,10 +1292,10 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         ].contains(specification.family) {
             name = accessibilityXCategoryValue(for: datum)
         } else if let date = datum.xDate {
-            name = formatters.format(
+            name = effectiveFormatters.format(
                 column: xColumn, value: .date(date), context: .markAccessibility)
         } else if let number = datum.xNumber {
-            name = formatters.format(
+            name = effectiveFormatters.format(
                 column: xColumn, value: .double(number), context: .markAccessibility)
         } else {
             name = accessibilityXCategoryValue(for: datum)
@@ -1260,7 +1306,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
                     for: datum,
                     measureSemantics: renderedMeasureSemantics,
                     profiles: preparedChart.core.table.profiles,
-                    formatters: formatters,
+                    formatters: effectiveFormatters,
                     textResolver: effectiveTextResolver)
             {
                 return description
@@ -1355,7 +1401,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             AxisValueLabel {
                 if let number = value.as(Double.self) {
                     Text(
-                        formatters.format(
+                        effectiveFormatters.format(
                             column: column,
                             value: .double(number),
                             context: .axisTick))
@@ -1392,7 +1438,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         let purpose: AutoChartFormattingPurpose = normalizedFraction
             ? .normalizedFraction(renderedMeasureSemantics.aggregation)
             : renderedMeasureSemantics.formattingPurpose
-        return formatters.format(
+        return effectiveFormatters.format(
             AutoChartFormattingRequest(
                 column: sourceMeasureColumn,
                 value: value,
@@ -1409,7 +1455,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             AxisValueLabel {
                 if let date = value.as(Date.self) {
                     Text(
-                        formatters.format(
+                        effectiveFormatters.format(
                             column: column,
                             value: .date(date),
                             context: .axisTick))
@@ -1906,9 +1952,31 @@ public struct AutoChartPlot<RowID: Hashable & Sendable>: View {
     private let plotHeight: CGFloat?
     private let interactions: AutoChartInteractions
     private let presentationContext: AutoChartPresentationContext?
-    private let formatters: AutoChartFormatters
-    private let textResolver: AutoChartTextResolver
+    private let formatters: AutoChartFormatters?
+    private let textResolver: AutoChartTextResolver?
 
+    public init(
+        preparedChart: AutoChartPreparedChart<RowID>,
+        analysisID: AutoChartAnalysisID,
+        selection: Binding<AutoChartSelectionSet<RowID>> = .constant(.init()),
+        plotHeight: CGFloat? = AutoChartDefaultPlotHeight.plotOnly,
+        interactions: AutoChartInteractions = .all,
+        presentationContext: AutoChartPresentationContext? = nil,
+        formatters: AutoChartFormatters? = nil,
+        textResolver: AutoChartTextResolver? = nil
+    ) {
+        self.chart = preparedChart
+        self.analysisID = analysisID
+        self.selection = selection
+        self.plotHeight = plotHeight
+        self.interactions = interactions
+        self.presentationContext = presentationContext
+        self.formatters = formatters
+        self.textResolver = textResolver
+    }
+
+    /// Compatibility overload for the original nonoptional presentation inputs.
+    @_disfavoredOverload
     public init(
         preparedChart: AutoChartPreparedChart<RowID>,
         analysisID: AutoChartAnalysisID,
@@ -1919,14 +1987,15 @@ public struct AutoChartPlot<RowID: Hashable & Sendable>: View {
         formatters: AutoChartFormatters = .init(),
         textResolver: AutoChartTextResolver = .default
     ) {
-        self.chart = preparedChart
-        self.analysisID = analysisID
-        self.selection = selection
-        self.plotHeight = plotHeight
-        self.interactions = interactions
-        self.presentationContext = presentationContext
-        self.formatters = formatters
-        self.textResolver = textResolver
+        self.init(
+            preparedChart: preparedChart,
+            analysisID: analysisID,
+            selection: selection,
+            plotHeight: plotHeight,
+            interactions: interactions,
+            presentationContext: presentationContext,
+            formatters: Optional(formatters),
+            textResolver: Optional(textResolver))
     }
 
     public var body: some View {

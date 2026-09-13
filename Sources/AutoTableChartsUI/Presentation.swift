@@ -1,5 +1,106 @@
+import Dispatch
 import Foundation
 import AutoTableCharts
+
+final class AutoChartCancellationToken: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+
+    var isCancelled: Bool {
+        lock.withLock { cancelled }
+    }
+
+    func cancel() {
+        lock.withLock { cancelled = true }
+    }
+
+    func checkCancellation() throws {
+        if isCancelled { throw CancellationError() }
+    }
+}
+
+private final class AutoChartCancellableWorkRelay<Value: Sendable>: @unchecked Sendable {
+    private typealias Outcome = Result<Value, any Error>
+    private typealias Continuation = CheckedContinuation<Outcome, Never>
+
+    private enum State {
+        case pending
+        case waiting(Continuation)
+        case completed(Outcome)
+    }
+
+    private let lock = NSLock()
+    private var state: State = .pending
+
+    func value() async throws -> Value {
+        let outcome = await withCheckedContinuation { continuation in
+            let completed = lock.withLock { () -> Outcome? in
+                switch state {
+                case .pending:
+                    state = .waiting(continuation)
+                    return nil
+                case .waiting:
+                    preconditionFailure("Cancellable work supports one waiter.")
+                case .completed(let outcome):
+                    return outcome
+                }
+            }
+            if let completed {
+                continuation.resume(returning: completed)
+            }
+        }
+        return try outcome.get()
+    }
+
+    func complete(with outcome: Result<Value, any Error>) {
+        let continuation = lock.withLock { () -> Continuation? in
+            switch state {
+            case .pending:
+                state = .completed(outcome)
+                return nil
+            case .waiting(let continuation):
+                state = .completed(outcome)
+                return continuation
+            case .completed:
+                return nil
+            }
+        }
+        continuation?.resume(returning: outcome)
+    }
+}
+
+enum AutoChartCancellableWork {
+    static func run<Value: Sendable>(
+        on queue: DispatchQueue,
+        _ operation: @escaping @Sendable (AutoChartCancellationToken) throws -> Value
+    ) async throws -> Value {
+        try Task.checkCancellation()
+        let callbackContext = AutoChartHostCallbackActivity.currentContext
+        let cancellation = AutoChartCancellationToken()
+        let relay = AutoChartCancellableWorkRelay<Value>()
+        queue.async {
+            guard !cancellation.isCancelled else { return }
+            do {
+                let value = try AutoChartHostCallbackActivity.withContext(callbackContext) {
+                    try cancellation.checkCancellation()
+                    return try operation(cancellation)
+                }
+                try cancellation.checkCancellation()
+                relay.complete(with: .success(value))
+            } catch {
+                relay.complete(with: .failure(error))
+            }
+        }
+        return try await withTaskCancellationHandler {
+            let value = try await relay.value()
+            try Task.checkCancellation()
+            return value
+        } onCancel: {
+            cancellation.cancel()
+            relay.complete(with: .failure(CancellationError()))
+        }
+    }
+}
 
 /// Hashable presentation inputs used to memoize work outside SwiftUI initializers.
 public struct AutoChartPresentationContext: Hashable, Codable, Sendable {
@@ -280,20 +381,26 @@ public final class AutoChartPresenter: @unchecked Sendable {
         textResolver: AutoChartTextResolver = .default,
         priority: TaskPriority = .userInitiated
     ) async throws -> AutoChartPresentedChart<RowID> {
-        let hostCallbackContext = AutoChartHostCallbackActivity.currentContext
-        let work = Task.detached(priority: priority) {
-            try AutoChartHostCallbackActivity.withContext(hostCallbackContext) {
-                try self.presentCheckingCancellation(
-                    chart,
-                    context: context,
-                    formatters: formatters,
-                    textResolver: textResolver)
-            }
+        let qos: DispatchQoS.QoSClass
+        switch priority {
+        case .background:
+            qos = .background
+        case .low:
+            qos = .utility
+        case .high:
+            qos = .userInitiated
+        default:
+            qos = .default
         }
-        return try await withTaskCancellationHandler {
-            try await work.value
-        } onCancel: {
-            work.cancel()
+        return try await AutoChartCancellableWork.run(
+            on: DispatchQueue.global(qos: qos)
+        ) { cancellation in
+            try self.present(
+                chart,
+                context: context,
+                formatters: formatters,
+                textResolver: textResolver,
+                checkingCancellation: cancellation.checkCancellation)
         }
     }
 

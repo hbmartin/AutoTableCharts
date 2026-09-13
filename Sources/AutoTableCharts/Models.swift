@@ -642,6 +642,10 @@ public struct AutoChartColumnHints: Hashable, Codable, Sendable {
             // permission to sum upstream sums and counts. Preserve provenance
             // when that flag grants no extra rollup permission, but keep an
             // unknown policy conservative for additive upstream operations.
+            // Consequently, a 0.1.0 compatibility hop cannot retain both
+            // `.aggregated(.sum/.count)` provenance and an `.unknown` policy;
+            // safety takes precedence and the old decoder treats the operation
+            // as a row-level preferred transform.
             let safety: LegacyAggregationSafety =
                 sourceOperation == .sum || sourceOperation == .count
                 ? .unknown : .alreadyAggregated
@@ -868,14 +872,32 @@ public struct AutoChartColumn: Identifiable, Hashable, Codable, Sendable {
             AutoChartColumnSemantics.self, forKey: .semantics)
         {
             semantics = decoded
-            normalizedHints = try container.decodeIfPresent(
+            let hints = try container.decodeIfPresent(
                 AutoChartColumnHints.self, forKey: .hints) ?? decoded.hints
+            normalizedHints = Self.normalizedDecodedHints(hints, semantics: decoded)
         } else {
             let legacy = try container.decodeIfPresent(
                 AutoChartColumnHints.self, forKey: .hints) ?? .init()
             semantics = AutoChartColumnSemantics(hints: legacy)
-            normalizedHints = legacy
+            normalizedHints = Self.normalizedDecodedHints(legacy, semantics: semantics)
         }
+    }
+
+    private static func normalizedDecodedHints(
+        _ hints: AutoChartColumnHints,
+        semantics: AutoChartColumnSemantics
+    ) -> AutoChartColumnHints {
+        guard hints.role == .measure,
+            hints.measureSemantics == nil,
+            case .measure(_, _, let measureSemantics, _) = semantics,
+            measureSemantics == AutoChartMeasureSemantics()
+        else { return hints }
+
+        // Version 0.1.0 represented a default measure with only role == .measure.
+        // Normalize that coherent legacy spelling to the same hints produced by
+        // the current `.measure()` declaration so equality and content identity
+        // do not depend on which version encoded the column.
+        return semantics.hints
     }
 
     public func encode(to encoder: any Encoder) throws {
@@ -2178,7 +2200,7 @@ package enum AutoChartHostCallbackActivity {
     @TaskLocal private static var inheritedScope: Scope?
 
     /// A transferable reference to the caller's current callback scope.
-    /// Detached presentation work restores it so re-entrant callbacks retain
+    /// Off-actor presentation work restores it so re-entrant callbacks retain
     /// the same bounded fallback behavior as their originating task.
     package struct Context: Sendable {
         fileprivate let scope: Scope?

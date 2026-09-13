@@ -65,11 +65,16 @@ if (( ${#swift_test_sources[@]} == 0 )); then
   exit 1
 fi
 
-if perl -0ne '
-  $found ||= /#if ATC_TEST_HOOKS\s+\@Test/;
-  END { exit($found ? 0 : 1) }
-' "${swift_test_sources[@]}"
+if ! conditional_test_attribute_count="$(perl -0ne '
+  $count += () = /#if ATC_TEST_HOOKS\s+\@Test/g;
+  END { print(($count || 0) . "\n") }
+' "${swift_test_sources[@]}")"
 then
+  echo "Could not audit conditional test attributes." >&2
+  exit 1
+fi
+
+if [[ "$conditional_test_attribute_count" -ne 0 ]]; then
   echo "Hook-dependent tests must use a conditional trait, not a conditional @Test attribute." >&2
   exit 1
 fi
@@ -77,21 +82,28 @@ fi
 manifest_count="${#hook_test_specifiers[@]}"
 
 for test_specifier in "${hook_test_specifiers[@]}"; do
+  suite_and_test="${test_specifier#*.}"
+  suite_name="${suite_and_test%%/*}"
   test_name="${test_specifier##*/}"
   test_name="${test_name%%(*}"
-  if HOOK_TEST_NAME="$test_name" perl -0ne '
-    while (/(\@Test\b(?:(?!\@Test\b).)*?\bfunc\s+\Q$ENV{HOOK_TEST_NAME}\E\s*\([^)]*\)(?:(?!\@Test\b).)*?)(?=\@Test\b|\z)/sg) {
-      $block = $1;
-      $matches++;
-      $guards++
-        if $block =~ /\.disabled\(\s*if:\s*!testHooksAvailable,\s*testHooksUnavailable\s*\)/s;
-      $bodies++
-        if $block =~ /\bfunc\s+\Q$ENV{HOOK_TEST_NAME}\E\s*\([^)]*\).*?\{\s*#if\s+ATC_TEST_HOOKS\b/s;
+  if HOOK_SUITE_NAME="$suite_name" HOOK_TEST_NAME="$test_name" perl -0ne '
+    while (/(\@Suite\b(?:(?!\@Suite\b).)*?\bstruct\s+\Q$ENV{HOOK_SUITE_NAME}\E\b(?:(?!\@Suite\b).)*?)(?=\@Suite\b|\z)/sg) {
+      $suite = $1;
+      $suite_matches++;
+      while ($suite =~ /(\@Test\b(?:(?!\@Test\b|\bfunc\b).)*?\bfunc\s+\Q$ENV{HOOK_TEST_NAME}\E\s*\([^)]*\)\s*(?:async\s*)?(?:throws\s*)?\{)(\s*#if\s+ATC_TEST_HOOKS\b)?/sg) {
+        $declaration = $1;
+        $has_hook_body = defined $2;
+        $test_matches++;
+        $guards++
+          if $declaration =~ /\.disabled\(\s*if:\s*!testHooksAvailable,\s*testHooksUnavailable\s*\)/s;
+        $bodies++ if $has_hook_body;
+      }
     }
     END {
-      exit 2 if ($matches || 0) != 1;
-      exit 3 if ($guards || 0) != 1;
-      exit 4 if ($bodies || 0) != 1;
+      exit 2 if ($suite_matches || 0) != 1;
+      exit 3 if ($test_matches || 0) != 1;
+      exit 4 if ($guards || 0) != 1;
+      exit 5 if ($bodies || 0) != 1;
     }
   ' "${swift_test_sources[@]}"
   then
@@ -99,9 +111,10 @@ for test_specifier in "${hook_test_specifiers[@]}"; do
   else
     audit_status=$?
     case "$audit_status" in
-      2) audit_problem="does not identify exactly one source test" ;;
-      3) audit_problem="does not carry the required unavailable-hook guard" ;;
-      4) audit_problem="does not wrap its body in #if ATC_TEST_HOOKS" ;;
+      2) audit_problem="does not identify exactly one source suite" ;;
+      3) audit_problem="does not identify exactly one source test in its suite" ;;
+      4) audit_problem="does not carry the required unavailable-hook guard" ;;
+      5) audit_problem="does not begin its body with #if ATC_TEST_HOOKS" ;;
       *) audit_problem="could not be audited" ;;
     esac
     echo "Hook-dependent test $test_specifier $audit_problem." >&2
@@ -109,15 +122,20 @@ for test_specifier in "${hook_test_specifiers[@]}"; do
   fi
 done
 
-read -r hook_guard_count hook_body_count < <(perl -0ne '
-  while (/(\@Test\b(?:(?!\@Test\b).)*?\bfunc\s+[A-Za-z_][A-Za-z0-9_]*\s*\([^)]*\)(?:(?!\@Test\b).)*?)(?=\@Test\b|\z)/sg) {
-    $block = $1;
-    $guards++
-      if $block =~ /\.disabled\(\s*if:\s*!testHooksAvailable,\s*testHooksUnavailable\s*\)/s;
-    $bodies++ if $block =~ /^\s*#if\s+ATC_TEST_HOOKS\b/m;
-  }
+if ! audit_counts="$(perl -0ne '
+  $guards += () = /\.disabled\(\s*if:\s*!testHooksAvailable,\s*testHooksUnavailable\s*\)/g;
+  $bodies += () = /^[ \t]+#if[ \t]+ATC_TEST_HOOKS[ \t]*$/mg;
   END { print(($guards || 0) . " " . ($bodies || 0) . "\n") }
-' "${swift_test_sources[@]}")
+' "${swift_test_sources[@]}")"
+then
+  echo "Could not count hook-dependent test guards and bodies." >&2
+  exit 1
+fi
+
+if ! read -r hook_guard_count hook_body_count <<< "$audit_counts"; then
+  echo "Could not read hook-dependent test audit counts." >&2
+  exit 1
+fi
 
 if [[ "$hook_guard_count" -ne "$manifest_count" \
   || "$hook_body_count" -ne "$manifest_count" ]]
