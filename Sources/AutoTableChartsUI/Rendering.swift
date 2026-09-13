@@ -287,6 +287,8 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     @Environment(\.autoChartPresentationContext) private var environmentPresentationContext
     @Environment(\.autoChartFormatters) private var environmentFormatters
     @Environment(\.autoChartTextResolver) private var environmentTextResolver
+    @Environment(\.accessibilityDifferentiateWithoutColor)
+    private var differentiateWithoutColor
 
     private func effectivePresentationInputs(
         explicit: AutoChartPresentationContext?
@@ -545,7 +547,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
                     .lineLimit(isCompact ? 2 : nil)
             }
             if validation.isValid {
-                chartBody
+                accessibleChartBody
                     .frame(height: presentation.plotHeight)
                 if presentation.chrome.contains(.selectionSummary), let first = selection.first {
                     let summary = first.presentation(
@@ -624,6 +626,15 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         .onChange(of: selection) { _, updated in
             synchronizeInteractionState(from: updated)
         }
+        }
+    }
+
+    @ViewBuilder
+    private var accessibleChartBody: some View {
+        if let descriptor = audioGraphDescriptor {
+            chartBody.accessibilityChartDescriptor(descriptor)
+        } else {
+            chartBody
         }
     }
 
@@ -844,6 +855,14 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             .foregroundStyle(by: .value(countTitle, datum.yNumber ?? 0))
             .opacity(selectionOpacity(for: datum))
             .accessibilityLabel(heatmapAccessibilityLabel(for: datum))
+            .annotation(position: .overlay) {
+                if differentiateWithoutColor, let value = datum.yNumber {
+                    Text(formattedMeasureValue(value, for: .axisTick))
+                        .font(.caption2.weight(.semibold))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.55)
+                }
+            }
         }
         .chartXAxisLabel(xTitle)
         .chartXAxis {
@@ -966,6 +985,14 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
                 .foregroundStyle(by: .value(seriesTitle, seriesValue(for: datum)))
                 .opacity(selectionOpacity(for: datum))
                 .accessibilityLabel(markAccessibilityLabel(for: datum))
+                .annotation(position: .overlay) {
+                    if differentiateWithoutColor {
+                        Text(accessibilitySeriesValue(for: datum))
+                            .font(.caption2.weight(.semibold))
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.55)
+                    }
+                }
         } else {
             mark
                 .opacity(selectionOpacity(for: datum))
@@ -1293,6 +1320,176 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             column: resolvedColumn(specification.encoding.facet),
             context: .markAccessibility,
             formatters: effectiveFormatters)
+    }
+
+    private func accessibilityYCategoryValue(for datum: AutoChartDatum) -> String {
+        categoryValueForSurface(
+            identity: datum.yIdentity,
+            value: datum.yCategoryValue,
+            label: datum.yLabel,
+            labels: yDisplayLabels,
+            fallback: resolvedPresentation.missingValue,
+            column: resolvedColumn(specification.encoding.y),
+            context: .markAccessibility,
+            formatters: effectiveFormatters)
+    }
+
+    private struct AudioGraphSeriesKey: Hashable {
+        var series: String?
+        var facet: String?
+        var secondaryCategory: String?
+
+        var name: String {
+            [series, facet, secondaryCategory]
+                .compactMap { $0 }
+                .filter { !$0.isEmpty }
+                .joined(separator: ", ")
+        }
+    }
+
+    private var audioGraphDescriptor: AutoChartAudioGraphDescriptor? {
+        guard ![.kpi, .range].contains(specification.family) else { return nil }
+
+        let isNumericX = xSemanticType == .quantitative
+            || specification.family == .histogram
+        let isTemporalX = xSemanticType == .temporal
+        var pointsBySeries: [AudioGraphSeriesKey: [AutoChartAudioGraphDescriptor.Point]] = [:]
+        var seriesOrder: [AudioGraphSeriesKey] = []
+        var categoryOrder: [String] = []
+        var seenCategories: Set<String> = []
+        var xNumbers: [Double] = []
+        var yNumbers: [Double] = []
+        var additionalNumbers: [Double] = []
+
+        for datum in data {
+            guard let y = datum.yNumber ?? datum.median, y.isFinite else { continue }
+            let x: AutoChartAudioGraphDescriptor.XValue
+            if isTemporalX, let date = datum.xDate {
+                let value = date.timeIntervalSinceReferenceDate
+                x = .number(value)
+                xNumbers.append(value)
+            } else if isNumericX,
+                let value = datum.xNumber
+                    ?? histogramMidpoint(for: datum)
+            {
+                x = .number(value)
+                xNumbers.append(value)
+            } else {
+                let value = accessibilityXCategoryValue(for: datum)
+                x = .category(value)
+                if seenCategories.insert(value).inserted { categoryOrder.append(value) }
+            }
+
+            let key = AudioGraphSeriesKey(
+                series: specification.encoding.series == nil
+                    ? nil : accessibilitySeriesValue(for: datum),
+                facet: specification.encoding.facet == nil
+                    ? nil : accessibilityFacetValue(for: datum),
+                secondaryCategory: specification.family == .heatmap
+                    ? accessibilityYCategoryValue(for: datum) : nil)
+            if pointsBySeries[key] == nil { seriesOrder.append(key) }
+            let additional = datum.size.flatMap { $0.isFinite ? $0 : nil }
+            pointsBySeries[key, default: []].append(
+                .init(
+                    x: x,
+                    y: y,
+                    label: specification.family == .heatmap
+                        ? heatmapAccessibilityLabel(for: datum)
+                        : markAccessibilityLabel(for: datum),
+                    additionalValue: additional))
+            yNumbers.append(y)
+            if let additional { additionalNumbers.append(additional) }
+        }
+        guard !yNumbers.isEmpty else { return nil }
+
+        let xAxis: AutoChartAudioGraphDescriptor.XAxis
+        if isTemporalX {
+            guard let range = audioGraphRange(xNumbers) else { return nil }
+            let formatter = effectiveFormatters
+            let column = resolvedColumn(specification.encoding.x)
+            xAxis = .numeric(
+                title: xTitle,
+                range: sharedXDateDomain.map {
+                    let lower = $0.lowerBound.timeIntervalSinceReferenceDate
+                    let upper = $0.upperBound.timeIntervalSinceReferenceDate
+                    return audioGraphNondegenerateRange(
+                        lower...upper)
+                } ?? range,
+                valueDescription: { value in
+                    formatter.format(
+                        column: column,
+                        value: .date(Date(timeIntervalSinceReferenceDate: value)),
+                        context: .markAccessibility)
+                })
+        } else if isNumericX {
+            guard let range = audioGraphRange(xNumbers) else { return nil }
+            let formatter = effectiveFormatters
+            let column = resolvedColumn(specification.encoding.x)
+            xAxis = .numeric(
+                title: xTitle,
+                range: sharedXNumberDomain.map(audioGraphNondegenerateRange) ?? range,
+                valueDescription: { value in
+                    formatter.format(
+                        column: column,
+                        value: .double(value),
+                        context: .markAccessibility)
+                })
+        } else {
+            xAxis = .categorical(title: xTitle, order: categoryOrder)
+        }
+
+        let continuous = [.line, .pointLine, .area].contains(specification.family)
+        let fallbackSeriesName = yTitle.isEmpty ? displayTitle : yTitle
+        let audioSeries = seriesOrder.map { key in
+            AutoChartAudioGraphDescriptor.Series(
+                name: key.name.isEmpty ? fallbackSeriesName : key.name,
+                isContinuous: continuous,
+                points: pointsBySeries[key] ?? [])
+        }
+        let sizeColumn = resolvedColumn(specification.encoding.size)
+        let formatter = effectiveFormatters
+        return AutoChartAudioGraphDescriptor(
+            title: displayTitle.isEmpty ? nil : displayTitle,
+            xAxis: xAxis,
+            yTitle: specification.family == .histogram ? countTitle : yTitle,
+            yRange: sharedYDomain.map(audioGraphNondegenerateRange)
+                ?? audioGraphRange(yNumbers)!,
+            yValueDescription: { value in
+                formattedMeasureValue(value, for: .markAccessibility)
+            },
+            additionalAxis: audioGraphRange(additionalNumbers).map { range in
+                (
+                    title: sizeColumn?.name ?? "Size",
+                    range: range,
+                    valueDescription: { value in
+                        formatter.format(
+                            column: sizeColumn,
+                            value: .double(value),
+                            context: .markAccessibility)
+                    }
+                )
+            },
+            series: audioSeries)
+    }
+
+    private func histogramMidpoint(for datum: AutoChartDatum) -> Double? {
+        guard let lower = datum.lower, let upper = datum.upper,
+            lower.isFinite, upper.isFinite
+        else { return nil }
+        return (lower + upper) / 2
+    }
+
+    private func audioGraphRange(_ values: [Double]) -> ClosedRange<Double>? {
+        guard let minimum = values.min(), let maximum = values.max() else { return nil }
+        return audioGraphNondegenerateRange(minimum...maximum)
+    }
+
+    private func audioGraphNondegenerateRange(
+        _ range: ClosedRange<Double>
+    ) -> ClosedRange<Double> {
+        guard range.lowerBound == range.upperBound else { return range }
+        let padding = max(abs(range.lowerBound) * 0.05, 1)
+        return (range.lowerBound - padding)...(range.upperBound + padding)
     }
 
     private func resolvedSelectionDimensionLabel(

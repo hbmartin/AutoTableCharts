@@ -9,11 +9,18 @@ public struct AutoChartDomainColumn<Record: Sendable>: Sendable {
         id: AutoChartColumnID,
         name: String,
         displayName: String? = nil,
+        categoryOrder: [AutoChartValue]? = nil,
+        provenance: AutoChartColumnProvenance? = nil,
         semantics: AutoChartColumnSemantics,
         value: @escaping @Sendable (Record) -> Value
     ) {
         self.column = AutoChartColumn(
-            id: id, name: name, displayName: displayName, semantics: semantics)
+            id: id,
+            name: name,
+            displayName: displayName,
+            categoryOrder: categoryOrder,
+            provenance: provenance,
+            semantics: semantics)
         self.value = { value($0).autoChartValue }
     }
 }
@@ -33,6 +40,8 @@ public struct AutoChartDimension<Record: Sendable>: Sendable {
         semanticType: AutoChartSemanticType? = nil,
         unit: AutoChartUnit? = nil,
         grain: String? = nil,
+        categoryOrder: [AutoChartValue]? = nil,
+        provenance: AutoChartColumnProvenance? = nil,
         value: @escaping @Sendable (Record) -> Value
     ) {
         columns = [
@@ -40,6 +49,8 @@ public struct AutoChartDimension<Record: Sendable>: Sendable {
                 id: id,
                 name: name,
                 displayName: displayName,
+                categoryOrder: categoryOrder,
+                provenance: provenance,
                 semantics: .dimension(
                     role: role, semanticType: semanticType, unit: unit, grain: grain),
                 value: value)
@@ -59,6 +70,7 @@ public struct Measure<Record: Sendable>: Sendable {
         unit: AutoChartUnit? = nil,
         semantics: AutoChartMeasureSemantics = .init(),
         grain: String? = nil,
+        provenance: AutoChartColumnProvenance? = nil,
         value: @escaping @Sendable (Record) -> Value
     ) {
         columns = [
@@ -66,6 +78,7 @@ public struct Measure<Record: Sendable>: Sendable {
                 id: id,
                 name: name,
                 displayName: displayName,
+                provenance: provenance,
                 semantics: .measure(
                     semanticType: semanticType,
                     unit: unit,
@@ -85,6 +98,7 @@ public struct Identifier<Record: Sendable>: Sendable {
         name: String,
         displayName: String? = nil,
         semanticType: AutoChartSemanticType? = nil,
+        provenance: AutoChartColumnProvenance? = nil,
         value: @escaping @Sendable (Record) -> Value
     ) {
         columns = [
@@ -92,6 +106,7 @@ public struct Identifier<Record: Sendable>: Sendable {
                 id: id,
                 name: name,
                 displayName: displayName,
+                provenance: provenance,
                 semantics: .identifier(semanticType: semanticType),
                 value: value)
         ]
@@ -110,6 +125,8 @@ public struct Interval<Record: Sendable>: Sendable {
         startDisplayName: String? = nil,
         endDisplayName: String? = nil,
         grain: String? = nil,
+        startProvenance: AutoChartColumnProvenance? = nil,
+        endProvenance: AutoChartColumnProvenance? = nil,
         start: @escaping @Sendable (Record) -> Start,
         end: @escaping @Sendable (Record) -> End
     ) {
@@ -118,12 +135,14 @@ public struct Interval<Record: Sendable>: Sendable {
                 id: startID,
                 name: startName,
                 displayName: startDisplayName,
+                provenance: startProvenance,
                 semantics: .intervalStart(grain: grain),
                 value: start),
             AutoChartDomainColumn(
                 id: endID,
                 name: endName,
                 displayName: endDisplayName,
+                provenance: endProvenance,
                 semantics: .intervalEnd(grain: grain),
                 value: end),
         ]

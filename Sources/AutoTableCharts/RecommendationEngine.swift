@@ -407,9 +407,10 @@ enum AutoChartRecommendationEngine {
                             rationale: ["A nonnegative temporal measure can use an area baseline."],
                             warnings: warnings))
                 }
-                if let series = categorical.first(where: {
-                    $0.distinctCount >= 2 && $0.distinctCount <= options.maximumSeries
-                }) {
+                for series in categorical
+                where series.distinctCount >= 2
+                    && series.distinctCount <= options.maximumSeries
+                {
                     candidates.append(
                         candidate(
                             family: .line, x: time, y: measure, series: series,
@@ -473,11 +474,11 @@ enum AutoChartRecommendationEngine {
                     )
                 }
 
-                if let series = categorical.first(where: {
-                    $0.column.id != dimension.column.id
-                        && $0.distinctCount >= 2
-                        && $0.distinctCount <= options.maximumSeries
-                }) {
+                for series in categorical
+                where series.column.id != dimension.column.id
+                    && series.distinctCount >= 2
+                    && series.distinctCount <= options.maximumSeries
+                {
                     let uniqueAtSeriesGrain = hasUniqueCombination(
                         snapshot: snapshot,
                         fields: [dimension.column.id, series.column.id],
@@ -534,10 +535,10 @@ enum AutoChartRecommendationEngine {
                         score: 81 + goalBonus(.relationship, context.goal),
                         rationale: ["Two quantitative fields support relationship analysis."],
                         warnings: warnings))
-                if let size = quantitative.first(where: {
-                    $0.column.id != left.column.id && $0.column.id != right.column.id
-                        && ($0.numericMinimum ?? -1) >= 0
-                }) {
+                for size in quantitative
+                where size.column.id != left.column.id && size.column.id != right.column.id
+                    && (size.numericMinimum ?? -1) >= 0
+                {
                     var bubble = candidate(
                         family: .bubble, x: left, y: right,
                         context: context,
@@ -551,9 +552,7 @@ enum AutoChartRecommendationEngine {
         }
 
         for measure in quantitative {
-            let binCount = max(
-                5,
-                min(20, Int(Double(measure.numericValueCount).squareRoot().rounded())))
+            let binCount = histogramBinCount(for: measure)
             candidates.append(
                 candidate(
                     family: .histogram, x: measure, context: context,
@@ -568,24 +567,24 @@ enum AutoChartRecommendationEngine {
                         + goalBonus(.outlier, context.goal),
                     rationale: ["Quartiles summarize spread and potential outliers."],
                     warnings: warnings))
-            if let group = categorical.first(where: {
+            for group in categorical {
                 guard let categoryCount = validationMemo.boundedBoxPlotCategoryCount(
                     snapshotIdentity: snapshot.validationIdentity,
-                    categoryID: $0.column.id,
+                    categoryID: group.column.id,
                     measureID: measure.column.id),
                     let includesMissing = validationMemo.boxPlotIncludesMissing(
                         snapshotIdentity: snapshot.validationIdentity,
-                        categoryID: $0.column.id,
+                        categoryID: group.column.id,
                         measureID: measure.column.id)
                 else {
                     assertionFailure(
                         "The box-plot validation index must contain every candidate pair.")
-                    return false
+                    continue
                 }
                 let renderableCategoryCount = categoryCount - (includesMissing ? 1 : 0)
-                return renderableCategoryCount >= 2
-                    && categoryCount <= maximumGroupedBoxPlotCategories
-            }) {
+                guard renderableCategoryCount >= 2,
+                    categoryCount <= maximumGroupedBoxPlotCategories
+                else { continue }
                 let groupedBox = candidate(
                     family: .boxPlot, x: group, y: measure, context: context,
                     score: 73 + goalBonus(.distribution, context.goal),
@@ -613,16 +612,25 @@ enum AutoChartRecommendationEngine {
 
         if !snapshot.metadata.isTruncated {
             if let time = temporal.first, let measure = quantitative.first {
-                let series = categorical.first(where: {
-                    $0.distinctCount >= 2 && $0.distinctCount <= options.maximumSeries
-                })
                 candidates.append(
                     candidate(
-                        family: .scatter, x: time, y: measure, series: series,
+                        family: .scatter, x: time, y: measure,
                         context: context,
                         score: 72 + goalBonus(.relationship, context.goal),
                         rationale: ["Dated values can be inspected along a temporal axis."],
                         warnings: warnings))
+                for series in categorical
+                where series.distinctCount >= 2
+                    && series.distinctCount <= options.maximumSeries
+                {
+                    candidates.append(
+                        candidate(
+                            family: .scatter, x: time, y: measure, series: series,
+                            context: context,
+                            score: 72 + goalBonus(.relationship, context.goal),
+                            rationale: ["Dated values can be inspected along a temporal axis."],
+                            warnings: warnings))
+                }
             }
 
             if temporal.count >= 2, let label = categorical.first {
@@ -661,41 +669,43 @@ enum AutoChartRecommendationEngine {
             }
         }
 
-        var facetProfile: AutoChartColumnProfile?
-        var facetBase: AutoChartRecommendation?
+        let facetBases = candidates.filter {
+            [.line, .bar, .scatter].contains($0.specification.family)
+        }
         for facet in categorical
         where facet.distinctCount >= 2 && facet.distinctCount <= options.maximumFacets {
-            let base = candidates.first { recommendation in
-                [.line, .bar, .scatter].contains(recommendation.specification.family)
-                    && recommendation.specification.encoding.x != facet.column.id
-                    && recommendation.specification.encoding.y != facet.column.id
-                    && recommendation.specification.encoding.series != facet.column.id
-                    && cachedStructuralValidation(recommendation.specification).isValid
+            for base in facetBases
+            where base.specification.encoding.x != facet.column.id
+                && base.specification.encoding.y != facet.column.id
+                && base.specification.encoding.series != facet.column.id
+                && cachedStructuralValidation(base.specification).isValid
+            {
+                var faceted = base
+                let baseFamily = faceted.specification.family
+                faceted.specification.family = .faceted
+                faceted.specification.facetBaseFamily = baseFamily
+                faceted.specification.encoding.facet = facet.column.id
+                faceted.diagnostics = faceted.diagnostics.map { diagnostic in
+                    var diagnostic = diagnostic
+                    if diagnostic.family == baseFamily { diagnostic.family = .faceted }
+                    return diagnostic
+                }
+                faceted.score -= 4
+                faceted.rationale = [
+                    AutoChartMessage(
+                        category: .rationale,
+                        code: .recommendationRationale,
+                        defaultText: "Small multiples separate a low-cardinality dimension.")
+                ]
+                candidates.append(faceted)
             }
-            guard let base else { continue }
-            facetProfile = facet
-            facetBase = base
-            break
         }
-        if let facet = facetProfile, let base = facetBase {
-            var faceted = base
-            let baseFamily = faceted.specification.family
-            faceted.specification.family = .faceted
-            faceted.specification.facetBaseFamily = baseFamily
-            faceted.specification.encoding.facet = facet.column.id
-            faceted.diagnostics = faceted.diagnostics.map { diagnostic in
-                var diagnostic = diagnostic
-                if diagnostic.family == baseFamily { diagnostic.family = .faceted }
-                return diagnostic
-            }
-            faceted.score -= 4
-            faceted.rationale = [
-                AutoChartMessage(
-                    category: .rationale,
-                    code: .recommendationRationale,
-                    defaultText: "Small multiples separate a low-cardinality dimension.")
-            ]
-            candidates.append(faceted)
+
+        candidates = candidates.map {
+            dataAwareRecommendation(
+                $0,
+                snapshot: snapshot,
+                profiles: profileIndex)
         }
 
         // Apply request constraints before structural or prepared-domain validation.
@@ -710,7 +720,7 @@ enum AutoChartRecommendationEngine {
             if lhs != rhs { return lhs < rhs }
             return $0.id < $1.id
         }
-        let diverse = diversify(
+        let diverse = selectFeaturedSet(
             ranked,
             limit: options.maximumRecommendations,
             isValid: { cachedPreparedValidation($0.specification).isValid })
@@ -736,7 +746,7 @@ enum AutoChartRecommendationEngine {
                                 structural.issues.filter { $0.severity == .error }
                                     .map { $0.messageValue.code }))
                     }
-                    // `diversify` prepares only candidates it actually considers.
+                    // Featured-set selection prepares only candidates it actually considers.
                     // Do not turn trace construction into a full data-preparation
                     // pass over candidates already excluded by the result limit.
                     if let prepared = preparedValidationResults[candidate.specification],
@@ -1306,6 +1316,34 @@ enum AutoChartRecommendationEngine {
                         family: specification.family))
             }
         }
+        if let riskyColumns = fanOutRisk(
+            specification: specification,
+            snapshot: snapshot,
+            profiles: profiles)
+        {
+            issues.append(
+                .init(
+                    severity: .error,
+                    code: .fanOutRisk,
+                    message:
+                        "This chart would combine a measure across a finer-grain dimension and may double-count values from a one-to-many join.",
+                    family: specification.family,
+                    columnIDs: riskyColumns))
+        }
+        if let riskyColumns = chasmRisk(
+            specification: specification,
+            snapshot: snapshot,
+            profiles: profiles)
+        {
+            issues.append(
+                .init(
+                    severity: .error,
+                    code: .chasmRisk,
+                    message:
+                        "This chart combines measures from unrelated child grains and may multiply both sides of a multi-join result.",
+                    family: specification.family,
+                    columnIDs: riskyColumns))
+        }
         if [.donut, .stackedBar, .normalizedBar].contains(specification.family) {
             rejectMissing(specification.encoding.x, "Composition categories")
             rejectMissing(specification.encoding.y, "Composition measures")
@@ -1487,6 +1525,451 @@ enum AutoChartRecommendationEngine {
 
     private static func goalBonus(_ target: AutoChartGoal, _ actual: AutoChartGoal) -> Double {
         target == actual ? 18 : 0
+    }
+
+    private static func histogramBinCount(
+        for profile: AutoChartColumnProfile
+    ) -> Int {
+        let fallback = Int(Double(profile.numericValueCount).squareRoot().rounded())
+        guard profile.numericValueCount > 1,
+            let minimum = profile.numericMinimum,
+            let maximum = profile.numericMaximum,
+            let quartile1 = profile.numericQuartile1,
+            let quartile3 = profile.numericQuartile3
+        else { return max(5, min(20, fallback)) }
+
+        let range = maximum - minimum
+        let interquartileRange = quartile3 - quartile1
+        let width = 2 * interquartileRange
+            / pow(Double(profile.numericValueCount), 1.0 / 3.0)
+        guard range > 0, width > 0, range.isFinite, width.isFinite else {
+            return max(5, min(20, fallback))
+        }
+        return max(5, min(20, Int(ceil(range / width))))
+    }
+
+    private struct DescriptiveSignal {
+        var adjustment = 0.0
+        var message: String?
+        var arguments: [String: AutoChartMessageArgument] = [:]
+    }
+
+    private static func dataAwareRecommendation(
+        _ recommendation: AutoChartRecommendation,
+        snapshot: AutoChartSnapshot,
+        profiles: [AutoChartColumnID: AutoChartColumnProfile]
+    ) -> AutoChartRecommendation {
+        var result = recommendation
+        let specification = recommendation.specification
+        let familyPrior = familyPrior(
+            for: specification,
+            profiles: profiles)
+        let preferredTransform = specification.encoding.y.flatMap { profiles[$0] }.map {
+            preferredTransformBonus(specification.aggregation, $0)
+        } ?? 0
+        let taskFit = recommendation.score - familyPrior - preferredTransform
+        let signal = descriptiveSignal(
+            for: specification,
+            snapshot: snapshot,
+            profiles: profiles)
+        let readabilityPenalty = readabilityPenalty(
+            for: specification,
+            rowCount: snapshot.rows.count,
+            profiles: profiles)
+        let breakdown = AutoChartScoreBreakdown(
+            familyPrior: familyPrior,
+            taskFit: taskFit,
+            preferredTransform: preferredTransform,
+            signal: signal.adjustment,
+            readabilityPenalty: readabilityPenalty)
+        result.scoreBreakdown = breakdown
+        result.score = breakdown.total
+        if let message = signal.message {
+            result.rationale.append(
+                AutoChartMessage(
+                    category: .rationale,
+                    code: .dataSignalRationale,
+                    arguments: signal.arguments,
+                    defaultText: message))
+        }
+        if readabilityPenalty >= 1 {
+            result.rationale.append(
+                AutoChartMessage(
+                    category: .rationale,
+                    code: .readabilityRationale,
+                    arguments: ["penalty": .number(readabilityPenalty)],
+                    defaultText:
+                        "Dense marks or categories reduce this chart's readability score by \(readabilityPenalty.formatted(.number.precision(.fractionLength(0...1)))) points."
+                ))
+        }
+        return result
+    }
+
+    private static func familyPrior(
+        for specification: AutoChartSpecification,
+        profiles: [AutoChartColumnID: AutoChartColumnProfile]
+    ) -> Double {
+        let family = specification.family == .faceted
+            ? specification.facetBaseFamily ?? .bar
+            : specification.family
+        let base: Double = switch family {
+        case .kpi: 98
+        case .bar: 82
+        case .rankedDot: 74
+        case .groupedBar: 76
+        case .stackedBar: 69
+        case .normalizedBar: 62
+        case .line: specification.encoding.series == nil ? 84 : 87
+        case .pointLine: 80
+        case .area: 70
+        case .scatter:
+            specification.encoding.x.flatMap { profiles[$0] }?.isTemporal == true ? 72 : 81
+        case .bubble: 68
+        case .histogram: 71
+        case .boxPlot: specification.encoding.x == nil ? 66 : 73
+        case .heatmap: 67
+        case .donut: 58
+        case .range: specification.encoding.start == specification.encoding.end ? 70 : 78
+        case .faceted: 0
+        }
+        return specification.family == .faceted ? base - 4 : base
+    }
+
+    private static func descriptiveSignal(
+        for specification: AutoChartSpecification,
+        snapshot: AutoChartSnapshot,
+        profiles: [AutoChartColumnID: AutoChartColumnProfile]
+    ) -> DescriptiveSignal {
+        switch specification.family {
+        case .line, .pointLine, .area:
+            guard specification.encoding.series == nil,
+                let x = specification.encoding.x,
+                let y = specification.encoding.y,
+                let rho = spearmanCorrelation(
+                    pairedNumbers(snapshot: snapshot, x: x, y: y)),
+                abs(rho) >= 0.35
+            else { return DescriptiveSignal() }
+            let adjustment = min(4, abs(rho) * 4)
+            return DescriptiveSignal(
+                adjustment: adjustment,
+                message:
+                    "The measure follows the ordered axis consistently (Spearman rho \(rho.formatted(.number.precision(.fractionLength(2)))); this is descriptive, not a significance claim).",
+                arguments: ["spearmanRho": .number(rho)])
+        case .scatter, .bubble:
+            guard let x = specification.encoding.x,
+                let y = specification.encoding.y
+            else { return DescriptiveSignal() }
+            let pairs = pairedNumbers(snapshot: snapshot, x: x, y: y)
+            guard let pearson = pearsonCorrelation(pairs),
+                let spearman = spearmanCorrelation(pairs)
+            else { return DescriptiveSignal() }
+            let strength = max(abs(pearson), abs(spearman))
+            guard strength >= 0.35 else { return DescriptiveSignal() }
+            return DescriptiveSignal(
+                adjustment: min(4, strength * 4),
+                message:
+                    "The two measures show a descriptive relationship (Pearson \(pearson.formatted(.number.precision(.fractionLength(2)))), Spearman \(spearman.formatted(.number.precision(.fractionLength(2)))); neither value is a significance claim).",
+                arguments: [
+                    "pearson": .number(pearson),
+                    "spearmanRho": .number(spearman),
+                ])
+        case .bar, .rankedDot, .groupedBar, .stackedBar, .normalizedBar:
+            guard let x = specification.encoding.x,
+                let y = specification.encoding.y,
+                let effect = categoricalEffect(
+                    snapshot: snapshot,
+                    category: x,
+                    measure: y,
+                    semanticType: profiles[x]?.semanticType),
+                effect >= 0.2
+            else { return DescriptiveSignal() }
+            return DescriptiveSignal(
+                adjustment: min(3, effect * 3),
+                message:
+                    "Differences between returned groups account for \((effect * 100).formatted(.number.precision(.fractionLength(0))))% of the observed measure variation.",
+                arguments: ["etaSquared": .number(effect)])
+        case .histogram:
+            guard let x = specification.encoding.x,
+                let skewness = profiles[x]?.numericSkewness,
+                abs(skewness) >= 0.5
+            else { return DescriptiveSignal() }
+            return DescriptiveSignal(
+                adjustment: min(2, abs(skewness)),
+                message:
+                    "The returned distribution is asymmetric (skewness \(skewness.formatted(.number.precision(.fractionLength(2))))).",
+                arguments: ["skewness": .number(skewness)])
+        case .boxPlot:
+            guard let y = specification.encoding.y,
+                let fraction = outlierFraction(
+                    snapshot: snapshot,
+                    measure: y,
+                    profile: profiles[y]),
+                fraction > 0
+            else { return DescriptiveSignal() }
+            return DescriptiveSignal(
+                adjustment: min(2, fraction * 8),
+                message:
+                    "\((fraction * 100).formatted(.number.precision(.fractionLength(0))))% of returned values fall beyond the 1.5-IQR fences.",
+                arguments: ["outlierFraction": .number(fraction)])
+        case .donut:
+            guard let x = specification.encoding.x,
+                let y = specification.encoding.y,
+                let shares = compositionShares(
+                    snapshot: snapshot,
+                    category: x,
+                    measure: y,
+                    semanticType: profiles[x]?.semanticType),
+                shares.count >= 2
+            else { return DescriptiveSignal() }
+            let largest = shares.max() ?? 0
+            let normalizedEntropy = -shares.reduce(0.0) {
+                $0 + ($1 > 0 ? $1 * log($1) : 0)
+            } / log(Double(shares.count))
+            let penalty = (largest >= 0.8 ? 3.0 : 0)
+                + (normalizedEntropy >= 0.95 ? 1.5 : 0)
+            guard penalty > 0 else { return DescriptiveSignal() }
+            return DescriptiveSignal(
+                adjustment: -penalty,
+                message:
+                    "The composition is visually weak because its largest share is \((largest * 100).formatted(.number.precision(.fractionLength(0))))% or its sectors are nearly uniform.",
+                arguments: [
+                    "largestShare": .number(largest),
+                    "normalizedEntropy": .number(normalizedEntropy),
+                ])
+        case .kpi, .heatmap, .range, .faceted:
+            return DescriptiveSignal()
+        }
+    }
+
+    private static func readabilityPenalty(
+        for specification: AutoChartSpecification,
+        rowCount: Int,
+        profiles: [AutoChartColumnID: AutoChartColumnProfile]
+    ) -> Double {
+        var penalty = 0.0
+        if let x = specification.encoding.x,
+            profiles[x]?.isCategorical == true
+        {
+            let count = profiles[x]?.distinctCount ?? 0
+            penalty += min(8, Double(max(0, count - 6)) * 0.5)
+        }
+        if let series = specification.encoding.series {
+            let count = profiles[series]?.distinctCount ?? 0
+            penalty += min(4, Double(max(0, count - 3)) * 0.75)
+        }
+        if let facet = specification.encoding.facet {
+            let count = profiles[facet]?.distinctCount ?? 0
+            penalty += min(4, Double(max(0, count - 3)))
+        }
+        if [.scatter, .bubble].contains(specification.family), rowCount > 200 {
+            penalty += min(4, Double(rowCount - 200) / 75)
+        }
+        if [.line, .pointLine, .area].contains(specification.family),
+            let x = specification.encoding.x,
+            let profile = profiles[x],
+            profile.temporalValueCount > 2
+        {
+            penalty += min(
+                2,
+                Double(profile.temporalIrregularGapCount)
+                    / Double(profile.temporalValueCount - 1) * 2)
+        }
+        return penalty
+    }
+
+    private static func pairedNumbers(
+        snapshot: AutoChartSnapshot,
+        x: AutoChartColumnID,
+        y: AutoChartColumnID
+    ) -> [(Double, Double)] {
+        snapshot.rows.compactMap { row in
+            let xValue: Double? = row.values[x]?.numericValue
+                ?? row.values[x].flatMap(AutoChartProfiler.dateValue)?
+                    .timeIntervalSinceReferenceDate
+            guard let xValue, let yValue = row.values[y]?.numericValue else { return nil }
+            return (xValue, yValue)
+        }
+    }
+
+    private static func pearsonCorrelation(
+        _ values: [(Double, Double)]
+    ) -> Double? {
+        guard values.count >= 5 else { return nil }
+        let count = Double(values.count)
+        let meanX = values.reduce(0.0) { $0 + $1.0 } / count
+        let meanY = values.reduce(0.0) { $0 + $1.1 } / count
+        var covariance = 0.0
+        var varianceX = 0.0
+        var varianceY = 0.0
+        for (x, y) in values {
+            let dx = x - meanX
+            let dy = y - meanY
+            covariance += dx * dy
+            varianceX += dx * dx
+            varianceY += dy * dy
+        }
+        let denominator = (varianceX * varianceY).squareRoot()
+        guard denominator > 0, denominator.isFinite else { return nil }
+        let result = covariance / denominator
+        return result.isFinite ? max(-1, min(1, result)) : nil
+    }
+
+    private static func spearmanCorrelation(
+        _ values: [(Double, Double)]
+    ) -> Double? {
+        guard values.count >= 5 else { return nil }
+        let xRanks = averageRanks(values.map(\.0))
+        let yRanks = averageRanks(values.map(\.1))
+        return pearsonCorrelation(Array(zip(xRanks, yRanks)))
+    }
+
+    private static func averageRanks(_ values: [Double]) -> [Double] {
+        let indexed = values.enumerated().sorted {
+            $0.element == $1.element ? $0.offset < $1.offset : $0.element < $1.element
+        }
+        var result = Array(repeating: 0.0, count: values.count)
+        var lower = 0
+        while lower < indexed.count {
+            var upper = lower + 1
+            while upper < indexed.count,
+                indexed[upper].element == indexed[lower].element
+            {
+                upper += 1
+            }
+            let rank = (Double(lower + 1) + Double(upper)) / 2
+            for offset in lower..<upper { result[indexed[offset].offset] = rank }
+            lower = upper
+        }
+        return result
+    }
+
+    private static func categoricalEffect(
+        snapshot: AutoChartSnapshot,
+        category: AutoChartColumnID,
+        measure: AutoChartColumnID,
+        semanticType: AutoChartSemanticType?
+    ) -> Double? {
+        var groups: [AutoChartValueIdentity: [Double]] = [:]
+        for row in snapshot.rows {
+            guard let value = row.values[measure]?.numericValue else { continue }
+            let identity = AutoChartProfiler.identity(
+                row.values[category], semanticType: semanticType)
+            guard identity != .missing else { continue }
+            groups[identity, default: []].append(value)
+        }
+        let count = groups.values.reduce(0) { $0 + $1.count }
+        guard count >= 8, groups.count >= 2, groups.count < count else { return nil }
+        let mean = groups.values.joined().reduce(0, +) / Double(count)
+        let total = groups.values.joined().reduce(0.0) {
+            $0 + ($1 - mean) * ($1 - mean)
+        }
+        guard total > 0, total.isFinite else { return nil }
+        let between = groups.values.reduce(0.0) { result, values in
+            let groupMean = values.reduce(0, +) / Double(values.count)
+            return result + Double(values.count) * (groupMean - mean) * (groupMean - mean)
+        }
+        let effect = between / total
+        return effect.isFinite ? max(0, min(1, effect)) : nil
+    }
+
+    private static func outlierFraction(
+        snapshot: AutoChartSnapshot,
+        measure: AutoChartColumnID,
+        profile: AutoChartColumnProfile?
+    ) -> Double? {
+        guard let quartile1 = profile?.numericQuartile1,
+            let quartile3 = profile?.numericQuartile3
+        else { return nil }
+        let interquartileRange = quartile3 - quartile1
+        guard interquartileRange > 0 else { return nil }
+        let lower = quartile1 - 1.5 * interquartileRange
+        let upper = quartile3 + 1.5 * interquartileRange
+        let values = snapshot.rows.compactMap { $0.values[measure]?.numericValue }
+        guard values.count >= 5 else { return nil }
+        return Double(values.lazy.filter { $0 < lower || $0 > upper }.count)
+            / Double(values.count)
+    }
+
+    private static func compositionShares(
+        snapshot: AutoChartSnapshot,
+        category: AutoChartColumnID,
+        measure: AutoChartColumnID,
+        semanticType: AutoChartSemanticType?
+    ) -> [Double]? {
+        var totals: [AutoChartValueIdentity: Double] = [:]
+        for row in snapshot.rows {
+            guard let value = row.values[measure]?.numericValue, value > 0 else { continue }
+            let identity = AutoChartProfiler.identity(
+                row.values[category], semanticType: semanticType)
+            guard identity != .missing else { continue }
+            totals[identity, default: 0] += value
+        }
+        let total = totals.values.reduce(0, +)
+        guard total > 0, total.isFinite else { return nil }
+        return totals.values.map { $0 / total }
+    }
+
+    private static func fanOutRisk(
+        specification: AutoChartSpecification,
+        snapshot: AutoChartSnapshot,
+        profiles: [AutoChartColumnID: AutoChartColumnProfile]
+    ) -> [AutoChartColumnID]? {
+        guard let semanticModel = snapshot.metadata.semanticModel,
+            let measureID = specification.encoding.y,
+            let measure = profiles[measureID]?.column,
+            let measureGrain = measure.provenance?.sourceGrain
+        else { return nil }
+
+        let wasCombinedUpstream: Bool = {
+            guard let semantics = measure.hints.measureSemantics,
+                case .aggregated = semantics.source
+            else { return false }
+            return true
+        }()
+        guard specification.aggregation != .none || wasCombinedUpstream else {
+            return nil
+        }
+
+        let groupingIDs = orderedUnique(
+            [
+                specification.encoding.x,
+                specification.encoding.series,
+                specification.encoding.facet,
+            ].compactMap { $0 })
+        for groupingID in groupingIDs {
+            guard let groupingGrain =
+                profiles[groupingID]?.column.provenance?.sourceGrain
+                    ?? snapshot.metadata.rowGrain,
+                semanticModel.isStrictlyFiner(groupingGrain, than: measureGrain)
+            else { continue }
+            return [groupingID, measureID]
+        }
+        return nil
+    }
+
+    private static func chasmRisk(
+        specification: AutoChartSpecification,
+        snapshot: AutoChartSnapshot,
+        profiles: [AutoChartColumnID: AutoChartColumnProfile]
+    ) -> [AutoChartColumnID]? {
+        let baseFamily = specification.family == .faceted
+            ? specification.facetBaseFamily
+            : specification.family
+        guard [.scatter, .bubble].contains(baseFamily),
+            let semanticModel = snapshot.metadata.semanticModel,
+            let xID = specification.encoding.x,
+            let yID = specification.encoding.y,
+            profiles[xID]?.isQuantitative == true,
+            profiles[yID]?.isQuantitative == true,
+            let xGrain = profiles[xID]?.column.provenance?.sourceGrain,
+            let yGrain = profiles[yID]?.column.provenance?.sourceGrain,
+            xGrain != yGrain
+        else { return nil }
+
+        guard !semanticModel.isStrictlyFiner(xGrain, than: yGrain),
+            !semanticModel.isStrictlyFiner(yGrain, than: xGrain)
+        else { return nil }
+        return [xID, yID]
     }
 
     /// Composition marks must partition a whole, so contributions have to be
@@ -1973,29 +2456,90 @@ enum AutoChartRecommendationEngine {
         return Array(bestCandidateByID.values)
     }
 
-    private static func diversify(
+    private static func selectFeaturedSet(
         _ ranked: [AutoChartRecommendation],
         limit: Int,
         isValid: (AutoChartRecommendation) -> Bool
     ) -> [AutoChartRecommendation] {
         var output: [AutoChartRecommendation] = []
-        var seenFamilies: Set<AutoChartFamily> = []
-        for recommendation in ranked where output.count < limit {
-            guard !seenFamilies.contains(recommendation.specification.family),
-                isValid(recommendation)
-            else { continue }
-            seenFamilies.insert(recommendation.specification.family)
-            output.append(recommendation)
-        }
-        if output.count < limit {
-            for recommendation in ranked
-            where output.count < limit
-                && !output.contains(where: { $0.id == recommendation.id })
-                && isValid(recommendation)
-            {
-                output.append(recommendation)
+        var remaining = ranked
+        var coveredFields: Set<AutoChartColumnID> = []
+        var coveredTasks: Set<AutoChartGoal> = []
+        var coveredVisualGroups: Set<String> = []
+        var coveredQueries: Set<String> = []
+
+        while output.count < limit, !remaining.isEmpty {
+            let scored = remaining.enumerated().map { offset, recommendation in
+                let fields = Set(recommendation.specification.encoding.columnIDs)
+                let task = recommendationTask(recommendation.specification)
+                let visualGroup = visualRedundancyGroup(recommendation.specification)
+                let query = dataQuerySignature(recommendation.specification)
+                let gain = recommendation.score
+                    + Double(fields.subtracting(coveredFields).count) * 2
+                    + (coveredTasks.contains(task) ? 0 : 6)
+                    - (coveredQueries.contains(query) ? 12 : 0)
+                    - (coveredVisualGroups.contains(visualGroup) ? 4 : 0)
+                return (offset: offset, recommendation: recommendation, gain: gain)
+            }.sorted {
+                if $0.gain != $1.gain { return $0.gain > $1.gain }
+                return $0.offset < $1.offset
             }
+
+            var selectedOffset: Int?
+            for candidate in scored where isValid(candidate.recommendation) {
+                selectedOffset = candidate.offset
+                break
+            }
+            guard let selectedOffset else { break }
+            let selected = remaining.remove(at: selectedOffset)
+            output.append(selected)
+            coveredFields.formUnion(selected.specification.encoding.columnIDs)
+            coveredTasks.insert(recommendationTask(selected.specification))
+            coveredVisualGroups.insert(visualRedundancyGroup(selected.specification))
+            coveredQueries.insert(dataQuerySignature(selected.specification))
         }
         return output
+    }
+
+    private static func recommendationTask(
+        _ specification: AutoChartSpecification
+    ) -> AutoChartGoal {
+        switch specification.family {
+        case .kpi: .overview
+        case .bar, .groupedBar: .comparison
+        case .rankedDot: .ranking
+        case .stackedBar, .normalizedBar, .donut: .composition
+        case .line, .pointLine, .area: .trend
+        case .scatter, .bubble, .heatmap: .relationship
+        case .histogram, .boxPlot: .distribution
+        case .range: .range
+        case .faceted:
+            recommendationTask(
+                AutoChartSpecification(
+                    family: specification.facetBaseFamily ?? .bar,
+                    encoding: specification.encoding))
+        }
+    }
+
+    private static func visualRedundancyGroup(
+        _ specification: AutoChartSpecification
+    ) -> String {
+        switch specification.family {
+        case .bar, .rankedDot: "categorical-magnitude"
+        case .groupedBar: "grouped-magnitude"
+        case .stackedBar, .normalizedBar, .donut: "composition"
+        case .line, .pointLine, .area: "trend"
+        case .scatter, .bubble: "relationship"
+        case .histogram, .boxPlot: "distribution"
+        case .kpi, .heatmap, .range: specification.family.rawValue
+        case .faceted: "faceted-\(specification.facetBaseFamily?.rawValue ?? "bar")"
+        }
+    }
+
+    private static func dataQuerySignature(
+        _ specification: AutoChartSpecification
+    ) -> String {
+        let fields = specification.encoding.columnIDs.map(\.rawValue).sorted()
+        return fields.joined(separator: "|") + "|\(specification.aggregation.rawValue)"
     }
 }

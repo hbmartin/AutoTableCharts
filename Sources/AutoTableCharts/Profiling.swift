@@ -173,13 +173,35 @@ package struct AutoChartSnapshot: Sendable {
 
     var estimatedStorageCost: Int {
         var storageCost = 256
+        Self.addStorageCost(metadata.grain?.utf8.count ?? 0, to: &storageCost)
+        Self.addStorageCost(metadata.provenance?.utf8.count ?? 0, to: &storageCost)
+        for entity in metadata.rowGrain?.entities ?? [] {
+            Self.addStorageCost(entity.rawValue.utf8.count, to: &storageCost)
+        }
+        for relationship in metadata.semanticModel?.relationships ?? [] {
+            Self.addStorageCost(64, to: &storageCost)
+            Self.addStorageCost(relationship.one.rawValue.utf8.count, to: &storageCost)
+            Self.addStorageCost(relationship.many.rawValue.utf8.count, to: &storageCost)
+        }
         for column in columns {
             Self.addStorageCost(256, to: &storageCost)
             Self.addStorageCost(column.id.rawValue.utf8.count, to: &storageCost)
             Self.addStorageCost(column.name.utf8.count, to: &storageCost)
             Self.addStorageCost(column.displayName?.utf8.count ?? 0, to: &storageCost)
+            for value in column.categoryOrder ?? [] {
+                Self.addStorageCost(48, to: &storageCost)
+                Self.addStorageCost(Self.payloadCost(value), to: &storageCost)
+            }
             Self.addStorageCost(column.hints.grain?.utf8.count ?? 0, to: &storageCost)
             Self.addStorageCost(Self.unitStringCost(column.hints.unit), to: &storageCost)
+            for source in column.provenance?.sourceColumns ?? [] {
+                Self.addStorageCost(64, to: &storageCost)
+                Self.addStorageCost(source.entity.rawValue.utf8.count, to: &storageCost)
+                Self.addStorageCost(source.name.utf8.count, to: &storageCost)
+            }
+            for entity in column.provenance?.sourceGrain?.entities ?? [] {
+                Self.addStorageCost(entity.rawValue.utf8.count, to: &storageCost)
+            }
         }
         for row in rows {
             Self.addStorageCost(128, to: &storageCost)
@@ -312,11 +334,26 @@ public struct AutoChartColumnProfile: Sendable {
     public var distinctCount: Int
     public var numericMinimum: Double?
     public var numericMaximum: Double?
+    /// Arithmetic mean of finite numeric values.
+    public var numericMean: Double?
+    /// Population standard deviation of finite numeric values.
+    public var numericStandardDeviation: Double?
+    /// Exact quartiles using linear interpolation over sorted finite values.
+    public var numericQuartile1: Double?
+    public var numericMedian: Double?
+    public var numericQuartile3: Double?
+    /// Third standardized moment of finite numeric values, when defined.
+    public var numericSkewness: Double?
+    /// Fractions among finite numeric values.
+    public var numericZeroFraction: Double
+    public var numericNegativeFraction: Double
     /// Whether every value is a positive number, counting a missing or non-finite
     /// value as disqualifying. Recommendation uses this to avoid proposing a
     /// composition that could only ever render part of a whole.
     public var allNumericValuesPositive: Bool
     public var averageTextLength: Double
+    /// Shannon entropy in bits across renderable category identities.
+    public var categoryEntropy: Double?
     /// Typed dates that can position a mark on a finite axis.
     ///
     /// A profile is a summary: it keeps this count rather than the dates
@@ -325,6 +362,10 @@ public struct AutoChartColumnProfile: Sendable {
     public var temporalValueCount: Int
     public var temporalMinimum: Date?
     public var temporalMaximum: Date?
+    /// Most frequent positive interval between adjacent sorted dates.
+    public var temporalModalGap: TimeInterval?
+    /// Number of adjacent positive intervals that differ from the modal gap.
+    public var temporalIrregularGapCount: Int
     /// Typed dates whose interval cannot be positioned on a finite chart axis.
     public var nonFiniteDateCount: Int
 
@@ -334,7 +375,7 @@ public struct AutoChartColumnProfile: Sendable {
     /// Flat, and it stays flat only because every stored property is a scalar
     /// summary. Anything row-proportional added here has to be charged for, or
     /// the cache will admit more than the host asked for.
-    var estimatedRetainedCost: Int { 192 }
+    var estimatedRetainedCost: Int { 288 }
 
     /// Creates a column profile.
     ///
@@ -353,11 +394,22 @@ public struct AutoChartColumnProfile: Sendable {
         distinctCount: Int,
         numericMinimum: Double? = nil,
         numericMaximum: Double? = nil,
+        numericMean: Double? = nil,
+        numericStandardDeviation: Double? = nil,
+        numericQuartile1: Double? = nil,
+        numericMedian: Double? = nil,
+        numericQuartile3: Double? = nil,
+        numericSkewness: Double? = nil,
+        numericZeroFraction: Double = 0,
+        numericNegativeFraction: Double = 0,
         allNumericValuesPositive: Bool = false,
         averageTextLength: Double = 0,
+        categoryEntropy: Double? = nil,
         temporalValueCount: Int = 0,
         temporalMinimum: Date? = nil,
         temporalMaximum: Date? = nil,
+        temporalModalGap: TimeInterval? = nil,
+        temporalIrregularGapCount: Int = 0,
         nonFiniteDateCount: Int = 0
     ) {
         self.column = column
@@ -370,11 +422,22 @@ public struct AutoChartColumnProfile: Sendable {
         self.distinctCount = distinctCount
         self.numericMinimum = numericMinimum
         self.numericMaximum = numericMaximum
+        self.numericMean = numericMean
+        self.numericStandardDeviation = numericStandardDeviation
+        self.numericQuartile1 = numericQuartile1
+        self.numericMedian = numericMedian
+        self.numericQuartile3 = numericQuartile3
+        self.numericSkewness = numericSkewness
+        self.numericZeroFraction = numericZeroFraction
+        self.numericNegativeFraction = numericNegativeFraction
         self.allNumericValuesPositive = allNumericValuesPositive
         self.averageTextLength = averageTextLength
+        self.categoryEntropy = categoryEntropy
         self.temporalValueCount = temporalValueCount
         self.temporalMinimum = temporalMinimum
         self.temporalMaximum = temporalMaximum
+        self.temporalModalGap = temporalModalGap
+        self.temporalIrregularGapCount = temporalIrregularGapCount
         self.nonFiniteDateCount = nonFiniteDateCount
     }
 
@@ -495,10 +558,13 @@ package enum AutoChartProfiler {
             }
         }
         let numeric = nonNull.compactMap(\.numericValue)
+        let numericStatistics = numericStatistics(numeric)
         var temporalValueCount = 0
         var temporalMinimum: Date?
         var temporalMaximum: Date?
         var nonFiniteDateCount = 0
+        var finiteDates: [Date] = []
+        finiteDates.reserveCapacity(nonNull.count)
         for value in nonNull {
             if case .date(let date) = value,
                 !date.timeIntervalSinceReferenceDate.isFinite
@@ -508,6 +574,7 @@ package enum AutoChartProfiler {
             }
             guard let date = dateValue(value) else { continue }
             temporalValueCount += 1
+            finiteDates.append(date)
             temporalMinimum = min(temporalMinimum ?? date, date)
             temporalMaximum = max(temporalMaximum ?? date, date)
         }
@@ -527,6 +594,7 @@ package enum AutoChartProfiler {
             resolvesToRawIdentity(type)
             ? raw
             : try summarize(values, type)
+        let temporalRegularity = temporalRegularity(finiteDates)
         return AutoChartColumnProfile(
             column: column,
             semanticType: type,
@@ -538,14 +606,25 @@ package enum AutoChartProfiler {
             distinctCount: raw.distinct.count,
             numericMinimum: numeric.min(),
             numericMaximum: numeric.max(),
+            numericMean: numericStatistics.mean,
+            numericStandardDeviation: numericStatistics.standardDeviation,
+            numericQuartile1: numericStatistics.quartile1,
+            numericMedian: numericStatistics.median,
+            numericQuartile3: numericStatistics.quartile3,
+            numericSkewness: numericStatistics.skewness,
+            numericZeroFraction: numericStatistics.zeroFraction,
+            numericNegativeFraction: numericStatistics.negativeFraction,
             allNumericValuesPositive: !numeric.isEmpty
                 && numeric.count == nonNull.count
                 && numeric.allSatisfy { $0 > 0 },
             averageTextLength: textLengths.isEmpty
                 ? 0 : Double(textLengths.reduce(0, +)) / Double(textLengths.count),
+            categoryEntropy: entropy(renderable.frequencies),
             temporalValueCount: temporalValueCount,
             temporalMinimum: temporalMinimum,
             temporalMaximum: temporalMaximum,
+            temporalModalGap: temporalRegularity.modalGap,
+            temporalIrregularGapCount: temporalRegularity.irregularGapCount,
             nonFiniteDateCount: nonFiniteDateCount)
     }
 
@@ -553,6 +632,7 @@ package enum AutoChartProfiler {
     private struct IdentitySummary {
         var valueCount = 0
         var distinct: Set<AutoChartValueIdentity> = []
+        var frequencies: [AutoChartValueIdentity: Int] = [:]
     }
 
     private static func identitySummary(
@@ -565,6 +645,7 @@ package enum AutoChartProfiler {
             guard identity != .missing else { continue }
             summary.valueCount += 1
             summary.distinct.insert(identity)
+            summary.frequencies[identity, default: 0] += 1
         }
         return summary
     }
@@ -580,8 +661,107 @@ package enum AutoChartProfiler {
             guard identity != .missing else { continue }
             summary.valueCount += 1
             summary.distinct.insert(identity)
+            summary.frequencies[identity, default: 0] += 1
         }
         return summary
+    }
+
+    private struct NumericStatistics {
+        var mean: Double?
+        var standardDeviation: Double?
+        var quartile1: Double?
+        var median: Double?
+        var quartile3: Double?
+        var skewness: Double?
+        var zeroFraction: Double
+        var negativeFraction: Double
+    }
+
+    private static func numericStatistics(_ values: [Double]) -> NumericStatistics {
+        guard !values.isEmpty else {
+            return NumericStatistics(
+                mean: nil,
+                standardDeviation: nil,
+                quartile1: nil,
+                median: nil,
+                quartile3: nil,
+                skewness: nil,
+                zeroFraction: 0,
+                negativeFraction: 0)
+        }
+        var mean = 0.0
+        var sumSquaredDeviation = 0.0
+        for (offset, value) in values.enumerated() {
+            let count = Double(offset + 1)
+            let delta = value - mean
+            mean += delta / count
+            sumSquaredDeviation += delta * (value - mean)
+        }
+        let variance = max(0, sumSquaredDeviation / Double(values.count))
+        let standardDeviation = variance.squareRoot()
+        let skewness: Double? = {
+            guard values.count >= 3, standardDeviation > 0 else { return nil }
+            let thirdMoment = values.reduce(0.0) {
+                $0 + pow(($1 - mean) / standardDeviation, 3)
+            } / Double(values.count)
+            return thirdMoment.isFinite ? thirdMoment : nil
+        }()
+        let sorted = values.sorted()
+        return NumericStatistics(
+            mean: mean,
+            standardDeviation: standardDeviation,
+            quartile1: quantile(sorted, probability: 0.25),
+            median: quantile(sorted, probability: 0.5),
+            quartile3: quantile(sorted, probability: 0.75),
+            skewness: skewness,
+            zeroFraction: Double(values.lazy.filter { $0 == 0 }.count) / Double(values.count),
+            negativeFraction: Double(values.lazy.filter { $0 < 0 }.count)
+                / Double(values.count))
+    }
+
+    private static func quantile(
+        _ sorted: [Double],
+        probability: Double
+    ) -> Double? {
+        guard let first = sorted.first else { return nil }
+        guard sorted.count > 1 else { return first }
+        let position = probability * Double(sorted.count - 1)
+        let lower = Int(position.rounded(.down))
+        let upper = Int(position.rounded(.up))
+        guard lower != upper else { return sorted[lower] }
+        let fraction = position - Double(lower)
+        return sorted[lower] + (sorted[upper] - sorted[lower]) * fraction
+    }
+
+    private static func entropy(
+        _ frequencies: [AutoChartValueIdentity: Int]
+    ) -> Double? {
+        let count = frequencies.values.reduce(0, +)
+        guard count > 0, frequencies.count > 1 else { return nil }
+        return frequencies.values.reduce(0.0) { result, frequency in
+            let probability = Double(frequency) / Double(count)
+            return result - probability * log2(probability)
+        }
+    }
+
+    private static func temporalRegularity(
+        _ dates: [Date]
+    ) -> (modalGap: TimeInterval?, irregularGapCount: Int) {
+        let ordered = dates.sorted()
+        guard ordered.count > 1 else { return (nil, 0) }
+        let gaps = zip(ordered, ordered.dropFirst()).compactMap { earlier, later in
+            let gap = later.timeIntervalSince(earlier)
+            return gap > 0 && gap.isFinite ? gap : nil
+        }
+        guard !gaps.isEmpty else { return (nil, 0) }
+        let frequencies = Dictionary(grouping: gaps, by: { $0 }).mapValues(\.count)
+        let modal = frequencies.keys.sorted().max { left, right in
+            let leftCount = frequencies[left] ?? 0
+            let rightCount = frequencies[right] ?? 0
+            return leftCount == rightCount ? left > right : leftCount < rightCount
+        }
+        guard let modal else { return (nil, 0) }
+        return (modal, gaps.lazy.filter { $0 != modal }.count)
     }
 
     /// Whether ``identity(_:semanticType:)`` ignores this semantic type, so the
