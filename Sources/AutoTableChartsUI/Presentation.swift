@@ -280,6 +280,7 @@ public struct AutoChartPresentedChart<RowID: Hashable & Sendable>: Sendable {
     package let facetPanels: [AutoChartFacetPanel]
     package let sharedXCategoryDomain: [String]
     package let kpi: AutoChartPresentedKPI?
+    let audioGraphDescriptor: AutoChartAudioGraphDescriptor?
     package let formatters: AutoChartFormatters
     package let textResolver: AutoChartTextResolver
     let requestID: AutoChartPresentationRequestID
@@ -297,6 +298,7 @@ public struct AutoChartPresentedChart<RowID: Hashable & Sendable>: Sendable {
         facetPanels: [AutoChartFacetPanel],
         sharedXCategoryDomain: [String],
         kpi: AutoChartPresentedKPI?,
+        audioGraphDescriptor: AutoChartAudioGraphDescriptor?,
         formatters: AutoChartFormatters,
         textResolver: AutoChartTextResolver,
         requestID: AutoChartPresentationRequestID
@@ -311,6 +313,7 @@ public struct AutoChartPresentedChart<RowID: Hashable & Sendable>: Sendable {
         self.facetPanels = facetPanels
         self.sharedXCategoryDomain = sharedXCategoryDomain
         self.kpi = kpi
+        self.audioGraphDescriptor = audioGraphDescriptor
         self.formatters = formatters
         self.textResolver = textResolver
         self.requestID = requestID
@@ -332,6 +335,7 @@ private struct AutoChartPresentationPayload: Sendable {
     let facetPanels: [AutoChartFacetPanel]
     let sharedXCategoryDomain: [String]
     let kpi: AutoChartPresentedKPI?
+    let audioGraphDescriptor: AutoChartAudioGraphDescriptor?
 }
 
 /// Thread-safe presenter memoized by prepared-chart and presentation-context identity.
@@ -439,13 +443,31 @@ public final class AutoChartPresenter: @unchecked Sendable {
             using: textResolver,
             formatters: formatters)
         try checkingCancellation()
+        let usesDeclaredOrder = specification.sort == .source
+        let xDeclaredRanks = usesDeclaredOrder
+            ? declaredCategoryRanks(for: specification.encoding.x.flatMap {
+                core.table.profiles[$0]
+            }) : [:]
+        let yDeclaredRanks = usesDeclaredOrder
+            ? declaredCategoryRanks(for: specification.encoding.y.flatMap {
+                core.table.profiles[$0]
+            }) : [:]
+        let seriesDeclaredRanks = declaredCategoryRanks(
+            for: specification.encoding.series.flatMap {
+                core.table.profiles[$0]
+            })
+        let facetDeclaredRanks = declaredCategoryRanks(
+            for: specification.encoding.facet.flatMap {
+                core.table.profiles[$0]
+            })
         let renderedData: [AutoChartDatum]
         if specification.family == .boxPlot {
             renderedData = orderedBoxPlotData(
                 core.data,
                 labels: resolved.xDisplayLabels,
                 fallback: resolved.missingValue,
-                locale: formatters.locale)
+                locale: formatters.locale,
+                declaredRanks: xDeclaredRanks)
         } else {
             renderedData = orderedPresentedData(
                 core.data,
@@ -453,7 +475,10 @@ public final class AutoChartPresenter: @unchecked Sendable {
                 xLabels: resolved.xDisplayLabels,
                 yLabels: resolved.yDisplayLabels,
                 missingValue: resolved.missingValue,
-                locale: formatters.locale)
+                locale: formatters.locale,
+                xDeclaredRanks: xDeclaredRanks,
+                yDeclaredRanks: yDeclaredRanks,
+                seriesDeclaredRanks: seriesDeclaredRanks)
         }
         try checkingCancellation()
         let sharedXCategoryDomain = core.presentation.usesSharedXCategoryDomain
@@ -467,7 +492,8 @@ public final class AutoChartPresenter: @unchecked Sendable {
                 in: renderedData,
                 labels: resolved.facetDisplayLabels,
                 fallback: resolved.missingFacet,
-                locale: formatters.locale)
+                locale: formatters.locale,
+                declaredRanks: facetDeclaredRanks)
             : []
         try checkingCancellation()
         let kpi: AutoChartPresentedKPI?
@@ -500,6 +526,13 @@ public final class AutoChartPresenter: @unchecked Sendable {
         let title = chart.recommendation.specification.title.isEmpty
             ? textResolver(chart.recommendation.specification.family.localizationMessage)
             : chart.recommendation.specification.title
+        let audioGraphDescriptor = makeAutoChartAudioGraphDescriptor(
+            preparedChart: chart,
+            renderedData: renderedData,
+            resolved: resolved,
+            displayTitle: title,
+            formatters: formatters,
+            textResolver: textResolver)
         let proposed = AutoChartPresentationPayload(
             title: title,
             diagnostics: chart.diagnostics,
@@ -508,7 +541,8 @@ public final class AutoChartPresenter: @unchecked Sendable {
             renderedData: renderedData,
             facetPanels: facetPanels,
             sharedXCategoryDomain: sharedXCategoryDomain,
-            kpi: kpi)
+            kpi: kpi,
+            audioGraphDescriptor: audioGraphDescriptor)
         let payload = lock.withLock {
             if let cached = cachedPayload(for: requestID) { return cached }
             guard maximumEntries > 0 else { return proposed }
@@ -569,6 +603,7 @@ public final class AutoChartPresenter: @unchecked Sendable {
             facetPanels: payload.facetPanels,
             sharedXCategoryDomain: payload.sharedXCategoryDomain,
             kpi: payload.kpi,
+            audioGraphDescriptor: payload.audioGraphDescriptor,
             formatters: formatters,
             textResolver: textResolver,
             requestID: requestID)

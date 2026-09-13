@@ -2409,6 +2409,32 @@ private let date = AutoChartColumn(
 }
 
 @Suite struct ProfilingTests {
+    @Test func quantilesRemainFiniteAcrossOppositeExtremeValues() throws {
+        let median = try #require(
+            AutoChartProfiler.quantile([-1e308, 1e308], probability: 0.5))
+        #expect(median.isFinite)
+        #expect(median == 0)
+    }
+
+    @Test func ordinaryCalendarAndJitteredTemporalGapsAreRegular() throws {
+        let monthly = try [
+            Date("2026-01-01T00:00:00Z", strategy: .iso8601),
+            Date("2026-02-01T00:00:00Z", strategy: .iso8601),
+            Date("2026-03-01T00:00:00Z", strategy: .iso8601),
+            Date("2026-04-01T00:00:00Z", strategy: .iso8601),
+        ]
+        #expect(AutoChartProfiler.temporalRegularity(monthly).irregularGapCount == 0)
+
+        let start = try Date("2026-01-01T00:00:00Z", strategy: .iso8601)
+        let jittered = [
+            start,
+            start.addingTimeInterval(86_400),
+            start.addingTimeInterval(172_800.001),
+            start.addingTimeInterval(259_200),
+        ]
+        #expect(AutoChartProfiler.temporalRegularity(jittered).irregularGapCount == 0)
+    }
+
     @Test func secondOrderProfilesAreDeterministicAndBounded() throws {
         let numeric = AutoChartColumn(
             id: "numeric", name: "numeric",
@@ -3030,6 +3056,130 @@ private let date = AutoChartColumn(
             AutoChartRecommendationEngine.validate(
                 specification: safeSpecification,
                 for: safe).isValid)
+    }
+
+    @Test func grainCodingNormalizesDuplicatesAndStrictnessUsesRelationships() throws {
+        let property: AutoChartEntityID = "property"
+        let fund: AutoChartEntityID = "fund"
+        let tenant: AutoChartEntityID = "tenant"
+        let decoded = try JSONDecoder().decode(
+            AutoChartGrain.self,
+            from: Data(#"{"entities":["property","property"]}"#.utf8))
+        #expect(decoded == AutoChartGrain(entity: property))
+        #expect(Set([decoded, AutoChartGrain(entity: property)]).count == 1)
+
+        let model = AutoChartSemanticModel(
+            relationships: [.init(one: fund, many: property)])
+        #expect(
+            !model.isStrictlyFiner(
+                AutoChartGrain([property]),
+                than: AutoChartGrain([fund, property])))
+        #expect(
+            model.isStrictlyFiner(
+                AutoChartGrain([property]),
+                than: AutoChartGrain([fund])))
+        #expect(
+            !model.isStrictlyFiner(
+                AutoChartGrain([property, tenant]),
+                than: AutoChartGrain([tenant, property])))
+    }
+
+    @Test func fanOutUsesRowGrainAndSkipsDuplicateInvariantAggregations() {
+        let fund: AutoChartEntityID = "fund"
+        let property: AutoChartEntityID = "property"
+        let lease: AutoChartEntityID = "lease"
+        let model = AutoChartSemanticModel(
+            relationships: [
+                .init(one: fund, many: property),
+                .init(one: property, many: lease),
+            ])
+        let fundName = AutoChartColumn(
+            id: "fund", name: "fund",
+            provenance: .init(sourceGrain: .init(entity: fund)),
+            semantics: .dimension(semanticType: .nominal))
+        let leaseType = AutoChartColumn(
+            id: "lease", name: "lease_type",
+            provenance: .init(sourceGrain: .init(entity: lease)),
+            semantics: .dimension(semanticType: .nominal))
+        let propertyValue = AutoChartColumn(
+            id: "value", name: "property_value",
+            provenance: .init(sourceGrain: .init(entity: property)),
+            semantics: .measure(
+                semantics: .init(source: .rowLevel, rollup: .additive)))
+        let minimumValue = AutoChartColumn(
+            id: "minimum", name: "minimum_value",
+            provenance: .init(sourceGrain: .init(entity: property)),
+            semantics: .measure(
+                semantics: .init(source: .rowLevel, rollup: .safe(.minimum))))
+        let metadata = AutoChartTableMetadata(
+            rowGrain: .init(entity: lease), semanticModel: model)
+        let input = table(
+            columns: [fundName, leaseType, propertyValue, minimumValue],
+            rows: (0..<6).map { offset in
+                [.text("Core"), .text(offset.isMultiple(of: 2) ? "A" : "B"),
+                 .double(100), .double(Double(offset + 1))]
+            },
+            metadata: metadata)
+
+        let sum = AutoChartRecommendationEngine.validate(
+            specification: .bar(
+                category: fundName.id, measure: propertyValue.id, aggregation: .sum),
+            for: input)
+        #expect(sum.issues.contains { $0.messageValue.code == .fanOutRisk })
+
+        let box = AutoChartRecommendationEngine.validate(
+            specification: .boxPlot(measure: propertyValue.id),
+            for: input)
+        #expect(box.issues.contains { $0.messageValue.code == .fanOutRisk })
+
+        let minimum = AutoChartRecommendationEngine.validate(
+            specification: .bar(
+                category: fundName.id, measure: minimumValue.id,
+                aggregation: .minimum),
+            for: input)
+        #expect(!minimum.issues.contains { $0.messageValue.code == .fanOutRisk })
+
+        let heatmap = AutoChartRecommendationEngine.validate(
+            specification: .heatmap(x: fundName.id, y: leaseType.id),
+            for: input)
+        #expect(!heatmap.issues.contains { $0.messageValue.code == .fanOutRisk })
+    }
+
+    @Test func histogramRecommendationClampsAnUnrepresentableBinEstimate() throws {
+        let input = table(
+            columns: [measure],
+            rows: [0, 0, 0, 1e-6, 1e-6, 1e-6, 1e-6, 1e15].map {
+                [.double($0)]
+            })
+        let histogram = try #require(
+            AutoChartRecommendationEngine.recommendations(
+                for: input,
+                options: .init(maximumRecommendations: 12))
+                .candidates.first { $0.specification.family == .histogram })
+        #expect(histogram.specification.binCount == 20)
+    }
+
+    @Test func groupedBoxPlotSignalUsesDisplayedGroupQuartiles() throws {
+        let firstRows: [[AutoChartValue]] = [0, 1, 2, 3, 100].map {
+            [.text("A"), .double(Double($0))]
+        }
+        let secondRows: [[AutoChartValue]] = [1_000, 1_001, 1_002, 1_003, 1_100].map {
+            [.text("B"), .double(Double($0))]
+        }
+        let rows = firstRows + secondRows
+        let groupedBox = try #require(
+            AutoChartRecommendationEngine.recommendations(
+                for: table(columns: [category, measure], rows: rows),
+                options: .init(maximumRecommendations: 12))
+                .candidates.first {
+                    $0.specification.family == .boxPlot
+                        && $0.specification.encoding.x == category.id
+                })
+        #expect((groupedBox.scoreBreakdown?.signal ?? 0) > 0)
+        #expect(
+            groupedBox.rationale.contains {
+                $0.defaultText.contains("displayed group's 1.5-IQR fences")
+            })
     }
 
     @Test func grainAwareValidationRejectsChasmMeasurePairs() {
@@ -8006,6 +8156,74 @@ private let date = AutoChartColumn(
         #expect(ordered.map(\.id) == ["real", "missing"])
         #expect(displayValues == ["November", "Zulu"])
         #expect(!displayValues.contains("all"))
+    }
+
+    @Test func declaredOrdersReachBoxPlotsHeatmapsFacetsAndSeries() {
+        let alpha = AutoChartDatum(
+            id: "alpha", sourceRowIDs: [0],
+            xIdentity: "text:5:Alpha", xLabel: "Alpha",
+            yIdentity: "text:3:Low", yLabel: "Low",
+            seriesIdentity: "text:6:Actual", series: "Actual", median: 1)
+        let zulu = AutoChartDatum(
+            id: "zulu", sourceRowIDs: [1],
+            xIdentity: "text:4:Zulu", xLabel: "Zulu",
+            yIdentity: "text:4:High", yLabel: "High",
+            seriesIdentity: "text:4:Plan", series: "Plan", median: 2)
+        let xRanks = ["text:4:Zulu": 0, "text:5:Alpha": 1]
+        let yRanks = ["text:4:High": 0, "text:3:Low": 1]
+
+        #expect(
+            orderedBoxPlotData(
+                [alpha, zulu], labels: [:], fallback: "Missing",
+                locale: Locale(identifier: "en_US"), declaredRanks: xRanks)
+                .map(\.id) == ["zulu", "alpha"])
+
+        let heatmap = orderedPresentedData(
+            [alpha, zulu],
+            specification: .heatmap(x: "x", y: "y"),
+            xLabels: [:], yLabels: [:], missingValue: "Missing",
+            locale: Locale(identifier: "en_US"),
+            xDeclaredRanks: xRanks, yDeclaredRanks: yRanks)
+        #expect(heatmap.map(\.id) == ["zulu", "alpha"])
+
+        let facets = [
+            AutoChartDatum(
+                id: "a", sourceRowIDs: [0], yNumber: 1,
+                facetIdentity: "text:5:Alpha", facet: "Alpha"),
+            AutoChartDatum(
+                id: "z", sourceRowIDs: [1], yNumber: 2,
+                facetIdentity: "text:4:Zulu", facet: "Zulu"),
+        ]
+        #expect(
+            orderedFacetPanels(
+                in: facets, labels: [:], fallback: "Missing",
+                locale: Locale(identifier: "en_US"), declaredRanks: xRanks)
+                .map(\.key) == ["text:4:Zulu", "text:5:Alpha"])
+
+        let sameCategory = [
+            AutoChartDatum(
+                id: "actual", sourceRowIDs: [0],
+                xIdentity: "text:1:A", xLabel: "A",
+                yNumber: 1,
+                seriesIdentity: "text:6:Actual", series: "Actual"),
+            AutoChartDatum(
+                id: "plan", sourceRowIDs: [1],
+                xIdentity: "text:1:A", xLabel: "A",
+                yNumber: 2,
+                seriesIdentity: "text:4:Plan", series: "Plan"),
+        ]
+        let grouped = AutoChartSpecification(
+            family: .groupedBar,
+            encoding: .init(x: "x", y: "value", series: "series"),
+            aggregation: .sum,
+            sort: .source)
+        #expect(
+            orderedPresentedData(
+                sameCategory, specification: grouped,
+                xLabels: [:], yLabels: [:], missingValue: "Missing",
+                locale: Locale(identifier: "en_US"),
+                seriesDeclaredRanks: ["text:4:Plan": 0, "text:6:Actual": 1])
+                .map(\.id) == ["plan", "actual"])
     }
 
     @Test func boxPlotOrderingUsesLocaleAwareCollation() {

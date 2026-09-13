@@ -1341,7 +1341,7 @@ public actor AutoChartAnalyzer {
             options: catalogOptions,
             constraints: constraints)
         try Task.checkCancellation()
-        let recommendations = set.chartRecommendations
+        let recommendations = set.catalogedRecommendations
         let outcome: AutoChartRecommendationOutcome
         if recommendations.isEmpty {
             let reason = set.fallbackReason ?? "No safe chart can represent this result."
@@ -1357,9 +1357,19 @@ public actor AutoChartAnalyzer {
             let featuredLimit = min(
                 options.maximumRecommendations,
                 AutoChartRecommendationCatalog.maximumFeaturedCount)
+            let catalogIDs = Set(recommendations.map(\.id))
+            var featured = set.chartRecommendations.filter {
+                catalogIDs.contains($0.id)
+            }
+            for recommendation in recommendations
+            where featured.count < featuredLimit
+                && !featured.contains(where: { $0.id == recommendation.id })
+            {
+                featured.append(recommendation)
+            }
             outcome = .charts(
                 AutoChartRecommendationCatalog(
-                    featured: Array(recommendations.prefix(featuredLimit)),
+                    featured: Array(featured.prefix(featuredLimit)),
                     cataloged: recommendations))
         }
         try Task.checkCancellation()
