@@ -109,6 +109,50 @@ private enum AutoChartViewContent<RowID: Hashable & Sendable>: Sendable {
     case fallback(AutoChartFallback)
 }
 
+struct AutoChartViewPresentationInputs {
+    let context: AutoChartPresentationContext
+    let formatters: AutoChartFormatters
+    let textResolver: AutoChartTextResolver
+
+    static func resolve(
+        explicitContext: AutoChartPresentationContext?,
+        environmentContext: AutoChartPresentationContext?,
+        explicitFormatters: AutoChartFormatters?,
+        environmentFormatters: AutoChartFormatters?,
+        explicitTextResolver: AutoChartTextResolver?,
+        environmentTextResolver: AutoChartTextResolver?
+    ) -> Self {
+        let suppliedContext = explicitContext ?? environmentContext
+        let suppliedFormatters = explicitFormatters ?? environmentFormatters
+        let formatters: AutoChartFormatters
+        let context: AutoChartPresentationContext
+        switch (suppliedContext, suppliedFormatters) {
+        case (let suppliedContext?, let suppliedFormatters?):
+            context = suppliedContext
+            formatters = suppliedFormatters
+        case (let suppliedContext?, nil):
+            context = suppliedContext
+            formatters = AutoChartFormatters(
+                locale: suppliedContext.locale,
+                timeZone: suppliedContext.timeZone)
+        case (nil, let suppliedFormatters?):
+            formatters = suppliedFormatters
+            context = AutoChartPresentationContext(
+                locale: suppliedFormatters.locale,
+                timeZone: suppliedFormatters.timeZone)
+        case (nil, nil):
+            formatters = AutoChartFormatters()
+            context = AutoChartPresentationContext(
+                locale: formatters.locale,
+                timeZone: formatters.timeZone)
+        }
+        return Self(
+            context: context,
+            formatters: formatters,
+            textResolver: explicitTextResolver ?? environmentTextResolver ?? .default)
+    }
+}
+
 private struct AutoChartDeferredPresentationView<RowID: Hashable & Sendable>: View {
     let preparedChart: AutoChartPreparedChart<RowID>
     let context: AutoChartPresentationContext
@@ -244,22 +288,24 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     @Environment(\.autoChartFormatters) private var environmentFormatters
     @Environment(\.autoChartTextResolver) private var environmentTextResolver
 
+    private func effectivePresentationInputs(
+        explicit: AutoChartPresentationContext?
+    ) -> AutoChartViewPresentationInputs {
+        AutoChartViewPresentationInputs.resolve(
+            explicitContext: explicit,
+            environmentContext: environmentPresentationContext,
+            explicitFormatters: formatters,
+            environmentFormatters: environmentFormatters,
+            explicitTextResolver: textResolver,
+            environmentTextResolver: environmentTextResolver)
+    }
+
     private var effectiveFormatters: AutoChartFormatters {
-        formatters ?? environmentFormatters ?? .init()
+        effectivePresentationInputs(explicit: nil).formatters
     }
 
     private var effectiveTextResolver: AutoChartTextResolver {
-        textResolver ?? environmentTextResolver ?? .default
-    }
-
-    private func effectivePresentationContext(
-        explicit: AutoChartPresentationContext?
-    ) -> AutoChartPresentationContext {
-        explicit
-            ?? environmentPresentationContext
-            ?? AutoChartPresentationContext(
-                locale: effectiveFormatters.locale,
-                timeZone: effectiveFormatters.timeZone)
+        effectivePresentationInputs(explicit: nil).textResolver
     }
 
     /// Defers presentation until the view participates in a SwiftUI lifecycle.
@@ -462,14 +508,15 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     public var body: some View {
         switch content {
         case .deferred(let preparedChart, let explicitContext):
+            let inputs = effectivePresentationInputs(explicit: explicitContext)
             AutoChartDeferredPresentationView(
                 preparedChart: preparedChart,
-                context: effectivePresentationContext(explicit: explicitContext),
+                context: inputs.context,
                 analysisID: analysisID,
                 selection: $selection,
                 presentation: presentation,
-                formatters: effectiveFormatters,
-                textResolver: effectiveTextResolver)
+                formatters: inputs.formatters,
+                textResolver: inputs.textResolver)
         case .fallback(let fallback):
             VStack(alignment: .leading, spacing: 10) {
                 ContentUnavailableView(

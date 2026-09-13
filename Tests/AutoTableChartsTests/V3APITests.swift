@@ -1574,6 +1574,39 @@ private final class ProgressRecorder: @unchecked Sendable {
             formatters: formatters)
         #expect(calls.value == 0)
     }
+
+    @Test func directViewFallbackFormattersFollowTheEffectiveContext() throws {
+        let timeZone = try #require(TimeZone(identifier: "Pacific/Honolulu"))
+        let explicitContext = AutoChartPresentationContext(
+            identity: "explicit",
+            locale: Locale(identifier: "fr_FR"),
+            timeZone: timeZone)
+        let explicit = AutoChartViewPresentationInputs.resolve(
+            explicitContext: explicitContext,
+            environmentContext: nil,
+            explicitFormatters: nil,
+            environmentFormatters: nil,
+            explicitTextResolver: nil,
+            environmentTextResolver: nil)
+        #expect(explicit.context == explicitContext)
+        #expect(explicit.formatters.locale == explicitContext.locale)
+        #expect(explicit.formatters.timeZone == explicitContext.timeZone)
+
+        let environmentContext = AutoChartPresentationContext(
+            identity: "environment",
+            locale: Locale(identifier: "de_DE"),
+            timeZone: .gmt)
+        let inherited = AutoChartViewPresentationInputs.resolve(
+            explicitContext: nil,
+            environmentContext: environmentContext,
+            explicitFormatters: nil,
+            environmentFormatters: nil,
+            explicitTextResolver: nil,
+            environmentTextResolver: nil)
+        #expect(inherited.context == environmentContext)
+        #expect(inherited.formatters.locale == environmentContext.locale)
+        #expect(inherited.formatters.timeZone == environmentContext.timeZone)
+    }
 }
 
 @MainActor
