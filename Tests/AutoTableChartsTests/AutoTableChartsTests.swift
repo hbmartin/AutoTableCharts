@@ -2927,13 +2927,21 @@ private let date = AutoChartColumn(
             id: "area", name: "area",
             hints: .init(semanticType: .quantitative, role: .measure))
         let rows: [[AutoChartValue]] = (0..<6).map { offset in
-            [
-                .text("2026-0\(offset + 1)-01"),
-                .text(offset.isMultiple(of: 2) ? "West" : "East"),
-                .text(offset.isMultiple(of: 3) ? "A" : "B"),
-                .double(Double(offset + 1)),
-                .double(Double(offset + 2)),
-                .double(Double(offset + 3)),
+            let dateValue = AutoChartValue.text("2026-0\(offset + 1)-01")
+            let regionValue = AutoChartValue.text(
+                offset.isMultiple(of: 2) ? "West" : "East")
+            let productValue = AutoChartValue.text(
+                offset.isMultiple(of: 3) ? "A" : "B")
+            let primaryValue = AutoChartValue.double(Double(offset + 1))
+            let secondaryValue = AutoChartValue.double(Double(offset + 2))
+            let sizeValue = AutoChartValue.double(Double(offset + 3))
+            return [
+                dateValue,
+                regionValue,
+                productValue,
+                primaryValue,
+                secondaryValue,
+                sizeValue,
             ]
         }
         let result = AutoChartRecommendationEngine.recommendations(
