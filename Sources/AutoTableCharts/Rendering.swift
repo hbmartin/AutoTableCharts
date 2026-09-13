@@ -310,6 +310,41 @@ private func categoryPrecedes(
     return lhs.sourceOffset < rhs.sourceOffset
 }
 
+private func categoryPrecedes(
+    _ lhs: AutoChartCategorySortKey,
+    _ rhs: AutoChartCategorySortKey,
+    declaredRanks: [String: Int],
+    locale: Locale? = nil
+) -> Bool {
+    let leftRank = declaredRanks[lhs.identity]
+    let rightRank = declaredRanks[rhs.identity]
+    switch (leftRank, rightRank) {
+    case (.some(let left), .some(let right)) where left != right:
+        return left < right
+    case (.some, nil):
+        return true
+    case (nil, .some):
+        return false
+    default:
+        return categoryPrecedes(lhs, rhs, locale: locale)
+    }
+}
+
+package func declaredCategoryRanks(
+    for profile: AutoChartColumnProfile?
+) -> [String: Int] {
+    guard let profile, let order = profile.column.categoryOrder else { return [:] }
+    var ranks: [String: Int] = [:]
+    for value in order {
+        guard let identity = AutoChartProfiler.identity(
+            value, semanticType: profile.semanticType).stringValue,
+            ranks[identity] == nil
+        else { continue }
+        ranks[identity] = ranks.count
+    }
+    return ranks
+}
+
 private func requiresContinuousXOrdering(
     family: AutoChartFamily,
     semanticType: AutoChartSemanticType?
@@ -1157,13 +1192,7 @@ package enum AutoChartDataPreparation {
                 xLabel = nonMissingCategoryLabel(for: groupIdentity)
             }
             func quantile(_ p: Double) -> Double {
-                guard sortedValues.count > 1 else { return sortedValues[0] }
-                let position = p * Double(sortedValues.count - 1)
-                let lower = Int(position.rounded(.down))
-                let upper = Int(position.rounded(.up))
-                if lower == upper { return sortedValues[lower] }
-                let fraction = position - Double(lower)
-                return sortedValues[lower] * (1 - fraction) + sortedValues[upper] * fraction
+                AutoChartProfiler.quantile(sortedValues, probability: p) ?? sortedValues[0]
             }
             return AutoChartDatum(
                 id: "box-\(identity ?? "missing")",
@@ -1267,21 +1296,10 @@ package enum AutoChartDataPreparation {
             }
         }
         if specification.sort == .source,
-            let categoryOrder = specification.encoding.x.flatMap({
-                profiles[$0]?.column.categoryOrder
-            }),
-            !categoryOrder.isEmpty
+            let x = specification.encoding.x
         {
-            let orderedIdentities = categoryOrder.compactMap {
-                AutoChartProfiler.identity(
-                    $0,
-                    semanticType: xSemanticType).stringValue
-            }
-            var ranks: [String: Int] = [:]
-            for (offset, identity) in orderedIdentities.enumerated()
-            where ranks[identity] == nil {
-                ranks[identity] = offset
-            }
+            let ranks = declaredCategoryRanks(for: profiles[x])
+            guard !ranks.isEmpty else { return data }
             return data.enumerated().sorted { lhs, rhs in
                 let leftRank = lhs.element.xIdentity.flatMap { ranks[$0] }
                 let rightRank = rhs.element.xIdentity.flatMap { ranks[$0] }
@@ -1424,7 +1442,8 @@ package func orderedBoxPlotData(
     _ data: [AutoChartDatum],
     labels: [String: String],
     fallback: String,
-    locale: Locale
+    locale: Locale,
+    declaredRanks: [String: Int] = [:]
 ) -> [AutoChartDatum] {
     data.enumerated().map { offset, datum in
         (
@@ -1439,7 +1458,10 @@ package func orderedBoxPlotData(
                 sourceOffset: offset)
         )
     }.sorted {
-        categoryPrecedes($0.sortKey, $1.sortKey, locale: locale)
+        categoryPrecedes(
+            $0.sortKey, $1.sortKey,
+            declaredRanks: declaredRanks,
+            locale: locale)
     }.map(\.datum)
 }
 
@@ -1453,7 +1475,8 @@ package func orderedFacetPanels(
     in data: [AutoChartDatum],
     labels: [String: String],
     fallback: String,
-    locale: Locale
+    locale: Locale,
+    declaredRanks: [String: Int] = [:]
 ) -> [AutoChartFacetPanel] {
     let facets = Dictionary(grouping: data, by: \.facetIdentity)
     return facets.map { key, panelData in
@@ -1475,6 +1498,7 @@ package func orderedFacetPanels(
                 displayValue: rhs.element.displayValue,
                 identity: rhs.element.key ?? "",
                 sourceOffset: rhs.offset),
+            declaredRanks: declaredRanks,
             locale: locale)
     }.map(\.element)
 }
@@ -1488,7 +1512,10 @@ package func orderedPresentedData(
     xLabels: [String: String],
     yLabels: [String: String],
     missingValue: String,
-    locale: Locale
+    locale: Locale,
+    xDeclaredRanks: [String: Int] = [:],
+    yDeclaredRanks: [String: Int] = [:],
+    seriesDeclaredRanks: [String: Int] = [:]
 ) -> [AutoChartDatum] {
     func key(
         identity: String?,
@@ -1523,9 +1550,51 @@ package func orderedPresentedData(
             )
         }.sorted { lhs, rhs in
             if lhs.x.displayValue != rhs.x.displayValue || lhs.x.identity != rhs.x.identity {
-                return categoryPrecedes(lhs.x, rhs.x, locale: locale)
+                return categoryPrecedes(
+                    lhs.x, rhs.x,
+                    declaredRanks: xDeclaredRanks,
+                    locale: locale)
             }
-            return categoryPrecedes(lhs.y, rhs.y, locale: locale)
+            return categoryPrecedes(
+                lhs.y, rhs.y,
+                declaredRanks: yDeclaredRanks,
+                locale: locale)
+        }.map(\.datum)
+    }
+
+    if specification.sort == .source,
+        !xDeclaredRanks.isEmpty || !seriesDeclaredRanks.isEmpty
+    {
+        return data.enumerated().map { offset, datum in
+            (
+                datum: datum,
+                x: key(
+                    identity: datum.xIdentity,
+                    preparedLabel: datum.xLabel,
+                    labels: xLabels,
+                    offset: offset),
+                series: AutoChartCategorySortKey(
+                    displayValue: datum.series ?? "",
+                    identity: datum.seriesIdentity ?? "",
+                    sourceOffset: offset)
+            )
+        }.sorted { lhs, rhs in
+            if lhs.x.identity != rhs.x.identity {
+                if xDeclaredRanks.isEmpty {
+                    return lhs.x.sourceOffset < rhs.x.sourceOffset
+                }
+                return categoryPrecedes(
+                    lhs.x, rhs.x,
+                    declaredRanks: xDeclaredRanks,
+                    locale: locale)
+            }
+            if seriesDeclaredRanks.isEmpty {
+                return lhs.series.sourceOffset < rhs.series.sourceOffset
+            }
+            return categoryPrecedes(
+                lhs.series, rhs.series,
+                declaredRanks: seriesDeclaredRanks,
+                locale: locale)
         }.map(\.datum)
     }
 
@@ -1548,6 +1617,7 @@ fileprivate struct AutoChartGeneratedTextRequirements: Sendable {
     var resolvesYTitle: Bool
     var resolvesSeriesTitle: Bool
     var resolvesFacetTitle: Bool
+    var resolvesSizeTitle: Bool
     var countTitle: AutoChartMessage?
     var medianTitle: AutoChartMessage?
     var rangeStartTitle: AutoChartMessage?
@@ -1630,6 +1700,8 @@ package struct AutoChartRenderPresentation: Sendable {
         category: .interface, code: .seriesTitle, defaultText: "Series")
     package static let defaultFacetTitleMessage = AutoChartMessage(
         category: .interface, code: .facetTitle, defaultText: "Facet")
+    package static let defaultSizeTitleMessage = AutoChartMessage(
+        category: .interface, code: .sizeTitle, defaultText: "Size")
     package static let rangeStartTitleMessage = AutoChartMessage(
         category: .interface, code: .rangeStartTitle, defaultText: "Start")
     package static let rangeEndTitleMessage = AutoChartMessage(
@@ -1659,6 +1731,8 @@ package struct AutoChartRenderPresentation: Sendable {
     package var seriesTitleMessage: AutoChartMessage?
     package var facetTitle: String
     package var facetTitleMessage: AutoChartMessage?
+    package var sizeTitle: String
+    package var sizeTitleMessage: AutoChartMessage?
     package var xSemanticType: AutoChartSemanticType?
     package var usesXIdentityLabels: Bool
     package var usesYIdentityLabels: Bool
@@ -1902,12 +1976,22 @@ package struct AutoChartRenderPresentation: Sendable {
             facetTitle = "Facet"
             facetTitleMessage = Self.defaultFacetTitleMessage
         }
+        if let sourceSizeTitle = specification.encoding.size
+            .flatMap({ snapshot.column($0) }).map(AutoChartProfiler.displayName)
+        {
+            sizeTitle = sourceSizeTitle
+            sizeTitleMessage = nil
+        } else {
+            sizeTitle = "Size"
+            sizeTitleMessage = Self.defaultSizeTitleMessage
+        }
         let generatedTextUsage = specification.family.generatedTextUsage
         generatedTextRequirements = AutoChartGeneratedTextRequirements(
             resolvesXTitle: generatedTextUsage.resolvesXTitle,
             resolvesYTitle: generatedTextUsage.resolvesYTitle,
             resolvesSeriesTitle: specification.encoding.series != nil,
             resolvesFacetTitle: specification.encoding.facet != nil,
+            resolvesSizeTitle: specification.encoding.size != nil,
             countTitle: generatedTextUsage.usesCountTitle
                 ? Self.countTitleMessage : nil,
             medianTitle: generatedTextUsage.usesMedianTitle ? Self.medianTitleMessage : nil,
@@ -2071,6 +2155,7 @@ package struct AutoChartResolvedPresentation: Sendable {
     package var y: String
     package var series: String
     package var facet: String
+    package var size: String
     package var count: String
     package var median: String
     package var rangeStart: String
@@ -2111,6 +2196,9 @@ package struct AutoChartResolvedPresentation: Sendable {
         let resolvedFacet = resolve(
             requirements.resolvesFacetTitle ? presentation.facetTitleMessage : nil,
             fallback: presentation.facetTitle)
+        let resolvedSize = resolve(
+            requirements.resolvesSizeTitle ? presentation.sizeTitleMessage : nil,
+            fallback: presentation.sizeTitle)
         let resolvedCount = resolve(
             requirements.countTitle,
             fallback: AutoChartRenderPresentation.countTitleMessage.defaultText)
@@ -2301,6 +2389,7 @@ package struct AutoChartResolvedPresentation: Sendable {
         y = resolvedY
         series = resolvedSeries
         facet = resolvedFacet
+        size = resolvedSize
         count = resolvedCount
         median = resolvedMedian
         rangeStart = resolvedRangeStart

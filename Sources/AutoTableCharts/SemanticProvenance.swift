@@ -32,6 +32,10 @@ public struct AutoChartSourceColumn: Hashable, Codable, Sendable {
 public struct AutoChartGrain: Hashable, Codable, Sendable {
     public private(set) var entities: [AutoChartEntityID]
 
+    private enum CodingKeys: String, CodingKey {
+        case entities
+    }
+
     public init(_ entities: [AutoChartEntityID]) {
         var seen: Set<AutoChartEntityID> = []
         self.entities = entities.filter { seen.insert($0).inserted }
@@ -39,6 +43,16 @@ public struct AutoChartGrain: Hashable, Codable, Sendable {
 
     public init(entity: AutoChartEntityID) {
         self.init([entity])
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(try container.decode([AutoChartEntityID].self, forKey: .entities))
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(entities, forKey: .entities)
     }
 }
 
@@ -77,40 +91,35 @@ public struct AutoChartSemanticModel: Hashable, Codable, Sendable {
         self.relationships = relationships
     }
 
+    /// Whether `candidate` identifies observations at least as finely as `reference`.
+    ///
+    /// Every reference entity must be present in the candidate or be an ancestor
+    /// of an entity in the candidate. The relation is intentionally non-strict:
+    /// reordered entities and redundant ancestor keys may describe the same grain.
+    public func isAtLeastAsFine(
+        _ candidate: AutoChartGrain,
+        as reference: AutoChartGrain
+    ) -> Bool {
+        guard !candidate.entities.isEmpty, !reference.entities.isEmpty else { return false }
+        for entity in reference.entities {
+            guard candidate.entities.contains(where: {
+                entity == $0 || isAncestor(entity, of: $0)
+            }) else { return false }
+        }
+        return true
+    }
+
     /// Whether `candidate` identifies observations strictly finer than `reference`.
     ///
-    /// A composite grain is finer when it adds an entity key, or when every
-    /// reference entity is the same as or an ancestor of a candidate entity and
-    /// at least one relationship traversal is required.
+    /// Strictness is derived from the non-strict relation in both directions so
+    /// equivalent composite grains do not become finer merely because their entity
+    /// arrays use a different order or include a redundant ancestor key.
     public func isStrictlyFiner(
         _ candidate: AutoChartGrain,
         than reference: AutoChartGrain
     ) -> Bool {
-        guard !candidate.entities.isEmpty, !reference.entities.isEmpty,
-            candidate != reference
-        else { return false }
-
-        let candidateSet = Set(candidate.entities)
-        let referenceSet = Set(reference.entities)
-        if referenceSet.isSubset(of: candidateSet) { return true }
-
-        var traversedRelationship = false
-        for entity in reference.entities {
-            var matched = false
-            for candidateEntity in candidate.entities {
-                if entity == candidateEntity {
-                    matched = true
-                    break
-                }
-                if isAncestor(entity, of: candidateEntity) {
-                    matched = true
-                    traversedRelationship = true
-                    break
-                }
-            }
-            if !matched { return false }
-        }
-        return traversedRelationship
+        isAtLeastAsFine(candidate, as: reference)
+            && !isAtLeastAsFine(reference, as: candidate)
     }
 
     private func isAncestor(

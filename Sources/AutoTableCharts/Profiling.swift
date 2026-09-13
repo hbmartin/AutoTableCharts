@@ -719,7 +719,7 @@ package enum AutoChartProfiler {
                 / Double(values.count))
     }
 
-    private static func quantile(
+    package static func quantile(
         _ sorted: [Double],
         probability: Double
     ) -> Double? {
@@ -730,7 +730,15 @@ package enum AutoChartProfiler {
         let upper = Int(position.rounded(.up))
         guard lower != upper else { return sorted[lower] }
         let fraction = position - Double(lower)
-        return sorted[lower] + (sorted[upper] - sorted[lower]) * fraction
+        let lowerValue = sorted[lower]
+        let upperValue = sorted[upper]
+        // Subtraction can overflow for finite values with opposite signs. A
+        // convex weighted sum avoids that span while same-sign interpolation
+        // retains the more accurate difference form.
+        if lowerValue.sign == upperValue.sign {
+            return lowerValue + (upperValue - lowerValue) * fraction
+        }
+        return lowerValue * (1 - fraction) + upperValue * fraction
     }
 
     private static func entropy(
@@ -738,30 +746,66 @@ package enum AutoChartProfiler {
     ) -> Double? {
         let count = frequencies.values.reduce(0, +)
         guard count > 0, frequencies.count > 1 else { return nil }
-        return frequencies.values.reduce(0.0) { result, frequency in
+        return frequencies.values.sorted().reduce(0.0) { result, frequency in
             let probability = Double(frequency) / Double(count)
             return result - probability * log2(probability)
         }
     }
 
-    private static func temporalRegularity(
+    package static func temporalRegularity(
         _ dates: [Date]
     ) -> (modalGap: TimeInterval?, irregularGapCount: Int) {
-        let ordered = dates.sorted()
+        let ordered = Array(
+            Set(dates.filter { $0.timeIntervalSinceReferenceDate.isFinite })
+        ).sorted()
         guard ordered.count > 1 else { return (nil, 0) }
         let gaps = zip(ordered, ordered.dropFirst()).compactMap { earlier, later in
             let gap = later.timeIntervalSince(earlier)
             return gap > 0 && gap.isFinite ? gap : nil
         }
         guard !gaps.isEmpty else { return (nil, 0) }
-        let frequencies = Dictionary(grouping: gaps, by: { $0 }).mapValues(\.count)
-        let modal = frequencies.keys.sorted().max { left, right in
-            let leftCount = frequencies[left] ?? 0
-            let rightCount = frequencies[right] ?? 0
-            return leftCount == rightCount ? left > right : leftCount < rightCount
+
+        // Calendar months, daylight-saving transitions, and ordinary timestamp
+        // jitter do not produce bit-identical second intervals. Cluster nearby
+        // gaps deterministically while keeping genuinely different cadences apart.
+        struct GapCluster {
+            var gaps: [TimeInterval]
+
+            var representative: TimeInterval {
+                gaps[gaps.count / 2]
+            }
         }
-        guard let modal else { return (nil, 0) }
-        return (modal, gaps.lazy.filter { $0 != modal }.count)
+        func areEquivalent(_ left: TimeInterval, _ right: TimeInterval) -> Bool {
+            let scale = max(abs(left), abs(right))
+            return abs(left - right) <= max(0.001, scale * 0.125)
+        }
+
+        var clusters: [GapCluster] = []
+        for gap in gaps.sorted() {
+            if let index = clusters.indices.last,
+                areEquivalent(clusters[index].representative, gap)
+            {
+                clusters[index].gaps.append(gap)
+            } else {
+                clusters.append(GapCluster(gaps: [gap]))
+            }
+        }
+        guard let modalCluster = clusters.enumerated().max(by: { lhs, rhs in
+            if lhs.element.gaps.count != rhs.element.gaps.count {
+                return lhs.element.gaps.count < rhs.element.gaps.count
+            }
+            return lhs.element.representative > rhs.element.representative
+        })?.element else { return (nil, 0) }
+        return (
+            modalCluster.representative,
+            gaps.count - modalCluster.gaps.count)
+    }
+
+    package static func temporalIrregularityFraction(_ dates: [Date]) -> Double? {
+        let uniqueCount = Set(dates).count
+        guard uniqueCount > 1 else { return nil }
+        let regularity = temporalRegularity(dates)
+        return Double(regularity.irregularGapCount) / Double(uniqueCount - 1)
     }
 
     /// Whether ``identity(_:semanticType:)`` ignores this semantic type, so the

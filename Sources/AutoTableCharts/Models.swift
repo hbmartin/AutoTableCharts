@@ -1909,6 +1909,7 @@ public struct AutoChartMessage: Hashable, Codable, Sendable {
         public static let medianTitle = Self(rawValue: "medianTitle")
         public static let seriesTitle = Self(rawValue: "seriesTitle")
         public static let facetTitle = Self(rawValue: "facetTitle")
+        public static let sizeTitle = Self(rawValue: "sizeTitle")
         public static let rangeStartTitle = Self(rawValue: "rangeStartTitle")
         public static let rangeEndTitle = Self(rawValue: "rangeEndTitle")
         public static let dateTitle = Self(rawValue: "dateTitle")
@@ -2475,6 +2476,7 @@ extension AutoChartRecommendation {
 
 struct AutoChartCandidateResults: Sendable {
     public var recommendations: [AutoChartRecommendation]
+    var catalogedRecommendations: [AutoChartRecommendation]
     var candidates: [AutoChartRecommendation]
     public var fallbackReason: String?
     var decisions: [AutoChartCandidateDecision]
@@ -2482,15 +2484,20 @@ struct AutoChartCandidateResults: Sendable {
     /// Creates a recommendation result.
     ///
     /// - Parameters:
-    ///   - recommendations: Ranked chart or fallback recommendations.
+    ///   - recommendations: The diversity-ranked featured recommendations.
+    ///   - catalogedRecommendations: The score-ranked validated catalog.
+    ///   - candidates: Structurally valid candidates before prepared-domain filtering.
     ///   - fallbackReason: The reason only a table can safely represent the data.
+    ///   - decisions: Optional candidate decision-trace entries.
     public init(
         recommendations: [AutoChartRecommendation],
+        catalogedRecommendations: [AutoChartRecommendation]? = nil,
         candidates: [AutoChartRecommendation]? = nil,
         fallbackReason: String? = nil,
         decisions: [AutoChartCandidateDecision] = []
     ) {
         self.recommendations = recommendations
+        self.catalogedRecommendations = catalogedRecommendations ?? recommendations
         self.candidates = candidates ?? recommendations
         self.fallbackReason = fallbackReason
         self.decisions = decisions

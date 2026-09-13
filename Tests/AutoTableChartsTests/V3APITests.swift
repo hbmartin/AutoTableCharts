@@ -42,6 +42,83 @@ import Accessibility
         #expect(yAxis.valueDescriptionProvider(20) == "$20")
         #expect(descriptor.series.first?.dataPoints.first?.label == "Office, $20")
     }
+
+    @Test func partialSizeValuesSuppressBothAxisAndPointPayloads() throws {
+        let input = AutoChartAudioGraphDescriptor(
+            title: "Bubble",
+            xAxis: .numeric(title: "X", range: 0...1, valueDescription: { String($0) }),
+            yTitle: "Y",
+            yRange: 0...1,
+            yValueDescription: { String($0) },
+            additionalAxis: (
+                title: "Market value",
+                range: 1...2,
+                valueDescription: { String($0) }),
+            series: [
+                .init(
+                    name: "Series",
+                    isContinuous: false,
+                    points: [
+                        .init(x: .number(0), y: 0, label: "Complete", additionalValue: 1),
+                        .init(x: .number(1), y: 1, label: "Missing size", additionalValue: nil),
+                    ])
+            ])
+        let descriptor = input.makeChartDescriptor()
+
+        #expect(descriptor.additionalAxes.isEmpty)
+    }
+
+    @Test func presenterMarksFacetedLineAudioSeriesContinuous() async throws {
+        let request = try AutoChartRequest(table: domainDataset())
+        let analysis = try await AutoChartAnalyzer().analyze(request)
+        let specification = AutoChartSpecification(
+            family: .faceted,
+            encoding: .init(x: "start", y: "value", facet: "category"),
+            facetBaseFamily: .line)
+        let chart = try await analysis.prepare(specification)
+        let descriptor = try #require(
+            AutoChartPresenter().present(chart).audioGraphDescriptor)
+
+        #expect(!descriptor.series.isEmpty)
+        #expect(descriptor.series.allSatisfy { $0.isContinuous })
+    }
+
+    @Test func presenterUsesCountAndDisplayAwareSizeAxisTitles() async throws {
+        let x = AutoChartColumn(id: "x", name: "x", semantics: .measure())
+        let y = AutoChartColumn(id: "y", name: "y", semantics: .measure())
+        let size = AutoChartColumn(
+            id: "size", name: "raw_size", displayName: "Market capitalization",
+            semantics: .measure())
+        let firstCategory = AutoChartColumn(
+            id: "first", name: "first",
+            semantics: .dimension(semanticType: .nominal))
+        let secondCategory = AutoChartColumn(
+            id: "second", name: "second",
+            semantics: .dimension(semanticType: .nominal))
+        let dataset = try AutoChartDataset(
+            columns: [x, y, size, firstCategory, secondCategory],
+            rows: [
+                [.double(1), .double(2), .double(3), .text("A"), .text("One")],
+                [.double(2), .double(4), .double(6), .text("B"), .text("Two")],
+            ],
+            rowIDs: [1, 2])
+        let analysis = try await AutoChartAnalyzer().analyze(
+            try AutoChartRequest(table: dataset))
+
+        let bubble = try await analysis.prepare(
+            AutoChartSpecification(
+                family: .bubble,
+                encoding: .init(x: x.id, y: y.id, size: size.id)))
+        let bubbleDescriptor = try #require(
+            AutoChartPresenter().present(bubble).audioGraphDescriptor)
+        #expect(bubbleDescriptor.additionalAxis?.title == "Market capitalization")
+
+        let heatmap = try await analysis.prepare(
+            .heatmap(x: firstCategory.id, y: secondCategory.id))
+        let heatmapDescriptor = try #require(
+            AutoChartPresenter().present(heatmap).audioGraphDescriptor)
+        #expect(heatmapDescriptor.yTitle == "Count")
+    }
 }
 #endif
 
@@ -892,6 +969,38 @@ private final class ProgressRecorder: @unchecked Sendable {
             })
         #expect(options.count == 50)
         #expect(options.allSatisfy { $0.label.hasPrefix("localized:") })
+    }
+
+    @Test func analyzerCatalogIsScoreOrderedWhileFeaturedRemainsBounded() async throws {
+        let request = try AutoChartRequest(
+            table: wideDomainDataset(),
+            options: .init(maximumRecommendations: 5))
+        let analysis = try await AutoChartAnalyzer().analyze(request)
+        guard case .charts(let catalog) = analysis.outcome else {
+            Issue.record("Expected chart recommendations.")
+            return
+        }
+
+        #expect(catalog.featured.count == 5)
+        #expect(catalog.cataloged.count <= 50)
+        #expect(
+            zip(catalog.cataloged, catalog.cataloged.dropFirst())
+                .allSatisfy { $0.score >= $1.score })
+    }
+
+    @Test func facetedExpansionIsBoundedPerBaseFamily() throws {
+        let dataset = try wideDomainDataset()
+        let maximumColumns = 8
+        let result = AutoChartRecommendationEngine.recommendations(
+            for: dataset,
+            options: .init(
+                maximumRecommendations: 5,
+                maximumCandidateColumns: maximumColumns))
+        let eligibleFacets = result.candidates.filter {
+            $0.specification.family == .faceted
+        }
+
+        #expect(eligibleFacets.count <= maximumColumns * 3 * maximumColumns)
     }
 
     @Test func catalogDecodingReappliesAllCollectionInvariants() throws {
