@@ -28,7 +28,26 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
     /// The resolver currently governing presentation work, including any
     /// environment override applied by ``AutoChartSessionView``.
     package var presentationTextResolver: AutoChartTextResolver {
-        textResolver
+        presentationConfiguration.textResolver
+    }
+
+    private struct PresentationConfiguration {
+        var context = AutoChartPresentationContext()
+        var formatters: AutoChartFormatters?
+        var textResolver = AutoChartTextResolver.default
+
+        func applying(_ overrides: PresentationOverrides) -> Self {
+            Self(
+                context: overrides.context ?? context,
+                formatters: overrides.formatters ?? formatters,
+                textResolver: overrides.textResolver ?? textResolver)
+        }
+    }
+
+    private struct PresentationOverrides {
+        var context: AutoChartPresentationContext?
+        var formatters: AutoChartFormatters?
+        var textResolver: AutoChartTextResolver?
     }
 
     private let cache: AutoChartCache
@@ -36,15 +55,9 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
     private let presenter: AutoChartPresenter
     private var request: AutoChartRequest<RowID>?
     private var strategy: AutoChartPreparationStrategy = .preferredOrPrimary
-    private var presentationContext = AutoChartPresentationContext()
-    private var formatters: AutoChartFormatters?
-    private var textResolver = AutoChartTextResolver.default
-    private var loadedPresentationContext = AutoChartPresentationContext()
-    private var loadedFormatters: AutoChartFormatters?
-    private var loadedTextResolver = AutoChartTextResolver.default
-    private var environmentPresentationContext: AutoChartPresentationContext?
-    private var environmentFormatters: AutoChartFormatters?
-    private var environmentTextResolver: AutoChartTextResolver?
+    private var presentationConfiguration = PresentationConfiguration()
+    private var loadedPresentationConfiguration = PresentationConfiguration()
+    private var environmentPresentationOverrides = PresentationOverrides()
     private var generation: UInt64 = 0
     private var presentationGeneration: UInt64 = 0
     @ObservationIgnored private var task: Task<Void, Never>?
@@ -74,16 +87,15 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         formatters: AutoChartFormatters? = nil,
         textResolver: AutoChartTextResolver = .default
     ) {
-        loadedPresentationContext = presentationContext
-        loadedFormatters = formatters
-        loadedTextResolver = textResolver
+        loadedPresentationConfiguration = PresentationConfiguration(
+            context: presentationContext,
+            formatters: formatters,
+            textResolver: textResolver)
         start(
             request,
             preference: preference,
             preparation: preparation,
-            presentationContext: effectivePresentationContext,
-            formatters: effectiveFormatters,
-            textResolver: effectiveTextResolver,
+            presentationConfiguration: effectivePresentationConfiguration,
             clearsVisibleState: self.request?.id != request.id)
     }
 
@@ -102,9 +114,7 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
             request,
             preference: preference,
             preparation: strategy,
-            presentationContext: presentationContext,
-            formatters: formatters,
-            textResolver: textResolver,
+            presentationConfiguration: presentationConfiguration,
             clearsVisibleState: false)
     }
 
@@ -112,7 +122,7 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
     /// replacing formatter or text-resolver configuration. The current ready
     /// presentation remains visible until its replacement is available.
     public func setPresentationContext(_ context: AutoChartPresentationContext) {
-        loadedPresentationContext = context
+        loadedPresentationConfiguration.context = context
         rebuildEffectivePresentation()
     }
 
@@ -122,8 +132,8 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         _ context: AutoChartPresentationContext,
         formatters: AutoChartFormatters?
     ) {
-        loadedPresentationContext = context
-        loadedFormatters = formatters
+        loadedPresentationConfiguration.context = context
+        loadedPresentationConfiguration.formatters = formatters
         rebuildEffectivePresentation()
     }
 
@@ -133,8 +143,8 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         _ context: AutoChartPresentationContext,
         textResolver: AutoChartTextResolver
     ) {
-        loadedPresentationContext = context
-        loadedTextResolver = textResolver
+        loadedPresentationConfiguration.context = context
+        loadedPresentationConfiguration.textResolver = textResolver
         rebuildEffectivePresentation()
     }
 
@@ -144,9 +154,10 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         formatters: AutoChartFormatters?,
         textResolver: AutoChartTextResolver
     ) {
-        loadedPresentationContext = context
-        loadedFormatters = formatters
-        loadedTextResolver = textResolver
+        loadedPresentationConfiguration = PresentationConfiguration(
+            context: context,
+            formatters: formatters,
+            textResolver: textResolver)
         rebuildEffectivePresentation()
     }
 
@@ -157,39 +168,23 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         formatters: AutoChartFormatters?,
         textResolver: AutoChartTextResolver?
     ) {
-        environmentPresentationContext = context
-        environmentFormatters = formatters
-        environmentTextResolver = textResolver
+        environmentPresentationOverrides = PresentationOverrides(
+            context: context,
+            formatters: formatters,
+            textResolver: textResolver)
         rebuildEffectivePresentation()
     }
 
-    private var effectivePresentationContext: AutoChartPresentationContext {
-        environmentPresentationContext ?? loadedPresentationContext
-    }
-
-    private var effectiveFormatters: AutoChartFormatters? {
-        environmentFormatters ?? loadedFormatters
-    }
-
-    private var effectiveTextResolver: AutoChartTextResolver {
-        environmentTextResolver ?? loadedTextResolver
+    private var effectivePresentationConfiguration: PresentationConfiguration {
+        loadedPresentationConfiguration.applying(environmentPresentationOverrides)
     }
 
     private func rebuildEffectivePresentation() {
-        rebuildPresentation(
-            context: effectivePresentationContext,
-            formatters: effectiveFormatters,
-            textResolver: effectiveTextResolver)
+        rebuildPresentation(effectivePresentationConfiguration)
     }
 
-    private func rebuildPresentation(
-        context: AutoChartPresentationContext,
-        formatters: AutoChartFormatters?,
-        textResolver: AutoChartTextResolver
-    ) {
-        presentationContext = context
-        self.formatters = formatters
-        self.textResolver = textResolver
+    private func rebuildPresentation(_ configuration: PresentationConfiguration) {
+        presentationConfiguration = configuration
         switch state {
         case .ready(let analysis, _):
             guard let chart = analysis.primaryChart else { return }
@@ -225,9 +220,7 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
             request,
             preference: preference,
             preparation: strategy,
-            presentationContext: presentationContext,
-            formatters: formatters,
-            textResolver: textResolver,
+            presentationConfiguration: presentationConfiguration,
             clearsVisibleState: true)
     }
 
@@ -247,9 +240,7 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         _ request: AutoChartRequest<RowID>,
         preference: AutoChartPreference,
         preparation: AutoChartPreparationStrategy,
-        presentationContext: AutoChartPresentationContext,
-        formatters: AutoChartFormatters?,
-        textResolver: AutoChartTextResolver,
+        presentationConfiguration: PresentationConfiguration,
         clearsVisibleState: Bool
     ) {
         generation &+= 1
@@ -262,9 +253,7 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         self.request = request
         self.preference = preference
         self.strategy = preparation
-        self.presentationContext = presentationContext
-        self.formatters = formatters
-        self.textResolver = textResolver
+        self.presentationConfiguration = presentationConfiguration
         if clearsVisibleState {
             selection.removeAll()
         }
@@ -340,11 +329,11 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         chart: AutoChartPreparedChart<RowID>,
         keepsVisiblePresentation: Bool
     ) {
-        let context = presentationContext
-        let formatters = self.formatters ?? AutoChartFormatters(
+        let context = presentationConfiguration.context
+        let formatters = presentationConfiguration.formatters ?? AutoChartFormatters(
             locale: context.locale,
             timeZone: context.timeZone)
-        let textResolver = self.textResolver
+        let textResolver = presentationConfiguration.textResolver
         let requestID = AutoChartPresentationRequestID(
             preparedChart: chart.id,
             context: context,

@@ -23,7 +23,7 @@ a cancellable presentation task. Call
 convenience memo in response to memory pressure.
 
 `presentCancellable` runs formatter and text-resolver callbacks outside the
-main actor as part of its detached presentation work. Hosts whose callbacks
+main actor as part of cancellable dispatch work. Hosts whose callbacks
 require caller-context execution can use the synchronous `present` method.
 
 Deferred convenience views require a mounted SwiftUI lifecycle to run their
@@ -44,3 +44,8 @@ Use the environment modifiers `autoChartPresentationContext(_:)`,
 `autoChartPalette(_:)`, and `autoChartTheme(_:)` to configure a subtree.
 Only explicitly supplied environment values override presentation settings
 passed to ``AutoChartSession/load(_:preference:preparation:presentationContext:formatters:textResolver:)``.
+For direct `AutoChartView` and `AutoChartPlot` construction, an omitted context,
+formatter, or resolver inherits the corresponding environment value, while an
+initializer argument takes precedence. A view initialized from an already
+presented chart keeps that chart's formatter and resolver so its resolved labels,
+controls, and accessibility text remain consistent.

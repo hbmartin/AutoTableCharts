@@ -43,6 +43,13 @@ Non-additive and unknown values block implicit aggregation. A mean, percentage,
 ratio, inventory balance, or distinct count is not additive merely because it is
 numeric.
 
+The column encoder also writes the hints shape released in version 0.1.0. That
+shape cannot represent an upstream sum or count together with an unknown rollup
+policy: its `alreadyAggregated` spelling implies additive rollup. When data passes
+through a 0.1.0 decoder and encoder, AutoTableCharts preserves the conservative
+unknown policy, so the upstream operation returns as a row-level preferred
+transform. Current-to-current coding retains the complete semantics exactly.
+
 ### Describe result completeness
 
 Set ``AutoChartTableMetadata/isTruncated`` for pages, previews, limits, samples,

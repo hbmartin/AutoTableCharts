@@ -678,6 +678,68 @@ private final class ProgressRecorder: @unchecked Sendable {
         #expect(decoded == hints)
         #expect(decoded.measureSemantics == nil)
     }
+
+    @Test func releasedDefaultMeasureColumnMatchesCurrentDeclaration() throws {
+        let released = ReleasedV1Column(
+            id: "value",
+            name: "Value",
+            displayName: nil,
+            hints: releasedV1MeasureHints(
+                aggregation: nil,
+                safety: .unknown))
+        let decoded = try JSONDecoder().decode(
+            AutoChartColumn.self,
+            from: JSONEncoder().encode(released))
+        let current = AutoChartColumn(
+            id: "value",
+            name: "Value",
+            semantics: .measure())
+
+        #expect(decoded == current)
+        #expect(decoded.hints == current.hints)
+
+        let decodedDataset = try AutoChartDataset(
+            columns: [decoded],
+            rows: [[.double(1)]],
+            rowIDs: [1],
+            key: .contentAddressed(identity: "default-measure"))
+        let currentDataset = try AutoChartDataset(
+            columns: [current],
+            rows: [[.double(1)]],
+            rowIDs: [1],
+            key: .contentAddressed(identity: "default-measure"))
+        #expect(
+            try AutoChartRequest(table: decodedDataset).id
+                == AutoChartRequest(table: currentDataset).id)
+    }
+
+    @Test func releasedHopKeepsUnknownAdditiveSourcesConservative() throws {
+        for aggregation in [AutoChartAggregation.sum, .count] {
+            let current = AutoChartColumn(
+                id: "value",
+                name: "Value",
+                semantics: .measure(
+                    semantics: .init(
+                        source: .aggregated(aggregation),
+                        rollup: .unknown)))
+            let released = try JSONDecoder().decode(
+                ReleasedV1Column.self,
+                from: JSONEncoder().encode(current))
+            #expect(released.hints.aggregation == aggregation)
+            #expect(released.hints.aggregationSafety == .unknown)
+
+            let roundTripped = try JSONDecoder().decode(
+                AutoChartColumn.self,
+                from: JSONEncoder().encode(released))
+            #expect(
+                roundTripped.hints.measureSemantics
+                    == AutoChartMeasureSemantics(
+                        source: .rowLevel,
+                        rollup: .unknown,
+                        preferredTransform: aggregation))
+            #expect(roundTripped != current)
+        }
+    }
 }
 
 @Suite struct V3IdentityCatalogAndConstraintTests {
@@ -1348,7 +1410,7 @@ private final class ProgressRecorder: @unchecked Sendable {
     }
 
     @Test(.timeLimit(.minutes(1)))
-    func capturedHostCallbackContextSurvivesDetachedPresentationWork() async {
+    func capturedHostCallbackContextSurvivesOffActorPresentationWork() async {
         let token = AutoChartHostCallbackToken()
         let result = V3LockedBox<Bool>()
         let completed = DispatchSemaphore(value: 0)
@@ -1512,10 +1574,70 @@ private final class ProgressRecorder: @unchecked Sendable {
             formatters: formatters)
         #expect(calls.value == 0)
     }
+
+    @Test func directViewFallbackFormattersFollowTheEffectiveContext() throws {
+        let timeZone = try #require(TimeZone(identifier: "Pacific/Honolulu"))
+        let explicitContext = AutoChartPresentationContext(
+            identity: "explicit",
+            locale: Locale(identifier: "fr_FR"),
+            timeZone: timeZone)
+        let explicit = AutoChartViewPresentationInputs.resolve(
+            explicitContext: explicitContext,
+            environmentContext: nil,
+            explicitFormatters: nil,
+            environmentFormatters: nil,
+            explicitTextResolver: nil,
+            environmentTextResolver: nil)
+        #expect(explicit.context == explicitContext)
+        #expect(explicit.formatters.locale == explicitContext.locale)
+        #expect(explicit.formatters.timeZone == explicitContext.timeZone)
+
+        let environmentContext = AutoChartPresentationContext(
+            identity: "environment",
+            locale: Locale(identifier: "de_DE"),
+            timeZone: .gmt)
+        let inherited = AutoChartViewPresentationInputs.resolve(
+            explicitContext: nil,
+            environmentContext: environmentContext,
+            explicitFormatters: nil,
+            environmentFormatters: nil,
+            explicitTextResolver: nil,
+            environmentTextResolver: nil)
+        #expect(inherited.context == environmentContext)
+        #expect(inherited.formatters.locale == environmentContext.locale)
+        #expect(inherited.formatters.timeZone == environmentContext.timeZone)
+    }
 }
 
 @MainActor
 @Suite struct V3SessionTests {
+    @Test func cancelledProgressTextResolutionDoesNotStartResolver() async {
+        let gate = V3AsyncTestGate()
+        let calls = V3Counter()
+        let resolver = AutoChartTextResolver { message in
+            calls.increment()
+            return message.defaultText
+        }
+        let resolution = Task {
+            await gate.pause()
+            return await AutoChartProgressTextResolution.resolve(
+                AutoChartProgressAccessibility.preparing,
+                using: resolver)
+        }
+
+        guard await gate.waitUntilPaused() else {
+            resolution.cancel()
+            await gate.release()
+            Issue.record("The cancellation test did not reach its gate.")
+            return
+        }
+        resolution.cancel()
+        await gate.release()
+
+        #expect(await resolution.value == nil)
+        #expect(calls.value == 0)
+    }
+
     @Test func progressTextResolutionReturnsPromptlyWhenCancelled() async {
         let callback = V3OneShotBlockingCallback()
         defer { callback.release() }
@@ -1543,33 +1665,117 @@ private final class ProgressRecorder: @unchecked Sendable {
         #expect(cancellationStarted.duration(to: clock.now) < .seconds(1))
     }
 
+    @Test func cancelledProgressRestartsDoNotInvokeQueuedResolver() async {
+        let callback = V3OneShotBlockingCallback()
+        defer { callback.release() }
+        let resolver = AutoChartTextResolver { message in
+            callback.invoke()
+            return message.defaultText
+        }
+        let first = Task {
+            await AutoChartProgressTextResolution.resolve(
+                AutoChartProgressAccessibility.preparing,
+                using: resolver)
+        }
+
+        guard await waitForV3Condition({ callback.isBlocked }) else {
+            first.cancel()
+            Issue.record("The first progress resolver did not begin.")
+            return
+        }
+        first.cancel()
+        #expect(await first.value == nil)
+
+        let secondStarted = V3Counter()
+        let second = Task {
+            secondStarted.increment()
+            return await AutoChartProgressTextResolution.resolve(
+                AutoChartProgressAccessibility.updating,
+                using: resolver)
+        }
+        guard await waitForV3Condition({ secondStarted.value == 1 }) else {
+            second.cancel()
+            Issue.record("The replacement progress resolution did not begin.")
+            return
+        }
+        second.cancel()
+        #expect(await second.value == nil)
+
+        callback.release()
+        #expect(await waitForV3Condition({ callback.completedInvocations == 1 }))
+        #expect(callback.completedInvocations == 1)
+        #expect(!callback.didTimeOut)
+    }
+
     @Test func progressTextResolutionRetainsActiveCallbackContext() async {
         let resolverReached = DispatchSemaphore(value: 0)
+        let outerToken = AutoChartHostCallbackToken()
         let resolver = AutoChartTextResolver { _ in
-            let result = AutoChartHostCallbackActivity.hasActiveCallback
-                ? "active" : "inactive"
+            let result = AutoChartHostCallbackActivity.invoke(
+                outerToken,
+                { "context-missing" },
+                fallback: "context-restored")
             resolverReached.signal()
             return result
         }
-        let outerToken = AutoChartHostCallbackToken()
 
-        let (resolution, resolverStarted) = await Task.detached {
-            AutoChartHostCallbackActivity.invoke(
-                outerToken,
-                {
-                    let resolution = Task {
-                        await AutoChartProgressTextResolution.resolve(
-                            AutoChartProgressAccessibility.preparing,
-                            using: resolver)
-                    }
-                    let started = resolverReached.wait(timeout: .now() + 2) == .success
-                    return (resolution, started)
-                },
-                fallback: (Task { nil }, false))
-        }.value
+        let (resolution, resolverStarted): (Task<String?, Never>, Bool) =
+            await withCheckedContinuation { continuation in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let result = AutoChartHostCallbackActivity.invoke(
+                        outerToken,
+                        {
+                            let resolution = Task {
+                                await AutoChartProgressTextResolution.resolve(
+                                    AutoChartProgressAccessibility.preparing,
+                                    using: resolver)
+                            }
+                            let started =
+                                resolverReached.wait(timeout: .now() + 2) == .success
+                            return (resolution, started)
+                        },
+                        fallback: (Task { nil }, false))
+                    continuation.resume(returning: result)
+                }
+            }
 
         #expect(resolverStarted)
-        #expect(await resolution.value == "active")
+        #expect(await resolution.value == "context-restored")
+    }
+
+    @Test func presentationResolutionReturnsPromptlyWhenCancelled() async throws {
+        let request = try AutoChartRequest(table: domainDataset())
+        let analysis = try await AutoChartAnalyzer().analyze(
+            request,
+            preparation: .primary)
+        let chart = try #require(analysis.primaryChart)
+        let callback = V3OneShotBlockingCallback()
+        defer { callback.release() }
+        let formatters = AutoChartFormatters(request: { _, _, _ in
+            callback.invoke()
+            return nil
+        })
+        let presentation = Task {
+            try await AutoChartPresenter().presentCancellable(
+                chart,
+                formatters: formatters)
+        }
+
+        guard await waitForV3Condition({ callback.isBlocked }) else {
+            presentation.cancel()
+            Issue.record("The presentation resolver did not begin.")
+            return
+        }
+        let clock = ContinuousClock()
+        let cancellationStarted = clock.now
+        presentation.cancel()
+        do {
+            _ = try await presentation.value
+            Issue.record("Cancelled presentation unexpectedly completed.")
+        } catch {
+            #expect(error is CancellationError)
+        }
+        #expect(cancellationStarted.duration(to: clock.now) < .seconds(1))
     }
 
     @Test func asyncTestGateRegistersAndReleasesEveryWaiter() async {
@@ -1953,6 +2159,11 @@ private final class ProgressRecorder: @unchecked Sendable {
         session.retry(preference: .chart(.recommended))
         let third = try await sessionFailure(from: session)
         #expect(third.episodeID != second.episodeID)
+        #expect(session.preference == .chart(.recommended))
+
+        session.retry()
+        let fourth = try await sessionFailure(from: session)
+        #expect(fourth.episodeID != third.episodeID)
         #expect(session.preference == .chart(.recommended))
 
         session.load(try AutoChartRequest(table: domainDataset()))
