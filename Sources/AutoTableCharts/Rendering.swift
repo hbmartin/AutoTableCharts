@@ -326,8 +326,82 @@ private func categoryPrecedes(
     case (nil, .some):
         return false
     default:
+        if !declaredRanks.isEmpty, lhs.sourceOffset != rhs.sourceOffset {
+            return lhs.sourceOffset < rhs.sourceOffset
+        }
         return categoryPrecedes(lhs, rhs, locale: locale)
     }
+}
+
+private func declaredOrSourceComparison(
+    _ lhs: AutoChartCategorySortKey,
+    _ rhs: AutoChartCategorySortKey,
+    declaredRanks: [String: Int]
+) -> ComparisonResult {
+    let leftRank = declaredRanks[lhs.identity]
+    let rightRank = declaredRanks[rhs.identity]
+    switch (leftRank, rightRank) {
+    case (.some(let left), .some(let right)) where left != right:
+        return left < right ? .orderedAscending : .orderedDescending
+    case (.some, nil):
+        return .orderedAscending
+    case (nil, .some):
+        return .orderedDescending
+    default:
+        if lhs.sourceOffset != rhs.sourceOffset {
+            return lhs.sourceOffset < rhs.sourceOffset
+                ? .orderedAscending : .orderedDescending
+        }
+        if lhs.identity != rhs.identity {
+            return lhs.identity < rhs.identity ? .orderedAscending : .orderedDescending
+        }
+        return .orderedSame
+    }
+}
+
+/// Keeps every x category contiguous according to its first occurrence, then
+/// applies any declared series order within that category. Using category-level
+/// offsets makes the comparator transitive even when source rows are interleaved.
+private func orderedByDeclaredSourceOrder(
+    _ data: [AutoChartDatum],
+    xDeclaredRanks: [String: Int],
+    seriesDeclaredRanks: [String: Int]
+) -> [AutoChartDatum] {
+    var firstXOffsets: [String: Int] = [:]
+    var firstSeriesOffsets: [String: Int] = [:]
+    for (offset, datum) in data.enumerated() {
+        let xIdentity = datum.xIdentity ?? ""
+        let seriesIdentity = datum.seriesIdentity ?? ""
+        if firstXOffsets[xIdentity] == nil { firstXOffsets[xIdentity] = offset }
+        if firstSeriesOffsets[seriesIdentity] == nil {
+            firstSeriesOffsets[seriesIdentity] = offset
+        }
+    }
+    return data.enumerated().map { offset, datum in
+        (
+            offset: offset,
+            datum: datum,
+            x: AutoChartCategorySortKey(
+                displayValue: datum.xLabel ?? "",
+                identity: datum.xIdentity ?? "",
+                sourceOffset: firstXOffsets[datum.xIdentity ?? ""] ?? offset),
+            series: AutoChartCategorySortKey(
+                displayValue: datum.series ?? "",
+                identity: datum.seriesIdentity ?? "",
+                sourceOffset: firstSeriesOffsets[datum.seriesIdentity ?? ""] ?? offset)
+        )
+    }.sorted { lhs, rhs in
+        if lhs.x.identity != rhs.x.identity {
+            return declaredOrSourceComparison(
+                lhs.x, rhs.x, declaredRanks: xDeclaredRanks) == .orderedAscending
+        }
+        if lhs.series.identity != rhs.series.identity {
+            return declaredOrSourceComparison(
+                lhs.series, rhs.series,
+                declaredRanks: seriesDeclaredRanks) == .orderedAscending
+        }
+        return lhs.offset < rhs.offset
+    }.map(\.datum)
 }
 
 package func declaredCategoryRanks(
@@ -1298,22 +1372,14 @@ package enum AutoChartDataPreparation {
         if specification.sort == .source,
             let x = specification.encoding.x
         {
-            let ranks = declaredCategoryRanks(for: profiles[x])
-            guard !ranks.isEmpty else { return data }
-            return data.enumerated().sorted { lhs, rhs in
-                let leftRank = lhs.element.xIdentity.flatMap { ranks[$0] }
-                let rightRank = rhs.element.xIdentity.flatMap { ranks[$0] }
-                switch (leftRank, rightRank) {
-                case (.some(let left), .some(let right)):
-                    return left == right ? lhs.offset < rhs.offset : left < right
-                case (.some, nil):
-                    return true
-                case (nil, .some):
-                    return false
-                case (nil, nil):
-                    return lhs.offset < rhs.offset
-                }
-            }.map(\.element)
+            let xRanks = declaredCategoryRanks(for: profiles[x])
+            let seriesRanks = declaredCategoryRanks(
+                for: specification.encoding.series.flatMap { profiles[$0] })
+            guard !xRanks.isEmpty || !seriesRanks.isEmpty else { return data }
+            return orderedByDeclaredSourceOrder(
+                data,
+                xDeclaredRanks: xRanks,
+                seriesDeclaredRanks: seriesRanks)
         }
         return orderedByMeasure(data, sort: specification.sort) { offset, datum in
             AutoChartCategorySortKey(
@@ -1479,6 +1545,10 @@ package func orderedFacetPanels(
     declaredRanks: [String: Int] = [:]
 ) -> [AutoChartFacetPanel] {
     let facets = Dictionary(grouping: data, by: \.facetIdentity)
+    var firstOffsets: [String?: Int] = [:]
+    for (offset, datum) in data.enumerated() where firstOffsets[datum.facetIdentity] == nil {
+        firstOffsets[datum.facetIdentity] = offset
+    }
     return facets.map { key, panelData in
         AutoChartFacetPanel(
             key: key,
@@ -1493,11 +1563,11 @@ package func orderedFacetPanels(
             AutoChartCategorySortKey(
                 displayValue: lhs.element.displayValue,
                 identity: lhs.element.key ?? "",
-                sourceOffset: lhs.offset),
+                sourceOffset: firstOffsets[lhs.element.key] ?? lhs.offset),
             AutoChartCategorySortKey(
                 displayValue: rhs.element.displayValue,
                 identity: rhs.element.key ?? "",
-                sourceOffset: rhs.offset),
+                sourceOffset: firstOffsets[rhs.element.key] ?? rhs.offset),
             declaredRanks: declaredRanks,
             locale: locale)
     }.map(\.element)
@@ -1534,6 +1604,10 @@ package func orderedPresentedData(
     }
 
     if specification.family == .heatmap {
+        var firstXOffsets: [String?: Int] = [:]
+        for (offset, datum) in data.enumerated() where firstXOffsets[datum.xIdentity] == nil {
+            firstXOffsets[datum.xIdentity] = offset
+        }
         return data.enumerated().map { offset, datum in
             (
                 datum: datum,
@@ -1541,7 +1615,7 @@ package func orderedPresentedData(
                     identity: datum.xIdentity,
                     preparedLabel: datum.xLabel,
                     labels: xLabels,
-                    offset: 0),
+                    offset: firstXOffsets[datum.xIdentity] ?? offset),
                 y: key(
                     identity: datum.yIdentity,
                     preparedLabel: datum.yLabel,
@@ -1565,37 +1639,10 @@ package func orderedPresentedData(
     if specification.sort == .source,
         !xDeclaredRanks.isEmpty || !seriesDeclaredRanks.isEmpty
     {
-        return data.enumerated().map { offset, datum in
-            (
-                datum: datum,
-                x: key(
-                    identity: datum.xIdentity,
-                    preparedLabel: datum.xLabel,
-                    labels: xLabels,
-                    offset: offset),
-                series: AutoChartCategorySortKey(
-                    displayValue: datum.series ?? "",
-                    identity: datum.seriesIdentity ?? "",
-                    sourceOffset: offset)
-            )
-        }.sorted { lhs, rhs in
-            if lhs.x.identity != rhs.x.identity {
-                if xDeclaredRanks.isEmpty {
-                    return lhs.x.sourceOffset < rhs.x.sourceOffset
-                }
-                return categoryPrecedes(
-                    lhs.x, rhs.x,
-                    declaredRanks: xDeclaredRanks,
-                    locale: locale)
-            }
-            if seriesDeclaredRanks.isEmpty {
-                return lhs.series.sourceOffset < rhs.series.sourceOffset
-            }
-            return categoryPrecedes(
-                lhs.series, rhs.series,
-                declaredRanks: seriesDeclaredRanks,
-                locale: locale)
-        }.map(\.datum)
+        return orderedByDeclaredSourceOrder(
+            data,
+            xDeclaredRanks: xDeclaredRanks,
+            seriesDeclaredRanks: seriesDeclaredRanks)
     }
 
     guard !xLabels.isEmpty else { return data }

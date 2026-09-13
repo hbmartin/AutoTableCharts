@@ -280,7 +280,6 @@ public struct AutoChartPresentedChart<RowID: Hashable & Sendable>: Sendable {
     package let facetPanels: [AutoChartFacetPanel]
     package let sharedXCategoryDomain: [String]
     package let kpi: AutoChartPresentedKPI?
-    let audioGraphDescriptor: AutoChartAudioGraphDescriptor?
     package let formatters: AutoChartFormatters
     package let textResolver: AutoChartTextResolver
     let requestID: AutoChartPresentationRequestID
@@ -298,7 +297,6 @@ public struct AutoChartPresentedChart<RowID: Hashable & Sendable>: Sendable {
         facetPanels: [AutoChartFacetPanel],
         sharedXCategoryDomain: [String],
         kpi: AutoChartPresentedKPI?,
-        audioGraphDescriptor: AutoChartAudioGraphDescriptor?,
         formatters: AutoChartFormatters,
         textResolver: AutoChartTextResolver,
         requestID: AutoChartPresentationRequestID
@@ -313,10 +311,30 @@ public struct AutoChartPresentedChart<RowID: Hashable & Sendable>: Sendable {
         self.facetPanels = facetPanels
         self.sharedXCategoryDomain = sharedXCategoryDomain
         self.kpi = kpi
-        self.audioGraphDescriptor = audioGraphDescriptor
         self.formatters = formatters
         self.textResolver = textResolver
         self.requestID = requestID
+    }
+
+    /// Audio Graph work is deferred until a renderer or test actually requests
+    /// it. Most presenter consumers only need the value presentation payload.
+    var audioGraphDescriptor: AutoChartAudioGraphDescriptor? {
+        makeAudioGraphDescriptor(
+            formatters: formatters,
+            textResolver: textResolver)
+    }
+
+    func makeAudioGraphDescriptor(
+        formatters: AutoChartFormatters,
+        textResolver: AutoChartTextResolver
+    ) -> AutoChartAudioGraphDescriptor? {
+        makeAutoChartAudioGraphDescriptor(
+            preparedChart: preparedChart,
+            renderedData: renderedData,
+            resolved: resolvedPresentation,
+            displayTitle: title,
+            formatters: formatters,
+            textResolver: textResolver)
     }
 }
 
@@ -335,7 +353,6 @@ private struct AutoChartPresentationPayload: Sendable {
     let facetPanels: [AutoChartFacetPanel]
     let sharedXCategoryDomain: [String]
     let kpi: AutoChartPresentedKPI?
-    let audioGraphDescriptor: AutoChartAudioGraphDescriptor?
 }
 
 /// Thread-safe presenter memoized by prepared-chart and presentation-context identity.
@@ -526,13 +543,6 @@ public final class AutoChartPresenter: @unchecked Sendable {
         let title = chart.recommendation.specification.title.isEmpty
             ? textResolver(chart.recommendation.specification.family.localizationMessage)
             : chart.recommendation.specification.title
-        let audioGraphDescriptor = makeAutoChartAudioGraphDescriptor(
-            preparedChart: chart,
-            renderedData: renderedData,
-            resolved: resolved,
-            displayTitle: title,
-            formatters: formatters,
-            textResolver: textResolver)
         let proposed = AutoChartPresentationPayload(
             title: title,
             diagnostics: chart.diagnostics,
@@ -541,8 +551,7 @@ public final class AutoChartPresenter: @unchecked Sendable {
             renderedData: renderedData,
             facetPanels: facetPanels,
             sharedXCategoryDomain: sharedXCategoryDomain,
-            kpi: kpi,
-            audioGraphDescriptor: audioGraphDescriptor)
+            kpi: kpi)
         let payload = lock.withLock {
             if let cached = cachedPayload(for: requestID) { return cached }
             guard maximumEntries > 0 else { return proposed }
@@ -603,7 +612,6 @@ public final class AutoChartPresenter: @unchecked Sendable {
             facetPanels: payload.facetPanels,
             sharedXCategoryDomain: payload.sharedXCategoryDomain,
             kpi: payload.kpi,
-            audioGraphDescriptor: payload.audioGraphDescriptor,
             formatters: formatters,
             textResolver: textResolver,
             requestID: requestID)

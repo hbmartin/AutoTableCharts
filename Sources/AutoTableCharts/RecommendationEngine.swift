@@ -282,13 +282,15 @@ enum AutoChartRecommendationEngine {
         for table: Table,
         context: AutoChartContext = .init(),
         options: AutoChartOptions = .init(),
-        constraints: AutoChartRecommendationConstraints = .init()
+        constraints: AutoChartRecommendationConstraints = .init(),
+        featuredLimit: Int? = nil
     ) -> AutoChartCandidateResults {
         recommendations(
             snapshot: AutoChartSnapshot(table),
             context: context,
             options: options,
-            constraints: constraints)
+            constraints: constraints,
+            featuredLimit: featuredLimit)
     }
 
     static func validate<Table: AutoChartTable>(
@@ -302,7 +304,8 @@ enum AutoChartRecommendationEngine {
         snapshot: AutoChartSnapshot,
         context: AutoChartContext,
         options: AutoChartOptions,
-        constraints: AutoChartRecommendationConstraints = .init()
+        constraints: AutoChartRecommendationConstraints = .init(),
+        featuredLimit: Int? = nil
     ) -> AutoChartCandidateResults {
         guard !snapshot.rows.isEmpty, !snapshot.columns.isEmpty else {
             return AutoChartCandidateResults(
@@ -375,37 +378,54 @@ enum AutoChartRecommendationEngine {
         var bestBaseScoreByID: [AutoChartRecommendationID: Double] = [:]
         var traceCandidatesByID: [AutoChartRecommendationID: AutoChartRecommendation] = [:]
         var facetBases: [AutoChartRecommendation] = []
-        var facetBaseIDs: Set<AutoChartRecommendationID> = []
+        var facetBaseIndexByID: [AutoChartRecommendationID: Int] = [:]
         var descriptiveSignalCache: [DescriptiveSignalCacheKey: DescriptiveSignal] = [:]
         var temporalRegularityCache: [TemporalRegularityCacheKey: Double] = [:]
+        let constraintsPermitFaceting =
+            (constraints.includedFamilies?.contains(.faceted) ?? true)
+                && !constraints.excludedFamilies.contains(.faceted)
 
         /// Scores and validates candidates as they are generated. Keeping only the
         /// best scored value for each structural ID avoids retaining an additional
         /// unscored candidate array during the high-cardinality size/facet loops.
         func processCandidate(_ recommendation: AutoChartRecommendation) {
-            if [.line, .bar, .scatter].contains(recommendation.specification.family),
-                facetBaseIDs.insert(recommendation.id).inserted
-            {
-                facetBases.append(recommendation)
+            let specification = recommendation.specification
+            let isFacetBase = constraintsPermitFaceting
+                && [.line, .bar, .scatter].contains(specification.family)
+            let isAllowed = constraints.allows(specification)
+            guard isFacetBase || isAllowed else { return }
+            if isFacetBase {
+                if let index = facetBaseIndexByID[recommendation.id] {
+                    if facetBases[index].score < recommendation.score {
+                        facetBases[index] = recommendation
+                    }
+                } else {
+                    facetBaseIndexByID[recommendation.id] = facetBases.count
+                    facetBases.append(recommendation)
+                }
             }
-
-            guard constraints.allows(recommendation.specification) else { return }
+            guard isAllowed else { return }
             if let existingScore = bestBaseScoreByID[recommendation.id],
                 existingScore >= recommendation.score
             {
                 return
             }
             bestBaseScoreByID[recommendation.id] = recommendation.score
-
             let structural = structuralValidation(
-                recommendation.specification,
-                cacheResult: recommendation.specification.family != .faceted
+                specification,
+                cacheResult: specification.family != .faceted
                     || options.includesDecisionTrace)
             guard structural.isValid else {
                 if options.includesDecisionTrace {
                     traceCandidatesByID[recommendation.id] = recommendation
                 }
                 return
+            }
+            // Valid faceted candidates are retained below, so retaining their
+            // structural result costs no additional specification lifetime and
+            // avoids validating them again during catalog construction.
+            if specification.family == .faceted, !options.includesDecisionTrace {
+                structuralValidationResults[specification] = structural
             }
             let scored = dataAwareRecommendation(
                 recommendation,
@@ -728,40 +748,68 @@ enum AutoChartRecommendationEngine {
         }
 
         // Faceting every eligible series base creates a cubic cross product at
-        // the default column cap. Keep all required non-faceted candidates, but
-        // take a deterministic, family-balanced base shortlist for expansion.
+        // the default column cap. Only let structurally valid bases that can
+        // satisfy the eventual faceted request consume the bounded shortlist.
+        let eligibleFacets = categorical.filter {
+            $0.distinctCount >= 2 && $0.distinctCount <= options.maximumFacets
+        }
+        func facetedSpecification(
+            from base: AutoChartRecommendation,
+            facet: AutoChartColumnProfile
+        ) -> AutoChartSpecification? {
+            guard base.specification.encoding.x != facet.column.id,
+                base.specification.encoding.y != facet.column.id,
+                base.specification.encoding.series != facet.column.id
+            else { return nil }
+            var specification = base.specification
+            specification.family = .faceted
+            specification.facetBaseFamily = base.specification.family
+            specification.encoding.facet = facet.column.id
+            return specification
+        }
+        func facetedCandidate(
+            from base: AutoChartRecommendation,
+            facet: AutoChartColumnProfile
+        ) -> AutoChartRecommendation? {
+            guard let specification = facetedSpecification(from: base, facet: facet) else {
+                return nil
+            }
+            var faceted = base
+            let baseFamily = base.specification.family
+            faceted.specification = specification
+            faceted.diagnostics = faceted.diagnostics.map { diagnostic in
+                var diagnostic = diagnostic
+                if diagnostic.family == baseFamily { diagnostic.family = .faceted }
+                return diagnostic
+            }
+            faceted.score -= 4
+            faceted.rationale = [
+                AutoChartMessage(
+                    category: .rationale,
+                    code: .recommendationRationale,
+                    defaultText: "Small multiples separate a low-cardinality dimension.")
+            ]
+            return faceted
+        }
+        let viableFacetBases = facetBases.filter { base in
+            eligibleFacets.contains { facet in
+                facetedSpecification(from: base, facet: facet).map {
+                    constraints.allows($0)
+                } ?? false
+            }
+        }
         let facetBaseLimitPerFamily = options.maximumCandidateColumns
         let boundedFacetBases = [AutoChartFamily.line, .bar, .scatter].flatMap { family in
-            facetBases.lazy.filter { $0.specification.family == family }.sorted {
-                if $0.score != $1.score { return $0.score > $1.score }
-                return $0.id < $1.id
-            }.prefix(facetBaseLimitPerFamily)
+            balancedFacetBases(
+                viableFacetBases.filter { $0.specification.family == family },
+                limit: facetBaseLimitPerFamily,
+                isValid: { cachedStructuralValidation($0.specification).isValid })
         }
-        for facet in categorical
-        where facet.distinctCount >= 2 && facet.distinctCount <= options.maximumFacets {
-            for base in boundedFacetBases
-            where base.specification.encoding.x != facet.column.id
-                && base.specification.encoding.y != facet.column.id
-                && base.specification.encoding.series != facet.column.id
-                && cachedStructuralValidation(base.specification).isValid
-            {
-                var faceted = base
-                let baseFamily = faceted.specification.family
-                faceted.specification.family = .faceted
-                faceted.specification.facetBaseFamily = baseFamily
-                faceted.specification.encoding.facet = facet.column.id
-                faceted.diagnostics = faceted.diagnostics.map { diagnostic in
-                    var diagnostic = diagnostic
-                    if diagnostic.family == baseFamily { diagnostic.family = .faceted }
-                    return diagnostic
-                }
-                faceted.score -= 4
-                faceted.rationale = [
-                    AutoChartMessage(
-                        category: .rationale,
-                        code: .recommendationRationale,
-                        defaultText: "Small multiples separate a low-cardinality dimension.")
-                ]
+        for facet in eligibleFacets {
+            for base in boundedFacetBases {
+                guard let faceted = facetedCandidate(from: base, facet: facet),
+                    constraints.allows(faceted.specification)
+                else { continue }
                 processCandidate(faceted)
             }
         }
@@ -784,10 +832,38 @@ enum AutoChartRecommendationEngine {
             guard cachedPreparedValidation(candidate.specification).isValid else { continue }
             cataloged.append(candidate)
         }
+        let resolvedFeaturedLimit = min(
+            options.maximumRecommendations,
+            max(1, featuredLimit ?? options.maximumRecommendations))
         let diverse = selectFeaturedSet(
             ranked,
-            limit: options.maximumRecommendations,
+            limit: resolvedFeaturedLimit,
             isValid: { cachedPreparedValidation($0.specification).isValid })
+        // Featured recommendations are allowed to reserve catalog slots. This
+        // keeps the public subset invariant without erasing the diversity work
+        // whenever a useful alternative falls just below the score-only cutoff.
+        let diverseIDs = Set(diverse.map(\.id))
+        for recommendation in diverse
+        where !cataloged.contains(where: { $0.id == recommendation.id })
+        {
+            if cataloged.count == options.maximumRecommendations,
+                let removable = cataloged.lastIndex(where: {
+                    !diverseIDs.contains($0.id)
+                })
+            {
+                cataloged.remove(at: removable)
+            }
+            if cataloged.count < options.maximumRecommendations {
+                cataloged.append(recommendation)
+            }
+        }
+        cataloged.sort {
+            if $0.score != $1.score { return $0.score > $1.score }
+            let lhs = familyPriority($0.specification.family)
+            let rhs = familyPriority($1.specification.family)
+            if lhs != rhs { return lhs < rhs }
+            return $0.id < $1.id
+        }
         let decisions: [AutoChartCandidateDecision] = options.includesDecisionTrace
             ? {
                 let rankedIDs = Dictionary(
@@ -1607,11 +1683,15 @@ enum AutoChartRecommendationEngine {
         let interquartileRange = quartile3 - quartile1
         let width = 2 * interquartileRange
             / pow(Double(profile.numericValueCount), 1.0 / 3.0)
-        guard range > 0, width > 0, range.isFinite, width.isFinite else {
+        guard range > 0, width > 0, width.isFinite else {
             return max(5, min(20, fallback))
         }
+        // A finite input domain can still overflow while subtracting opposite
+        // extremes. That and an overflowing quotient both mean the estimate is
+        // above the supported ceiling, not that the fallback is preferable.
+        guard range.isFinite else { return 20 }
         let estimate = ceil(range / width)
-        guard estimate.isFinite else { return max(5, min(20, fallback)) }
+        guard estimate.isFinite else { return 20 }
         if estimate <= 5 { return 5 }
         if estimate >= 20 { return 20 }
         return Int(estimate)
@@ -1944,17 +2024,7 @@ enum AutoChartRecommendationEngine {
                 }
                 var irregularContributions: [Double] = []
                 var gapCount = 0
-                let orderedGroups = datesByGroup.keys.sorted { lhs, rhs in
-                    let left = (
-                        lhs.series.stringValue ?? "",
-                        lhs.facet.stringValue ?? "")
-                    let right = (
-                        rhs.series.stringValue ?? "",
-                        rhs.facet.stringValue ?? "")
-                    return left < right
-                }
-                for group in orderedGroups {
-                    guard let dates = datesByGroup[group] else { continue }
+                for dates in datesByGroup.values {
                     let uniqueCount = Set(dates).count
                     guard uniqueCount > 1,
                         let groupFraction = AutoChartProfiler.temporalIrregularityFraction(dates)
@@ -2052,9 +2122,7 @@ enum AutoChartRecommendationEngine {
             guard identity != .missing else { continue }
             groups[identity, default: []].append(value)
         }
-        let orderedGroups = groups.keys.sorted {
-            ($0.stringValue ?? "") < ($1.stringValue ?? "")
-        }.compactMap { groups[$0] }
+        let orderedGroups = Array(groups.values)
         let count = orderedGroups.reduce(0) { $0 + $1.count }
         guard count >= 8, groups.count >= 2, groups.count < count else { return nil }
         let values = orderedGroups.flatMap { $0 }
@@ -2116,12 +2184,8 @@ enum AutoChartRecommendationEngine {
         }
         var outlierCount = 0
         var population = 0
-        for identity in groups.keys.sorted(by: {
-            ($0.stringValue ?? "") < ($1.stringValue ?? "")
-        }) {
-            guard let values = groups[identity], let result = outliers(in: values) else {
-                continue
-            }
+        for values in groups.values {
+            guard let result = outliers(in: values) else { continue }
             outlierCount += result.count
             population += result.population
         }
@@ -2218,7 +2282,13 @@ enum AutoChartRecommendationEngine {
         if let rowGrain = snapshot.metadata.rowGrain,
             semanticModel.isStrictlyFiner(rowGrain, than: measureGrain)
         {
-            return orderedUnique(groupingIDs + [measureID])
+            let accountedEntities = measureGrain.entities + groupingIDs.flatMap { groupingID in
+                profiles[groupingID]?.column.provenance?.sourceGrain?.entities ?? []
+            }
+            let accountedGrain = AutoChartGrain(accountedEntities)
+            if !semanticModel.isAtLeastAsFine(accountedGrain, as: rowGrain) {
+                return orderedUnique(groupingIDs + [measureID])
+            }
         }
         return nil
     }
@@ -2242,8 +2312,8 @@ enum AutoChartRecommendationEngine {
             xGrain != yGrain
         else { return nil }
 
-        guard !semanticModel.isStrictlyFiner(xGrain, than: yGrain),
-            !semanticModel.isStrictlyFiner(yGrain, than: xGrain)
+        guard !semanticModel.isAtLeastAsFine(xGrain, as: yGrain),
+            !semanticModel.isAtLeastAsFine(yGrain, as: xGrain)
         else { return nil }
         return [xID, yID]
     }
@@ -2693,6 +2763,12 @@ enum AutoChartRecommendationEngine {
             let profile = profiles[field],
             profile.isUniqueAtRowGrain
         {
+            memo?.storeUniqueCombination(
+                true,
+                snapshotIdentity: snapshot.validationIdentity,
+                fields: fields,
+                measure: measure,
+                droppingRowsMissing: droppingRowsMissing)
             return true
         }
         if let cached = memo?.uniqueCombination(
@@ -2733,19 +2809,52 @@ enum AutoChartRecommendationEngine {
         AutoChartFamily.allCases.firstIndex(of: family) ?? Int.max
     }
 
-    static func bestCandidatesByID(
-        _ candidates: [AutoChartRecommendation]
+    /// Selects a bounded set without letting the lexical order of specification
+    /// IDs concentrate every base on the same x, y, or series column.
+    private static func balancedFacetBases(
+        _ candidates: [AutoChartRecommendation],
+        limit: Int,
+        isValid: (AutoChartRecommendation) -> Bool
     ) -> [AutoChartRecommendation] {
-        var bestCandidateByID: [AutoChartRecommendationID: AutoChartRecommendation] = [:]
-        for recommendation in candidates {
-            if let existing = bestCandidateByID[recommendation.id],
-                existing.score >= recommendation.score
-            {
-                continue
-            }
-            bestCandidateByID[recommendation.id] = recommendation
+        guard limit > 0 else { return [] }
+        var remaining = candidates
+        var output: [AutoChartRecommendation] = []
+        var xUses: [AutoChartColumnID: Int] = [:]
+        var yUses: [AutoChartColumnID: Int] = [:]
+        var seriesUses: [AutoChartColumnID: Int] = [:]
+
+        func reuseCount(_ recommendation: AutoChartRecommendation) -> Int {
+            let encoding = recommendation.specification.encoding
+            return (encoding.x.map { xUses[$0, default: 0] } ?? 0)
+                + (encoding.y.map { yUses[$0, default: 0] } ?? 0)
+                + (encoding.series.map { seriesUses[$0, default: 0] } ?? 0)
         }
-        return Array(bestCandidateByID.values)
+
+        while output.count < limit, !remaining.isEmpty {
+            var selected = remaining.startIndex
+            for index in remaining.indices.dropFirst() {
+                let proposal = remaining[index]
+                let incumbent = remaining[selected]
+                let proposalReuse = reuseCount(proposal)
+                let incumbentReuse = reuseCount(incumbent)
+                if proposalReuse < incumbentReuse
+                    || (proposalReuse == incumbentReuse
+                        && (proposal.score > incumbent.score
+                            || (proposal.score == incumbent.score
+                                && proposal.id < incumbent.id)))
+                {
+                    selected = index
+                }
+            }
+            let recommendation = remaining.remove(at: selected)
+            guard isValid(recommendation) else { continue }
+            output.append(recommendation)
+            let encoding = recommendation.specification.encoding
+            if let x = encoding.x { xUses[x, default: 0] += 1 }
+            if let y = encoding.y { yUses[y, default: 0] += 1 }
+            if let series = encoding.series { seriesUses[series, default: 0] += 1 }
+        }
+        return output
     }
 
     private static func selectFeaturedSet(

@@ -367,6 +367,8 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         formatters: AutoChartFormatters? = nil,
         textResolver: AutoChartTextResolver? = nil
     ) {
+        let effectiveFormatters = formatters ?? presentedChart.formatters
+        let effectiveTextResolver = textResolver ?? presentedChart.textResolver
         content = .chart(
             presentedChart.preparedChart,
             presentedChart.resolvedPresentation)
@@ -375,12 +377,18 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         facetPanels = presentedChart.facetPanels
         sharedXCategoryDomain = presentedChart.sharedXCategoryDomain
         presentedKPI = presentedChart.kpi
-        presentedAudioGraphDescriptor = presentedChart.audioGraphDescriptor
+        #if canImport(Accessibility)
+        presentedAudioGraphDescriptor = presentedChart.makeAudioGraphDescriptor(
+            formatters: effectiveFormatters,
+            textResolver: effectiveTextResolver)
+        #else
+        presentedAudioGraphDescriptor = nil
+        #endif
         self.analysisID = analysisID
         self._selection = selection
         self.presentation = presentation
-        self.formatters = formatters ?? presentedChart.formatters
-        self.textResolver = textResolver ?? presentedChart.textResolver
+        self.formatters = effectiveFormatters
+        self.textResolver = effectiveTextResolver
     }
 
     /// Defers presentation until the view participates in a SwiftUI lifecycle.
@@ -1332,18 +1340,6 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             labels: facetDisplayLabels,
             fallback: resolvedPresentation.missingFacet,
             column: resolvedColumn(specification.encoding.facet),
-            context: .markAccessibility,
-            formatters: effectiveFormatters)
-    }
-
-    private func accessibilityYCategoryValue(for datum: AutoChartDatum) -> String {
-        categoryValueForSurface(
-            identity: datum.yIdentity,
-            value: datum.yCategoryValue,
-            label: datum.yLabel,
-            labels: yDisplayLabels,
-            fallback: resolvedPresentation.missingValue,
-            column: resolvedColumn(specification.encoding.y),
             context: .markAccessibility,
             formatters: effectiveFormatters)
     }
