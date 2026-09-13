@@ -2637,27 +2637,25 @@ private let date = AutoChartColumn(
 }
 
 @Suite struct RecommendationTests {
-    @Test func candidateDeduplicationUsesStableSpecificationIDs() throws {
-        let first = AutoChartRecommendation(
-            specification: AutoChartSpecification(family: .bar, title: "First title"),
-            score: 10,
-            rationale: ["First"])
-        let higher = AutoChartRecommendation(
-            specification: AutoChartSpecification(family: .bar, title: "Higher title"),
-            score: 20,
-            rationale: ["Higher"])
-        let equal = AutoChartRecommendation(
-            specification: AutoChartSpecification(family: .bar, title: "Equal title"),
-            score: 10,
-            rationale: ["Equal"])
+    @Test func generatedCandidatesHaveUniqueStableSpecificationIDs() {
+        let secondMeasure = AutoChartColumn(
+            id: "second-measure", name: "second_measure",
+            semantics: .measure(semantics: .init(rollup: .additive)))
+        let input = table(
+            columns: [date, category, measure, secondMeasure],
+            rows: (0..<8).map { offset in
+                [
+                    .date(Date(timeIntervalSince1970: Double(offset * 86_400))),
+                    .text(offset.isMultiple(of: 2) ? "A" : "B"),
+                    .double(Double(offset + 1)),
+                    .double(Double((offset + 1) * 2)),
+                ]
+            })
+        let candidates = AutoChartRecommendationEngine.recommendations(
+            for: input,
+            options: .init(maximumRecommendations: 20)).candidates
 
-        #expect(first.id == higher.id)
-        let highest = try #require(AutoChartRecommendationEngine.bestCandidatesByID([first, higher]).first)
-        #expect(AutoChartRecommendationEngine.bestCandidatesByID([first, higher]).count == 1)
-        #expect(highest.specification.title == "Higher title")
-
-        let stableTie = try #require(AutoChartRecommendationEngine.bestCandidatesByID([first, equal]).first)
-        #expect(stableTie.specification.title == "First title")
+        #expect(Set(candidates.map(\.id)).count == candidates.count)
     }
 
     @Test func scalarUsesKPI() {
@@ -3084,6 +3082,117 @@ private let date = AutoChartColumn(
                 than: AutoChartGrain([tenant, property])))
     }
 
+    @Test func chasmValidationAcceptsEquivalentCompositeGrains() {
+        let property: AutoChartEntityID = "property"
+        let tenant: AutoChartEntityID = "tenant"
+        let model = AutoChartSemanticModel(
+            relationships: [.init(one: property, many: tenant)])
+        let reordered = AutoChartColumn(
+            id: "reordered", name: "reordered",
+            provenance: .init(sourceGrain: .init([property, tenant])),
+            semantics: .measure())
+        let canonical = AutoChartColumn(
+            id: "canonical", name: "canonical",
+            provenance: .init(sourceGrain: .init([tenant, property])),
+            semantics: .measure())
+        let withoutRedundantAncestor = AutoChartColumn(
+            id: "tenant", name: "tenant",
+            provenance: .init(sourceGrain: .init(entity: tenant)),
+            semantics: .measure())
+        let size = AutoChartColumn(id: "size", name: "size", semantics: .measure())
+        let input = table(
+            columns: [reordered, canonical, withoutRedundantAncestor, size],
+            rows: [
+                [.double(1), .double(2), .double(3), .double(4)],
+                [.double(2), .double(3), .double(4), .double(5)],
+            ],
+            metadata: .init(semanticModel: model))
+
+        let scatter = AutoChartRecommendationEngine.validate(
+            specification: .scatter(x: reordered.id, y: canonical.id),
+            for: input)
+        let bubble = AutoChartRecommendationEngine.validate(
+            specification: .bubble(
+                x: reordered.id, y: withoutRedundantAncestor.id, size: size.id),
+            for: input)
+
+        #expect(scatter.isValid)
+        #expect(bubble.isValid)
+    }
+
+    @Test func rowGrainRefinementCoveredByGroupingAllowsValidRollup() {
+        let property: AutoChartEntityID = "property"
+        let monthEntity: AutoChartEntityID = "month"
+        let month = AutoChartColumn(
+            id: "month", name: "month",
+            provenance: .init(sourceGrain: .init(entity: monthEntity)),
+            semantics: .dimension(semanticType: .nominal))
+        let squareFeet = AutoChartColumn(
+            id: "square-feet", name: "square_feet",
+            provenance: .init(sourceGrain: .init(entity: property)),
+            semantics: .measure(
+                semantics: .init(source: .rowLevel, rollup: .additive)))
+        let input = table(
+            columns: [month, squareFeet],
+            rows: [
+                [.text("January"), .double(100)],
+                [.text("January"), .double(200)],
+                [.text("February"), .double(100)],
+                [.text("February"), .double(200)],
+            ],
+            metadata: .init(
+                rowGrain: .init([property, monthEntity]),
+                semanticModel: .init()))
+        let validation = AutoChartRecommendationEngine.validate(
+            specification: .bar(
+                category: month.id,
+                measure: squareFeet.id,
+                aggregation: .sum),
+            for: input)
+
+        #expect(validation.isValid)
+        #expect(!validation.issues.contains { $0.messageValue.code == .fanOutRisk })
+    }
+
+    @Test func uniqueRowGrainShortcutIsMemoizedForFacetedSupersets() {
+        let uniqueCategory = AutoChartColumn(
+            id: "unique", name: "unique",
+            semantics: .dimension(semanticType: .nominal))
+        let facet = AutoChartColumn(
+            id: "facet", name: "facet",
+            semantics: .dimension(semanticType: .nominal))
+        let value = AutoChartColumn(id: "value", name: "value", semantics: .measure())
+        let snapshot = AutoChartSnapshot(
+            table(
+                columns: [uniqueCategory, facet, value],
+                rows: [
+                    [.text("A"), .text("One"), .double(1)],
+                    [.text("B"), .text("Two"), .double(2)],
+                ]))
+        let profiles = AutoChartProfiler.profileIndex(snapshot)
+        let memo = AutoChartRecommendationEngine.AutoChartValidationMemo()
+        let base = AutoChartRecommendationEngine.validate(
+            specification: .bar(
+                category: uniqueCategory.id, measure: value.id, aggregation: .none),
+            snapshot: snapshot,
+            profiles: profiles,
+            memo: memo)
+
+        #expect(base.isValid)
+        #expect(
+            memo.uniqueCombination(
+                snapshotIdentity: snapshot.validationIdentity,
+                fields: [uniqueCategory.id],
+                measure: value.id,
+                droppingRowsMissing: [uniqueCategory.id]) == true)
+        #expect(
+            memo.uniqueCombination(
+                snapshotIdentity: snapshot.validationIdentity,
+                fields: [uniqueCategory.id, facet.id],
+                measure: value.id,
+                droppingRowsMissing: [uniqueCategory.id]) == true)
+    }
+
     @Test func fanOutUsesRowGrainAndSkipsDuplicateInvariantAggregations() {
         let fund: AutoChartEntityID = "fund"
         let property: AutoChartEntityID = "property"
@@ -3156,6 +3265,22 @@ private let date = AutoChartColumn(
                 for: input,
                 options: .init(maximumRecommendations: 12))
                 .candidates.first { $0.specification.family == .histogram })
+        #expect(histogram.specification.binCount == 20)
+    }
+
+    @Test func histogramRecommendationTreatsOverflowingEstimateAsMaximumBins() throws {
+        let tiny = 1e-300
+        let input = table(
+            columns: [measure],
+            rows: [0, 0, 0, tiny, tiny, tiny, tiny, Double.greatestFiniteMagnitude].map {
+                [.double($0)]
+            })
+        let histogram = try #require(
+            AutoChartRecommendationEngine.recommendations(
+                for: input,
+                options: .init(maximumRecommendations: 12))
+                .candidates.first { $0.specification.family == .histogram })
+
         #expect(histogram.specification.binCount == 20)
     }
 
@@ -8224,6 +8349,68 @@ private let date = AutoChartColumn(
                 locale: Locale(identifier: "en_US"),
                 seriesDeclaredRanks: ["text:4:Plan": 0, "text:6:Actual": 1])
                 .map(\.id) == ["plan", "actual"])
+    }
+
+    @Test func sourceOrderingUsesFirstCategoryOccurrenceBeforeSeriesRank() {
+        let data = [
+            AutoChartDatum(
+                id: "a-plan", sourceRowIDs: [0],
+                xIdentity: "text:1:A", xLabel: "A", yNumber: 1,
+                seriesIdentity: "text:4:Plan", series: "Plan"),
+            AutoChartDatum(
+                id: "b", sourceRowIDs: [1],
+                xIdentity: "text:1:B", xLabel: "B", yNumber: 2,
+                seriesIdentity: "text:4:Plan", series: "Plan"),
+            AutoChartDatum(
+                id: "c", sourceRowIDs: [2],
+                xIdentity: "text:1:C", xLabel: "C", yNumber: 3,
+                seriesIdentity: "text:4:Plan", series: "Plan"),
+            AutoChartDatum(
+                id: "a-actual", sourceRowIDs: [3],
+                xIdentity: "text:1:A", xLabel: "A", yNumber: 4,
+                seriesIdentity: "text:6:Actual", series: "Actual"),
+        ]
+        let specification = AutoChartSpecification(
+            family: .groupedBar,
+            encoding: .init(x: "x", y: "value", series: "series"),
+            aggregation: .sum,
+            sort: .source)
+        let ordered = orderedPresentedData(
+            data,
+            specification: specification,
+            xLabels: [:],
+            yLabels: [:],
+            missingValue: "Missing",
+            locale: Locale(identifier: "en_US"),
+            seriesDeclaredRanks: ["text:6:Actual": 0, "text:4:Plan": 1])
+
+        #expect(ordered.map(\.id) == ["a-actual", "a-plan", "b", "c"])
+    }
+
+    @Test func partialCategoryOrderPreservesSourceOrderForUnrankedValues() {
+        let data = [
+            AutoChartDatum(
+                id: "zulu", sourceRowIDs: [0],
+                xIdentity: "text:4:Zulu", xLabel: "Zulu", yNumber: 1),
+            AutoChartDatum(
+                id: "beta", sourceRowIDs: [1],
+                xIdentity: "text:4:Beta", xLabel: "Beta", yNumber: 2),
+            AutoChartDatum(
+                id: "alpha", sourceRowIDs: [2],
+                xIdentity: "text:5:Alpha", xLabel: "Alpha", yNumber: 3),
+        ]
+        let specification = AutoChartSpecification.bar(
+            category: "category", measure: "value", aggregation: .sum)
+        let ordered = orderedPresentedData(
+            data,
+            specification: specification,
+            xLabels: [:],
+            yLabels: [:],
+            missingValue: "Missing",
+            locale: Locale(identifier: "en_US"),
+            xDeclaredRanks: ["text:5:Alpha": 0])
+
+        #expect(ordered.map(\.id) == ["alpha", "zulu", "beta"])
     }
 
     @Test func boxPlotOrderingUsesLocaleAwareCollation() {

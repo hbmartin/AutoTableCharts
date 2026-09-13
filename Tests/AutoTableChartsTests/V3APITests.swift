@@ -66,6 +66,10 @@ import Accessibility
         let descriptor = input.makeChartDescriptor()
 
         #expect(descriptor.additionalAxes.isEmpty)
+        #expect(
+            descriptor.series.flatMap(\.dataPoints).allSatisfy {
+                $0.__additionalValues.isEmpty
+            })
     }
 
     @Test func presenterMarksFacetedLineAudioSeriesContinuous() async throws {
@@ -118,6 +122,39 @@ import Accessibility
         let heatmapDescriptor = try #require(
             AutoChartPresenter().present(heatmap).audioGraphDescriptor)
         #expect(heatmapDescriptor.yTitle == "Count")
+    }
+
+    @Test func presenterDefersAudioGraphWorkAndSupportsRenderTimeFormatters() async throws {
+        let x = AutoChartColumn(id: "x", name: "x", semantics: .measure())
+        let y = AutoChartColumn(id: "y", name: "y", semantics: .measure())
+        let dataset = try AutoChartDataset(
+            columns: [x, y],
+            rows: [[.double(1), .double(2)], [.double(3), .double(4)]],
+            rowIDs: [1, 2])
+        let analysis = try await AutoChartAnalyzer().analyze(
+            try AutoChartRequest(table: dataset))
+        let chart = try await analysis.prepare(.scatter(x: x.id, y: y.id))
+        let calls = V3Counter()
+        let formatters = AutoChartFormatters(request: { request, _, _ in
+            guard request.context == .markAccessibility else { return nil }
+            calls.increment()
+            return "render-time"
+        })
+
+        let presented = AutoChartPresenter().present(chart, formatters: formatters)
+        #expect(calls.value == 0)
+
+        let descriptor = try #require(presented.audioGraphDescriptor)
+        #expect(calls.value > 0)
+        #expect(descriptor.yValueDescription(2) == "render-time")
+
+        let overridden = try #require(
+            presented.makeAudioGraphDescriptor(
+                formatters: AutoChartFormatters(request: { request, _, _ in
+                    request.context == .markAccessibility ? "view-override" : nil
+                }),
+                textResolver: .default))
+        #expect(overridden.yValueDescription(2) == "view-override")
     }
 }
 #endif
@@ -982,7 +1019,11 @@ private final class ProgressRecorder: @unchecked Sendable {
         }
 
         #expect(catalog.featured.count == 5)
+        #expect(Set(catalog.featured.map(\.specification.family)).count > 1)
         #expect(catalog.cataloged.count <= 50)
+        #expect(catalog.featured.allSatisfy { featured in
+            catalog.cataloged.contains { $0.id == featured.id }
+        })
         #expect(
             zip(catalog.cataloged, catalog.cataloged.dropFirst())
                 .allSatisfy { $0.score >= $1.score })
@@ -1001,6 +1042,28 @@ private final class ProgressRecorder: @unchecked Sendable {
         }
 
         #expect(eligibleFacets.count <= maximumColumns * 3 * maximumColumns)
+        let facetedBarXColumns = Set(
+            eligibleFacets.compactMap { recommendation in
+                recommendation.specification.facetBaseFamily == .bar
+                    ? recommendation.specification.encoding.x : nil
+            })
+        #expect(facetedBarXColumns.count == maximumColumns)
+    }
+
+    @Test func facetedShortlistHonorsEventualRequestConstraints() throws {
+        let dataset = try wideDomainDataset()
+        let constraints = AutoChartRecommendationConstraints(
+            includedFamilies: [.faceted],
+            requiredColumns: ["dimension-6", "dimension-7", "measure-7"])
+        let result = AutoChartRecommendationEngine.recommendations(
+            for: dataset,
+            options: .init(maximumCandidateColumns: 8),
+            constraints: constraints)
+
+        #expect(!result.chartRecommendations.isEmpty)
+        #expect(result.chartRecommendations.allSatisfy {
+            constraints.allows($0.specification)
+        })
     }
 
     @Test func catalogDecodingReappliesAllCollectionInvariants() throws {

@@ -1335,11 +1335,15 @@ public actor AutoChartAnalyzer {
         // Prepared-domain validation may scan every row for each candidate.
         catalogOptions.maximumRecommendations =
             AutoChartRecommendationCatalog.maximumCatalogedCount
+        let featuredLimit = min(
+            options.maximumRecommendations,
+            AutoChartRecommendationCatalog.maximumFeaturedCount)
         let set = AutoChartRecommendationEngine.recommendations(
             snapshot: source.snapshot,
             context: context,
             options: catalogOptions,
-            constraints: constraints)
+            constraints: constraints,
+            featuredLimit: featuredLimit)
         try Task.checkCancellation()
         let recommendations = set.catalogedRecommendations
         let outcome: AutoChartRecommendationOutcome
@@ -1354,22 +1358,9 @@ public actor AutoChartAnalyzer {
                         code: code,
                         defaultText: reason)))
         } else {
-            let featuredLimit = min(
-                options.maximumRecommendations,
-                AutoChartRecommendationCatalog.maximumFeaturedCount)
-            let catalogIDs = Set(recommendations.map(\.id))
-            var featured = set.chartRecommendations.filter {
-                catalogIDs.contains($0.id)
-            }
-            for recommendation in recommendations
-            where featured.count < featuredLimit
-                && !featured.contains(where: { $0.id == recommendation.id })
-            {
-                featured.append(recommendation)
-            }
             outcome = .charts(
                 AutoChartRecommendationCatalog(
-                    featured: Array(featured.prefix(featuredLimit)),
+                    featured: set.chartRecommendations,
                     cataloged: recommendations))
         }
         try Task.checkCancellation()

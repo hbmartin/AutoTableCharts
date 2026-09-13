@@ -425,7 +425,7 @@ private struct CountingChartRowsTable: AutoChartTable {
     }
 
     @Test func resolutionReportsExactAndPolicyDefaulting() async throws {
-        #expect(AutoTableCharts.recommendationPolicyVersion == 13)
+        #expect(AutoTableCharts.recommendationPolicyVersion == 14)
         let dataset = try AutoChartDataset<Int>(
             columns: [v2Category, v2Measure],
             rows: [[.text("A"), .double(1)], [.text("B"), .double(2)]])
@@ -459,7 +459,7 @@ private struct CountingChartRowsTable: AutoChartTable {
         }
         #expect(defaulted.id == primary.id)
         #expect(previous == 10)
-        #expect(current == 13)
+        #expect(current == 14)
 
         let absent = AutoChartRecommendationID(
             policyVersion: AutoTableCharts.recommendationPolicyVersion,
