@@ -2278,6 +2278,19 @@ enum AutoChartRecommendationEngine {
                 return orderedUnique(groupingIDs + [measureID])
             }
 
+            let identifyingGroupingEntities: [AutoChartEntityID] = groupingIDs.flatMap {
+                groupingID in
+                guard profiles[groupingID]?.semanticType == .identifier else {
+                    return [AutoChartEntityID]()
+                }
+                return profiles[groupingID]?.column.provenance?.sourceGrain?.entities ?? []
+            }
+            let explicitlyIdentifiedGrain = AutoChartGrain(
+                measureGrain.entities + identifyingGroupingEntities)
+            if semanticModel.isAtLeastAsFine(explicitlyIdentifiedGrain, as: rowGrain) {
+                return nil
+            }
+
             // Naming the entities that refine row grain is not enough to prove
             // that the displayed values identify those entity instances. A
             // quarter derived from a month-grain column, for example, still
@@ -2292,24 +2305,11 @@ enum AutoChartRecommendationEngine {
                 return nil
             }
 
-            let identifyingGroupingEntities: [AutoChartEntityID] = groupingIDs.flatMap {
-                groupingID in
-                guard profiles[groupingID]?.column.hints.role == .identifier else {
-                    return [AutoChartEntityID]()
-                }
-                return profiles[groupingID]?.column.provenance?.sourceGrain?.entities ?? []
-            }
-            let explicitlyIdentifiedGrain = AutoChartGrain(
-                measureGrain.entities + identifyingGroupingEntities)
-            if semanticModel.isAtLeastAsFine(explicitlyIdentifiedGrain, as: rowGrain) {
-                return nil
-            }
-
             // A result can also prove the rollup safe by retaining identifiers
             // for the measure grain. In that case each measure entity must occur
             // at most once for the displayed grouping values.
             let measureIdentifierProfiles = profiles.values.filter { profile in
-                guard profile.column.hints.role == .identifier,
+                guard profile.semanticType == .identifier,
                     let identifierGrain = profile.column.provenance?.sourceGrain
                 else { return false }
                 return semanticModel.isAtLeastAsFine(measureGrain, as: identifierGrain)
@@ -2698,6 +2698,9 @@ enum AutoChartRecommendationEngine {
     final class AutoChartValidationMemo {
         private let boxPlotCategoryIndex: BoxPlotCategoryIndex?
         private var uniqueCombinations: [AutoChartCombinationRequest: Bool] = [:]
+        #if ATC_TEST_HOOKS
+        private(set) var uniqueCombinationScanCountForTesting = 0
+        #endif
 
         init() {
             boxPlotCategoryIndex = nil
@@ -2788,6 +2791,12 @@ enum AutoChartRecommendationEngine {
                     droppingRowsMissing: droppingRowsMissing)
             ] = value
         }
+
+        #if ATC_TEST_HOOKS
+        func recordUniqueCombinationScanForTesting() {
+            uniqueCombinationScanCountForTesting += 1
+        }
+        #endif
     }
 
     private static func hasUniqueCombination(
@@ -2798,6 +2807,7 @@ enum AutoChartRecommendationEngine {
         droppingRowsMissing: Set<AutoChartColumnID> = [],
         memo: AutoChartValidationMemo? = nil
     ) -> Bool {
+        let fields = orderedUnique(fields)
         guard !fields.isEmpty else { return false }
         if fields.count == 1,
             let field = fields.first,
@@ -2821,6 +2831,9 @@ enum AutoChartRecommendationEngine {
         {
             return cached
         }
+        #if ATC_TEST_HOOKS
+        memo?.recordUniqueCombinationScanForTesting()
+        #endif
         var seen: Set<[AutoChartValueIdentity]> = []
         var isUnique = true
         for row in snapshot.rows {
@@ -2870,7 +2883,7 @@ enum AutoChartRecommendationEngine {
         isValid: (AutoChartRecommendation) -> Bool
     ) -> [AutoChartRecommendation] {
         guard limit > 0 else { return [] }
-        var remaining = candidates
+        var remaining = candidates.filter(isValid)
         var output: [AutoChartRecommendation] = []
         var xUses: [AutoChartColumnID: Int] = [:]
         var yUses: [AutoChartColumnID: Int] = [:]
@@ -2884,23 +2897,21 @@ enum AutoChartRecommendationEngine {
         }
 
         while output.count < limit, !remaining.isEmpty {
-            // Reuse counts only change after a valid selection. Sorting once per
-            // selection lets an arbitrarily long invalid prefix be discarded in
-            // one pass instead of rescanning the shrinking array quadratically.
-            remaining.sort { proposal, incumbent in
+            var selected = remaining.startIndex
+            for index in remaining.indices.dropFirst() {
+                let proposal = remaining[index]
+                let incumbent = remaining[selected]
                 let proposalReuse = reuseCount(proposal)
                 let incumbentReuse = reuseCount(incumbent)
                 if proposalReuse != incumbentReuse {
-                    return proposalReuse < incumbentReuse
+                    if proposalReuse < incumbentReuse { selected = index }
+                } else if proposal.score != incumbent.score {
+                    if proposal.score > incumbent.score { selected = index }
+                } else if proposal.id < incumbent.id {
+                    selected = index
                 }
-                if proposal.score != incumbent.score {
-                    return proposal.score > incumbent.score
-                }
-                return proposal.id < incumbent.id
             }
-            guard let selected = remaining.firstIndex(where: isValid) else { break }
-            let recommendation = remaining[selected]
-            remaining.removeSubrange(...selected)
+            let recommendation = remaining.remove(at: selected)
             output.append(recommendation)
             let encoding = recommendation.specification.encoding
             if let x = encoding.x { xUses[x, default: 0] += 1 }

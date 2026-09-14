@@ -3126,7 +3126,7 @@ private let date = AutoChartColumn(
         let propertyID = AutoChartColumn(
             id: "property-id", name: "property_id",
             provenance: .init(sourceGrain: .init(entity: property)),
-            semantics: .identifier())
+            semantics: .inferred())
         let month = AutoChartColumn(
             id: "month", name: "month",
             provenance: .init(sourceGrain: .init(entity: monthEntity)),
@@ -3156,6 +3156,132 @@ private let date = AutoChartColumn(
 
         #expect(validation.isValid)
         #expect(!validation.issues.contains { $0.messageValue.code == .fanOutRisk })
+    }
+
+    @Test func rowGrainRefinementWithoutIdentifierEvidenceRemainsFanOutRisk() {
+        let property: AutoChartEntityID = "property"
+        let monthEntity: AutoChartEntityID = "month"
+        let month = AutoChartColumn(
+            id: "month", name: "month",
+            provenance: .init(sourceGrain: .init(entity: monthEntity)),
+            semantics: .dimension(semanticType: .nominal))
+        let squareFeet = AutoChartColumn(
+            id: "square-feet", name: "square_feet",
+            provenance: .init(sourceGrain: .init(entity: property)),
+            semantics: .measure(
+                semantics: .init(source: .rowLevel, rollup: .additive)))
+        let input = table(
+            columns: [month, squareFeet],
+            rows: [
+                [.text("January"), .double(100)],
+                [.text("January"), .double(200)],
+                [.text("February"), .double(100)],
+                [.text("February"), .double(200)],
+            ],
+            metadata: .init(
+                rowGrain: .init([property, monthEntity]),
+                semanticModel: .init()))
+        let validation = AutoChartRecommendationEngine.validate(
+            specification: .bar(
+                category: month.id,
+                measure: squareFeet.id,
+                aggregation: .sum),
+            for: input)
+
+        #expect(!validation.isValid)
+        #expect(validation.issues.contains { $0.messageValue.code == .fanOutRisk })
+    }
+
+    @Test(.disabled(if: !testHooksAvailable, testHooksUnavailable))
+    func identifierGroupingGrainAvoidsUniquenessScans() {
+        #if ATC_TEST_HOOKS
+        let property: AutoChartEntityID = "property"
+        let monthEntity: AutoChartEntityID = "month"
+        let monthID = AutoChartColumn(
+            id: "month-id", name: "month_id",
+            provenance: .init(sourceGrain: .init(entity: monthEntity)),
+            semantics: .identifier())
+        let squareFeet = AutoChartColumn(
+            id: "square-feet", name: "square_feet",
+            provenance: .init(sourceGrain: .init(entity: property)),
+            semantics: .measure(
+                semantics: .init(source: .rowLevel, rollup: .additive)))
+        let snapshot = AutoChartSnapshot(
+            table(
+                columns: [monthID, squareFeet],
+                rows: [
+                    [.text("2026-01"), .double(100)],
+                    [.text("2026-01"), .double(200)],
+                ],
+                metadata: .init(
+                    rowGrain: .init([property, monthEntity]),
+                    semanticModel: .init())))
+        let profiles = AutoChartProfiler.profileIndex(snapshot)
+        let memo = AutoChartRecommendationEngine.AutoChartValidationMemo()
+        let validation = AutoChartRecommendationEngine.validate(
+            specification: .bar(
+                category: monthID.id,
+                measure: squareFeet.id,
+                aggregation: .sum),
+            snapshot: snapshot,
+            profiles: profiles,
+            memo: memo)
+
+        #expect(!validation.issues.contains { $0.messageValue.code == .fanOutRisk })
+        #expect(memo.uniqueCombinationScanCountForTesting == 0)
+        #endif
+    }
+
+    @Test func identifierGroupingOverlapUsesCanonicalUniquenessFields() {
+        let property: AutoChartEntityID = "property"
+        let unit: AutoChartEntityID = "unit"
+        let month: AutoChartEntityID = "month"
+        let propertyID = AutoChartColumn(
+            id: "property-id", name: "property_id",
+            provenance: .init(sourceGrain: .init(entity: property)),
+            semantics: .identifier())
+        let unitID = AutoChartColumn(
+            id: "unit-id", name: "unit_id",
+            provenance: .init(sourceGrain: .init(entity: unit)),
+            semantics: .identifier())
+        let monthName = AutoChartColumn(
+            id: "month", name: "month",
+            provenance: .init(sourceGrain: .init(entity: month)),
+            semantics: .dimension(semanticType: .nominal))
+        let value = AutoChartColumn(
+            id: "value", name: "value",
+            provenance: .init(sourceGrain: .init([property, unit])),
+            semantics: .measure(
+                semantics: .init(source: .rowLevel, rollup: .additive)))
+        let snapshot = AutoChartSnapshot(
+            table(
+                columns: [propertyID, unitID, monthName, value],
+                rows: [
+                    [.text("P1"), .text("U1"), .text("January"), .double(100)],
+                    [.text("P1"), .text("U2"), .text("January"), .double(200)],
+                ],
+                metadata: .init(
+                    rowGrain: .init([property, unit, month]),
+                    semanticModel: .init())))
+        let profiles = AutoChartProfiler.profileIndex(snapshot)
+        let memo = AutoChartRecommendationEngine.AutoChartValidationMemo()
+        let validation = AutoChartRecommendationEngine.validate(
+            specification: .groupedBar(
+                category: propertyID.id,
+                measure: value.id,
+                series: monthName.id,
+                aggregation: .sum),
+            snapshot: snapshot,
+            profiles: profiles,
+            memo: memo)
+
+        #expect(!validation.issues.contains { $0.messageValue.code == .fanOutRisk })
+        #expect(
+            memo.uniqueCombination(
+                snapshotIdentity: snapshot.validationIdentity,
+                fields: [propertyID.id, unitID.id, monthName.id],
+                measure: value.id,
+                droppingRowsMissing: []) == true)
     }
 
     @Test func derivedGroupingValueDoesNotProveRowGrainUniqueness() {

@@ -29,7 +29,16 @@ non-additive unless the host can provide a stronger, truthful contract.
 ``AutoChartGrain`` to a result field. ``AutoChartTableMetadata/semanticModel``
 declares one-to-many entity relationships. When a measure is grouped or rolled
 up by a strictly finer entity, validation returns the typed `fanOutRisk`
-finding—even if repeated result values happen to look harmless.
+finding unless the result proves that the refinement is safe. Accepted proofs
+are an identifier grouping whose declared grain covers the result row grain, an
+observably unique grouping combination, or retained measure-grain identifiers
+that are unique within the displayed groups. Identifier evidence includes both
+explicit identifier hints and identifiers inferred by profiling.
+
+The rule remains conservative when a row-grain refinement has no observable
+uniqueness or identifier evidence. In particular, omitting the identifier column
+needed to establish measure-grain uniqueness still produces `fanOutRisk`; the
+package does not infer uniqueness from a plausible query shape alone.
 Scatter and bubble charts likewise reject incomparable child-grain measure
 pairs that can form a chasm trap across two one-to-many joins.
 

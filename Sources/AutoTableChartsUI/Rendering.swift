@@ -8,6 +8,27 @@ import AutoTableCharts
 /// Sessions may still inject their own presenter.
 private let autoChartConveniencePresenter = AutoChartPresenter()
 
+func autoChartPresentedChartForView<RowID: Hashable & Sendable>(
+    _ presentedChart: AutoChartPresentedChart<RowID>,
+    formatters: AutoChartFormatters?,
+    textResolver: AutoChartTextResolver?,
+    presenter: AutoChartPresenter = autoChartConveniencePresenter
+) -> AutoChartPresentedChart<RowID> {
+    let effectiveFormatters = formatters ?? presentedChart.formatters
+    let effectiveTextResolver = textResolver ?? presentedChart.textResolver
+    let requestedID = AutoChartPresentationRequestID(
+        preparedChart: presentedChart.id,
+        context: presentedChart.context,
+        formatters: effectiveFormatters,
+        textResolver: effectiveTextResolver)
+    guard requestedID != presentedChart.requestID else { return presentedChart }
+    return presenter.present(
+        presentedChart.preparedChart,
+        context: presentedChart.context,
+        formatters: effectiveFormatters,
+        textResolver: effectiveTextResolver)
+}
+
 /// Process-wide memo used by deferred convenience presentation tasks.
 ///
 /// Release its bounded presentation payloads in response to memory pressure or
@@ -367,36 +388,28 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         formatters: AutoChartFormatters? = nil,
         textResolver: AutoChartTextResolver? = nil
     ) {
-        let effectiveFormatters = formatters ?? presentedChart.formatters
-        let effectiveTextResolver = textResolver ?? presentedChart.textResolver
+        let effectivePresentedChart = autoChartPresentedChartForView(
+            presentedChart,
+            formatters: formatters,
+            textResolver: textResolver)
         content = .chart(
-            presentedChart.preparedChart,
-            presentedChart.resolvedPresentation)
-        displayTitle = presentedChart.title
-        renderedData = presentedChart.renderedData
-        facetPanels = presentedChart.facetPanels
-        sharedXCategoryDomain = presentedChart.sharedXCategoryDomain
-        presentedKPI = presentedChart.kpi
+            effectivePresentedChart.preparedChart,
+            effectivePresentedChart.resolvedPresentation)
+        displayTitle = effectivePresentedChart.title
+        renderedData = effectivePresentedChart.renderedData
+        facetPanels = effectivePresentedChart.facetPanels
+        sharedXCategoryDomain = effectivePresentedChart.sharedXCategoryDomain
+        presentedKPI = effectivePresentedChart.kpi
         #if canImport(Accessibility)
-        if [.kpi, .range].contains(
-            presentedChart.preparedChart.recommendation.specification.family)
-        {
-            presentedAudioGraphDescriptor = nil
-        } else {
-            presentedAudioGraphDescriptor = AutoChartLazyAudioGraphDescriptor {
-                presentedChart.makeAudioGraphDescriptor(
-                    formatters: effectiveFormatters,
-                    textResolver: effectiveTextResolver)
-            }
-        }
+        presentedAudioGraphDescriptor = effectivePresentedChart.makeLazyAudioGraphDescriptor()
         #else
         presentedAudioGraphDescriptor = nil
         #endif
         self.analysisID = analysisID
         self._selection = selection
         self.presentation = presentation
-        self.formatters = effectiveFormatters
-        self.textResolver = effectiveTextResolver
+        self.formatters = effectivePresentedChart.formatters
+        self.textResolver = effectivePresentedChart.textResolver
     }
 
     /// Defers presentation until the view participates in a SwiftUI lifecycle.

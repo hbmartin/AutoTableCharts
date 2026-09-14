@@ -345,6 +345,8 @@ public struct AutoChartPresentedChart<RowID: Hashable & Sendable>: Sendable {
     package let kpi: AutoChartPresentedKPI?
     package let formatters: AutoChartFormatters
     package let textResolver: AutoChartTextResolver
+    let audioGraphAvailability: AutoChartAudioGraphAvailability?
+    let audioGraphDescriptorCache: AutoChartAudioGraphDescriptorCache
     let requestID: AutoChartPresentationRequestID
 
     public var id: AutoChartPreparedChartID { preparedChart.id }
@@ -362,6 +364,8 @@ public struct AutoChartPresentedChart<RowID: Hashable & Sendable>: Sendable {
         kpi: AutoChartPresentedKPI?,
         formatters: AutoChartFormatters,
         textResolver: AutoChartTextResolver,
+        audioGraphAvailability: AutoChartAudioGraphAvailability?,
+        audioGraphDescriptorCache: AutoChartAudioGraphDescriptorCache,
         requestID: AutoChartPresentationRequestID
     ) {
         self.preparedChart = preparedChart
@@ -376,56 +380,38 @@ public struct AutoChartPresentedChart<RowID: Hashable & Sendable>: Sendable {
         self.kpi = kpi
         self.formatters = formatters
         self.textResolver = textResolver
+        self.audioGraphAvailability = audioGraphAvailability
+        self.audioGraphDescriptorCache = audioGraphDescriptorCache
         self.requestID = requestID
     }
 
     /// Builds an Audio Graph descriptor explicitly. SwiftUI uses a lazy
     /// representable so ordinary view reconstruction does not call this method.
     func makeAudioGraphDescriptor() -> AutoChartAudioGraphDescriptor? {
-        makeAudioGraphDescriptor(
-            formatters: formatters,
-            textResolver: textResolver)
+        guard let audioGraphAvailability else { return nil }
+        return makeAudioGraphDescriptor(availability: audioGraphAvailability)
     }
 
-    func makeAudioGraphDescriptor(
-        formatters: AutoChartFormatters,
-        textResolver: AutoChartTextResolver
-    ) -> AutoChartAudioGraphDescriptor? {
-        let requestedID = AutoChartPresentationRequestID(
-            preparedChart: preparedChart.id,
-            context: context,
-            formatters: formatters,
-            textResolver: textResolver)
-        let resolved: AutoChartResolvedPresentation
-        let descriptorData: [AutoChartDatum]
-        let displayTitle: String
-        if requestedID == requestID {
-            resolved = resolvedPresentation
-            descriptorData = renderedData
-            displayTitle = title
-        } else {
-            let core = preparedChart.core
-            let specification = preparedChart.recommendation.specification
-            resolved = core.presentation.resolvedPresentation(
-                data: core.data,
-                using: textResolver,
-                formatters: formatters)
-            descriptorData = orderedPresentationContent(
-                core: core,
-                specification: specification,
-                resolved: resolved,
-                formatters: formatters).data
-            displayTitle = resolvedDisplayTitle(
-                for: preparedChart,
-                textResolver: textResolver)
+    func makeLazyAudioGraphDescriptor() -> AutoChartLazyAudioGraphDescriptor? {
+        guard let audioGraphAvailability else { return nil }
+        return AutoChartLazyAudioGraphDescriptor {
+            makeAudioGraphDescriptor(availability: audioGraphAvailability)
         }
-        return makeAutoChartAudioGraphDescriptor(
-            preparedChart: preparedChart,
-            renderedData: descriptorData,
-            resolved: resolved,
-            displayTitle: displayTitle,
-            formatters: formatters,
-            textResolver: textResolver)
+    }
+
+    private func makeAudioGraphDescriptor(
+        availability: AutoChartAudioGraphAvailability
+    ) -> AutoChartAudioGraphDescriptor {
+        audioGraphDescriptorCache.value {
+            makeAutoChartAudioGraphDescriptor(
+                preparedChart: preparedChart,
+                renderedData: renderedData,
+                resolved: resolvedPresentation,
+                displayTitle: title,
+                formatters: formatters,
+                textResolver: textResolver,
+                availability: availability)
+        }
     }
 }
 
@@ -444,6 +430,8 @@ private struct AutoChartPresentationPayload: Sendable {
     let facetPanels: [AutoChartFacetPanel]
     let sharedXCategoryDomain: [String]
     let kpi: AutoChartPresentedKPI?
+    let audioGraphAvailability: AutoChartAudioGraphAvailability?
+    let audioGraphDescriptorCache: AutoChartAudioGraphDescriptorCache
 }
 
 /// Thread-safe presenter memoized by prepared-chart and presentation-context identity.
@@ -600,6 +588,10 @@ public final class AutoChartPresenter: @unchecked Sendable {
         } else {
             kpi = nil
         }
+        let audioGraphAvailability = makeAutoChartAudioGraphAvailability(
+            preparedChart: chart,
+            renderedData: renderedData)
+        try checkingCancellation()
         let title = resolvedDisplayTitle(for: chart, textResolver: textResolver)
         let proposed = AutoChartPresentationPayload(
             title: title,
@@ -609,7 +601,9 @@ public final class AutoChartPresenter: @unchecked Sendable {
             renderedData: renderedData,
             facetPanels: facetPanels,
             sharedXCategoryDomain: sharedXCategoryDomain,
-            kpi: kpi)
+            kpi: kpi,
+            audioGraphAvailability: audioGraphAvailability,
+            audioGraphDescriptorCache: AutoChartAudioGraphDescriptorCache())
         let payload = lock.withLock {
             if let cached = cachedPayload(for: requestID) { return cached }
             guard maximumEntries > 0 else { return proposed }
@@ -672,6 +666,8 @@ public final class AutoChartPresenter: @unchecked Sendable {
             kpi: payload.kpi,
             formatters: formatters,
             textResolver: textResolver,
+            audioGraphAvailability: payload.audioGraphAvailability,
+            audioGraphDescriptorCache: payload.audioGraphDescriptorCache,
             requestID: requestID)
     }
 }
