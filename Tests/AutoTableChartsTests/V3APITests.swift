@@ -147,16 +147,23 @@ import Accessibility
             try AutoChartRequest(table: dataset))
         let chart = try await analysis.prepare(.bar(category: x.id, measure: y.id))
         let calls = V3Counter()
+        let measureRequest = V3LockedBox<AutoChartFormattingRequest>()
         let formatters = AutoChartFormatters(request: { request, _, _ in
-            guard request.context == .markAccessibility,
-                request.column?.id == x.id
-            else { return nil }
-            calls.increment()
-            return "render-time"
+            guard request.context == .markAccessibility else { return nil }
+            if request.column?.id == x.id {
+                calls.increment()
+                return "render-time"
+            }
+            if request.column?.id == y.id {
+                measureRequest.store(request)
+                return "measure-value"
+            }
+            return nil
         })
 
         let presented = AutoChartPresenter().present(chart, formatters: formatters)
         #expect(calls.value == 0)
+        #expect(measureRequest.value == nil)
 
         await MainActor.run {
             _ = AutoChartView(
@@ -165,6 +172,7 @@ import Accessibility
                 formatters: formatters)
         }
         #expect(calls.value == 0)
+        #expect(measureRequest.value == nil)
 
         let lazy = try #require(presented.makeLazyAudioGraphDescriptor())
         _ = lazy.makeChartDescriptor()
@@ -172,6 +180,18 @@ import Accessibility
         #expect(firstBuildCalls > 0)
         _ = lazy.makeChartDescriptor()
         #expect(calls.value == firstBuildCalls)
+
+        let secondLazy = try #require(presented.makeLazyAudioGraphDescriptor())
+        _ = secondLazy.makeChartDescriptor()
+        #expect(calls.value > firstBuildCalls)
+
+        let descriptor = secondLazy.descriptor()
+        #expect(descriptor.yValueDescription(2) == "measure-value")
+        let request = try #require(measureRequest.value)
+        #expect(request.column?.id == y.id)
+        #expect(request.value == .double(2))
+        #expect(request.context == .markAccessibility)
+        #expect(request.purpose == .value)
     }
 
     @Test func emptyAndAllNullBarsExposeNoAudioGraph() async throws {
@@ -240,16 +260,43 @@ import Accessibility
                 encoding: .init(x: category.id, y: measure.id, facet: facet.id),
                 facetBaseFamily: .bar,
                 sort: .ascending))
-        let swedish = AutoChartPresenter().present(
+        let presenter = AutoChartPresenter(maximumEntries: 0)
+        let swedish = presenter.present(
             chart,
             formatters: .init(locale: Locale(identifier: "sv_SE")))
-        let american = autoChartPresentedChartForView(
-            swedish,
-            formatters: .init(locale: Locale(identifier: "en_US")),
-            textResolver: AutoChartTextResolver { message in
-                "US: \(message.defaultText)"
-            },
-            presenter: AutoChartPresenter())
+        let resolverCalls = V3Counter()
+        let formatterCalls = V3Counter()
+        let americanFormatters = AutoChartFormatters(
+            locale: Locale(identifier: "en_US"),
+            request: { _, _, _ in
+                formatterCalls.increment()
+                return nil
+            })
+        let americanResolver = AutoChartTextResolver { message in
+            resolverCalls.increment()
+            return "US: \(message.defaultText)"
+        }
+
+        await MainActor.run {
+            _ = AutoChartView(
+                presentedChart: swedish,
+                analysisID: analysis.id,
+                formatters: americanFormatters,
+                textResolver: americanResolver)
+        }
+        #expect(resolverCalls.value == 0)
+        #expect(formatterCalls.value == 0)
+
+        let american = try await swedish.rePresentCancellable(
+            formatters: americanFormatters,
+            textResolver: americanResolver)
+        let afterFirstOverride = resolverCalls.value
+        let formatterCallsAfterFirstOverride = formatterCalls.value
+        _ = try await swedish.rePresentCancellable(
+            formatters: americanFormatters,
+            textResolver: americanResolver)
+        #expect(resolverCalls.value > afterFirstOverride)
+        #expect(formatterCalls.value > formatterCallsAfterFirstOverride)
 
         #expect(swedish.sharedXCategoryDomain == ["z", "ä"])
         #expect(american.sharedXCategoryDomain == ["ä", "z"])
@@ -266,6 +313,64 @@ import Accessibility
             descriptor.series.flatMap(\.points).map(\.label).allSatisfy {
                 $0.contains("ä") || $0.contains("z")
             })
+
+        let existingAXDescriptor = try #require(
+            swedish.makeLazyAudioGraphDescriptor()).makeChartDescriptor()
+        let originalFrame = CGRect(x: 1, y: 2, width: 300, height: 200)
+        existingAXDescriptor.contentFrame = originalFrame
+        try #require(american.makeLazyAudioGraphDescriptor())
+            .updateChartDescriptor(existingAXDescriptor)
+        let updatedXAxis = try #require(
+            existingAXDescriptor.xAxis as? AXCategoricalDataAxisDescriptor)
+        #expect(existingAXDescriptor.contentFrame == originalFrame)
+        #expect(existingAXDescriptor.title == american.title)
+        #expect(updatedXAxis.categoryOrder == american.sharedXCategoryDomain)
+        #expect(existingAXDescriptor.yAxis?.title == descriptor.yTitle)
+        #expect(
+            existingAXDescriptor.series.flatMap(\.dataPoints).map(\.label)
+                == descriptor.series.flatMap(\.points).map(\.label))
+    }
+
+    @Test func singletonExtremeAudioGraphRangesRemainFiniteAndOrdered() async throws {
+        for value in [Double.greatestFiniteMagnitude, -Double.greatestFiniteMagnitude] {
+            let x = AutoChartColumn(id: "x", name: "X", semantics: .measure())
+            let y = AutoChartColumn(id: "y", name: "Y", semantics: .measure())
+            let dataset = try AutoChartDataset(
+                columns: [x, y],
+                rows: [[.double(value), .double(value)]],
+                rowIDs: [1])
+            let analysis = try await AutoChartAnalyzer().analyze(
+                try AutoChartRequest(table: dataset))
+            let chart = try await analysis.prepare(.scatter(x: x.id, y: y.id))
+            let descriptor = try #require(
+                AutoChartPresenter().present(chart).makeAudioGraphDescriptor())
+            guard case .numeric(_, let xRange, _) = descriptor.xAxis else {
+                Issue.record("Expected a numeric Audio Graph x axis")
+                continue
+            }
+
+            for range in [xRange, descriptor.yRange] {
+                #expect(range.lowerBound.isFinite)
+                #expect(range.upperBound.isFinite)
+                #expect(range.lowerBound < range.upperBound)
+                #expect(range.contains(value))
+            }
+
+            let axDescriptor = descriptor.makeChartDescriptor()
+            let xAxis = try #require(
+                axDescriptor.xAxis as? AXNumericDataAxisDescriptor)
+            let yAxis = try #require(axDescriptor.yAxis)
+            for axis in [xAxis, yAxis] {
+                #expect(axis.range.lowerBound.isFinite)
+                #expect(axis.range.upperBound.isFinite)
+                #expect(axis.range.lowerBound < axis.range.upperBound)
+                #expect(axis.range.contains(value))
+                #expect(axis.gridlinePositions.allSatisfy { $0.isFinite })
+                #expect(
+                    zip(axis.gridlinePositions, axis.gridlinePositions.dropFirst())
+                        .allSatisfy { $0 <= $1 })
+            }
+        }
     }
 }
 #endif
@@ -1175,6 +1280,33 @@ private final class ProgressRecorder: @unchecked Sendable {
         #expect(result.chartRecommendations.allSatisfy {
             constraints.allows($0.specification)
         })
+    }
+
+    @Test(.disabled(if: !testHooksAvailable, testHooksUnavailable))
+    func facetedShortlistingStopsAfterFillingTheValidLimit() {
+        #if ATC_TEST_HOOKS
+        let candidates = (0..<8).map { index in
+            recommendation(
+                .bar(
+                    category: AutoChartColumnID(rawValue: "category-\(index)"),
+                    measure: "value"),
+                score: Double(8 - index))
+        }
+        let validationCount = V3Counter()
+        let selected = AutoChartRecommendationEngine.balancedFacetBasesForTesting(
+            candidates,
+            limit: 3,
+            isValid: { recommendation in
+                validationCount.increment()
+                return recommendation.score <= 6
+            })
+
+        #expect(validationCount.value == 5)
+        #expect(selected.map { $0.score } == [6, 5, 4])
+        #expect(selected.compactMap { $0.specification.encoding.x?.rawValue } == [
+            "category-2", "category-3", "category-4",
+        ])
+        #endif
     }
 
     @Test func catalogDecodingReappliesAllCollectionInvariants() throws {

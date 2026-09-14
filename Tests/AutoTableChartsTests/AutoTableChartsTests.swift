@@ -3200,7 +3200,7 @@ private let date = AutoChartColumn(
         let monthID = AutoChartColumn(
             id: "month-id", name: "month_id",
             provenance: .init(sourceGrain: .init(entity: monthEntity)),
-            semantics: .identifier())
+            semantics: .identifier(semanticType: .nominal))
         let squareFeet = AutoChartColumn(
             id: "square-feet", name: "square_feet",
             provenance: .init(sourceGrain: .init(entity: property)),
@@ -3227,6 +3227,7 @@ private let date = AutoChartColumn(
             profiles: profiles,
             memo: memo)
 
+        #expect(validation.isValid)
         #expect(!validation.issues.contains { $0.messageValue.code == .fanOutRisk })
         #expect(memo.uniqueCombinationScanCountForTesting == 0)
         #endif
@@ -3239,7 +3240,7 @@ private let date = AutoChartColumn(
         let propertyID = AutoChartColumn(
             id: "property-id", name: "property_id",
             provenance: .init(sourceGrain: .init(entity: property)),
-            semantics: .identifier())
+            semantics: .identifier(semanticType: .nominal))
         let unitID = AutoChartColumn(
             id: "unit-id", name: "unit_id",
             provenance: .init(sourceGrain: .init(entity: unit)),
@@ -3275,6 +3276,7 @@ private let date = AutoChartColumn(
             profiles: profiles,
             memo: memo)
 
+        #expect(validation.isValid)
         #expect(!validation.issues.contains { $0.messageValue.code == .fanOutRisk })
         #expect(
             memo.uniqueCombination(
