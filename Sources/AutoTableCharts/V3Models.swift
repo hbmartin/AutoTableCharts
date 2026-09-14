@@ -101,9 +101,13 @@ public struct AutoChartRecommendationConstraints: Hashable, Codable, Sendable {
         self.excludedColumns = excludedColumns
     }
 
+    func allowsFamily(_ family: AutoChartFamily) -> Bool {
+        if let includedFamilies, !includedFamilies.contains(family) { return false }
+        return !excludedFamilies.contains(family)
+    }
+
     func allows(_ specification: AutoChartSpecification) -> Bool {
-        if let includedFamilies, !includedFamilies.contains(specification.family) { return false }
-        if excludedFamilies.contains(specification.family) { return false }
+        guard allowsFamily(specification.family) else { return false }
         let columns = Set(specification.encoding.columnIDs)
         return requiredColumns.isSubset(of: columns)
             && columns.isDisjoint(with: excludedColumns)

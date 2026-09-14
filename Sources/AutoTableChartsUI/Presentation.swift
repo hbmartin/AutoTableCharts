@@ -267,6 +267,69 @@ struct AutoChartPresentationRequestID: Hashable, Sendable {
     }
 }
 
+private struct AutoChartOrderedPresentationContent {
+    let data: [AutoChartDatum]
+    let facetDeclaredRanks: [String: Int]
+}
+
+private func orderedPresentationContent(
+    core: AutoChartRenderCore,
+    specification: AutoChartSpecification,
+    resolved: AutoChartResolvedPresentation,
+    formatters: AutoChartFormatters
+) -> AutoChartOrderedPresentationContent {
+    let usesDeclaredOrder = specification.sort == .source
+    let xDeclaredRanks = usesDeclaredOrder
+        ? declaredCategoryRanks(for: specification.encoding.x.flatMap {
+            core.table.profiles[$0]
+        }) : [:]
+    let yDeclaredRanks = usesDeclaredOrder
+        ? declaredCategoryRanks(for: specification.encoding.y.flatMap {
+            core.table.profiles[$0]
+        }) : [:]
+    let seriesDeclaredRanks = usesDeclaredOrder
+        ? declaredCategoryRanks(for: specification.encoding.series.flatMap {
+            core.table.profiles[$0]
+        }) : [:]
+    let facetDeclaredRanks = usesDeclaredOrder
+        ? declaredCategoryRanks(for: specification.encoding.facet.flatMap {
+            core.table.profiles[$0]
+        }) : [:]
+    let data: [AutoChartDatum]
+    if specification.family == .boxPlot {
+        data = orderedBoxPlotData(
+            core.data,
+            labels: resolved.xDisplayLabels,
+            fallback: resolved.missingValue,
+            locale: formatters.locale,
+            declaredRanks: xDeclaredRanks)
+    } else {
+        data = orderedPresentedData(
+            core.data,
+            specification: specification,
+            xLabels: resolved.xDisplayLabels,
+            yLabels: resolved.yDisplayLabels,
+            missingValue: resolved.missingValue,
+            locale: formatters.locale,
+            xDeclaredRanks: xDeclaredRanks,
+            yDeclaredRanks: yDeclaredRanks,
+            seriesDeclaredRanks: seriesDeclaredRanks)
+    }
+    return AutoChartOrderedPresentationContent(
+        data: data,
+        facetDeclaredRanks: facetDeclaredRanks)
+}
+
+private func resolvedDisplayTitle<RowID: Hashable & Sendable>(
+    for chart: AutoChartPreparedChart<RowID>,
+    textResolver: AutoChartTextResolver
+) -> String {
+    let specification = chart.recommendation.specification
+    return specification.title.isEmpty
+        ? textResolver(specification.family.localizationMessage)
+        : specification.title
+}
+
 /// A chart whose presentation metadata has been resolved and can be rendered synchronously.
 public struct AutoChartPresentedChart<RowID: Hashable & Sendable>: Sendable {
     public let preparedChart: AutoChartPreparedChart<RowID>
@@ -316,9 +379,9 @@ public struct AutoChartPresentedChart<RowID: Hashable & Sendable>: Sendable {
         self.requestID = requestID
     }
 
-    /// Audio Graph work is deferred until a renderer or test actually requests
-    /// it. Most presenter consumers only need the value presentation payload.
-    var audioGraphDescriptor: AutoChartAudioGraphDescriptor? {
+    /// Builds an Audio Graph descriptor explicitly. SwiftUI uses a lazy
+    /// representable so ordinary view reconstruction does not call this method.
+    func makeAudioGraphDescriptor() -> AutoChartAudioGraphDescriptor? {
         makeAudioGraphDescriptor(
             formatters: formatters,
             textResolver: textResolver)
@@ -328,11 +391,39 @@ public struct AutoChartPresentedChart<RowID: Hashable & Sendable>: Sendable {
         formatters: AutoChartFormatters,
         textResolver: AutoChartTextResolver
     ) -> AutoChartAudioGraphDescriptor? {
-        makeAutoChartAudioGraphDescriptor(
+        let requestedID = AutoChartPresentationRequestID(
+            preparedChart: preparedChart.id,
+            context: context,
+            formatters: formatters,
+            textResolver: textResolver)
+        let resolved: AutoChartResolvedPresentation
+        let descriptorData: [AutoChartDatum]
+        let displayTitle: String
+        if requestedID == requestID {
+            resolved = resolvedPresentation
+            descriptorData = renderedData
+            displayTitle = title
+        } else {
+            let core = preparedChart.core
+            let specification = preparedChart.recommendation.specification
+            resolved = core.presentation.resolvedPresentation(
+                data: core.data,
+                using: textResolver,
+                formatters: formatters)
+            descriptorData = orderedPresentationContent(
+                core: core,
+                specification: specification,
+                resolved: resolved,
+                formatters: formatters).data
+            displayTitle = resolvedDisplayTitle(
+                for: preparedChart,
+                textResolver: textResolver)
+        }
+        return makeAutoChartAudioGraphDescriptor(
             preparedChart: preparedChart,
-            renderedData: renderedData,
-            resolved: resolvedPresentation,
-            displayTitle: title,
+            renderedData: descriptorData,
+            resolved: resolved,
+            displayTitle: displayTitle,
             formatters: formatters,
             textResolver: textResolver)
     }
@@ -460,43 +551,12 @@ public final class AutoChartPresenter: @unchecked Sendable {
             using: textResolver,
             formatters: formatters)
         try checkingCancellation()
-        let usesDeclaredOrder = specification.sort == .source
-        let xDeclaredRanks = usesDeclaredOrder
-            ? declaredCategoryRanks(for: specification.encoding.x.flatMap {
-                core.table.profiles[$0]
-            }) : [:]
-        let yDeclaredRanks = usesDeclaredOrder
-            ? declaredCategoryRanks(for: specification.encoding.y.flatMap {
-                core.table.profiles[$0]
-            }) : [:]
-        let seriesDeclaredRanks = declaredCategoryRanks(
-            for: specification.encoding.series.flatMap {
-                core.table.profiles[$0]
-            })
-        let facetDeclaredRanks = declaredCategoryRanks(
-            for: specification.encoding.facet.flatMap {
-                core.table.profiles[$0]
-            })
-        let renderedData: [AutoChartDatum]
-        if specification.family == .boxPlot {
-            renderedData = orderedBoxPlotData(
-                core.data,
-                labels: resolved.xDisplayLabels,
-                fallback: resolved.missingValue,
-                locale: formatters.locale,
-                declaredRanks: xDeclaredRanks)
-        } else {
-            renderedData = orderedPresentedData(
-                core.data,
-                specification: specification,
-                xLabels: resolved.xDisplayLabels,
-                yLabels: resolved.yDisplayLabels,
-                missingValue: resolved.missingValue,
-                locale: formatters.locale,
-                xDeclaredRanks: xDeclaredRanks,
-                yDeclaredRanks: yDeclaredRanks,
-                seriesDeclaredRanks: seriesDeclaredRanks)
-        }
+        let ordered = orderedPresentationContent(
+            core: core,
+            specification: specification,
+            resolved: resolved,
+            formatters: formatters)
+        let renderedData = ordered.data
         try checkingCancellation()
         let sharedXCategoryDomain = core.presentation.usesSharedXCategoryDomain
             ? resolvedXCategoryDomain(
@@ -510,7 +570,7 @@ public final class AutoChartPresenter: @unchecked Sendable {
                 labels: resolved.facetDisplayLabels,
                 fallback: resolved.missingFacet,
                 locale: formatters.locale,
-                declaredRanks: facetDeclaredRanks)
+                declaredRanks: ordered.facetDeclaredRanks)
             : []
         try checkingCancellation()
         let kpi: AutoChartPresentedKPI?
@@ -540,9 +600,7 @@ public final class AutoChartPresenter: @unchecked Sendable {
         } else {
             kpi = nil
         }
-        let title = chart.recommendation.specification.title.isEmpty
-            ? textResolver(chart.recommendation.specification.family.localizationMessage)
-            : chart.recommendation.specification.title
+        let title = resolvedDisplayTitle(for: chart, textResolver: textResolver)
         let proposed = AutoChartPresentationPayload(
             title: title,
             diagnostics: chart.diagnostics,

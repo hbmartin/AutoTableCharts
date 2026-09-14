@@ -381,9 +381,7 @@ enum AutoChartRecommendationEngine {
         var facetBaseIndexByID: [AutoChartRecommendationID: Int] = [:]
         var descriptiveSignalCache: [DescriptiveSignalCacheKey: DescriptiveSignal] = [:]
         var temporalRegularityCache: [TemporalRegularityCacheKey: Double] = [:]
-        let constraintsPermitFaceting =
-            (constraints.includedFamilies?.contains(.faceted) ?? true)
-                && !constraints.excludedFamilies.contains(.faceted)
+        let constraintsPermitFaceting = constraints.allowsFamily(.faceted)
 
         /// Scores and validates candidates as they are generated. Keeping only the
         /// best scored value for each structural ID avoids retaining an additional
@@ -791,11 +789,13 @@ enum AutoChartRecommendationEngine {
             ]
             return faceted
         }
+        let hasFacetColumnConstraints = !constraints.requiredColumns.isEmpty
+            || !constraints.excludedColumns.isEmpty
         let viableFacetBases = facetBases.filter { base in
             eligibleFacets.contains { facet in
-                facetedSpecification(from: base, facet: facet).map {
-                    constraints.allows($0)
-                } ?? false
+                guard let specification = facetedSpecification(from: base, facet: facet)
+                else { return false }
+                return !hasFacetColumnConstraints || constraints.allows(specification)
             }
         }
         let facetBaseLimitPerFamily = options.maximumCandidateColumns
@@ -807,20 +807,12 @@ enum AutoChartRecommendationEngine {
         }
         for facet in eligibleFacets {
             for base in boundedFacetBases {
-                guard let faceted = facetedCandidate(from: base, facet: facet),
-                    constraints.allows(faceted.specification)
-                else { continue }
+                guard let faceted = facetedCandidate(from: base, facet: facet) else { continue }
                 processCandidate(faceted)
             }
         }
 
-        candidates.sort {
-            if $0.score != $1.score { return $0.score > $1.score }
-            let lhs = familyPriority($0.specification.family)
-            let rhs = familyPriority($1.specification.family)
-            if lhs != rhs { return lhs < rhs }
-            return $0.id < $1.id
-        }
+        candidates.sort(by: recommendationPrecedes)
         let ranked = candidates
 
         // The full catalog is score ordered. Prepared-domain validation remains
@@ -857,13 +849,7 @@ enum AutoChartRecommendationEngine {
                 cataloged.append(recommendation)
             }
         }
-        cataloged.sort {
-            if $0.score != $1.score { return $0.score > $1.score }
-            let lhs = familyPriority($0.specification.family)
-            let rhs = familyPriority($1.specification.family)
-            if lhs != rhs { return lhs < rhs }
-            return $0.id < $1.id
-        }
+        cataloged.sort(by: recommendationPrecedes)
         let decisions: [AutoChartCandidateDecision] = options.includesDecisionTrace
             ? {
                 let rankedIDs = Dictionary(
@@ -1460,7 +1446,8 @@ enum AutoChartRecommendationEngine {
         if let riskyColumns = fanOutRisk(
             specification: specification,
             snapshot: snapshot,
-            profiles: profiles)
+            profiles: profiles,
+            memo: memo)
         {
             issues.append(
                 .init(
@@ -2232,7 +2219,8 @@ enum AutoChartRecommendationEngine {
     private static func fanOutRisk(
         specification: AutoChartSpecification,
         snapshot: AutoChartSnapshot,
-        profiles: [AutoChartColumnID: AutoChartColumnProfile]
+        profiles: [AutoChartColumnID: AutoChartColumnProfile],
+        memo: AutoChartValidationMemo?
     ) -> [AutoChartColumnID]? {
         guard let semanticModel = snapshot.metadata.semanticModel else { return nil }
 
@@ -2289,6 +2277,60 @@ enum AutoChartRecommendationEngine {
             if !semanticModel.isAtLeastAsFine(accountedGrain, as: rowGrain) {
                 return orderedUnique(groupingIDs + [measureID])
             }
+
+            // Naming the entities that refine row grain is not enough to prove
+            // that the displayed values identify those entity instances. A
+            // quarter derived from a month-grain column, for example, still
+            // repeats a property measure for every month in the quarter.
+            if hasUniqueCombination(
+                snapshot: snapshot,
+                fields: groupingIDs,
+                measure: measureID,
+                profiles: profiles,
+                memo: memo)
+            {
+                return nil
+            }
+
+            let identifyingGroupingEntities: [AutoChartEntityID] = groupingIDs.flatMap {
+                groupingID in
+                guard profiles[groupingID]?.column.hints.role == .identifier else {
+                    return [AutoChartEntityID]()
+                }
+                return profiles[groupingID]?.column.provenance?.sourceGrain?.entities ?? []
+            }
+            let explicitlyIdentifiedGrain = AutoChartGrain(
+                measureGrain.entities + identifyingGroupingEntities)
+            if semanticModel.isAtLeastAsFine(explicitlyIdentifiedGrain, as: rowGrain) {
+                return nil
+            }
+
+            // A result can also prove the rollup safe by retaining identifiers
+            // for the measure grain. In that case each measure entity must occur
+            // at most once for the displayed grouping values.
+            let measureIdentifierProfiles = profiles.values.filter { profile in
+                guard profile.column.hints.role == .identifier,
+                    let identifierGrain = profile.column.provenance?.sourceGrain
+                else { return false }
+                return semanticModel.isAtLeastAsFine(measureGrain, as: identifierGrain)
+            }.sorted {
+                $0.column.id.rawValue < $1.column.id.rawValue
+            }
+            let measureIdentifierGrain = AutoChartGrain(
+                measureIdentifierProfiles.flatMap {
+                    $0.column.provenance?.sourceGrain?.entities ?? []
+                })
+            if semanticModel.isAtLeastAsFine(measureIdentifierGrain, as: measureGrain),
+                hasUniqueCombination(
+                    snapshot: snapshot,
+                    fields: measureIdentifierProfiles.map(\.column.id) + groupingIDs,
+                    measure: measureID,
+                    profiles: profiles,
+                    memo: memo)
+            {
+                return nil
+            }
+            return orderedUnique(groupingIDs + [measureID])
         }
         return nil
     }
@@ -2809,6 +2851,17 @@ enum AutoChartRecommendationEngine {
         AutoChartFamily.allCases.firstIndex(of: family) ?? Int.max
     }
 
+    private static func recommendationPrecedes(
+        _ lhs: AutoChartRecommendation,
+        _ rhs: AutoChartRecommendation
+    ) -> Bool {
+        if lhs.score != rhs.score { return lhs.score > rhs.score }
+        let lhsFamily = familyPriority(lhs.specification.family)
+        let rhsFamily = familyPriority(rhs.specification.family)
+        if lhsFamily != rhsFamily { return lhsFamily < rhsFamily }
+        return lhs.id < rhs.id
+    }
+
     /// Selects a bounded set without letting the lexical order of specification
     /// IDs concentrate every base on the same x, y, or series column.
     private static func balancedFacetBases(
@@ -2831,23 +2884,23 @@ enum AutoChartRecommendationEngine {
         }
 
         while output.count < limit, !remaining.isEmpty {
-            var selected = remaining.startIndex
-            for index in remaining.indices.dropFirst() {
-                let proposal = remaining[index]
-                let incumbent = remaining[selected]
+            // Reuse counts only change after a valid selection. Sorting once per
+            // selection lets an arbitrarily long invalid prefix be discarded in
+            // one pass instead of rescanning the shrinking array quadratically.
+            remaining.sort { proposal, incumbent in
                 let proposalReuse = reuseCount(proposal)
                 let incumbentReuse = reuseCount(incumbent)
-                if proposalReuse < incumbentReuse
-                    || (proposalReuse == incumbentReuse
-                        && (proposal.score > incumbent.score
-                            || (proposal.score == incumbent.score
-                                && proposal.id < incumbent.id)))
-                {
-                    selected = index
+                if proposalReuse != incumbentReuse {
+                    return proposalReuse < incumbentReuse
                 }
+                if proposal.score != incumbent.score {
+                    return proposal.score > incumbent.score
+                }
+                return proposal.id < incumbent.id
             }
-            let recommendation = remaining.remove(at: selected)
-            guard isValid(recommendation) else { continue }
+            guard let selected = remaining.firstIndex(where: isValid) else { break }
+            let recommendation = remaining[selected]
+            remaining.removeSubrange(...selected)
             output.append(recommendation)
             let encoding = recommendation.specification.encoding
             if let x = encoding.x { xUses[x, default: 0] += 1 }

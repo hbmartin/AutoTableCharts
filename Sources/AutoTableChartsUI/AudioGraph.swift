@@ -44,6 +44,12 @@ struct AutoChartAudioGraphDescriptor: @unchecked Sendable {
 
 }
 
+/// Defers the comparatively expensive value formatting and descriptor assembly
+/// until Accessibility asks SwiftUI for an Audio Graph.
+struct AutoChartLazyAudioGraphDescriptor: @unchecked Sendable {
+    var build: @Sendable () -> AutoChartAudioGraphDescriptor?
+}
+
 private struct AutoChartAudioGraphSeriesKey: Hashable {
     var series: String?
     var facet: String?
@@ -315,6 +321,15 @@ func makeAutoChartAudioGraphDescriptor<RowID: Hashable & Sendable>(
 #if canImport(SwiftUI) && canImport(Accessibility)
 import Accessibility
 import SwiftUI
+
+extension AutoChartLazyAudioGraphDescriptor: AXChartDescriptorRepresentable {
+    func makeChartDescriptor() -> AXChartDescriptor {
+        guard let descriptor = build() else {
+            preconditionFailure("Audio Graph descriptor requested for an unsupported chart")
+        }
+        return descriptor.makeChartDescriptor()
+    }
+}
 
 extension AutoChartAudioGraphDescriptor: AXChartDescriptorRepresentable {
     func makeChartDescriptor() -> AXChartDescriptor {
