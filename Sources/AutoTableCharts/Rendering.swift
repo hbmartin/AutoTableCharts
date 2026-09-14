@@ -310,7 +310,7 @@ private func firstPositions<Key: Hashable>(
 ) -> [Key: Int] {
     var positions: [Key: Int] = [:]
     for (offset, datum) in data.enumerated() {
-        let position = sourceRows ? datum.sourceRowIDs.min() ?? offset : offset
+        let position = sourceRows ? sourcePosition(of: datum, fallback: offset) : offset
         let identity = key(datum)
         positions[identity] = min(positions[identity] ?? position, position)
     }
@@ -1543,7 +1543,9 @@ package func orderedBoxPlotData(
                     labels: labels,
                     fallback: fallback),
                 identity: datum.xIdentity ?? "",
-                sourceOffset: sourcePosition(of: datum, fallback: offset))
+                sourceOffset: declaredRanks.isEmpty
+                    ? offset
+                    : sourcePosition(of: datum, fallback: offset))
         )
     }.sorted {
         categoryPrecedes(
@@ -1567,8 +1569,9 @@ package func orderedFacetPanels(
     declaredRanks: [String: Int] = [:]
 ) -> [AutoChartFacetPanel] {
     let facets = Dictionary(grouping: data, by: \.facetIdentity)
-    let firstOffsets = firstPositions(
-        in: data, keyedBy: \.facetIdentity, sourceRows: true)
+    let firstOffsets: [String?: Int] = declaredRanks.isEmpty
+        ? [:]
+        : firstPositions(in: data, keyedBy: \.facetIdentity, sourceRows: true)
     return facets.map { key, panelData in
         AutoChartFacetPanel(
             key: key,
@@ -1624,10 +1627,12 @@ package func orderedPresentedData(
     }
 
     if specification.family == .heatmap {
-        let firstXOffsets = firstPositions(
-            in: data, keyedBy: \.xIdentity, sourceRows: true)
-        let firstYOffsets = firstPositions(
-            in: data, keyedBy: \.yIdentity, sourceRows: true)
+        let firstXOffsets: [String?: Int] = xDeclaredRanks.isEmpty
+            ? [:]
+            : firstPositions(in: data, keyedBy: \.xIdentity, sourceRows: true)
+        let firstYOffsets: [String?: Int] = yDeclaredRanks.isEmpty
+            ? [:]
+            : firstPositions(in: data, keyedBy: \.yIdentity, sourceRows: true)
         return data.enumerated().map { offset, datum in
             (
                 datum: datum,

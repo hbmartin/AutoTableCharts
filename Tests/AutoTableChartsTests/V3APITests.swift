@@ -124,29 +124,33 @@ import Accessibility
             presentedHeatmap.makeAudioGraphDescriptor())
         #expect(heatmapDescriptor.yTitle == "Count")
 
-        let localized = try #require(
-            presentedHeatmap.makeAudioGraphDescriptor(
-                formatters: .init(),
-                textResolver: AutoChartTextResolver { message in
-                    "localized:\(message.defaultText)"
-                }))
+        let localizedPresented = AutoChartPresenter().present(
+            heatmap,
+            formatters: .init(),
+            textResolver: AutoChartTextResolver { message in
+                "localized:\(message.defaultText)"
+            })
+        let localized = try #require(localizedPresented.makeAudioGraphDescriptor())
         #expect(localized.title == "localized:Heatmap")
         #expect(localized.yTitle == "localized:Count")
     }
 
-    @Test func presenterDefersAudioGraphWorkAndSupportsRenderTimeFormatters() async throws {
-        let x = AutoChartColumn(id: "x", name: "x", semantics: .measure())
+    @Test func lazyAudioGraphDescriptorBuildsFormatterBackedContentOnce() async throws {
+        let x = AutoChartColumn(
+            id: "x", name: "x", semantics: .dimension(semanticType: .nominal))
         let y = AutoChartColumn(id: "y", name: "y", semantics: .measure())
         let dataset = try AutoChartDataset(
             columns: [x, y],
-            rows: [[.double(1), .double(2)], [.double(3), .double(4)]],
+            rows: [[.text("A"), .double(2)], [.text("B"), .double(4)]],
             rowIDs: [1, 2])
         let analysis = try await AutoChartAnalyzer().analyze(
             try AutoChartRequest(table: dataset))
-        let chart = try await analysis.prepare(.scatter(x: x.id, y: y.id))
+        let chart = try await analysis.prepare(.bar(category: x.id, measure: y.id))
         let calls = V3Counter()
         let formatters = AutoChartFormatters(request: { request, _, _ in
-            guard request.context == .markAccessibility else { return nil }
+            guard request.context == .markAccessibility,
+                request.column?.id == x.id
+            else { return nil }
             calls.increment()
             return "render-time"
         })
@@ -162,17 +166,106 @@ import Accessibility
         }
         #expect(calls.value == 0)
 
-        let descriptor = try #require(presented.makeAudioGraphDescriptor())
-        #expect(calls.value > 0)
-        #expect(descriptor.yValueDescription(2) == "render-time")
+        let lazy = try #require(presented.makeLazyAudioGraphDescriptor())
+        _ = lazy.makeChartDescriptor()
+        let firstBuildCalls = calls.value
+        #expect(firstBuildCalls > 0)
+        _ = lazy.makeChartDescriptor()
+        #expect(calls.value == firstBuildCalls)
+    }
 
-        let overridden = try #require(
-            presented.makeAudioGraphDescriptor(
-                formatters: AutoChartFormatters(request: { request, _, _ in
-                    request.context == .markAccessibility ? "view-override" : nil
-                }),
-                textResolver: .default))
-        #expect(overridden.yValueDescription(2) == "view-override")
+    @Test func emptyAndAllNullBarsExposeNoAudioGraph() async throws {
+        let category = AutoChartColumn(
+            id: "category", name: "Category",
+            semantics: .dimension(semanticType: .nominal))
+        let measure = AutoChartColumn(
+            id: "measure", name: "Measure", semantics: .measure())
+
+        for rows in [
+            [[AutoChartValue.text("A"), .null], [.text("B"), .null]],
+            [],
+        ] {
+            let dataset = try AutoChartDataset(
+                columns: [category, measure], rows: rows, rowIDs: Array(rows.indices))
+            let analysis = try await AutoChartAnalyzer().analyze(
+                try AutoChartRequest(table: dataset))
+            let chart = try await analysis.prepare(
+                .bar(category: category.id, measure: measure.id))
+            let presented = AutoChartPresenter().present(chart)
+
+            #expect(presented.renderedData.isEmpty)
+            #expect(presented.makeAudioGraphDescriptor() == nil)
+            #expect(presented.makeLazyAudioGraphDescriptor() == nil)
+        }
+    }
+
+    @Test func unsupportedFamiliesExposeNoLazyAudioGraphDescriptor() async throws {
+        let measure = AutoChartColumn(
+            id: "measure", name: "Measure", semantics: .measure())
+        let singleValue = try AutoChartDataset(
+            columns: [measure], rows: [[.double(1)]], rowIDs: [1])
+        let kpiAnalysis = try await AutoChartAnalyzer().analyze(
+            try AutoChartRequest(table: singleValue))
+        let kpi = try await kpiAnalysis.prepare(.kpi(measure: measure.id))
+        #expect(AutoChartPresenter().present(kpi).makeLazyAudioGraphDescriptor() == nil)
+
+        let rangeAnalysis = try await AutoChartAnalyzer().analyze(
+            try AutoChartRequest(table: domainDataset()))
+        let range = try await rangeAnalysis.prepare(
+            .range(label: "category", start: "start", end: "end"))
+        #expect(AutoChartPresenter().present(range).makeLazyAudioGraphDescriptor() == nil)
+    }
+
+    @Test func viewOverridesRepresentTheCompletePresentationPayload() async throws {
+        let category = AutoChartColumn(
+            id: "category", name: "Category",
+            semantics: .dimension(semanticType: .nominal))
+        let facet = AutoChartColumn(
+            id: "facet", name: "Facet",
+            semantics: .dimension(semanticType: .nominal))
+        let measure = AutoChartColumn(
+            id: "measure", name: "Measure", semantics: .measure())
+        let dataset = try AutoChartDataset(
+            columns: [category, measure, facet],
+            rows: [
+                [.text("z"), .double(1), .text("z")],
+                [.text("ä"), .double(1), .text("ä")],
+            ],
+            rowIDs: [1, 2])
+        let analysis = try await AutoChartAnalyzer().analyze(
+            try AutoChartRequest(table: dataset))
+        let chart = try await analysis.prepare(
+            AutoChartSpecification(
+                family: .faceted,
+                encoding: .init(x: category.id, y: measure.id, facet: facet.id),
+                facetBaseFamily: .bar,
+                sort: .ascending))
+        let swedish = AutoChartPresenter().present(
+            chart,
+            formatters: .init(locale: Locale(identifier: "sv_SE")))
+        let american = autoChartPresentedChartForView(
+            swedish,
+            formatters: .init(locale: Locale(identifier: "en_US")),
+            textResolver: AutoChartTextResolver { message in
+                "US: \(message.defaultText)"
+            },
+            presenter: AutoChartPresenter())
+
+        #expect(swedish.sharedXCategoryDomain == ["z", "ä"])
+        #expect(american.sharedXCategoryDomain == ["ä", "z"])
+        #expect(swedish.facetPanels.map(\.displayValue) == ["z", "ä"])
+        #expect(american.facetPanels.map(\.displayValue) == ["ä", "z"])
+        #expect(american.title == "US: Small multiples")
+        let descriptor = try #require(american.makeAudioGraphDescriptor())
+        guard case .categorical(_, let audioOrder) = descriptor.xAxis else {
+            Issue.record("Expected a categorical Audio Graph x axis")
+            return
+        }
+        #expect(audioOrder == american.sharedXCategoryDomain)
+        #expect(
+            descriptor.series.flatMap(\.points).map(\.label).allSatisfy {
+                $0.contains("ä") || $0.contains("z")
+            })
     }
 }
 #endif
@@ -1243,12 +1336,12 @@ private final class ProgressRecorder: @unchecked Sendable {
         let analysis = try await AutoChartAnalyzer().analyze(request, preparation: .none)
         let primary = try #require(analysis.outcome.catalog?.primary)
         let stale = AutoChartRecommendationID(
-            policyVersion: AutoTableCharts.recommendationPolicyVersion - 1,
+            policyVersion: 14,
             specificationID: primary.specification.id)
         let staleResolution = analysis.resolve(.chart(.specific(stale)))
         #expect(staleResolution.defaultReason == .policyVersionChanged(
-            previous: stale.policyVersion,
-            current: AutoTableCharts.recommendationPolicyVersion))
+            previous: 14,
+            current: 15))
         #expect(staleResolution.replacementPreference == .chart(.recommended))
 
         let missing = AutoChartRecommendationID(
