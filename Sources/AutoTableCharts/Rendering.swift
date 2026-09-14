@@ -284,6 +284,43 @@ private struct AutoChartCategorySortKey {
     var sourceOffset: Int
 }
 
+private func declaredRankComparison(
+    _ lhsIdentity: String,
+    _ rhsIdentity: String,
+    declaredRanks: [String: Int]
+) -> ComparisonResult? {
+    let leftRank = declaredRanks[lhsIdentity]
+    let rightRank = declaredRanks[rhsIdentity]
+    switch (leftRank, rightRank) {
+    case (.some(let left), .some(let right)) where left != right:
+        return left < right ? .orderedAscending : .orderedDescending
+    case (.some, nil):
+        return .orderedAscending
+    case (nil, .some):
+        return .orderedDescending
+    default:
+        return nil
+    }
+}
+
+private func firstPositions<Key: Hashable>(
+    in data: [AutoChartDatum],
+    keyedBy key: (AutoChartDatum) -> Key,
+    sourceRows: Bool
+) -> [Key: Int] {
+    var positions: [Key: Int] = [:]
+    for (offset, datum) in data.enumerated() {
+        let position = sourceRows ? datum.sourceRowIDs.min() ?? offset : offset
+        let identity = key(datum)
+        positions[identity] = min(positions[identity] ?? position, position)
+    }
+    return positions
+}
+
+private func sourcePosition(of datum: AutoChartDatum, fallback: Int) -> Int {
+    datum.sourceRowIDs.min() ?? fallback
+}
+
 /// Applies the category ordering ladder consistently across preparation and
 /// presentation. Resolved presentation text uses the formatter locale; raw
 /// preparation labels retain deterministic lexical ordering.
@@ -316,21 +353,15 @@ private func categoryPrecedes(
     declaredRanks: [String: Int],
     locale: Locale? = nil
 ) -> Bool {
-    let leftRank = declaredRanks[lhs.identity]
-    let rightRank = declaredRanks[rhs.identity]
-    switch (leftRank, rightRank) {
-    case (.some(let left), .some(let right)) where left != right:
-        return left < right
-    case (.some, nil):
-        return true
-    case (nil, .some):
-        return false
-    default:
-        if !declaredRanks.isEmpty, lhs.sourceOffset != rhs.sourceOffset {
-            return lhs.sourceOffset < rhs.sourceOffset
-        }
-        return categoryPrecedes(lhs, rhs, locale: locale)
+    if let comparison = declaredRankComparison(
+        lhs.identity, rhs.identity, declaredRanks: declaredRanks)
+    {
+        return comparison == .orderedAscending
     }
+    if !declaredRanks.isEmpty, lhs.sourceOffset != rhs.sourceOffset {
+        return lhs.sourceOffset < rhs.sourceOffset
+    }
+    return categoryPrecedes(lhs, rhs, locale: locale)
 }
 
 private func declaredOrSourceComparison(
@@ -338,25 +369,19 @@ private func declaredOrSourceComparison(
     _ rhs: AutoChartCategorySortKey,
     declaredRanks: [String: Int]
 ) -> ComparisonResult {
-    let leftRank = declaredRanks[lhs.identity]
-    let rightRank = declaredRanks[rhs.identity]
-    switch (leftRank, rightRank) {
-    case (.some(let left), .some(let right)) where left != right:
-        return left < right ? .orderedAscending : .orderedDescending
-    case (.some, nil):
-        return .orderedAscending
-    case (nil, .some):
-        return .orderedDescending
-    default:
-        if lhs.sourceOffset != rhs.sourceOffset {
-            return lhs.sourceOffset < rhs.sourceOffset
-                ? .orderedAscending : .orderedDescending
-        }
-        if lhs.identity != rhs.identity {
-            return lhs.identity < rhs.identity ? .orderedAscending : .orderedDescending
-        }
-        return .orderedSame
+    if let comparison = declaredRankComparison(
+        lhs.identity, rhs.identity, declaredRanks: declaredRanks)
+    {
+        return comparison
     }
+    if lhs.sourceOffset != rhs.sourceOffset {
+        return lhs.sourceOffset < rhs.sourceOffset
+            ? .orderedAscending : .orderedDescending
+    }
+    if lhs.identity != rhs.identity {
+        return lhs.identity < rhs.identity ? .orderedAscending : .orderedDescending
+    }
+    return .orderedSame
 }
 
 /// Keeps every x category contiguous according to its first occurrence, then
@@ -367,16 +392,13 @@ private func orderedByDeclaredSourceOrder(
     xDeclaredRanks: [String: Int],
     seriesDeclaredRanks: [String: Int]
 ) -> [AutoChartDatum] {
-    var firstXOffsets: [String: Int] = [:]
-    var firstSeriesOffsets: [String: Int] = [:]
-    for (offset, datum) in data.enumerated() {
-        let xIdentity = datum.xIdentity ?? ""
-        let seriesIdentity = datum.seriesIdentity ?? ""
-        if firstXOffsets[xIdentity] == nil { firstXOffsets[xIdentity] = offset }
-        if firstSeriesOffsets[seriesIdentity] == nil {
-            firstSeriesOffsets[seriesIdentity] = offset
-        }
-    }
+    // X positions preserve the prepared domain (including chronological
+    // domains). Series positions come from immutable source-row lineage, making
+    // this operation stable when presentation applies it a second time.
+    let firstXOffsets = firstPositions(
+        in: data, keyedBy: { $0.xIdentity ?? "" }, sourceRows: false)
+    let firstSeriesOffsets = firstPositions(
+        in: data, keyedBy: { $0.seriesIdentity ?? "" }, sourceRows: true)
     return data.enumerated().map { offset, datum in
         (
             offset: offset,
@@ -1521,7 +1543,7 @@ package func orderedBoxPlotData(
                     labels: labels,
                     fallback: fallback),
                 identity: datum.xIdentity ?? "",
-                sourceOffset: offset)
+                sourceOffset: sourcePosition(of: datum, fallback: offset))
         )
     }.sorted {
         categoryPrecedes(
@@ -1545,10 +1567,8 @@ package func orderedFacetPanels(
     declaredRanks: [String: Int] = [:]
 ) -> [AutoChartFacetPanel] {
     let facets = Dictionary(grouping: data, by: \.facetIdentity)
-    var firstOffsets: [String?: Int] = [:]
-    for (offset, datum) in data.enumerated() where firstOffsets[datum.facetIdentity] == nil {
-        firstOffsets[datum.facetIdentity] = offset
-    }
+    let firstOffsets = firstPositions(
+        in: data, keyedBy: \.facetIdentity, sourceRows: true)
     return facets.map { key, panelData in
         AutoChartFacetPanel(
             key: key,
@@ -1604,10 +1624,10 @@ package func orderedPresentedData(
     }
 
     if specification.family == .heatmap {
-        var firstXOffsets: [String?: Int] = [:]
-        for (offset, datum) in data.enumerated() where firstXOffsets[datum.xIdentity] == nil {
-            firstXOffsets[datum.xIdentity] = offset
-        }
+        let firstXOffsets = firstPositions(
+            in: data, keyedBy: \.xIdentity, sourceRows: true)
+        let firstYOffsets = firstPositions(
+            in: data, keyedBy: \.yIdentity, sourceRows: true)
         return data.enumerated().map { offset, datum in
             (
                 datum: datum,
@@ -1620,7 +1640,7 @@ package func orderedPresentedData(
                     identity: datum.yIdentity,
                     preparedLabel: datum.yLabel,
                     labels: yLabels,
-                    offset: offset)
+                    offset: firstYOffsets[datum.yIdentity] ?? offset)
             )
         }.sorted { lhs, rhs in
             if lhs.x.displayValue != rhs.x.displayValue || lhs.x.identity != rhs.x.identity {

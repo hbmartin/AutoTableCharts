@@ -81,7 +81,7 @@ import Accessibility
             facetBaseFamily: .line)
         let chart = try await analysis.prepare(specification)
         let descriptor = try #require(
-            AutoChartPresenter().present(chart).audioGraphDescriptor)
+            AutoChartPresenter().present(chart).makeAudioGraphDescriptor())
 
         #expect(!descriptor.series.isEmpty)
         #expect(descriptor.series.allSatisfy { $0.isContinuous })
@@ -114,14 +114,24 @@ import Accessibility
                 family: .bubble,
                 encoding: .init(x: x.id, y: y.id, size: size.id)))
         let bubbleDescriptor = try #require(
-            AutoChartPresenter().present(bubble).audioGraphDescriptor)
+            AutoChartPresenter().present(bubble).makeAudioGraphDescriptor())
         #expect(bubbleDescriptor.additionalAxis?.title == "Market capitalization")
 
         let heatmap = try await analysis.prepare(
             .heatmap(x: firstCategory.id, y: secondCategory.id))
+        let presentedHeatmap = AutoChartPresenter().present(heatmap)
         let heatmapDescriptor = try #require(
-            AutoChartPresenter().present(heatmap).audioGraphDescriptor)
+            presentedHeatmap.makeAudioGraphDescriptor())
         #expect(heatmapDescriptor.yTitle == "Count")
+
+        let localized = try #require(
+            presentedHeatmap.makeAudioGraphDescriptor(
+                formatters: .init(),
+                textResolver: AutoChartTextResolver { message in
+                    "localized:\(message.defaultText)"
+                }))
+        #expect(localized.title == "localized:Heatmap")
+        #expect(localized.yTitle == "localized:Count")
     }
 
     @Test func presenterDefersAudioGraphWorkAndSupportsRenderTimeFormatters() async throws {
@@ -144,7 +154,15 @@ import Accessibility
         let presented = AutoChartPresenter().present(chart, formatters: formatters)
         #expect(calls.value == 0)
 
-        let descriptor = try #require(presented.audioGraphDescriptor)
+        await MainActor.run {
+            _ = AutoChartView(
+                presentedChart: presented,
+                analysisID: analysis.id,
+                formatters: formatters)
+        }
+        #expect(calls.value == 0)
+
+        let descriptor = try #require(presented.makeAudioGraphDescriptor())
         #expect(calls.value > 0)
         #expect(descriptor.yValueDescription(2) == "render-time")
 
@@ -1642,6 +1660,40 @@ private final class ProgressRecorder: @unchecked Sendable {
             textResolver: reentrantResolver)
         #expect(reentrant.title.hasPrefix("reentrant:"))
         #expect(reentrantCalls.value == 1)
+    }
+
+    @Test func nonSourceFacetOrderIgnoresDeclaredRanksAndBarMagnitude() async throws {
+        let category = AutoChartColumn(
+            id: "category", name: "category",
+            semantics: .dimension(semanticType: .nominal))
+        let facet = AutoChartColumn(
+            id: "facet", name: "facet",
+            categoryOrder: [.text("Mid")],
+            semantics: .dimension(semanticType: .nominal))
+        let value = AutoChartColumn(
+            id: "value", name: "value",
+            semantics: .measure(
+                semantics: .init(source: .rowLevel, rollup: .additive)))
+        let dataset = try AutoChartDataset(
+            columns: [category, facet, value],
+            rows: [
+                [.text("Only"), .text("Zulu"), .double(10)],
+                [.text("Only"), .text("Alpha"), .double(30)],
+                [.text("Only"), .text("Mid"), .double(20)],
+            ],
+            rowIDs: [0, 1, 2])
+        let analysis = try await AutoChartAnalyzer().analyze(
+            try AutoChartRequest(table: dataset))
+        let chart = try await analysis.prepare(
+            AutoChartSpecification(
+                family: .faceted,
+                encoding: .init(x: category.id, y: value.id, facet: facet.id),
+                aggregation: .sum,
+                facetBaseFamily: .bar,
+                sort: .descending))
+        let presented = AutoChartPresenter().present(chart)
+
+        #expect(presented.facetPanels.map(\.displayValue) == ["Alpha", "Mid", "Zulu"])
     }
 
     @Test(.timeLimit(.minutes(1)))

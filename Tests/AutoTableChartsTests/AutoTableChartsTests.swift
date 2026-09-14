@@ -3120,9 +3120,13 @@ private let date = AutoChartColumn(
         #expect(bubble.isValid)
     }
 
-    @Test func rowGrainRefinementCoveredByGroupingAllowsValidRollup() {
+    @Test func rowGrainRefinementWithUniqueEntityKeysAllowsValidRollup() {
         let property: AutoChartEntityID = "property"
         let monthEntity: AutoChartEntityID = "month"
+        let propertyID = AutoChartColumn(
+            id: "property-id", name: "property_id",
+            provenance: .init(sourceGrain: .init(entity: property)),
+            semantics: .identifier())
         let month = AutoChartColumn(
             id: "month", name: "month",
             provenance: .init(sourceGrain: .init(entity: monthEntity)),
@@ -3133,12 +3137,12 @@ private let date = AutoChartColumn(
             semantics: .measure(
                 semantics: .init(source: .rowLevel, rollup: .additive)))
         let input = table(
-            columns: [month, squareFeet],
+            columns: [propertyID, month, squareFeet],
             rows: [
-                [.text("January"), .double(100)],
-                [.text("January"), .double(200)],
-                [.text("February"), .double(100)],
-                [.text("February"), .double(200)],
+                [.text("P1"), .text("January"), .double(100)],
+                [.text("P2"), .text("January"), .double(200)],
+                [.text("P1"), .text("February"), .double(100)],
+                [.text("P2"), .text("February"), .double(200)],
             ],
             metadata: .init(
                 rowGrain: .init([property, monthEntity]),
@@ -3152,6 +3156,46 @@ private let date = AutoChartColumn(
 
         #expect(validation.isValid)
         #expect(!validation.issues.contains { $0.messageValue.code == .fanOutRisk })
+    }
+
+    @Test func derivedGroupingValueDoesNotProveRowGrainUniqueness() {
+        let property: AutoChartEntityID = "property"
+        let monthEntity: AutoChartEntityID = "month"
+        let propertyID = AutoChartColumn(
+            id: "property-id", name: "property_id",
+            provenance: .init(sourceGrain: .init(entity: property)),
+            semantics: .identifier())
+        let quarter = AutoChartColumn(
+            id: "quarter", name: "quarter",
+            provenance: .init(sourceGrain: .init(entity: monthEntity)),
+            semantics: .dimension(semanticType: .nominal))
+        let squareFeet = AutoChartColumn(
+            id: "square-feet", name: "square_feet",
+            provenance: .init(sourceGrain: .init(entity: property)),
+            semantics: .measure(
+                semantics: .init(source: .rowLevel, rollup: .additive)))
+        let input = table(
+            columns: [propertyID, quarter, squareFeet],
+            rows: [
+                [.text("P1"), .text("Q1"), .double(100)],
+                [.text("P1"), .text("Q1"), .double(100)],
+                [.text("P1"), .text("Q1"), .double(100)],
+                [.text("P2"), .text("Q1"), .double(200)],
+                [.text("P2"), .text("Q1"), .double(200)],
+                [.text("P2"), .text("Q1"), .double(200)],
+            ],
+            metadata: .init(
+                rowGrain: .init([property, monthEntity]),
+                semanticModel: .init()))
+        let validation = AutoChartRecommendationEngine.validate(
+            specification: .bar(
+                category: quarter.id,
+                measure: squareFeet.id,
+                aggregation: .sum),
+            for: input)
+
+        #expect(!validation.isValid)
+        #expect(validation.issues.contains { $0.messageValue.code == .fanOutRisk })
     }
 
     @Test func uniqueRowGrainShortcutIsMemoizedForFacetedSupersets() {
@@ -8411,6 +8455,106 @@ private let date = AutoChartColumn(
             xDeclaredRanks: ["text:5:Alpha": 0])
 
         #expect(ordered.map(\.id) == ["alpha", "zulu", "beta"])
+    }
+
+    @Test func preparedPartialOrderUsesSourceRowsForBoxPlotAndHeatmapFallbacks() {
+        let x = AutoChartColumn(
+            id: "x", name: "x",
+            categoryOrder: [.text("Mid")],
+            semantics: .dimension(semanticType: .nominal))
+        let yCategory = AutoChartColumn(
+            id: "y-category", name: "y_category",
+            semantics: .dimension(semanticType: .nominal))
+        let value = AutoChartColumn(
+            id: "value", name: "value",
+            semantics: .measure(
+                semantics: .init(source: .rowLevel, rollup: .additive)))
+        let snapshot = AutoChartSnapshot(
+            table(
+                columns: [x, yCategory, value],
+                rows: [
+                    [.text("Zulu"), .text("Only"), .double(1)],
+                    [.text("Alpha"), .text("Only"), .double(2)],
+                    [.text("Mid"), .text("Only"), .double(3)],
+                ]))
+        let profiles = AutoChartProfiler.profileIndex(snapshot)
+        let ranks = declaredCategoryRanks(for: profiles[x.id])
+
+        let box = AutoChartDataPreparation.preparedData(
+            snapshot: snapshot,
+            specification: .boxPlot(measure: value.id, category: x.id),
+            profiles: profiles)
+        let orderedBox = orderedBoxPlotData(
+            box.data,
+            labels: [:],
+            fallback: "Missing",
+            locale: Locale(identifier: "en_US"),
+            declaredRanks: ranks)
+        #expect(orderedBox.compactMap(\.xLabel) == ["Mid", "Zulu", "Alpha"])
+
+        let heatmapSpecification = AutoChartSpecification.heatmap(
+            x: x.id, y: yCategory.id)
+        let heatmap = AutoChartDataPreparation.preparedData(
+            snapshot: snapshot,
+            specification: heatmapSpecification,
+            profiles: profiles)
+        let orderedHeatmap = orderedPresentedData(
+            heatmap.data,
+            specification: heatmapSpecification,
+            xLabels: [:],
+            yLabels: [:],
+            missingValue: "Missing",
+            locale: Locale(identifier: "en_US"),
+            xDeclaredRanks: ranks)
+        #expect(orderedHeatmap.compactMap(\.xLabel) == ["Mid", "Zulu", "Alpha"])
+    }
+
+    @Test func declaredSourceOrderingIsIdempotent() {
+        let data = [
+            AutoChartDatum(
+                id: "x-a", sourceRowIDs: [0],
+                xIdentity: "text:1:X", xLabel: "X", yNumber: 1,
+                seriesIdentity: "text:1:A", series: "A"),
+            AutoChartDatum(
+                id: "y-b", sourceRowIDs: [1],
+                xIdentity: "text:1:Y", xLabel: "Y", yNumber: 2,
+                seriesIdentity: "text:1:B", series: "B"),
+            AutoChartDatum(
+                id: "x-c", sourceRowIDs: [2],
+                xIdentity: "text:1:X", xLabel: "X", yNumber: 3,
+                seriesIdentity: "text:1:C", series: "C"),
+            AutoChartDatum(
+                id: "y-c", sourceRowIDs: [3],
+                xIdentity: "text:1:Y", xLabel: "Y", yNumber: 4,
+                seriesIdentity: "text:1:C", series: "C"),
+            AutoChartDatum(
+                id: "y-a", sourceRowIDs: [4],
+                xIdentity: "text:1:Y", xLabel: "Y", yNumber: 5,
+                seriesIdentity: "text:1:A", series: "A"),
+        ]
+        let specification = AutoChartSpecification(
+            family: .groupedBar,
+            encoding: .init(x: "x", y: "value", series: "series"),
+            aggregation: .sum,
+            sort: .source)
+        let first = orderedPresentedData(
+            data,
+            specification: specification,
+            xLabels: [:],
+            yLabels: [:],
+            missingValue: "Missing",
+            locale: Locale(identifier: "en_US"),
+            xDeclaredRanks: ["text:1:X": 0])
+        let second = orderedPresentedData(
+            first,
+            specification: specification,
+            xLabels: [:],
+            yLabels: [:],
+            missingValue: "Missing",
+            locale: Locale(identifier: "en_US"),
+            xDeclaredRanks: ["text:1:X": 0])
+
+        #expect(first.map(\.id) == second.map(\.id))
     }
 
     @Test func boxPlotOrderingUsesLocaleAwareCollation() {

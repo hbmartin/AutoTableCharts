@@ -269,7 +269,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     private let facetPanels: [AutoChartFacetPanel]
     private let sharedXCategoryDomain: [String]
     private let presentedKPI: AutoChartPresentedKPI?
-    private let presentedAudioGraphDescriptor: AutoChartAudioGraphDescriptor?
+    private let presentedAudioGraphDescriptor: AutoChartLazyAudioGraphDescriptor?
     private let analysisID: AutoChartAnalysisID
     @Binding private var selection: AutoChartSelectionSet<RowID>
 
@@ -378,9 +378,17 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         sharedXCategoryDomain = presentedChart.sharedXCategoryDomain
         presentedKPI = presentedChart.kpi
         #if canImport(Accessibility)
-        presentedAudioGraphDescriptor = presentedChart.makeAudioGraphDescriptor(
-            formatters: effectiveFormatters,
-            textResolver: effectiveTextResolver)
+        if [.kpi, .range].contains(
+            presentedChart.preparedChart.recommendation.specification.family)
+        {
+            presentedAudioGraphDescriptor = nil
+        } else {
+            presentedAudioGraphDescriptor = AutoChartLazyAudioGraphDescriptor {
+                presentedChart.makeAudioGraphDescriptor(
+                    formatters: effectiveFormatters,
+                    textResolver: effectiveTextResolver)
+            }
+        }
         #else
         presentedAudioGraphDescriptor = nil
         #endif
@@ -645,11 +653,15 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
 
     @ViewBuilder
     private var accessibleChartBody: some View {
+        #if canImport(Accessibility)
         if let descriptor = presentedAudioGraphDescriptor {
             chartBody.accessibilityChartDescriptor(descriptor)
         } else {
             chartBody
         }
+        #else
+        chartBody
+        #endif
     }
 
     @ViewBuilder
