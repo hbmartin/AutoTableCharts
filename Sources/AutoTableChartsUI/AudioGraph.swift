@@ -44,17 +44,6 @@ struct AutoChartAudioGraphDescriptor: @unchecked Sendable {
 
 }
 
-struct AutoChartAudioGraphAvailability: Sendable {
-    enum XAxis: Sendable {
-        case categorical
-        case numeric(fallbackRange: ClosedRange<Double>)
-        case temporal(fallbackRange: ClosedRange<Double>)
-    }
-
-    let xAxis: XAxis
-    let fallbackYRange: ClosedRange<Double>
-}
-
 final class AutoChartAudioGraphDescriptorCache: @unchecked Sendable {
     private let lock = NSLock()
     private var descriptor: AutoChartAudioGraphDescriptor?
@@ -79,6 +68,11 @@ final class AutoChartAudioGraphDescriptorCache: @unchecked Sendable {
 /// until Accessibility asks SwiftUI for an Audio Graph.
 struct AutoChartLazyAudioGraphDescriptor: Sendable {
     let build: @Sendable () -> AutoChartAudioGraphDescriptor
+    private let cache = AutoChartAudioGraphDescriptorCache()
+
+    func descriptor() -> AutoChartAudioGraphDescriptor {
+        cache.value(building: build)
+    }
 }
 
 private struct AutoChartAudioGraphSeriesKey: Hashable {
@@ -104,8 +98,20 @@ private func nondegenerateAudioGraphRange(
     _ range: ClosedRange<Double>
 ) -> ClosedRange<Double> {
     guard range.lowerBound == range.upperBound else { return range }
-    let padding = max(abs(range.lowerBound) * 0.05, 1)
-    return (range.lowerBound - padding)...(range.upperBound + padding)
+    let value = range.lowerBound
+    let greatest = Double.greatestFiniteMagnitude
+    let padding = max(abs(value) * 0.05, 1)
+    let lower = max(value - padding, -greatest)
+    let upper = min(value + padding, greatest)
+    if lower < upper { return lower...upper }
+
+    if value > 0 {
+        return value.nextDown...value
+    } else if value < 0 {
+        return value...value.nextUp
+    } else {
+        return -1...1
+    }
 }
 
 private func audioGraphRange(_ values: [Double]) -> ClosedRange<Double>? {
@@ -144,54 +150,40 @@ private func audioGraphNumericXValue(
     return value
 }
 
-func makeAutoChartAudioGraphAvailability<RowID: Hashable & Sendable>(
+private func autoChartAudioGraphXAxisKind<RowID: Hashable & Sendable>(
     preparedChart: AutoChartPreparedChart<RowID>,
-    renderedData: [AutoChartDatum]
-) -> AutoChartAudioGraphAvailability? {
-    let specification = preparedChart.recommendation.specification
-    guard ![.kpi, .range].contains(specification.family) else { return nil }
-
+    specification: AutoChartSpecification
+) -> AutoChartAudioGraphXAxisKind {
     let presentation = preparedChart.core.presentation
-    let xKind: AutoChartAudioGraphXAxisKind
     if presentation.xSemanticType == .temporal {
-        xKind = .temporal
+        return .temporal
     } else if presentation.xSemanticType == .quantitative
         || specification.family == .histogram
     {
-        xKind = .numeric
+        return .numeric
     } else {
-        xKind = .categorical
+        return .categorical
     }
+}
 
-    var xNumbers: [Double] = []
-    var yNumbers: [Double] = []
-    for datum in renderedData {
-        guard let y = audioGraphYValue(datum) else { continue }
+func hasUsableAutoChartAudioGraphData<RowID: Hashable & Sendable>(
+    preparedChart: AutoChartPreparedChart<RowID>,
+    renderedData: [AutoChartDatum]
+) -> Bool {
+    let specification = preparedChart.recommendation.specification
+    guard ![.kpi, .range].contains(specification.family) else { return false }
+    let xKind = autoChartAudioGraphXAxisKind(
+        preparedChart: preparedChart,
+        specification: specification)
+    return renderedData.contains { datum in
+        guard audioGraphYValue(datum) != nil else { return false }
         switch xKind {
         case .categorical:
-            break
+            return true
         case .numeric, .temporal:
-            guard let x = audioGraphNumericXValue(datum, kind: xKind) else { continue }
-            xNumbers.append(x)
+            return audioGraphNumericXValue(datum, kind: xKind) != nil
         }
-        yNumbers.append(y)
     }
-    guard let fallbackYRange = audioGraphRange(yNumbers) else { return nil }
-
-    let xAxis: AutoChartAudioGraphAvailability.XAxis
-    switch xKind {
-    case .categorical:
-        xAxis = .categorical
-    case .numeric:
-        guard let fallbackRange = audioGraphRange(xNumbers) else { return nil }
-        xAxis = .numeric(fallbackRange: fallbackRange)
-    case .temporal:
-        guard let fallbackRange = audioGraphRange(xNumbers) else { return nil }
-        xAxis = .temporal(fallbackRange: fallbackRange)
-    }
-    return AutoChartAudioGraphAvailability(
-        xAxis: xAxis,
-        fallbackYRange: fallbackYRange)
 }
 
 func makeAutoChartAudioGraphDescriptor<RowID: Hashable & Sendable>(
@@ -200,14 +192,17 @@ func makeAutoChartAudioGraphDescriptor<RowID: Hashable & Sendable>(
     resolved: AutoChartResolvedPresentation,
     displayTitle: String,
     formatters: AutoChartFormatters,
-    textResolver: AutoChartTextResolver,
-    availability: AutoChartAudioGraphAvailability
-) -> AutoChartAudioGraphDescriptor {
+    textResolver: AutoChartTextResolver
+) -> AutoChartAudioGraphDescriptor? {
     let specification = preparedChart.recommendation.specification
     let core = preparedChart.core
     let profiles = core.table.profiles
     let presentation = core.presentation
     let measureSemantics = core.measureSemantics
+    guard ![.kpi, .range].contains(specification.family) else { return nil }
+    let xKind = autoChartAudioGraphXAxisKind(
+        preparedChart: preparedChart,
+        specification: specification)
 
     func column(_ id: AutoChartColumnID?) -> AutoChartColumn? {
         id.flatMap { profiles[$0]?.column }
@@ -308,23 +303,21 @@ func makeAutoChartAudioGraphDescriptor<RowID: Hashable & Sendable>(
     var seriesOrder: [AutoChartAudioGraphSeriesKey] = []
     var categoryOrder: [String] = []
     var seenCategories: Set<String> = []
+    var xNumbers: [Double] = []
+    var yNumbers: [Double] = []
     var additionalNumbers: [Double] = []
     var everyPointHasFiniteSize = specification.encoding.size != nil
 
     for datum in renderedData {
         guard let y = audioGraphYValue(datum) else { continue }
         let x: AutoChartAudioGraphDescriptor.XValue
-        switch availability.xAxis {
-        case .temporal:
-            guard let value = audioGraphNumericXValue(datum, kind: .temporal) else {
+        switch xKind {
+        case .numeric, .temporal:
+            guard let value = audioGraphNumericXValue(datum, kind: xKind) else {
                 continue
             }
             x = .number(value)
-        case .numeric:
-            guard let value = audioGraphNumericXValue(datum, kind: .numeric) else {
-                continue
-            }
-            x = .number(value)
+            xNumbers.append(value)
         case .categorical:
             let value = xCategory(datum)
             x = .category(value)
@@ -350,12 +343,16 @@ func makeAutoChartAudioGraphDescriptor<RowID: Hashable & Sendable>(
         }
         pointsBySeries[key, default: []].append(
             .init(x: x, y: y, label: label, additionalValue: additional))
+        yNumbers.append(y)
         if let additional { additionalNumbers.append(additional) }
     }
 
+    guard let fallbackYRange = audioGraphRange(yNumbers) else { return nil }
+
     let xAxis: AutoChartAudioGraphDescriptor.XAxis
-    switch availability.xAxis {
-    case .temporal(let fallbackRange):
+    switch xKind {
+    case .temporal:
+        guard let fallbackRange = audioGraphRange(xNumbers) else { return nil }
         let xColumn = column(specification.encoding.x)
         xAxis = .numeric(
             title: resolved.x,
@@ -370,7 +367,8 @@ func makeAutoChartAudioGraphDescriptor<RowID: Hashable & Sendable>(
                     value: .date(Date(timeIntervalSinceReferenceDate: value)),
                     context: .markAccessibility)
             })
-    case .numeric(let fallbackRange):
+    case .numeric:
+        guard let fallbackRange = audioGraphRange(xNumbers) else { return nil }
         let xColumn = column(specification.encoding.x)
         xAxis = .numeric(
             title: resolved.x,
@@ -418,7 +416,7 @@ func makeAutoChartAudioGraphDescriptor<RowID: Hashable & Sendable>(
         yTitle: [.histogram, .heatmap].contains(specification.family)
             ? resolved.count : resolved.y,
         yRange: presentation.sharedYDomain.map(nondegenerateAudioGraphRange)
-            ?? availability.fallbackYRange,
+            ?? fallbackYRange,
         yValueDescription: formattedMeasure,
         additionalAxis: additionalAxis,
         series: audioSeries)
@@ -430,7 +428,19 @@ import SwiftUI
 
 extension AutoChartLazyAudioGraphDescriptor: AXChartDescriptorRepresentable {
     func makeChartDescriptor() -> AXChartDescriptor {
-        build().makeChartDescriptor()
+        descriptor().makeChartDescriptor()
+    }
+
+    func updateChartDescriptor(_ chartDescriptor: AXChartDescriptor) {
+        let replacement = descriptor().makeChartDescriptor()
+        chartDescriptor.title = replacement.title
+        chartDescriptor.attributedTitle = replacement.attributedTitle
+        chartDescriptor.summary = replacement.summary
+        chartDescriptor.contentDirection = replacement.contentDirection
+        chartDescriptor.xAxis = replacement.xAxis
+        chartDescriptor.yAxis = replacement.yAxis
+        chartDescriptor.additionalAxes = replacement.additionalAxes
+        chartDescriptor.series = replacement.series
     }
 }
 
@@ -504,7 +514,7 @@ extension AutoChartAudioGraphDescriptor: AXChartDescriptorRepresentable {
             range: range,
             gridlinePositions: [
                 range.lowerBound,
-                (range.lowerBound + range.upperBound) / 2,
+                audioGraphMidpoint(range.lowerBound, range.upperBound),
                 range.upperBound,
             ],
             valueDescriptionProvider: valueDescription)

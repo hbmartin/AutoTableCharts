@@ -2280,10 +2280,12 @@ enum AutoChartRecommendationEngine {
 
             let identifyingGroupingEntities: [AutoChartEntityID] = groupingIDs.flatMap {
                 groupingID in
-                guard profiles[groupingID]?.semanticType == .identifier else {
+                guard let profile = profiles[groupingID],
+                    providesIdentifierEvidence(profile)
+                else {
                     return [AutoChartEntityID]()
                 }
-                return profiles[groupingID]?.column.provenance?.sourceGrain?.entities ?? []
+                return profile.column.provenance?.sourceGrain?.entities ?? []
             }
             let explicitlyIdentifiedGrain = AutoChartGrain(
                 measureGrain.entities + identifyingGroupingEntities)
@@ -2309,7 +2311,7 @@ enum AutoChartRecommendationEngine {
             // for the measure grain. In that case each measure entity must occur
             // at most once for the displayed grouping values.
             let measureIdentifierProfiles = profiles.values.filter { profile in
-                guard profile.semanticType == .identifier,
+                guard providesIdentifierEvidence(profile),
                     let identifierGrain = profile.column.provenance?.sourceGrain
                 else { return false }
                 return semanticModel.isAtLeastAsFine(measureGrain, as: identifierGrain)
@@ -2864,6 +2866,12 @@ enum AutoChartRecommendationEngine {
         AutoChartFamily.allCases.firstIndex(of: family) ?? Int.max
     }
 
+    private static func providesIdentifierEvidence(
+        _ profile: AutoChartColumnProfile
+    ) -> Bool {
+        profile.column.hints.role == .identifier || profile.semanticType == .identifier
+    }
+
     private static func recommendationPrecedes(
         _ lhs: AutoChartRecommendation,
         _ rhs: AutoChartRecommendation
@@ -2883,7 +2891,7 @@ enum AutoChartRecommendationEngine {
         isValid: (AutoChartRecommendation) -> Bool
     ) -> [AutoChartRecommendation] {
         guard limit > 0 else { return [] }
-        var remaining = candidates.filter(isValid)
+        var remaining = candidates
         var output: [AutoChartRecommendation] = []
         var xUses: [AutoChartColumnID: Int] = [:]
         var yUses: [AutoChartColumnID: Int] = [:]
@@ -2912,6 +2920,7 @@ enum AutoChartRecommendationEngine {
                 }
             }
             let recommendation = remaining.remove(at: selected)
+            guard isValid(recommendation) else { continue }
             output.append(recommendation)
             let encoding = recommendation.specification.encoding
             if let x = encoding.x { xUses[x, default: 0] += 1 }
@@ -2920,6 +2929,16 @@ enum AutoChartRecommendationEngine {
         }
         return output
     }
+
+    #if ATC_TEST_HOOKS
+    static func balancedFacetBasesForTesting(
+        _ candidates: [AutoChartRecommendation],
+        limit: Int,
+        isValid: (AutoChartRecommendation) -> Bool
+    ) -> [AutoChartRecommendation] {
+        balancedFacetBases(candidates, limit: limit, isValid: isValid)
+    }
+    #endif
 
     private static func selectFeaturedSet(
         _ ranked: [AutoChartRecommendation],

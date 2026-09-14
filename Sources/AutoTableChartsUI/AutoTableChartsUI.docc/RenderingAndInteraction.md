@@ -48,9 +48,11 @@ For direct `AutoChartView` and `AutoChartPlot` construction, an omitted context,
 formatter, or resolver inherits the corresponding environment value, while an
 initializer argument takes precedence. A view initialized from an already
 presented chart keeps that chart's formatter and resolver unless the initializer
-explicitly overrides one. An explicit override re-presents the complete chart,
-including its visible order, domains, facets, controls, mark accessibility, and
-Audio Graph, so every surface uses the same labels and formatting.
+explicitly overrides one. An explicit override keeps the current chart visible,
+then asynchronously re-presents it through its originating presenter and cache
+policy. The replacement includes its visible order, domains, facets, controls,
+mark accessibility, and Audio Graph, so every surface uses the same labels and
+formatting without running host callbacks during view initialization.
 
 Every supported quantitative chart exposes an Apple Audio Graph descriptor built
 from the same prepared marks, display labels, units, locale, and time zone used
