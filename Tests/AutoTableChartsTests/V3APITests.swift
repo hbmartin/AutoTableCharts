@@ -174,15 +174,26 @@ import Accessibility
         #expect(calls.value == 0)
         #expect(measureRequest.value == nil)
 
-        let lazy = try #require(presented.makeLazyAudioGraphDescriptor())
+        let cache = AutoChartAudioGraphDescriptorCache()
+        let lazy = try #require(presented.makeLazyAudioGraphDescriptor(cache: cache))
         _ = lazy.makeChartDescriptor()
         let firstBuildCalls = calls.value
         #expect(firstBuildCalls > 0)
         _ = lazy.makeChartDescriptor()
         #expect(calls.value == firstBuildCalls)
 
-        let secondLazy = try #require(presented.makeLazyAudioGraphDescriptor())
-        _ = secondLazy.makeChartDescriptor()
+        let secondLazy = try #require(presented.makeLazyAudioGraphDescriptor(cache: cache))
+        let target = secondLazy.makeChartDescriptor()
+        #expect(calls.value == firstBuildCalls)
+        let originalXAxis = target.xAxis
+        let originalPoint = try #require(target.series.first?.dataPoints.first)
+        secondLazy.updateChartDescriptor(target)
+        #expect(calls.value == firstBuildCalls)
+        #expect(target.xAxis === originalXAxis)
+        #expect(target.series.first?.dataPoints.first === originalPoint)
+
+        let independent = try #require(presented.makeLazyAudioGraphDescriptor())
+        _ = independent.makeChartDescriptor()
         #expect(calls.value > firstBuildCalls)
 
         let descriptor = secondLazy.descriptor()
@@ -236,7 +247,9 @@ import Accessibility
         #expect(AutoChartPresenter().present(range).makeLazyAudioGraphDescriptor() == nil)
     }
 
-    @Test func viewOverridesRepresentTheCompletePresentationPayload() async throws {
+    @Test(.disabled(if: !testHooksAvailable, testHooksUnavailable))
+    func viewOverridesRepresentTheCompletePresentationPayload() async throws {
+        #if ATC_TEST_HOOKS
         let category = AutoChartColumn(
             id: "category", name: "Category",
             semantics: .dimension(semanticType: .nominal))
@@ -266,40 +279,44 @@ import Accessibility
             formatters: .init(locale: Locale(identifier: "sv_SE")))
         let resolverCalls = V3Counter()
         let formatterCalls = V3Counter()
+        let callbackThreads = V3ThreadRecorder()
         let americanFormatters = AutoChartFormatters(
             locale: Locale(identifier: "en_US"),
             request: { _, _, _ in
                 formatterCalls.increment()
+                callbackThreads.recordCurrentThread()
                 return nil
             })
         let americanResolver = AutoChartTextResolver { message in
             resolverCalls.increment()
+            callbackThreads.recordCurrentThread()
             return "US: \(message.defaultText)"
         }
 
-        await MainActor.run {
-            _ = AutoChartView(
+        let american = try await MainActor.run {
+            let view = AutoChartView(
                 presentedChart: swedish,
                 analysisID: analysis.id,
                 formatters: americanFormatters,
                 textResolver: americanResolver)
+            #expect(resolverCalls.value > 0)
+            #expect(formatterCalls.value > 0)
+            #expect(callbackThreads.result.allMainThread)
+            return try #require(view.presentedChartForTesting)
         }
-        #expect(resolverCalls.value == 0)
-        #expect(formatterCalls.value == 0)
-
-        let american = try await swedish.rePresentCancellable(
-            formatters: americanFormatters,
-            textResolver: americanResolver)
         let afterFirstOverride = resolverCalls.value
         let formatterCallsAfterFirstOverride = formatterCalls.value
-        _ = try await swedish.rePresentCancellable(
-            formatters: americanFormatters,
-            textResolver: americanResolver)
+        await MainActor.run {
+            _ = AutoChartView(
+                presentedChart: swedish, analysisID: analysis.id,
+                formatters: americanFormatters, textResolver: americanResolver)
+        }
         #expect(resolverCalls.value > afterFirstOverride)
         #expect(formatterCalls.value > formatterCallsAfterFirstOverride)
 
         #expect(swedish.sharedXCategoryDomain == ["z", "ä"])
         #expect(american.sharedXCategoryDomain == ["ä", "z"])
+        #expect(american.renderedData.compactMap(\.xLabel) == ["ä", "z"])
         #expect(swedish.facetPanels.map(\.displayValue) == ["z", "ä"])
         #expect(american.facetPanels.map(\.displayValue) == ["ä", "z"])
         #expect(american.title == "US: Small multiples")
@@ -314,12 +331,16 @@ import Accessibility
                 $0.contains("ä") || $0.contains("z")
             })
 
+        let cache = AutoChartAudioGraphDescriptorCache()
         let existingAXDescriptor = try #require(
-            swedish.makeLazyAudioGraphDescriptor()).makeChartDescriptor()
+            swedish.makeLazyAudioGraphDescriptor(cache: cache)).makeChartDescriptor()
         let originalFrame = CGRect(x: 1, y: 2, width: 300, height: 200)
         existingAXDescriptor.contentFrame = originalFrame
-        try #require(american.makeLazyAudioGraphDescriptor())
-            .updateChartDescriptor(existingAXDescriptor)
+        let overriddenAudioGraph = try #require(american.makeLazyAudioGraphDescriptor(cache: cache))
+        overriddenAudioGraph.updateChartDescriptor(existingAXDescriptor)
+        let updatedPoint = try #require(existingAXDescriptor.series.first?.dataPoints.first)
+        overriddenAudioGraph.updateChartDescriptor(existingAXDescriptor)
+        #expect(existingAXDescriptor.series.first?.dataPoints.first === updatedPoint)
         let updatedXAxis = try #require(
             existingAXDescriptor.xAxis as? AXCategoricalDataAxisDescriptor)
         #expect(existingAXDescriptor.contentFrame == originalFrame)
@@ -329,6 +350,7 @@ import Accessibility
         #expect(
             existingAXDescriptor.series.flatMap(\.dataPoints).map(\.label)
                 == descriptor.series.flatMap(\.points).map(\.label))
+        #endif
     }
 
     @Test func singletonExtremeAudioGraphRangesRemainFiniteAndOrdered() async throws {
@@ -584,16 +606,18 @@ private final class V3ThreadRecorder: @unchecked Sendable {
     private let lock = NSLock()
     private var callbackCount = 0
     private var observedMainThread = false
+    private var allMainThread = true
 
     func recordCurrentThread() {
         lock.withLock {
             callbackCount += 1
             observedMainThread = observedMainThread || Thread.isMainThread
+            allMainThread = allMainThread && Thread.isMainThread
         }
     }
 
-    var result: (count: Int, observedMainThread: Bool) {
-        lock.withLock { (callbackCount, observedMainThread) }
+    var result: (count: Int, observedMainThread: Bool, allMainThread: Bool) {
+        lock.withLock { (callbackCount, observedMainThread, allMainThread) }
     }
 }
 
@@ -1306,6 +1330,67 @@ private final class ProgressRecorder: @unchecked Sendable {
         #expect(selected.compactMap { $0.specification.encoding.x?.rawValue } == [
             "category-2", "category-3", "category-4",
         ])
+
+        let pool = (0..<512).map { index in
+            recommendation(
+                .bar(category: AutoChartColumnID(rawValue: "x-\(index)"), measure: "y"),
+                score: Double(512 - index))
+        }
+        for validCount in [0, 2] {
+            var comparisons = 0
+            var validations = 0
+            let sparse = AutoChartRecommendationEngine.balancedFacetBasesForTesting(
+                pool, limit: 8,
+                isValid: { candidate in
+                    validations += 1
+                    return candidate.score <= Double(validCount)
+                },
+                onComparison: { comparisons += 1 })
+            #expect(sparse.count == validCount)
+            #expect(validations == pool.count)
+            // A repeated full scan needs >130,000 comparisons for this pool.
+            #expect(comparisons < 30 * pool.count)
+        }
+        let diversified = [
+            recommendation(.bar(category: "x0", measure: "y0"), score: 10),
+            recommendation(.bar(category: "x0", measure: "y1"), score: 9),
+            recommendation(.bar(category: "x1", measure: "y0"), score: 8),
+            recommendation(.bar(category: "x1", measure: "y1"), score: 7),
+        ]
+        let balanced = AutoChartRecommendationEngine.balancedFacetBasesForTesting(
+            diversified, limit: 4, isValid: { _ in true })
+        #expect(balanced.map(\.score) == [10, 7, 9, 8])
+
+        var fullValidations = 0
+        let full = AutoChartRecommendationEngine.balancedFacetBasesForTesting(
+            pool, limit: 3,
+            isValid: { _ in fullValidations += 1; return true })
+        #expect(fullValidations == 3)
+        #expect(full.map(\.score) == [512, 511, 510])
+
+        // Equal scores must use lexical IDs, then preserve input order for exact ties.
+        let ties = candidates.reversed().map { original in
+            var copy = original
+            copy.score = 1
+            return copy
+        }
+        let ordered = AutoChartRecommendationEngine.balancedFacetBasesForTesting(
+            ties, limit: ties.count, isValid: { _ in true })
+        #expect(ordered.map(\.id) == ties.map(\.id).sorted())
+        var firstTie = candidates[0]
+        firstTie.score = 1
+        var secondTie = firstTie
+        secondTie.score = 1
+        firstTie.rationale = [.init(category: .rationale, code: .recommendationRationale,
+                                   defaultText: "first")]
+        secondTie.rationale = [.init(category: .rationale, code: .recommendationRationale,
+                                    defaultText: "second")]
+        let exactTies = AutoChartRecommendationEngine.balancedFacetBasesForTesting(
+            [firstTie, secondTie], limit: 2, isValid: { _ in true })
+        #expect(exactTies.map { $0.rationale.first?.defaultText } == ["first", "second"])
+        #expect(AutoChartRecommendationEngine.balancedFacetBasesForTesting(
+            pool, limit: 0, isValid: { _ in Issue.record("Unexpected validation"); return true }
+        ).isEmpty)
         #endif
     }
 

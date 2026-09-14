@@ -345,6 +345,7 @@ public struct AutoChartPresentedChart<RowID: Hashable & Sendable>: Sendable {
     package let kpi: AutoChartPresentedKPI?
     package let formatters: AutoChartFormatters
     package let textResolver: AutoChartTextResolver
+    let audioGraphAvailability: AutoChartAudioGraphAvailability?
     let originatingPresenter: AutoChartPresenterReference
     let requestID: AutoChartPresentationRequestID
 
@@ -363,6 +364,7 @@ public struct AutoChartPresentedChart<RowID: Hashable & Sendable>: Sendable {
         kpi: AutoChartPresentedKPI?,
         formatters: AutoChartFormatters,
         textResolver: AutoChartTextResolver,
+        audioGraphAvailability: AutoChartAudioGraphAvailability?,
         originatingPresenter: AutoChartPresenterReference,
         requestID: AutoChartPresentationRequestID
     ) {
@@ -378,40 +380,48 @@ public struct AutoChartPresentedChart<RowID: Hashable & Sendable>: Sendable {
         self.kpi = kpi
         self.formatters = formatters
         self.textResolver = textResolver
+        self.audioGraphAvailability = audioGraphAvailability
         self.originatingPresenter = originatingPresenter
         self.requestID = requestID
     }
 
-    /// Builds an Audio Graph descriptor explicitly. SwiftUI uses a lazy
-    /// representable so ordinary view reconstruction does not call this method.
+    /// Explicit descriptor building is uncached; SwiftUI supplies a view-owned cache.
     func makeAudioGraphDescriptor() -> AutoChartAudioGraphDescriptor? {
+        guard let audioGraphAvailability else { return nil }
+        return makeAudioGraphDescriptor(availability: audioGraphAvailability)
+    }
+
+    private func makeAudioGraphDescriptor(
+        availability: AutoChartAudioGraphAvailability
+    ) -> AutoChartAudioGraphDescriptor {
         makeAutoChartAudioGraphDescriptor(
             preparedChart: preparedChart,
             renderedData: renderedData,
             resolved: resolvedPresentation,
             displayTitle: title,
             formatters: formatters,
-            textResolver: textResolver)
+            textResolver: textResolver,
+            availability: availability)
     }
 
-    func makeLazyAudioGraphDescriptor() -> AutoChartLazyAudioGraphDescriptor? {
-        guard hasUsableAutoChartAudioGraphData(
-            preparedChart: preparedChart,
-            renderedData: renderedData)
-        else { return nil }
-        return AutoChartLazyAudioGraphDescriptor {
-            guard let descriptor = makeAudioGraphDescriptor() else {
-                preconditionFailure("Audio Graph usability changed for immutable chart data.")
-            }
-            return descriptor
+    func makeLazyAudioGraphDescriptor(
+        cache: AutoChartAudioGraphDescriptorCache? = AutoChartAudioGraphDescriptorCache()
+    ) -> AutoChartLazyAudioGraphDescriptor? {
+        guard let audioGraphAvailability else { return nil }
+        return AutoChartLazyAudioGraphDescriptor(requestID: requestID, cache: cache) {
+            makeAudioGraphDescriptor(availability: audioGraphAvailability)
         }
     }
 
-    func rePresentCancellable(
+    func rePresent(
         formatters: AutoChartFormatters,
         textResolver: AutoChartTextResolver
-    ) async throws -> AutoChartPresentedChart<RowID> {
-        try await originatingPresenter.active.presentCancellable(
+    ) -> AutoChartPresentedChart<RowID> {
+        let requestedID = AutoChartPresentationRequestID(
+            preparedChart: id, context: context,
+            formatters: formatters, textResolver: textResolver)
+        guard requestedID != requestID else { return self }
+        return originatingPresenter.active.present(
             preparedChart,
             context: context,
             formatters: formatters,
@@ -434,19 +444,19 @@ private struct AutoChartPresentationPayload: Sendable {
     let facetPanels: [AutoChartFacetPanel]
     let sharedXCategoryDomain: [String]
     let kpi: AutoChartPresentedKPI?
+    let audioGraphAvailability: AutoChartAudioGraphAvailability?
 }
 
 final class AutoChartPresenterReference: @unchecked Sendable {
     private weak var source: AutoChartPresenter?
-    private let fallback: AutoChartPresenter
+    private static let fallback = AutoChartPresenter(maximumEntries: 0)
 
     init(_ source: AutoChartPresenter) {
         self.source = source
-        self.fallback = AutoChartPresenter(maximumEntries: 0)
     }
 
     var active: AutoChartPresenter {
-        source ?? fallback
+        source ?? Self.fallback
     }
 }
 
@@ -604,6 +614,9 @@ public final class AutoChartPresenter: @unchecked Sendable {
         } else {
             kpi = nil
         }
+        let audioGraphAvailability = makeAutoChartAudioGraphAvailability(
+            preparedChart: chart, renderedData: renderedData)
+        try checkingCancellation()
         let title = resolvedDisplayTitle(for: chart, textResolver: textResolver)
         let proposed = AutoChartPresentationPayload(
             title: title,
@@ -613,7 +626,8 @@ public final class AutoChartPresenter: @unchecked Sendable {
             renderedData: renderedData,
             facetPanels: facetPanels,
             sharedXCategoryDomain: sharedXCategoryDomain,
-            kpi: kpi)
+            kpi: kpi,
+            audioGraphAvailability: audioGraphAvailability)
         let payload = lock.withLock {
             if let cached = cachedPayload(for: requestID) { return cached }
             guard maximumEntries > 0 else { return proposed }
@@ -676,6 +690,7 @@ public final class AutoChartPresenter: @unchecked Sendable {
             kpi: payload.kpi,
             formatters: formatters,
             textResolver: textResolver,
+            audioGraphAvailability: payload.audioGraphAvailability,
             originatingPresenter: AutoChartPresenterReference(self),
             requestID: requestID)
     }

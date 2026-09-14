@@ -43,7 +43,8 @@ let package = Package(
         ),
         .target(
             name: "AutoTableChartsUI",
-            dependencies: ["AutoTableCharts"]
+            dependencies: ["AutoTableCharts"],
+            swiftSettings: testHookSettings
         ),
         .testTarget(
             name: "AutoTableChartsTests",

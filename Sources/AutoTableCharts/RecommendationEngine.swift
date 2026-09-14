@@ -2888,10 +2888,11 @@ enum AutoChartRecommendationEngine {
     private static func balancedFacetBases(
         _ candidates: [AutoChartRecommendation],
         limit: Int,
-        isValid: (AutoChartRecommendation) -> Bool
+        isValid: (AutoChartRecommendation) -> Bool,
+        onComparison: () -> Void = {}
     ) -> [AutoChartRecommendation] {
         guard limit > 0 else { return [] }
-        var remaining = candidates
+        var remaining = Array(candidates.indices)
         var output: [AutoChartRecommendation] = []
         var xUses: [AutoChartColumnID: Int] = [:]
         var yUses: [AutoChartColumnID: Int] = [:]
@@ -2904,28 +2905,54 @@ enum AutoChartRecommendationEngine {
                 + (encoding.series.map { seriesUses[$0, default: 0] } ?? 0)
         }
 
+        func precedes(_ lhs: Int, _ rhs: Int) -> Bool {
+            onComparison()
+            let proposal = candidates[lhs]
+            let incumbent = candidates[rhs]
+            let proposalReuse = reuseCount(proposal)
+            let incumbentReuse = reuseCount(incumbent)
+            if proposalReuse != incumbentReuse { return proposalReuse < incumbentReuse }
+            if proposal.score != incumbent.score { return proposal.score > incumbent.score }
+            if proposal.id != incumbent.id { return proposal.id < incumbent.id }
+            return lhs < rhs
+        }
+
+        func siftDown(from start: Int) {
+            var parent = start
+            while parent * 2 + 1 < remaining.count {
+                var child = parent * 2 + 1
+                if child + 1 < remaining.count,
+                    precedes(remaining[child + 1], remaining[child])
+                {
+                    child += 1
+                }
+                guard precedes(remaining[child], remaining[parent]) else { return }
+                remaining.swapAt(parent, child)
+                parent = child
+            }
+        }
+
         while output.count < limit, !remaining.isEmpty {
-            var selected = remaining.startIndex
-            for index in remaining.indices.dropFirst() {
-                let proposal = remaining[index]
-                let incumbent = remaining[selected]
-                let proposalReuse = reuseCount(proposal)
-                let incumbentReuse = reuseCount(incumbent)
-                if proposalReuse != incumbentReuse {
-                    if proposalReuse < incumbentReuse { selected = index }
-                } else if proposal.score != incumbent.score {
-                    if proposal.score > incumbent.score { selected = index }
-                } else if proposal.id < incumbent.id {
-                    selected = index
+            // Reuse priorities only change after accepting a candidate. Heapify
+            // once per accepted base, then discard invalid picks in O(log n).
+            if remaining.count > 1 {
+                for parent in stride(from: remaining.count / 2 - 1, through: 0, by: -1) {
+                    siftDown(from: parent)
                 }
             }
-            let recommendation = remaining.remove(at: selected)
-            guard isValid(recommendation) else { continue }
-            output.append(recommendation)
-            let encoding = recommendation.specification.encoding
-            if let x = encoding.x { xUses[x, default: 0] += 1 }
-            if let y = encoding.y { yUses[y, default: 0] += 1 }
-            if let series = encoding.series { seriesUses[series, default: 0] += 1 }
+            while !remaining.isEmpty {
+                let recommendation = candidates[remaining[0]]
+                remaining.swapAt(0, remaining.count - 1)
+                remaining.removeLast()
+                if !remaining.isEmpty { siftDown(from: 0) }
+                guard isValid(recommendation) else { continue }
+                output.append(recommendation)
+                let encoding = recommendation.specification.encoding
+                if let x = encoding.x { xUses[x, default: 0] += 1 }
+                if let y = encoding.y { yUses[y, default: 0] += 1 }
+                if let series = encoding.series { seriesUses[series, default: 0] += 1 }
+                break
+            }
         }
         return output
     }
@@ -2934,9 +2961,11 @@ enum AutoChartRecommendationEngine {
     static func balancedFacetBasesForTesting(
         _ candidates: [AutoChartRecommendation],
         limit: Int,
-        isValid: (AutoChartRecommendation) -> Bool
+        isValid: (AutoChartRecommendation) -> Bool,
+        onComparison: () -> Void = {}
     ) -> [AutoChartRecommendation] {
-        balancedFacetBases(candidates, limit: limit, isValid: isValid)
+        balancedFacetBases(
+            candidates, limit: limit, isValid: isValid, onComparison: onComparison)
     }
     #endif
 
