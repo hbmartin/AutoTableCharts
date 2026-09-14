@@ -105,10 +105,6 @@ public struct AutoChartPresentation: Hashable, Sendable {
 
 private enum AutoChartViewContent<RowID: Hashable & Sendable>: Sendable {
     case deferred(AutoChartPreparedChart<RowID>, AutoChartPresentationContext?)
-    case presentedOverride(
-        AutoChartPresentedChart<RowID>,
-        AutoChartFormatters,
-        AutoChartTextResolver)
     case chart(AutoChartPreparedChart<RowID>, AutoChartResolvedPresentation)
     case fallback(AutoChartFallback)
 }
@@ -165,30 +161,8 @@ private struct AutoChartDeferredPresentationView<RowID: Hashable & Sendable>: Vi
     let presentation: AutoChartPresentation
     let formatters: AutoChartFormatters
     let textResolver: AutoChartTextResolver
-    let sourcePresentedChart: AutoChartPresentedChart<RowID>?
 
     @State private var presentedChart: AutoChartPresentedChart<RowID>?
-
-    init(
-        preparedChart: AutoChartPreparedChart<RowID>,
-        context: AutoChartPresentationContext,
-        analysisID: AutoChartAnalysisID,
-        selection: Binding<AutoChartSelectionSet<RowID>>,
-        presentation: AutoChartPresentation,
-        formatters: AutoChartFormatters,
-        textResolver: AutoChartTextResolver,
-        sourcePresentedChart: AutoChartPresentedChart<RowID>? = nil
-    ) {
-        self.preparedChart = preparedChart
-        self.context = context
-        self.analysisID = analysisID
-        self.selection = selection
-        self.presentation = presentation
-        self.formatters = formatters
-        self.textResolver = textResolver
-        self.sourcePresentedChart = sourcePresentedChart
-        _presentedChart = State(initialValue: sourcePresentedChart)
-    }
 
     private var requestID: AutoChartPresentationRequestID {
         AutoChartPresentationRequestID(
@@ -236,18 +210,11 @@ private struct AutoChartDeferredPresentationView<RowID: Hashable & Sendable>: Vi
                 self.presentedChart = nil
             }
             do {
-                let presented: AutoChartPresentedChart<RowID>
-                if let sourcePresentedChart {
-                    presented = try await sourcePresentedChart.rePresentCancellable(
-                        formatters: formatters,
-                        textResolver: textResolver)
-                } else {
-                    presented = try await autoChartConveniencePresenter.presentCancellable(
-                        preparedChart,
-                        context: context,
-                        formatters: formatters,
-                        textResolver: textResolver)
-                }
+                let presented = try await autoChartConveniencePresenter.presentCancellable(
+                    preparedChart,
+                    context: context,
+                    formatters: formatters,
+                    textResolver: textResolver)
                 try Task.checkCancellation()
                 presentedChart = presented
             } catch is CancellationError {
@@ -293,6 +260,12 @@ struct AutoChartKPIContent: View {
 
 /// Convenience composition of a prepared plot and optional package chrome.
 public struct AutoChartView<RowID: Hashable & Sendable>: View {
+    #if ATC_TEST_HOOKS
+    private let renderIdentityForTesting = UUID()
+    var presentedChartForTesting: AutoChartPresentedChart<RowID>?
+    @Environment(\.autoChartViewTestHooks) private var viewTestHooks
+    #endif
+
     private let content: AutoChartViewContent<RowID>
     private let displayTitle: String
     private let presentation: AutoChartPresentation
@@ -305,6 +278,8 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     private let presentedAudioGraphDescriptor: AutoChartLazyAudioGraphDescriptor?
     private let analysisID: AutoChartAnalysisID
     @Binding private var selection: AutoChartSelectionSet<RowID>
+
+    @StateObject private var audioGraphCache = AutoChartAudioGraphDescriptorCache()
 
     @State private var selectedCategory: String?
     @State private var selectedDate: Date?
@@ -392,6 +367,8 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     }
 
     /// Renders presentation work already memoized by ``AutoChartPresenter``.
+    /// Explicit formatter or resolver overrides resolve synchronously in the
+    /// caller's context. Pre-present expensive changes before updating the view.
     public init(
         presentedChart: AutoChartPresentedChart<RowID>,
         analysisID: AutoChartAnalysisID,
@@ -400,44 +377,28 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         formatters: AutoChartFormatters? = nil,
         textResolver: AutoChartTextResolver? = nil
     ) {
-        let effectiveFormatters = formatters ?? presentedChart.formatters
-        let effectiveTextResolver = textResolver ?? presentedChart.textResolver
-        let requestID = AutoChartPresentationRequestID(
-            preparedChart: presentedChart.id,
-            context: presentedChart.context,
-            formatters: effectiveFormatters,
-            textResolver: effectiveTextResolver)
-        if requestID == presentedChart.requestID {
-            content = .chart(
-                presentedChart.preparedChart,
-                presentedChart.resolvedPresentation)
-            displayTitle = presentedChart.title
-            renderedData = presentedChart.renderedData
-            facetPanels = presentedChart.facetPanels
-            sharedXCategoryDomain = presentedChart.sharedXCategoryDomain
-            presentedKPI = presentedChart.kpi
-            #if canImport(Accessibility)
-            presentedAudioGraphDescriptor = presentedChart.makeLazyAudioGraphDescriptor()
-            #else
-            presentedAudioGraphDescriptor = nil
-            #endif
-        } else {
-            content = .presentedOverride(
-                presentedChart,
-                effectiveFormatters,
-                effectiveTextResolver)
-            displayTitle = presentedChart.title
-            renderedData = presentedChart.renderedData
-            facetPanels = presentedChart.facetPanels
-            sharedXCategoryDomain = presentedChart.sharedXCategoryDomain
-            presentedKPI = presentedChart.kpi
-            presentedAudioGraphDescriptor = nil
-        }
+        let resolved = presentedChart.rePresent(
+            formatters: formatters ?? presentedChart.formatters,
+            textResolver: textResolver ?? presentedChart.textResolver)
+        #if ATC_TEST_HOOKS
+        presentedChartForTesting = resolved
+        #endif
+        content = .chart(resolved.preparedChart, resolved.resolvedPresentation)
+        displayTitle = resolved.title
+        renderedData = resolved.renderedData
+        facetPanels = resolved.facetPanels
+        sharedXCategoryDomain = resolved.sharedXCategoryDomain
+        presentedKPI = resolved.kpi
+        #if canImport(Accessibility)
+        presentedAudioGraphDescriptor = resolved.makeLazyAudioGraphDescriptor(cache: nil)
+        #else
+        presentedAudioGraphDescriptor = nil
+        #endif
         self.analysisID = analysisID
         self._selection = selection
         self.presentation = presentation
-        self.formatters = effectiveFormatters
-        self.textResolver = effectiveTextResolver
+        self.formatters = resolved.formatters
+        self.textResolver = resolved.textResolver
     }
 
     /// Defers presentation until the view participates in a SwiftUI lifecycle.
@@ -511,8 +472,6 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         switch content {
         case .deferred(let chart, _), .chart(let chart, _):
             return chart
-        case .presentedOverride(let chart, _, _):
-            return chart.preparedChart
         case .fallback:
             preconditionFailure("No chart content")
         }
@@ -584,16 +543,6 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
                 presentation: presentation,
                 formatters: inputs.formatters,
                 textResolver: inputs.textResolver)
-        case .presentedOverride(let presentedChart, let formatters, let textResolver):
-            AutoChartDeferredPresentationView(
-                preparedChart: presentedChart.preparedChart,
-                context: presentedChart.context,
-                analysisID: analysisID,
-                selection: $selection,
-                presentation: presentation,
-                formatters: formatters,
-                textResolver: textResolver,
-                sourcePresentedChart: presentedChart)
         case .fallback(let fallback):
             VStack(alignment: .leading, spacing: 10) {
                 ContentUnavailableView(
@@ -698,17 +647,40 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             resetInteractionState()
         }
         .onAppear { synchronizeInteractionState(from: selection) }
+        #if ATC_TEST_HOOKS
+        .background {
+            Color.clear
+                .onAppear { reportViewStateForTesting() }
+                .onChange(of: renderIdentityForTesting) { _, _ in
+                    reportViewStateForTesting()
+                }
+                .onChange(of: zoomScale) { _, _ in reportViewStateForTesting() }
+                .onChange(of: selection) { _, _ in reportViewStateForTesting() }
+        }
+        #endif
         .onChange(of: selection) { _, updated in
             synchronizeInteractionState(from: updated)
         }
         }
     }
 
+    #if ATC_TEST_HOOKS
+    private func reportViewStateForTesting() {
+        guard let viewTestHooks, let presentedChartForTesting else { return }
+        viewTestHooks.observe(AutoChartViewTestState(
+            requestID: presentedChartForTesting.requestID,
+            zoomScale: $zoomScale,
+            zoomAnchor: $zoomAnchor,
+            selectionCount: selection.count,
+            audioGraph: presentedAudioGraphDescriptor?.cached(in: audioGraphCache)))
+    }
+    #endif
+
     @ViewBuilder
     private var accessibleChartBody: some View {
         #if canImport(Accessibility)
         if let descriptor = presentedAudioGraphDescriptor {
-            chartBody.accessibilityChartDescriptor(descriptor)
+            chartBody.accessibilityChartDescriptor(descriptor.cached(in: audioGraphCache))
         } else {
             chartBody
         }

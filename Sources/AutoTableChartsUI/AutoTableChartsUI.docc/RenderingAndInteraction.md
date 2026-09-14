@@ -20,7 +20,8 @@ identity when the behavior captured by an existing callback changes. The
 `presentationContext` for the same invalidation control and defer memo misses to
 a cancellable presentation task. Call
 ``AutoChartConveniencePresentationCache/removeAll()`` to release the process-wide
-convenience memo in response to memory pressure.
+convenience memo in response to memory pressure. This does not purge independently
+owned presenters; use their `removeAll()` method to release those payloads.
 
 `presentCancellable` runs formatter and text-resolver callbacks outside the
 main actor as part of cancellable dispatch work. Hosts whose callbacks
@@ -48,11 +49,19 @@ For direct `AutoChartView` and `AutoChartPlot` construction, an omitted context,
 formatter, or resolver inherits the corresponding environment value, while an
 initializer argument takes precedence. A view initialized from an already
 presented chart keeps that chart's formatter and resolver unless the initializer
-explicitly overrides one. An explicit override keeps the current chart visible,
-then asynchronously re-presents it through its originating presenter and cache
-policy. The replacement includes its visible order, domains, facets, controls,
-mark accessibility, and Audio Graph, so every surface uses the same labels and
-formatting without running host callbacks during view initialization.
+explicitly overrides one. Explicit overrides resolve synchronously on the caller's
+context through the originating presenter and its cache policy. The resulting
+view is immediately usable by synchronous renderers and preserves interaction
+state when overrides change. A cache miss can run host callbacks during view
+initialization; pre-present expensive changes before updating an interactive view.
+The replacement includes visible order, domains, facets, controls, mark
+accessibility, and Audio Graph, so every surface uses the same labels and formatting.
+If the originating presenter has been released, overrides use an uncached fallback.
+
+Audio Graph availability is computed with the presentation payload. Mark formatting
+and AX descriptor construction remain lazy, with a single-presentation cache owned
+by each mounted view. Rebuilding that view or updating an unchanged Audio Graph
+does not repeat mark formatting or recreate the AX data points.
 
 Every supported quantitative chart exposes an Apple Audio Graph descriptor built
 from the same prepared marks, display labels, units, locale, and time zone used
