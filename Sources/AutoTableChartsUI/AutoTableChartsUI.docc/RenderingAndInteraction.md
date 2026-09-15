@@ -15,13 +15,21 @@ being replaced and `AutoChartSessionView` displays a compact progress indicator.
 histogram label resolution before a resolved chart body is evaluated. Its bounded
 memo is keyed by prepared-chart identity, ``AutoChartPresentationContext``, the
 effective locale and time zone, and host callback identity. Change the context
-identity when the behavior captured by an existing callback changes. The
+identity when the behavior captured by an existing callback changes. A formatter
+or resolver callback receives a generated identity by default; use its
+`cacheIdentity` parameter to let equivalent wrappers constructed during repeated
+view evaluation share entries, and change that identity whenever captured behavior
+changes. Autoupdating locale and time-zone identities are sampled into each request,
+so a system setting change intentionally invalidates the prior payload and starts
+asynchronous re-presentation. The
 `AutoChartView` and `AutoChartPlot` convenience initializers accept
 `presentationContext` for the same invalidation control and defer memo misses to
 a cancellable presentation task. Call
 ``AutoChartConveniencePresentationCache/removeAll()`` to release the process-wide
 convenience memo in response to memory pressure. This does not purge independently
-owned presenters; use their `removeAll()` method to release those payloads.
+owned presenters; use their `removeAll()` method to release those payloads. Presented
+charts whose originating presenter has been released also use this shared bounded
+fallback, so clearing the convenience cache purges those fallback entries.
 
 `presentCancellable` runs formatter and text-resolver callbacks outside the
 main actor as part of cancellable dispatch work. Hosts whose callbacks
@@ -49,19 +57,21 @@ For direct `AutoChartView` and `AutoChartPlot` construction, an omitted context,
 formatter, or resolver inherits the corresponding environment value, while an
 initializer argument takes precedence. A view initialized from an already
 presented chart keeps that chart's formatter and resolver unless the initializer
-explicitly overrides one. Explicit overrides resolve synchronously on the caller's
-context through the originating presenter and its cache policy. The resulting
-view is immediately usable by synchronous renderers and preserves interaction
-state when overrides change. A cache miss can run host callbacks during view
-initialization; pre-present expensive changes before updating an interactive view.
+explicitly overrides one. Exact request matches and exact cached overrides render
+synchronously without invoking host callbacks. An override cache miss keeps the
+previous valid chart visible with an updating indicator while a cancellable task
+re-presents it off the main actor; only the newest request is published. Retained
+selection is resynchronized to reordered and reformatted categories or donut angles,
+while presentation-only changes preserve zoom. Synchronous renderers and exporters
+must pre-present an override with ``AutoChartPresenter`` before constructing the view.
 The replacement includes visible order, domains, facets, controls, mark
 accessibility, and Audio Graph, so every surface uses the same labels and formatting.
-If the originating presenter has been released, overrides use an uncached fallback.
 
-Audio Graph availability is computed with the presentation payload. Mark formatting
-and AX descriptor construction remain lazy, with a single-presentation cache owned
-by each mounted view. Rebuilding that view or updating an unchanged Audio Graph
-does not repeat mark formatting or recreate the AX data points.
+Audio Graph availability uses an early-exit usability check during presentation.
+Range calculation, mark formatting, and AX descriptor construction remain lazy and
+share chart-only view state. Deferred and fallback views allocate no Audio Graph
+cache. Rebuilding an unchanged descriptor does not repeat mark formatting or recreate
+the AX data points, and application tracking weakly references framework AX objects.
 
 Every supported quantitative chart exposes an Apple Audio Graph descriptor built
 from the same prepared marks, display labels, units, locale, and time zone used

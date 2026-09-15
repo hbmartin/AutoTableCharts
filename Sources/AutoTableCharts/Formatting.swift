@@ -260,9 +260,15 @@ public struct AutoChartFormatters: Sendable {
         }
     }
 
+    /// Creates formatters with an optional stable presentation-cache identity.
+    ///
+    /// Separately constructed callbacks receive distinct generated identities by
+    /// default. Supply the same `cacheIdentity` when declarative rendering rebuilds
+    /// an equivalent callback, and change it whenever captured behavior changes.
     public init(
         locale: Locale = .autoupdatingCurrent,
         timeZone: TimeZone = .autoupdatingCurrent,
+        cacheIdentity: String? = nil,
         value: ValueFormatter? = nil
     ) {
         self.locale = locale
@@ -276,21 +282,25 @@ public struct AutoChartFormatters: Sendable {
                     locale,
                     timeZone)
             }
-            hostOverride = AutoChartHostCallback(requestFormatter)
+            hostOverride = AutoChartHostCallback(
+                cacheIdentity: cacheIdentity, requestFormatter)
         } else {
             hostOverride = nil
         }
     }
 
-    /// Creates formatters with an aggregation-aware host override.
+    /// Creates formatters with an aggregation-aware host override and an optional
+    /// stable presentation-cache identity. Reuse `cacheIdentity` only while the
+    /// callback's captured behavior remains equivalent.
     public init(
         locale: Locale = .autoupdatingCurrent,
         timeZone: TimeZone = .autoupdatingCurrent,
+        cacheIdentity: String? = nil,
         request: @escaping RequestFormatter
     ) {
         self.locale = locale
         self.timeZone = timeZone
-        hostOverride = AutoChartHostCallback(request)
+        hostOverride = AutoChartHostCallback(cacheIdentity: cacheIdentity, request)
     }
 
     public func format(
@@ -305,10 +315,10 @@ public struct AutoChartFormatters: Sendable {
                 context: context))
     }
 
-    /// Stable for copies of the same formatter bundle and distinct for newly
-    /// supplied host callbacks.
-    package var callbackIdentity: UUID? {
-        hostOverride?.token.identity
+    /// Stable for copies and for separately constructed callbacks that explicitly
+    /// share a cache identity. Otherwise distinct for newly supplied callbacks.
+    package var callbackIdentity: AutoChartHostCallbackCacheIdentity? {
+        hostOverride?.token.cacheIdentity
     }
 
     /// Formats a complete semantic request.

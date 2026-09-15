@@ -2,6 +2,10 @@ import Dispatch
 import Foundation
 import AutoTableCharts
 
+/// Bounded, source-snapshot-free memoization shared by convenience tasks and
+/// presented charts whose originating presenter has been released.
+let autoChartConveniencePresenter = AutoChartPresenter()
+
 final class AutoChartCancellationToken: @unchecked Sendable {
     private let lock = NSLock()
     private var cancelled = false
@@ -248,8 +252,8 @@ struct AutoChartPresentationRequestID: Hashable, Sendable {
     let preparedChart: AutoChartPreparedChartID
     let context: AutoChartPresentationContextIdentity
     let formatterFoundation: AutoChartFoundationPresentationIdentity
-    let formatterCallback: UUID?
-    let resolverCallback: UUID?
+    let formatterCallback: AutoChartHostCallbackCacheIdentity?
+    let resolverCallback: AutoChartHostCallbackCacheIdentity?
 
     init(
         preparedChart: AutoChartPreparedChartID,
@@ -405,7 +409,7 @@ public struct AutoChartPresentedChart<RowID: Hashable & Sendable>: Sendable {
     }
 
     func makeLazyAudioGraphDescriptor(
-        cache: AutoChartAudioGraphDescriptorCache? = AutoChartAudioGraphDescriptorCache()
+        cache: AutoChartAudioGraphViewCache? = AutoChartAudioGraphViewCache()
     ) -> AutoChartLazyAudioGraphDescriptor? {
         guard let audioGraphAvailability else { return nil }
         return AutoChartLazyAudioGraphDescriptor(requestID: requestID, cache: cache) {
@@ -413,19 +417,40 @@ public struct AutoChartPresentedChart<RowID: Hashable & Sendable>: Sendable {
         }
     }
 
-    func rePresent(
+    func presentationRequestID(
         formatters: AutoChartFormatters,
         textResolver: AutoChartTextResolver
-    ) -> AutoChartPresentedChart<RowID> {
-        let requestedID = AutoChartPresentationRequestID(
+    ) -> AutoChartPresentationRequestID {
+        AutoChartPresentationRequestID(
             preparedChart: id, context: context,
             formatters: formatters, textResolver: textResolver)
-        guard requestedID != requestID else { return self }
-        return originatingPresenter.active.present(
+    }
+
+    /// Returns an exact cached override without running host callbacks.
+    func cachedRePresentation(
+        requestID: AutoChartPresentationRequestID,
+        formatters: AutoChartFormatters,
+        textResolver: AutoChartTextResolver
+    ) -> AutoChartPresentedChart<RowID>? {
+        originatingPresenter.active.cachedPresentation(
             preparedChart,
             context: context,
             formatters: formatters,
-            textResolver: textResolver)
+            textResolver: textResolver,
+            requestID: requestID)
+    }
+
+    func rePresentCancellable(
+        requestID: AutoChartPresentationRequestID,
+        formatters: AutoChartFormatters,
+        textResolver: AutoChartTextResolver
+    ) async throws -> AutoChartPresentedChart<RowID> {
+        try await originatingPresenter.active.presentCancellable(
+            preparedChart,
+            context: context,
+            formatters: formatters,
+            textResolver: textResolver,
+            requestID: requestID)
     }
 }
 
@@ -449,14 +474,13 @@ private struct AutoChartPresentationPayload: Sendable {
 
 final class AutoChartPresenterReference: @unchecked Sendable {
     private weak var source: AutoChartPresenter?
-    private static let fallback = AutoChartPresenter(maximumEntries: 0)
 
     init(_ source: AutoChartPresenter) {
         self.source = source
     }
 
     var active: AutoChartPresenter {
-        source ?? Self.fallback
+        source ?? autoChartConveniencePresenter
     }
 }
 
@@ -530,21 +554,74 @@ public final class AutoChartPresenter: @unchecked Sendable {
         }
     }
 
+    /// Presents a request whose identity was already built by the caller. This
+    /// keeps SwiftUI task identity and presenter memoization on the same snapshot.
+    func presentCancellable<RowID: Hashable & Sendable>(
+        _ chart: AutoChartPreparedChart<RowID>,
+        context: AutoChartPresentationContext,
+        formatters: AutoChartFormatters,
+        textResolver: AutoChartTextResolver,
+        requestID: AutoChartPresentationRequestID,
+        priority: TaskPriority = .userInitiated
+    ) async throws -> AutoChartPresentedChart<RowID> {
+        let qos: DispatchQoS.QoSClass
+        switch priority {
+        case .background:
+            qos = .background
+        case .low:
+            qos = .utility
+        case .high:
+            qos = .userInitiated
+        default:
+            qos = .default
+        }
+        return try await AutoChartCancellableWork.run(
+            on: DispatchQueue.global(qos: qos)
+        ) { cancellation in
+            try self.present(
+                chart,
+                context: context,
+                formatters: formatters,
+                textResolver: textResolver,
+                requestID: requestID,
+                checkingCancellation: cancellation.checkCancellation)
+        }
+    }
+
+    /// Looks up an exact payload without invoking formatters or resolvers.
+    func cachedPresentation<RowID: Hashable & Sendable>(
+        _ chart: AutoChartPreparedChart<RowID>,
+        context: AutoChartPresentationContext,
+        formatters: AutoChartFormatters,
+        textResolver: AutoChartTextResolver,
+        requestID: AutoChartPresentationRequestID
+    ) -> AutoChartPresentedChart<RowID>? {
+        guard let payload = lock.withLock({ cachedPayload(for: requestID) }) else {
+            return nil
+        }
+        return presentedChart(
+            chart,
+            context: context,
+            formatters: formatters,
+            textResolver: textResolver,
+            payload: payload,
+            requestID: requestID)
+    }
+
     private func present<RowID: Hashable & Sendable>(
         _ chart: AutoChartPreparedChart<RowID>,
         context: AutoChartPresentationContext,
         formatters: AutoChartFormatters?,
         textResolver: AutoChartTextResolver,
+        requestID precomputedRequestID: AutoChartPresentationRequestID? = nil,
         checkingCancellation: () throws -> Void
     ) rethrows -> AutoChartPresentedChart<RowID> {
         try checkingCancellation()
         let formatters = formatters ?? AutoChartFormatters(
             locale: context.locale, timeZone: context.timeZone)
-        let requestID = AutoChartPresentationRequestID(
-            preparedChart: chart.id,
-            context: context,
-            formatters: formatters,
-            textResolver: textResolver)
+        let requestID = precomputedRequestID ?? AutoChartPresentationRequestID(
+            preparedChart: chart.id, context: context,
+            formatters: formatters, textResolver: textResolver)
         if let cached = lock.withLock({ cachedPayload(for: requestID) }) {
             try checkingCancellation()
             return presentedChart(
