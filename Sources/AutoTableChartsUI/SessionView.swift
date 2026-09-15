@@ -1,5 +1,6 @@
 #if canImport(SwiftUI) && canImport(Charts)
 import Dispatch
+import Foundation
 import SwiftUI
 import Charts
 import AutoTableCharts
@@ -38,6 +39,18 @@ public struct AutoChartTheme: @unchecked Sendable {
     public static let `default` = AutoChartTheme()
 }
 
+/// Controls synchronous host callback concurrency for mounted deferred charts.
+/// An already running callback cannot be interrupted; cancelled queued calls
+/// are removed before they start.
+public enum AutoChartDeferredCallbackScheduling: Hashable, Sendable {
+    /// Preserves the per-view one-at-a-time callback guarantee.
+    case serial
+    /// Lets one newer callback proceed past a blocked older callback.
+    case overlapping
+
+    var maximumConcurrentJobs: Int { self == .serial ? 1 : 2 }
+}
+
 private struct AutoChartPresentationContextKey: EnvironmentKey {
     static let defaultValue: AutoChartPresentationContext? = nil
 }
@@ -56,6 +69,10 @@ private struct AutoChartPaletteKey: EnvironmentKey {
 
 private struct AutoChartThemeKey: EnvironmentKey {
     static let defaultValue = AutoChartTheme.default
+}
+
+private struct AutoChartDeferredCallbackSchedulingKey: EnvironmentKey {
+    static let defaultValue = AutoChartDeferredCallbackScheduling.serial
 }
 
 extension EnvironmentValues {
@@ -83,6 +100,10 @@ extension EnvironmentValues {
         get { self[AutoChartThemeKey.self] }
         set { self[AutoChartThemeKey.self] = newValue }
     }
+    public var autoChartDeferredCallbackScheduling: AutoChartDeferredCallbackScheduling {
+        get { self[AutoChartDeferredCallbackSchedulingKey.self] }
+        set { self[AutoChartDeferredCallbackSchedulingKey.self] = newValue }
+    }
 }
 
 extension View {
@@ -105,6 +126,11 @@ extension View {
     public func autoChartTheme(_ value: AutoChartTheme) -> some View {
         environment(\.autoChartTheme, value)
     }
+    public func autoChartDeferredCallbackScheduling(
+        _ value: AutoChartDeferredCallbackScheduling
+    ) -> some View {
+        environment(\.autoChartDeferredCallbackScheduling, value)
+    }
 }
 
 enum AutoChartProgressAccessibility {
@@ -119,20 +145,20 @@ enum AutoChartProgressAccessibility {
 }
 
 enum AutoChartProgressTextResolution {
-    /// Keep progress callbacks off the cooperative executor without letting one
-    /// slow resolver delay newer labels or chart presentation work.
-    private static let queue = DispatchQueue(
-        label: "io.github.hbmartin.AutoTableCharts.ProgressTextResolution",
-        qos: .userInitiated,
-        attributes: .concurrent)
+    private static let scheduler = AutoChartCallbackWorkScheduler(
+        maximumConcurrentJobs: 1,
+        queue: DispatchQueue.global(qos: .userInitiated))
 
     static func resolve(
         _ message: AutoChartMessage,
-        using resolver: AutoChartTextResolver
+        using resolver: AutoChartTextResolver,
+        on scheduler: AutoChartCallbackWorkScheduler? = nil
     ) async -> String? {
         guard resolver.callbackIdentity != nil else { return message.defaultText }
         do {
-            return try await AutoChartCancellableWork.run(on: queue) { cancellation in
+            return try await AutoChartCancellableWork.run(
+                on: scheduler ?? Self.scheduler
+            ) { cancellation in
                 try cancellation.checkCancellation()
                 return resolver(message)
             }
@@ -148,6 +174,7 @@ enum AutoChartProgressTextResolution {
 struct AutoChartAccessibleProgressView: View {
     let message: AutoChartMessage
     let textResolver: AutoChartTextResolver?
+    let scheduler: AutoChartCallbackWorkScheduler?
 
     @Environment(\.autoChartTextResolver) private var environmentTextResolver
     @State private var accessibilityText: String
@@ -159,10 +186,12 @@ struct AutoChartAccessibleProgressView: View {
 
     init(
         message: AutoChartMessage,
-        textResolver: AutoChartTextResolver? = nil
+        textResolver: AutoChartTextResolver? = nil,
+        scheduler: AutoChartCallbackWorkScheduler? = nil
     ) {
         self.message = message
         self.textResolver = textResolver
+        self.scheduler = scheduler
         _accessibilityText = State(initialValue: message.defaultText)
     }
 
@@ -180,7 +209,8 @@ struct AutoChartAccessibleProgressView: View {
                 guard let resolver else { return }
                 let resolved = await AutoChartProgressTextResolution.resolve(
                     message,
-                    using: resolver)
+                    using: resolver,
+                    on: scheduler)
                 guard let resolved, !Task.isCancelled else { return }
                 if accessibilityText != resolved {
                     accessibilityText = resolved
@@ -325,7 +355,9 @@ public struct AutoChartSessionView<
                             selection: $session.selection,
                             presentation: .explorer())
                             .foregroundStyle(theme.legendColor)
-                        if session.isPresentationPending {
+                        if session.isPresentationPending
+                            || session.isPreferenceUpdatePending
+                        {
                             AutoChartAccessibleProgressView(
                                 message: AutoChartProgressAccessibility.updating,
                                 textResolver: session.presentationTextResolver)
@@ -347,6 +379,14 @@ public struct AutoChartSessionView<
         }
         .onChange(of: readyPreparedChartID) { _, id in
             guard id != nil else { return }
+            applyEnvironmentPresentation()
+        }
+        .onReceive(NotificationCenter.default.publisher(
+            for: NSLocale.currentLocaleDidChangeNotification)) { _ in
+            applyEnvironmentPresentation()
+        }
+        .onReceive(NotificationCenter.default.publisher(
+            for: .NSSystemTimeZoneDidChange)) { _ in
             applyEnvironmentPresentation()
         }
     }

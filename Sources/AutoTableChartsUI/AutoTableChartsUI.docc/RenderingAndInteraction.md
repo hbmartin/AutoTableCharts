@@ -9,7 +9,9 @@ states while preventing superseded work from replacing newer state. Two
 sessions can share one core cache while retaining independent preferences and
 selections. When a ready chart remains visible during presentation-only work,
 ``AutoChartSession/isPresentationPending`` reports that the visible payload is
-being replaced and `AutoChartSessionView` displays a compact progress indicator.
+being replaced. Same-request preference changes also keep that chart visible
+until the new choice is ready. `AutoChartSessionView` displays a compact updating
+indicator in either case.
 
 ``AutoChartPresenter`` performs localization, formatting, ordering, and
 histogram label resolution before a resolved chart body is evaluated. Its bounded
@@ -22,8 +24,10 @@ view evaluation share entries, and change that identity whenever captured behavi
 changes. Autoupdating locale and time-zone values are frozen from `Locale.current`
 and `TimeZone.current` once per request, preserving user formatting preferences;
 the same snapshots supply both the cache key and every formatted surface. A later
-system setting change therefore creates a new request without allowing the old
-request to cache output under the new locale or time zone. The
+system setting change triggers a new request in mounted session and convenience
+views without allowing the old request to cache output under the new locale or
+time zone. Mounted views using the immediate presented-chart initializer refresh
+synchronously when the effective Foundation request changes. The
 `AutoChartView` and `AutoChartPlot` convenience initializers accept
 `presentationContext` for the same invalidation control and defer memo misses to
 a cancellable presentation task. Call
@@ -37,11 +41,14 @@ fallback, so clearing the convenience cache purges those fallback entries.
 mode run formatter and text-resolver callbacks synchronously on the caller's
 thread. `presentCancellable` and explicit
 ``AutoChartOverridePresentationMode/deferred`` presentation run callbacks off-main.
-Progress-label resolution uses a separate concurrent execution lane. Superseded
-presentation generations may finish their synchronous host callbacks after newer
-work starts, but cancellation prevents their results from being cached or published.
-Callbacks supplied to deferred rendering must therefore honor their `@Sendable`
-contract and permit calls from overlapping generations.
+Each mounted deferred chart serializes its presentation and progress-label host
+callbacks by default. Use `autoChartDeferredCallbackScheduling(.overlapping)`
+to allow two callbacks from that chart to run at once. Cancelled queued calls are
+removed before starting; a synchronous callback already running may finish, but
+its cancelled result is not published. Work cancelled before cache commit cannot
+populate or evict cache entries. Outside a deferred chart, progress-label callbacks
+use a process-wide serial scheduler. Hosts opting into overlap must make their
+callbacks safe for concurrent calls.
 
 Deferred convenience views require a mounted SwiftUI lifecycle to run their
 presentation task. Synchronous renderers such as snapshot exporters should call
@@ -59,11 +66,15 @@ and otherwise completes the group. Every selected mark carries its analysis and
 prepared-chart identities, and `unionedSourceRows` supports linked table filtering.
 External row-ID updates select every intersecting mark and retain each mark's full
 source-row lineage, so aggregate selections stay consistent with chart-originated
-selections. External binding updates are reflected by chart highlighting.
+selections. External binding updates are reflected by chart highlighting. When
+charts share a selection binding, each chart ignores selections with foreign
+analysis or prepared-chart provenance. The binding owner decides when to clear
+it; sessions clear their own selections when accepting a different chart.
 
 Use the environment modifiers `autoChartPresentationContext(_:)`,
 `autoChartFormatters(_:)`, `autoChartTextResolver(_:)`,
-`autoChartPalette(_:)`, and `autoChartTheme(_:)` to configure a subtree.
+`autoChartPalette(_:)`, `autoChartTheme(_:)`, and
+`autoChartDeferredCallbackScheduling(_:)` to configure a subtree.
 Only explicitly supplied environment values override presentation settings
 passed to ``AutoChartSession/load(_:preference:preparation:presentationContext:formatters:textResolver:)``.
 For direct `AutoChartView` and `AutoChartPlot` construction, an omitted context,
@@ -76,8 +87,8 @@ is resolved immediately on the caller's thread. Pass
 `overridePresentationMode: .deferred` to keep the incoming chart visible with an
 updating indicator while a cancellable task re-presents it off the main actor; only
 the newest request is published. Replacing that chart while work is pending shows
-the replacement's immediate valid presentation and keeps the rendered child mounted
-so chart-change interaction resets still run. Retained
+the replacement's immediate valid presentation. A different prepared-chart ID
+remounts the rendered child and resets its local interaction state. Retained
 selection is resynchronized to reordered and reformatted categories or donut angles,
 while presentation-only changes preserve zoom. Synchronous renderers and exporters
 do not need to pre-present overrides supplied to a presented-chart view.

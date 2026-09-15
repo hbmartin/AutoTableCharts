@@ -78,6 +78,14 @@ public struct AutoChartSelectionSet<RowID: Hashable & Sendable>: Hashable, Senda
         isEmpty || preparedChartID == preparedChart.id
     }
 
+    package func belongs(
+        to analysisID: AutoChartAnalysisID,
+        preparedChartID: AutoChartPreparedChartID
+    ) -> Bool {
+        isEmpty || (self.analysisID == analysisID
+            && self.preparedChartID == preparedChartID)
+    }
+
     public func sourceRows(
         in preparedChart: AutoChartPreparedChart<RowID>
     ) -> Set<RowID> {

@@ -9,6 +9,7 @@ struct AutoChartViewTestHookState {
     let zoomScale: Binding<Double>
     let zoomAnchor: Binding<Double>
     let selectionCount: Int
+    let hasSelectionSummary: Bool
     let selectedCategory: String?
     let selectedAngle: Double?
     let displayTitle: String
@@ -20,10 +21,20 @@ struct AutoChartViewTestHookState {
     let kpiAccessibilityText: String?
 }
 
+enum AutoChartDeferredPresentationOutcome: Equatable {
+    case exact
+    case cancelled
+    case published
+}
+
 @MainActor
 final class AutoChartViewTestHooks {
     var observe: (AutoChartViewTestHookState) -> Void = { _ in }
+    var callbackSchedulerForTesting: AutoChartCallbackWorkScheduler?
     var didPublishDeferredPresentation: (AutoChartPresentationRequestID) -> Void = { _ in }
+    var didFinishDeferredPresentation: (
+        AutoChartPresentationRequestID, AutoChartDeferredPresentationOutcome
+    ) -> Void = { _, _ in }
     #if canImport(Accessibility)
     var observeAudioGraph: (
         AutoChartAudioGraphViewCache, AutoChartLazyAudioGraphDescriptor
