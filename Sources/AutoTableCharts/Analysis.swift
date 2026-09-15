@@ -296,6 +296,27 @@ final class AutoChartAnalysisPreparationProvider<RowID: Hashable & Sendable>: @u
         return validation.isValid ? recommendation : nil
     }
 
+    func recommendationCancellable(
+        for recommendationID: AutoChartRecommendationID
+    ) throws -> AutoChartRecommendation? {
+        try Task.checkCancellation()
+        guard let index = recommendationIndexByID[recommendationID] else { return nil }
+        let recommendation = recommendations[index]
+        if let isValid = validationLock.withLock({ validationByID[recommendationID] }) {
+            return isValid ? recommendation : nil
+        }
+        let validation = AutoChartRecommendationEngine.validate(
+            specification: recommendation.specification,
+            snapshot: source.snapshot,
+            profiles: source.profiles,
+            cancellationRequested: { Task.isCancelled })
+        try Task.checkCancellation()
+        validationLock.withLock {
+            validationByID[recommendationID] = validation.isValid
+        }
+        return validation.isValid ? recommendation : nil
+    }
+
     func prepare(_ specification: AutoChartSpecification) async throws
         -> AutoChartPreparedChart<RowID>
     {
@@ -370,6 +391,24 @@ public struct AutoChartAnalysis<RowID: Hashable & Sendable>: Sendable {
     public func resolve(
         _ preference: AutoChartPreference
     ) -> AutoChartPreferenceResolution {
+        // The ordinary public API remains synchronous for callers that have
+        // already selected a chart and need an immediate resolution.
+        try! resolved(preference, lookup: recommendation(for:))
+    }
+
+    /// Resolves off-catalog choices cooperatively when used by a cancellable
+    /// background task. Cancelled validation is never stored as a result.
+    public func resolveCancellable(
+        _ preference: AutoChartPreference
+    ) throws -> AutoChartPreferenceResolution {
+        try Task.checkCancellation()
+        return try resolved(preference, lookup: recommendationCancellable(for:))
+    }
+
+    private func resolved(
+        _ preference: AutoChartPreference,
+        lookup: (AutoChartRecommendationID) throws -> AutoChartRecommendation?
+    ) throws -> AutoChartPreferenceResolution {
         if case .table = preference {
             return AutoChartPreferenceResolution(
                 recommendation: nil, usesTable: true)
@@ -395,7 +434,7 @@ public struct AutoChartAnalysis<RowID: Hashable & Sendable>: Sendable {
                 let currentID = AutoChartRecommendationID(
                     policyVersion: AutoTableCharts.recommendationPolicyVersion,
                     specificationID: id.specificationID)
-                if let rebound = recommendation(for: currentID) {
+                if let rebound = try lookup(currentID) {
                     return AutoChartPreferenceResolution(
                         recommendation: rebound,
                         defaultReason: .policyVersionRebound(
@@ -410,7 +449,7 @@ public struct AutoChartAnalysis<RowID: Hashable & Sendable>: Sendable {
                         current: AutoTableCharts.recommendationPolicyVersion),
                     replacementPreference: .chart(.recommended))
             }
-            if let exact = recommendation(for: id) {
+            if let exact = try lookup(id) {
                 return AutoChartPreferenceResolution(recommendation: exact)
             }
             return AutoChartPreferenceResolution(
@@ -466,6 +505,20 @@ public struct AutoChartAnalysis<RowID: Hashable & Sendable>: Sendable {
             return cataloged
         }
         return provider.recommendation(for: id)
+    }
+
+    private func recommendationCancellable(
+        for id: AutoChartRecommendationID
+    ) throws -> AutoChartRecommendation? {
+        try Task.checkCancellation()
+        guard id.policyVersion == AutoTableCharts.recommendationPolicyVersion
+        else { return nil }
+        if case .charts(let catalog) = outcome,
+            let cataloged = catalog.recommendation(for: id)
+        {
+            return cataloged
+        }
+        return try provider.recommendationCancellable(for: id)
     }
 
     private func highestRankedPreparedChart(

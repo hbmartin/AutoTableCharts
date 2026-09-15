@@ -2459,6 +2459,122 @@ private final class ProgressRecorder: @unchecked Sendable {
 
 @MainActor
 @Suite struct V3SessionTests {
+    @Test func cancellableValidationStopsInsideARowScan() throws {
+        let dataset = try domainDataset()
+        let snapshot = AutoChartSnapshot(dataset)
+        let specification = AutoChartSpecification(
+            family: .bar,
+            encoding: .init(x: "category", y: "value"),
+            aggregation: .none)
+        let ordinary = AutoChartRecommendationEngine.validate(
+            specification: specification, snapshot: snapshot)
+        let hasDuplicate = ordinary.issues.contains(where: {
+            $0.messageValue.code == .duplicateMark
+        })
+        #expect(hasDuplicate)
+
+        var checks = 0
+        let cancelled = AutoChartRecommendationEngine.validate(
+            specification: specification,
+            snapshot: snapshot,
+            profiles: AutoChartProfiler.profileIndex(snapshot),
+            cancellationRequested: {
+                checks += 1
+                return checks >= 4
+            })
+        #expect(checks >= 4)
+        #expect(cancelled.issues.isEmpty)
+    }
+
+    @Test func cachedPreparationKeepsKnownChoiceAndLeavesUnlistedChoiceNeutral()
+        async throws
+    {
+        let cache = AutoChartCache()
+        let request = try AutoChartRequest(table: domainDataset())
+        let base = try await AutoChartAnalyzer(cache: cache).analyze(
+            request, preparation: .none)
+        let primary = try #require(base.outcome.catalog?.primary)
+        let known = AutoChartSession<Int>(cache: cache)
+        known.load(request, preference: .automatic)
+        guard case .preparing = known.state else {
+            Issue.record("A completed analysis should enter cached preparation immediately.")
+            return
+        }
+        #expect(known.currentRecommendation?.id == primary.id)
+        known.cancel()
+
+        let missing = AutoChartRecommendationID(
+            policyVersion: AutoTableCharts.recommendationPolicyVersion,
+            specificationID: .init(rawValue: "off-catalog-unresolved"))
+        let unlisted = AutoChartSession<Int>(cache: cache)
+        unlisted.load(request, preference: .chart(.specific(missing)))
+        guard case .preparing = unlisted.state else {
+            Issue.record("An unresolved cached choice should still prepare as Chart.")
+            return
+        }
+        #expect(unlisted.currentRecommendation == nil)
+        unlisted.cancel()
+    }
+
+    @Test func unloadRemovesTheRequestBehindLaterPreferenceChanges() async throws {
+        let cache = AutoChartCache()
+        let request = try AutoChartRequest(table: domainDataset())
+        let session = AutoChartSession<Int>(cache: cache)
+        session.load(request, preference: .automatic)
+        _ = try await readyAnalysis(from: session)
+        #expect(session.currentRecommendation != nil)
+
+        session.unload()
+        #expect(session.currentRecommendation == nil)
+        #expect(session.selection.isEmpty)
+        guard case .idle = session.state else {
+            Issue.record("Unloading must leave the session idle.")
+            return
+        }
+        #expect(!session.setPreference(.chart(.recommended)))
+        session.retry()
+        guard case .idle = session.state else {
+            Issue.record("An unloaded request restarted after a preference change.")
+            return
+        }
+    }
+
+    @Test(
+        .disabled(if: !testHooksAvailable, testHooksUnavailable))
+    func retryableFailureRetainsTheSelectedChoiceForSameTypeRetry()
+        async throws
+    {
+        #if ATC_TEST_HOOKS
+        let cache = AutoChartCache()
+        let request = try AutoChartRequest(table: domainDataset())
+        let base = try await AutoChartAnalyzer(cache: cache).analyze(
+            request, preparation: .none)
+        let selected = try #require(base.outcome.catalog?.primary)
+        let session = AutoChartSession<Int>(cache: cache)
+        session.load(request, preference: .chart(.specific(selected.id)))
+        #expect(session.currentRecommendation?.id == selected.id)
+        session.failCurrentAttemptForTesting(AutoChartFailure(
+            stage: .chartPreparation,
+            kind: .internalFailure,
+            isRetryable: true,
+            diagnosticID: "ATC.test.retryableFailure",
+            message: "A controlled presentation failure."))
+        guard case .failed = session.state else {
+            Issue.record("The controlled failure did not become visible.")
+            return
+        }
+        #expect(session.currentRecommendation?.id == selected.id)
+
+        session.retry(preference: .chart(.specific(selected.id)))
+        guard case .preparing = session.state else {
+            Issue.record("The same selected type did not start cached preparation.")
+            return
+        }
+        #expect(session.currentRecommendation?.id == selected.id)
+        session.cancel()
+        #endif
+    }
+
     @Test func cancelledProgressTextResolutionDoesNotStartResolver() async {
         let gate = V3AsyncTestGate()
         let calls = V3Counter()

@@ -17,6 +17,9 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
 
     public private(set) var state: State = .idle
     public private(set) var preference: AutoChartPreference = .automatic
+    /// The chart choice for this request, including while cached preparation is
+    /// pending or a retryable attempt has failed.
+    public private(set) var currentRecommendation: AutoChartRecommendation?
     public var selection = AutoChartSelectionSet<RowID>()
 
     /// True while the session is resolving a new presentation payload. A ready
@@ -64,6 +67,7 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
     private var presentationGeneration: UInt64 = 0
     @ObservationIgnored private var task: Task<Void, Never>?
     @ObservationIgnored private var presentationTask: Task<Void, Never>?
+    @ObservationIgnored private var recommendationTask: Task<Void, Never>?
     private var presentationRequestID: AutoChartPresentationRequestID?
     private var preferenceUpdatePending = false
 
@@ -79,6 +83,7 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
     deinit {
         task?.cancel()
         presentationTask?.cancel()
+        recommendationTask?.cancel()
     }
 
     /// Starts or supersedes a request. Replacement requests clear visible state immediately.
@@ -142,6 +147,7 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
                     presentationRequestID = nil
                 }
                 self.preference = preference
+                currentRecommendation = resolution.recommendation
                 state = .ready(
                     base.replacingPresentation(
                         preparedCharts: displayedAnalysis.preparedCharts,
@@ -273,12 +279,38 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         presentationGeneration &+= 1
         task?.cancel()
         presentationTask?.cancel()
+        recommendationTask?.cancel()
         task = nil
         presentationTask = nil
+        recommendationTask = nil
         presentationRequestID = nil
         preferenceUpdatePending = false
         state = .idle
     }
+
+    /// Ends ownership of the current request. Unlike `cancel`, a later
+    /// preference change cannot restart the unloaded request.
+    public func unload() {
+        cancel()
+        request = nil
+        selection.removeAll()
+        currentRecommendation = nil
+        preference = .automatic
+    }
+
+    #if ATC_TEST_HOOKS
+    /// Injects a terminal attempt after analysis for deterministic host UI tests.
+    public func failCurrentAttemptForTesting(_ failure: AutoChartFailure) {
+        generation &+= 1
+        task?.cancel()
+        task = nil
+        presentationGeneration &+= 1
+        presentationTask?.cancel()
+        presentationTask = nil
+        presentationRequestID = nil
+        state = .failed(failure)
+    }
+    #endif
 
     private func start(
         _ request: AutoChartRequest<RowID>,
@@ -300,6 +332,8 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         generation &+= 1
         let token = generation
         task?.cancel()
+        recommendationTask?.cancel()
+        recommendationTask = nil
         presentationGeneration &+= 1
         presentationTask?.cancel()
         presentationTask = nil
@@ -309,6 +343,7 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         self.strategy = preparation
         self.presentationConfiguration = presentationConfiguration
         preferenceUpdatePending = keepsReadyChart
+        if clearsVisibleState { currentRecommendation = nil }
         if clearsVisibleState {
             selection.removeAll()
         }
@@ -319,6 +354,10 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
             Self.canPrepareChart(for: preference, in: completed)
         {
             completedForPreparation = completed
+            if !keepsReadyChart {
+                beginRecommendationResolution(
+                    for: completed, preference: preference, token: token)
+            }
             if !keepsReadyChart { state = .preparing(completed, nil) }
         } else {
             completedForPreparation = nil
@@ -350,6 +389,9 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
                 guard let self, self.generation == token else { return }
                 self.task = nil
                 self.preferenceUpdatePending = false
+                self.recommendationTask?.cancel()
+                self.recommendationTask = nil
+                self.currentRecommendation = analysis.preferenceResolution?.recommendation
                 if case .tableFallback(let fallback) = analysis.outcome {
                     if !selection.isEmpty { selection.removeAll() }
                     state = .fallback(analysis, fallback)
@@ -370,11 +412,15 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
                 guard let self, self.generation == token else { return }
                 self.task = nil
                 self.preferenceUpdatePending = false
+                self.restoreRecommendationFromCache(
+                    request: request, preference: preference, token: token)
                 state = .failed(failure)
             } catch {
                 guard let self, self.generation == token else { return }
                 self.task = nil
                 self.preferenceUpdatePending = false
+                self.restoreRecommendationFromCache(
+                    request: request, preference: preference, token: token)
                 state = .failed(
                     AutoChartFailure(
                         stage: .recommendation,
@@ -383,6 +429,60 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
                         diagnosticID: "ATC.session.internalFailure",
                         message: String(describing: error)))
             }
+        }
+    }
+
+    private func restoreRecommendationFromCache(
+        request: AutoChartRequest<RowID>,
+        preference: AutoChartPreference,
+        token: UInt64
+    ) {
+        guard currentRecommendation == nil,
+            recommendationTask == nil,
+            let completed: AutoChartAnalysis<RowID> = cache.completedAnalysis(
+                for: request.id)
+        else { return }
+        beginRecommendationResolution(
+            for: completed, preference: preference, token: token)
+    }
+
+    private func beginRecommendationResolution(
+        for analysis: AutoChartAnalysis<RowID>,
+        preference: AutoChartPreference,
+        token: UInt64
+    ) {
+        currentRecommendation = Self.catalogRecommendation(
+            for: preference, in: analysis)
+        guard currentRecommendation == nil,
+            case .chart = preference
+        else { return }
+        recommendationTask = Task { [weak self] in
+            let worker = Task.detached(priority: .utility) {
+                try? analysis.resolveCancellable(preference).recommendation
+            }
+            let resolved = await withTaskCancellationHandler(
+                operation: { await worker.value },
+                onCancel: { worker.cancel() })
+            guard let self, self.generation == token,
+                !Task.isCancelled else { return }
+            self.currentRecommendation = resolved
+            self.recommendationTask = nil
+        }
+    }
+
+    private static func catalogRecommendation(
+        for preference: AutoChartPreference,
+        in analysis: AutoChartAnalysis<RowID>
+    ) -> AutoChartRecommendation? {
+        guard case .charts(let catalog) = analysis.outcome else { return nil }
+        switch preference {
+        case .automatic, .chart(.recommended): return catalog.primary
+        case .chart(.specific(let id)):
+            let currentID = AutoChartRecommendationID(
+                policyVersion: AutoTableCharts.recommendationPolicyVersion,
+                specificationID: id.specificationID)
+            return catalog.recommendation(for: currentID)
+        case .table: return nil
         }
     }
 

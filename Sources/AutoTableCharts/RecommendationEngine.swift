@@ -280,7 +280,8 @@ enum AutoChartRecommendationEngine {
         categoryID: AutoChartColumnID,
         categorySemanticType: AutoChartSemanticType,
         measureID: AutoChartColumnID,
-        memo: AutoChartValidationMemo?
+        memo: AutoChartValidationMemo?,
+        cancellationRequested: () -> Bool = { false }
     ) -> Bool {
         if let indexed = memo?.boxPlotIncludesMissing(
             snapshotIdentity: snapshot.validationIdentity,
@@ -290,7 +291,8 @@ enum AutoChartRecommendationEngine {
             return indexed
         }
         return snapshot.rows.contains { row in
-            AutoChartBoxPlotGrouping.measure(in: row, columnID: measureID) != nil
+            if cancellationRequested() { return true }
+            return AutoChartBoxPlotGrouping.measure(in: row, columnID: measureID) != nil
                 && AutoChartBoxPlotGrouping.categoryIdentity(
                     in: row,
                     columnID: categoryID,
@@ -944,8 +946,10 @@ enum AutoChartRecommendationEngine {
         profiles: [AutoChartColumnID: AutoChartColumnProfile],
         memo: AutoChartValidationMemo? = nil,
         preparedData: [AutoChartDatum]? = nil,
-        validatesPreparedNumericDomain: Bool = true
+        validatesPreparedNumericDomain: Bool = true,
+        cancellationRequested: () -> Bool = { false }
     ) -> AutoChartValidationResult {
+        if cancellationRequested() { return AutoChartValidationResult(issues: []) }
         var issues: [AutoChartDiagnostic] = []
         let referenced = orderedUnique(specification.encoding.columnIDs)
         for id in referenced where profiles[id] == nil {
@@ -1108,7 +1112,8 @@ enum AutoChartRecommendationEngine {
                         categoryID: x,
                         categorySemanticType: categoryProfile.semanticType,
                         measureID: y,
-                        memo: memo)
+                        memo: memo,
+                        cancellationRequested: cancellationRequested)
                 {
                     issues.append(
                         .init(
@@ -1463,6 +1468,7 @@ enum AutoChartRecommendationEngine {
                         family: specification.family))
             }
         }
+        if cancellationRequested() { return AutoChartValidationResult(issues: []) }
         if let riskyColumns = fanOutRisk(
             specification: specification,
             snapshot: snapshot,
@@ -1580,7 +1586,8 @@ enum AutoChartRecommendationEngine {
                 measure: y,
                 profiles: profiles,
                 droppingRowsMissing: Set([specification.encoding.x].compactMap { $0 }),
-                memo: memo)
+                memo: memo,
+                cancellationRequested: cancellationRequested)
         {
             issues.append(
                 .init(
@@ -1592,6 +1599,7 @@ enum AutoChartRecommendationEngine {
             let start = specification.encoding.start,
             let end = specification.encoding.end,
             snapshot.rows.contains(where: { row in
+                if cancellationRequested() { return true }
                 guard let startDate = row.values[start].flatMap(AutoChartProfiler.dateValue),
                     let endDate = row.values[end].flatMap(AutoChartProfiler.dateValue)
                 else { return false }
@@ -1604,6 +1612,7 @@ enum AutoChartRecommendationEngine {
                     code: .invalidTemporalRange,
                     message: "Range starts must not occur after their ends."))
         }
+        if cancellationRequested() { return AutoChartValidationResult(issues: []) }
         let structuralValidation = AutoChartValidationResult(issues: issues)
         guard validatesPreparedNumericDomain else { return structuralValidation }
         return validatePreparedNumericDomain(
@@ -2827,7 +2836,8 @@ enum AutoChartRecommendationEngine {
         measure: AutoChartColumnID,
         profiles: [AutoChartColumnID: AutoChartColumnProfile],
         droppingRowsMissing: Set<AutoChartColumnID> = [],
-        memo: AutoChartValidationMemo? = nil
+        memo: AutoChartValidationMemo? = nil,
+        cancellationRequested: () -> Bool = { false }
     ) -> Bool {
         let fields = orderedUnique(fields)
         guard !fields.isEmpty else { return false }
@@ -2859,6 +2869,7 @@ enum AutoChartRecommendationEngine {
         var seen: Set<[AutoChartValueIdentity]> = []
         var isUnique = true
         for row in snapshot.rows {
+            if cancellationRequested() { return false }
             guard row.values[measure]?.numericValue != nil else { continue }
             let values = fields.map { field in
                 AutoChartProfiler.identity(
