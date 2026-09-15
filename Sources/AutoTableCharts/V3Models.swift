@@ -86,17 +86,20 @@ public struct AutoChartPreparedChartID: Hashable, Sendable {
 public struct AutoChartRecommendationConstraints: Hashable, Codable, Sendable {
     public var includedFamilies: Set<AutoChartFamily>?
     public var excludedFamilies: Set<AutoChartFamily>
+    public var includedAggregations: Set<AutoChartAggregation>?
     public var requiredColumns: Set<AutoChartColumnID>
     public var excludedColumns: Set<AutoChartColumnID>
 
     public init(
         includedFamilies: Set<AutoChartFamily>? = nil,
         excludedFamilies: Set<AutoChartFamily> = [],
+        includedAggregations: Set<AutoChartAggregation>? = nil,
         requiredColumns: Set<AutoChartColumnID> = [],
         excludedColumns: Set<AutoChartColumnID> = []
     ) {
         self.includedFamilies = includedFamilies
         self.excludedFamilies = excludedFamilies
+        self.includedAggregations = includedAggregations
         self.requiredColumns = requiredColumns
         self.excludedColumns = excludedColumns
     }
@@ -108,6 +111,11 @@ public struct AutoChartRecommendationConstraints: Hashable, Codable, Sendable {
 
     func allows(_ specification: AutoChartSpecification) -> Bool {
         guard allowsFamily(specification.family) else { return false }
+        if let includedAggregations,
+            !includedAggregations.contains(specification.aggregation)
+        {
+            return false
+        }
         let columns = Set(specification.encoding.columnIDs)
         return requiredColumns.isSubset(of: columns)
             && columns.isDisjoint(with: excludedColumns)

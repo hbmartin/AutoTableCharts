@@ -1355,6 +1355,28 @@ private final class ProgressRecorder: @unchecked Sendable {
         #expect(catalog.cataloged.allSatisfy { constraints.allows($0.specification) })
     }
 
+    @Test func constraintsFilterAggregationsAndParticipateInRequestIdentity() async throws {
+        let dataset = try domainDataset()
+        let unconstrained = try AutoChartRequest(table: dataset)
+        let constraints = AutoChartRecommendationConstraints(
+            includedAggregations: [.none])
+        let request = try AutoChartRequest(table: dataset, constraints: constraints)
+        let analysis = try await AutoChartAnalyzer().analyze(request, preparation: .none)
+        let catalog = try #require(analysis.outcome.catalog)
+
+        #expect(request.id != unconstrained.id)
+        #expect(!catalog.cataloged.isEmpty)
+        #expect(catalog.cataloged.allSatisfy {
+            $0.specification.aggregation == .none
+                && constraints.allows($0.specification)
+        })
+
+        let roundTripped = try JSONDecoder().decode(
+            AutoChartRecommendationConstraints.self,
+            from: JSONEncoder().encode(constraints))
+        #expect(roundTripped == constraints)
+    }
+
     @Test func decisionTraceKeepsCatalogedRecommendationsClassifiedAsRecommended()
         async throws
     {

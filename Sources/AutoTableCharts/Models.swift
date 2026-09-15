@@ -428,7 +428,7 @@ public enum AutoChartUnit: Hashable, Codable, Sendable {
 }
 
 /// A transformation that combines values represented by one chart mark.
-public enum AutoChartAggregation: String, CaseIterable, Codable, Sendable {
+public enum AutoChartAggregation: String, CaseIterable, Hashable, Codable, Sendable {
     /// Preserve one mark per result-grain observation.
     case none
     /// Add contributing values.
