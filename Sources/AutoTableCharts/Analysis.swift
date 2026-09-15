@@ -432,7 +432,7 @@ public struct AutoChartAnalysis<RowID: Hashable & Sendable>: Sendable {
             let resolution
         {
             let preferred = resolution.recommendation.flatMap { resolved in
-                catalog.recommendation(for: resolved.id) == nil ? resolved : nil
+                catalog.containsCataloged(resolved.id) ? nil : resolved
             }
             presentedOutcome = .charts(
                 AutoChartRecommendationCatalog(
@@ -610,10 +610,12 @@ private struct AutoChartCachedAnalysis<RowID: Hashable & Sendable>: Sendable {
     let recommendationIndexByID: [AutoChartRecommendationID: Int]
     let validatedRecommendationIDs: Set<AutoChartRecommendationID>
 
-    var estimatedRetainedCost: Int {
-        source.cost + 256 + recommendations.count * 512 + profiles.count * 32
+    var exclusiveRetainedCost: Int {
+        256 + recommendations.count * 512 + profiles.count * 32
             + recommendationIndexByID.count * 24
     }
+
+    var estimatedRetainedCost: Int { source.cost + exclusiveRetainedCost }
 }
 
 #if ATC_TEST_HOOKS
@@ -2002,8 +2004,7 @@ public actor AutoChartAnalyzer {
         _ analysis: AutoChartCachedAnalysis<RowID>,
         for key: AnalysisKey
     ) {
-        let cost = 256 + analysis.recommendations.count * 512
-            + analysis.profiles.count * 32
+        let cost = analysis.exclusiveRetainedCost
         // Admitting an entry that cannot coexist with its shared source would
         // make the cost trim evict every other resident entry before finally
         // evicting this one, draining the cache on every oversized analysis.

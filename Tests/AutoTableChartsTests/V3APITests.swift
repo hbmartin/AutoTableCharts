@@ -1604,6 +1604,14 @@ private final class ProgressRecorder: @unchecked Sendable {
         } == true)
         #expect(prepared.preparedCharts.count == catalog.cataloged.count + 1)
 
+        let repeated = prepared.replacingPresentation(
+            preparedCharts: prepared.preparedCharts,
+            resolution: prepared.preferenceResolution)
+        #expect(repeated.outcome.catalog?.preferred?.id == offList.id)
+        #expect(repeated.outcome.catalog?.pickerOptions().contains {
+            $0.id == offList.id
+        } == true)
+
         let automatic = prepared.replacingPresentation(
             preparedCharts: prepared.preparedCharts,
             resolution: prepared.resolve(.automatic))
@@ -1730,6 +1738,20 @@ private final class ProgressRecorder: @unchecked Sendable {
         #expect(cache.completedAnalysis(for: request.id, as: Int.self) == nil)
         let trimmed = await cache.statistics()
         #expect(trimmed.retainedCost == 0)
+    }
+
+    @Test func analysisCacheChargesItsCandidateIndex() async throws {
+        let configuration = AutoChartAnalyzerConfiguration(
+            tables: .init(maximumEntries: 0),
+            analyses: .init(maximumEntries: 1),
+            preparedCharts: .init(maximumEntries: 0))
+        let analyzer = AutoChartAnalyzer(configuration: configuration)
+        let analysis = try await analyzer.analyze(
+            AutoChartRequest(table: domainDataset()), preparation: .none)
+        #expect(analysis.outcome.catalog?.cataloged.isEmpty == false)
+        let statistics = await analyzer.cacheStatistics
+        #expect(statistics.analyses.entries == 1)
+        #expect(statistics.analyses.retainedCost == analysis.estimatedRetainedCost)
     }
 
     @Test func completedAnalysisLookupRefreshesLeastRecentlyUsedOrder() async throws {

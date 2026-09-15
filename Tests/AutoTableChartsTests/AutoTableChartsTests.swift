@@ -2641,14 +2641,18 @@ private let date = AutoChartColumn(
         let secondMeasure = AutoChartColumn(
             id: "second-measure", name: "second_measure",
             semantics: .measure(semantics: .init(rollup: .additive)))
-        let rows: [[AutoChartValue]] = (0..<8).map { offset in
-                [
-                    .date(Date(timeIntervalSince1970: Double(offset * 86_400))),
-                    .text(offset.isMultiple(of: 2) ? "A" : "B"),
-                    .double(Double(offset + 1)),
-                    .double(Double((offset + 1) * 2)),
-                ]
-            }
+        var rows: [[AutoChartValue]] = []
+        rows.reserveCapacity(8)
+        for offset in 0..<8 {
+            let timestamp = Date(timeIntervalSince1970: Double(offset * 86_400))
+            let categoryValue = offset.isMultiple(of: 2) ? "A" : "B"
+            let firstValue = Double(offset + 1)
+            let secondValue = Double((offset + 1) * 2)
+            rows.append([
+                .date(timestamp), .text(categoryValue),
+                .double(firstValue), .double(secondValue),
+            ])
+        }
         let input = table(
             columns: [date, category, measure, secondMeasure],
             rows: rows)
