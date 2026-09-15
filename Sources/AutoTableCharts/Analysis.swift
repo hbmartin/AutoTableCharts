@@ -248,6 +248,7 @@ final class AutoChartAnalysisPreparationProvider<RowID: Hashable & Sendable>: @u
     let analyzer: AutoChartAnalyzer
     let source: AutoChartPreparedSource<RowID>
     let recommendations: [AutoChartRecommendation]
+    private let recommendationIndexByID: [AutoChartRecommendationID: Int]
     private let validationLock = NSLock()
     private var validationByID: [AutoChartRecommendationID: Bool]
 
@@ -260,6 +261,11 @@ final class AutoChartAnalysisPreparationProvider<RowID: Hashable & Sendable>: @u
         self.analyzer = analyzer
         self.source = source
         self.recommendations = recommendations
+        var index: [AutoChartRecommendationID: Int] = [:]
+        for (offset, recommendation) in recommendations.enumerated() {
+            if index[recommendation.id] == nil { index[recommendation.id] = offset }
+        }
+        self.recommendationIndexByID = index
         self.validationByID = Dictionary(
             uniqueKeysWithValues: validatedRecommendationIDs.map { ($0, true) })
     }
@@ -278,9 +284,8 @@ final class AutoChartAnalysisPreparationProvider<RowID: Hashable & Sendable>: @u
     func recommendation(
         for recommendationID: AutoChartRecommendationID
     ) -> AutoChartRecommendation? {
-        guard let recommendation = recommendations.first(where: {
-            $0.id == recommendationID
-        }) else { return nil }
+        guard let index = recommendationIndexByID[recommendationID] else { return nil }
+        let recommendation = recommendations[index]
         if let isValid = validationLock.withLock({ validationByID[recommendationID] }) {
             return isValid ? recommendation : nil
         }
@@ -422,6 +427,17 @@ public struct AutoChartAnalysis<RowID: Hashable & Sendable>: Sendable {
                 recommendation: primary, defaultReason: .recommended)
         case .chart(.specific(let id)):
             guard id.policyVersion == AutoTableCharts.recommendationPolicyVersion else {
+                let currentID = AutoChartRecommendationID(
+                    policyVersion: AutoTableCharts.recommendationPolicyVersion,
+                    specificationID: id.specificationID)
+                if let rebound = recommendation(for: currentID) {
+                    return AutoChartPreferenceResolution(
+                        recommendation: rebound,
+                        defaultReason: .policyVersionChanged(
+                            previous: id.policyVersion,
+                            current: AutoTableCharts.recommendationPolicyVersion),
+                        replacementPreference: .chart(.specific(currentID)))
+                }
                 return AutoChartPreferenceResolution(
                     recommendation: primary,
                     defaultReason: .policyVersionChanged(
@@ -439,7 +455,7 @@ public struct AutoChartAnalysis<RowID: Hashable & Sendable>: Sendable {
         }
     }
 
-    func replacingPresentation(
+    package func replacingPresentation(
         request: AutoChartRequestID? = nil,
         preparedCharts: [AutoChartRecommendationID: AutoChartPreparedChart<RowID>],
         resolution: AutoChartPreferenceResolution?
