@@ -1,5 +1,25 @@
 import Foundation
 
+private protocol AutoChartRecommendationComparisonObserving {
+    func recordComparison()
+}
+
+private struct AutoChartNoOpComparisonObserver: AutoChartRecommendationComparisonObserving {
+    @inline(__always)
+    func recordComparison() {}
+}
+
+#if ATC_TEST_HOOKS
+private struct AutoChartComparisonObserverForTesting:
+    AutoChartRecommendationComparisonObserving
+{
+    let body: () -> Void
+
+    @inline(__always)
+    func recordComparison() { body() }
+}
+#endif
+
 /// Profiles typed tables and returns a deterministic, semantically safe set of charts.
 ///
 /// The engine generates candidates from table structure, rejects candidates that
@@ -2888,9 +2908,22 @@ enum AutoChartRecommendationEngine {
     private static func balancedFacetBases(
         _ candidates: [AutoChartRecommendation],
         limit: Int,
-        isValid: (AutoChartRecommendation) -> Bool,
-        onComparison: (() -> Void)? = nil
+        isValid: (AutoChartRecommendation) -> Bool
     ) -> [AutoChartRecommendation] {
+        balancedFacetBasesImplementation(
+            candidates,
+            limit: limit,
+            isValid: isValid,
+            comparisonObserver: AutoChartNoOpComparisonObserver())
+    }
+
+    private static func balancedFacetBasesImplementation<Observer>(
+        _ candidates: [AutoChartRecommendation],
+        limit: Int,
+        isValid: (AutoChartRecommendation) -> Bool,
+        comparisonObserver: Observer
+    ) -> [AutoChartRecommendation]
+    where Observer: AutoChartRecommendationComparisonObserving {
         guard limit > 0 else { return [] }
         var remaining = Array(candidates.indices)
         var output: [AutoChartRecommendation] = []
@@ -2898,11 +2931,6 @@ enum AutoChartRecommendationEngine {
         var yUses: [AutoChartColumnID: Int] = [:]
         var seriesUses: [AutoChartColumnID: Int] = [:]
         var reuseScores = Array(repeating: 0, count: candidates.count)
-        #if ATC_TEST_HOOKS
-        // Select the observer once before heap work. Consumer comparisons never
-        // consult thread-local storage, and tests pay only a direct closure call.
-        let observeComparison = onComparison ?? {}
-        #endif
 
         func reuseCount(_ recommendation: AutoChartRecommendation) -> Int {
             let encoding = recommendation.specification.encoding
@@ -2912,9 +2940,7 @@ enum AutoChartRecommendationEngine {
         }
 
         func precedes(_ lhs: Int, _ rhs: Int) -> Bool {
-            #if ATC_TEST_HOOKS
-            observeComparison()
-            #endif
+            comparisonObserver.recordComparison()
             let proposal = candidates[lhs]
             let incumbent = candidates[rhs]
             let proposalReuse = reuseScores[lhs]
@@ -2975,9 +3001,10 @@ enum AutoChartRecommendationEngine {
         isValid: (AutoChartRecommendation) -> Bool,
         onComparison: @escaping () -> Void = {}
     ) -> [AutoChartRecommendation] {
-        balancedFacetBases(
+        balancedFacetBasesImplementation(
             candidates, limit: limit, isValid: isValid,
-            onComparison: onComparison)
+            comparisonObserver: AutoChartComparisonObserverForTesting(
+                body: onComparison))
     }
     #endif
 

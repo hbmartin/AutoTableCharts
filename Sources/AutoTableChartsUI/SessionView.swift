@@ -119,20 +119,20 @@ enum AutoChartProgressAccessibility {
 }
 
 enum AutoChartProgressTextResolution {
-    /// Keep progress callbacks off the cooperative executor and serialize them so
-    /// superseded, cancelled requests do not accumulate behind a slow host callback.
+    /// Keep progress callbacks off the cooperative executor without letting one
+    /// slow resolver delay newer labels or chart presentation work.
     private static let queue = DispatchQueue(
         label: "io.github.hbmartin.AutoTableCharts.ProgressTextResolution",
-        qos: .userInitiated)
+        qos: .userInitiated,
+        attributes: .concurrent)
 
     static func resolve(
         _ message: AutoChartMessage,
-        using resolver: AutoChartTextResolver,
-        on queue: DispatchQueue? = nil
+        using resolver: AutoChartTextResolver
     ) async -> String? {
         guard resolver.callbackIdentity != nil else { return message.defaultText }
         do {
-            return try await AutoChartCancellableWork.run(on: queue ?? self.queue) { cancellation in
+            return try await AutoChartCancellableWork.run(on: queue) { cancellation in
                 try cancellation.checkCancellation()
                 return resolver(message)
             }
@@ -148,7 +148,6 @@ enum AutoChartProgressTextResolution {
 struct AutoChartAccessibleProgressView: View {
     let message: AutoChartMessage
     let textResolver: AutoChartTextResolver?
-    let resolutionQueue: DispatchQueue?
 
     @Environment(\.autoChartTextResolver) private var environmentTextResolver
     @State private var accessibilityText: String
@@ -160,12 +159,10 @@ struct AutoChartAccessibleProgressView: View {
 
     init(
         message: AutoChartMessage,
-        textResolver: AutoChartTextResolver? = nil,
-        resolutionQueue: DispatchQueue? = nil
+        textResolver: AutoChartTextResolver? = nil
     ) {
         self.message = message
         self.textResolver = textResolver
-        self.resolutionQueue = resolutionQueue
         _accessibilityText = State(initialValue: message.defaultText)
     }
 
@@ -183,8 +180,7 @@ struct AutoChartAccessibleProgressView: View {
                 guard let resolver else { return }
                 let resolved = await AutoChartProgressTextResolution.resolve(
                     message,
-                    using: resolver,
-                    on: resolutionQueue)
+                    using: resolver)
                 guard let resolved, !Task.isCancelled else { return }
                 if accessibilityText != resolved {
                     accessibilityText = resolved
@@ -324,9 +320,10 @@ public struct AutoChartSessionView<
                 if let presented {
                     ZStack(alignment: .topTrailing) {
                         AutoChartView(
-                            presentedChart: presented,
+                            resolvedPresentedChart: presented,
                             analysisID: analysis.id,
-                            selection: $session.selection)
+                            selection: $session.selection,
+                            presentation: .explorer())
                             .foregroundStyle(theme.legendColor)
                         if session.isPresentationPending {
                             AutoChartAccessibleProgressView(

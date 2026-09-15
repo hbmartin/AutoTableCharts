@@ -20,17 +20,43 @@ private final class PresentationCounter: @unchecked Sendable {
     var value: Int { lock.withLock { count } }
 }
 
-private final class PresentationFoundationProbe: @unchecked Sendable {
+private final class PresentationBlockingGate: @unchecked Sendable {
     private let lock = NSLock()
-    private var samples: [(String, String)] = []
+    private let group = DispatchGroup()
+    private var isReleased = false
 
-    func record(locale: Locale, timeZone: TimeZone) {
-        lock.withLock {
-            samples.append((locale.identifier, timeZone.identifier))
+    init() {
+        group.enter()
+    }
+
+    @discardableResult
+    func wait(timeout: DispatchTime = .distantFuture) -> Bool {
+        group.wait(timeout: timeout) == .success
+    }
+
+    func release() {
+        let shouldLeave = lock.withLock {
+            guard !isReleased else { return false }
+            isReleased = true
+            return true
+        }
+        if shouldLeave {
+            group.leave()
         }
     }
 
-    var values: [(String, String)] { lock.withLock { samples } }
+    var isOpen: Bool { lock.withLock { isReleased } }
+}
+
+private final class PresentationFoundationProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var samples: [(Locale, TimeZone)] = []
+
+    func record(locale: Locale, timeZone: TimeZone) {
+        lock.withLock { samples.append((locale, timeZone)) }
+    }
+
+    var values: [(Locale, TimeZone)] { lock.withLock { samples } }
 }
 
 private final class PresentationCallbackConcurrencyProbe: @unchecked Sendable {
@@ -83,6 +109,8 @@ private func presentationFixture(offset: Double = 0) async throws -> (
         let presenter = AutoChartPresenter(maximumEntries: 0)
         let source = presenter.present(chart)
         let probe = PresentationFoundationProbe()
+        let currentLocale = Locale.current
+        let currentTimeZone = TimeZone.current
         let formatters = AutoChartFormatters(
             locale: .autoupdatingCurrent,
             timeZone: .autoupdatingCurrent,
@@ -102,6 +130,18 @@ private func presentationFixture(offset: Double = 0) async throws -> (
 
         #expect(request.formatters.locale == .autoupdatingCurrent)
         #expect(request.formatters.timeZone == .autoupdatingCurrent)
+        #expect(request.resolvedFormatters.locale == currentLocale)
+        #expect(request.resolvedFormatters.timeZone == currentTimeZone)
+        #expect(request.resolvedFormatters.locale.hourCycle == currentLocale.hourCycle)
+        #expect(
+            request.resolvedFormatters.locale.decimalSeparator
+                == currentLocale.decimalSeparator)
+        #expect(
+            request.resolvedFormatters.locale.groupingSeparator
+                == currentLocale.groupingSeparator)
+        #expect(
+            request.resolvedFormatters.locale.firstDayOfWeek
+                == currentLocale.firstDayOfWeek)
         #expect(
             request.id.formatterFoundation.localeIdentifier
                 == request.resolvedFormatters.locale.identifier)
@@ -118,13 +158,14 @@ private func presentationFixture(offset: Double = 0) async throws -> (
         _ = source.rePresent(request: request)
         #expect(!probe.values.isEmpty)
         #expect(probe.values.allSatisfy {
-            $0.0 == request.id.formatterFoundation.localeIdentifier
-                && $0.1 == request.id.formatterFoundation.timeZoneIdentifier
+            $0.0 == currentLocale && $0.1 == currentTimeZone
         })
         withExtendedLifetime(presenter) {}
     }
 
-    @Test func overridesRespectPresenterCachePolicyAndWeakOwnership() async throws {
+    @Test(.disabled(if: !testHooksAvailable, testHooksUnavailable))
+    func overridesRespectPresenterCachePolicyAndWeakOwnership() async throws {
+        #if ATC_TEST_HOOKS
         let (_, chart) = try await presentationFixture()
         let calls = PresentationCounter()
         let override = AutoChartTextResolver { message in
@@ -133,7 +174,7 @@ private func presentationFixture(offset: Double = 0) async throws -> (
         }
         let fallback = AutoChartPresenter()
         var presenter: AutoChartPresenter? = AutoChartPresenter(
-            releasedPresenterFallback: fallback)
+            releasedPresenterFallbackForTesting: fallback)
         weak let weakPresenter = presenter
         let source = try #require(presenter).present(chart)
         let request = source.presentationRequest(
@@ -181,6 +222,7 @@ private func presentationFixture(offset: Double = 0) async throws -> (
         _ = try await source.rePresentCancellable(
             request: request)
         #expect(calls.value > afterFallback)
+        #endif
     }
 
     #if canImport(Accessibility)
@@ -265,6 +307,46 @@ struct PresentedChartViewRegressionTests {
         #expect(overridden == prePresented)
     }
 
+    @Test func cachedOverrideExportsSynchronouslyWithoutInvokingCallbacks() async throws {
+        let (analysisID, chart) = try await presentationFixture()
+        let presenter = AutoChartPresenter()
+        let source = presenter.present(
+            chart,
+            formatters: .init(locale: Locale(identifier: "sv_SE")))
+        let calls = PresentationCounter()
+        let formatters = AutoChartFormatters(locale: Locale(identifier: "en_US"))
+        let resolver = AutoChartTextResolver(
+            cacheIdentity: "cached-export-resolver",
+            { message in
+                calls.increment()
+                return "Export: \(message.defaultText)"
+            })
+        let expected = presenter.present(
+            chart, formatters: formatters, textResolver: resolver)
+        let callsAfterCaching = calls.value
+
+        func pixels(_ view: AutoChartView<Int>) throws -> Data {
+            let renderer = ImageRenderer(content: view
+                .frame(width: 600, height: 400)
+                .environment(\.colorScheme, .light))
+            renderer.scale = 1
+            let image = try #require(renderer.cgImage)
+            return try #require(image.dataProvider?.data) as Data
+        }
+
+        let overriddenView = AutoChartView(
+            presentedChart: source,
+            analysisID: analysisID,
+            formatters: formatters,
+            textResolver: resolver)
+        #expect(calls.value == callsAfterCaching)
+        let overridden = try pixels(overriddenView)
+        let prePresented = try pixels(AutoChartView(
+            presentedChart: expected,
+            analysisID: analysisID))
+        #expect(overridden == prePresented)
+    }
+
     @Test func deferredOverrideMissPerformsNoCallbackWorkDuringViewInitialization() async throws {
         let (analysisID, chart) = try await presentationFixture()
         let presenter = AutoChartPresenter(maximumEntries: 0)
@@ -285,7 +367,7 @@ struct PresentedChartViewRegressionTests {
     }
 
     @Test(.disabled(if: !testHooksAvailable, testHooksUnavailable))
-    func deferredCallbacksRunOffMainAndAreSerializedWithProgress() async throws {
+    func deferredCallbacksRunOffMainAndResolveProgress() async throws {
         #if ATC_TEST_HOOKS
         let (analysisID, chart) = try await presentationFixture()
         let presenter = AutoChartPresenter(maximumEntries: 0)
@@ -299,23 +381,121 @@ struct PresentedChartViewRegressionTests {
         let hooks = AutoChartViewTestHooks()
         var observed: AutoChartViewTestHookState?
         hooks.observe = { observed = $0 }
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 600, height: 400),
-            styleMask: .borderless, backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false
-        let host = NSHostingView(rootView: HostedPresentationView(model: model, hooks: hooks))
-        window.contentView = host
-        window.orderFront(nil)
-        defer { window.contentView = nil; window.close() }
+        let harness = HostedViewHarnessForTesting(
+            rootView: HostedPresentationView(model: model, hooks: hooks))
+        let host = harness.host
+        defer { harness.close() }
 
         #expect(await waitForHostedChartUpdate(in: host) {
             observed?.requestID.resolverCallback == resolver.callbackIdentity
         })
         let result = probe.result
         #expect(result.count > 0)
-        #expect(result.maximumActive == 1)
         #expect(result.allOffMain)
         #expect(result.sawProgress)
+        withExtendedLifetime(presenter) {}
+        #endif
+    }
+
+    @Test(.disabled(if: !testHooksAvailable, testHooksUnavailable))
+    func blockedPresentationDoesNotDelayProgressResolution() async throws {
+        #if ATC_TEST_HOOKS
+        let (analysisID, chart) = try await presentationFixture()
+        let presenter = AutoChartPresenter(maximumEntries: 0)
+        let model = HostedPresentationModel(
+            chart: presenter.present(chart), analysisID: analysisID)
+        let presentationStarted = PresentationCounter()
+        let progressCalls = PresentationCounter()
+        let presentationGate = PresentationBlockingGate()
+        defer { presentationGate.release() }
+        let formatters = AutoChartFormatters(
+            cacheIdentity: "blocked-presentation-progress-lane",
+            request: { request, _, _ in
+                presentationStarted.increment()
+                presentationGate.wait()
+                return "Blocked: \(request.value.categoryString() ?? "value")"
+            })
+        let resolver = AutoChartTextResolver(
+            cacheIdentity: "blocked-presentation-progress-resolver",
+            { message in
+                if message.code == .presentationUpdating {
+                    progressCalls.increment()
+                }
+                return message.defaultText
+            })
+        model.formatters = formatters
+        model.resolver = resolver
+        let hooks = AutoChartViewTestHooks()
+        var observed: AutoChartViewTestHookState?
+        hooks.observe = { observed = $0 }
+        let harness = HostedViewHarnessForTesting(
+            rootView: HostedPresentationView(model: model, hooks: hooks))
+        let host = harness.host
+        defer { harness.close() }
+
+        #expect(await waitForHostedChartUpdate(in: host) {
+            presentationStarted.value > 0 && progressCalls.value > 0
+        })
+        #expect(observed?.requestID != AutoChartPresentationRequest(
+            preparedChart: chart.id,
+            context: model.chart.context,
+            formatters: formatters,
+            textResolver: resolver).id)
+        presentationGate.release()
+        #expect(await waitForHostedChartUpdate(in: host) {
+            observed?.requestID.formatterCallback == formatters.callbackIdentity
+                && observed?.requestID.resolverCallback == resolver.callbackIdentity
+        })
+        withExtendedLifetime(presenter) {}
+        #endif
+    }
+
+    @Test(.disabled(if: !testHooksAvailable, testHooksUnavailable))
+    func slowProgressResolutionDoesNotDelayChartPublication() async throws {
+        #if ATC_TEST_HOOKS
+        let (analysisID, chart) = try await presentationFixture()
+        let presenter = AutoChartPresenter(maximumEntries: 0)
+        let model = HostedPresentationModel(
+            chart: presenter.present(chart), analysisID: analysisID)
+        let progressStarted = PresentationBlockingGate()
+        let progressRelease = PresentationBlockingGate()
+        defer {
+            progressStarted.release()
+            progressRelease.release()
+        }
+        let formatters = AutoChartFormatters(
+            cacheIdentity: "progress-first-formatters",
+            request: { _, _, _ in
+                _ = progressStarted.wait(timeout: .now() + 2)
+                return nil
+            })
+        let resolver = AutoChartTextResolver(
+            cacheIdentity: "blocked-progress-resolver",
+            { message in
+                if message.code == .presentationUpdating {
+                    progressStarted.release()
+                    progressRelease.wait()
+                }
+                return message.defaultText
+            })
+        model.formatters = formatters
+        model.resolver = resolver
+        let hooks = AutoChartViewTestHooks()
+        var observed: AutoChartViewTestHookState?
+        hooks.observe = { observed = $0 }
+        let harness = HostedViewHarnessForTesting(
+            rootView: HostedPresentationView(model: model, hooks: hooks))
+        let host = harness.host
+        defer { harness.close() }
+
+        #expect(await waitForHostedChartUpdate(in: host, timeout: 1) {
+            progressStarted.isOpen
+        })
+        #expect(await waitForHostedChartUpdate(in: host, timeout: 1) {
+            observed?.requestID.formatterCallback == formatters.callbackIdentity
+                && observed?.requestID.resolverCallback == resolver.callbackIdentity
+        })
+        progressRelease.release()
         withExtendedLifetime(presenter) {}
         #endif
     }
@@ -332,14 +512,10 @@ struct PresentedChartViewRegressionTests {
         var publications = 0
         hooks.observe = { observed = $0 }
         hooks.didPublishDeferredPresentation = { _ in publications += 1 }
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 600, height: 400),
-            styleMask: .borderless, backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false
-        let host = NSHostingView(rootView: HostedPresentationView(model: model, hooks: hooks))
-        window.contentView = host
-        window.orderFront(nil)
-        defer { window.contentView = nil; window.close() }
+        let harness = HostedViewHarnessForTesting(
+            rootView: HostedPresentationView(model: model, hooks: hooks))
+        let host = harness.host
+        defer { harness.close() }
 
         #expect(await waitForHostedChartUpdate(in: host) {
             observed?.requestID == source.requestID
@@ -347,6 +523,121 @@ struct PresentedChartViewRegressionTests {
         try? await Task.sleep(for: .milliseconds(50))
         host.layoutSubtreeIfNeeded()
         #expect(publications == 0)
+        withExtendedLifetime(presenter) {}
+        #endif
+    }
+
+    @Test(.disabled(if: !testHooksAvailable, testHooksUnavailable))
+    func defaultImmediateModeUsesCachedOverridesAcrossParentRebuilds() async throws {
+        #if ATC_TEST_HOOKS
+        let (analysisID, chart) = try await presentationFixture()
+        let presenter = AutoChartPresenter()
+        let source = presenter.present(chart)
+        let resolverCalls = PresentationCounter()
+        let formatters = AutoChartFormatters(
+            locale: Locale(identifier: "en_US"))
+        let resolver = AutoChartTextResolver(
+            cacheIdentity: "hosted-default-cached-resolver",
+            { message in
+                if message.code.rawValue.hasPrefix("chartFamily.") {
+                    resolverCalls.increment()
+                }
+                return "Cached: \(message.defaultText)"
+            })
+        let expected = presenter.present(
+            chart, formatters: formatters, textResolver: resolver)
+        let resolverCallsAfterCaching = resolverCalls.value
+        let model = HostedPresentationModel(chart: source, analysisID: analysisID)
+        model.formatters = formatters
+        model.resolver = resolver
+        let hooks = AutoChartViewTestHooks()
+        var observed: AutoChartViewTestHookState?
+        var audioGraphReports = 0
+        hooks.observe = { observed = $0 }
+        hooks.observeAudioGraph = { _, _ in audioGraphReports += 1 }
+        let harness = HostedViewHarnessForTesting(
+            rootView: HostedDefaultPresentationView(model: model, hooks: hooks))
+        let host = harness.host
+        defer { harness.close() }
+
+        #expect(await waitForHostedChartUpdate(in: host) {
+            observed?.requestID == expected.requestID && audioGraphReports > 0
+        })
+        #expect(resolverCalls.value == resolverCallsAfterCaching)
+        let reportsBeforeRebuild = audioGraphReports
+        model.revision += 1
+        #expect(await waitForHostedChartUpdate(in: host) {
+            audioGraphReports > reportsBeforeRebuild
+                && observed?.requestID == expected.requestID
+        })
+        #expect(resolverCalls.value == resolverCallsAfterCaching)
+        withExtendedLifetime(presenter) {}
+        #endif
+    }
+
+    @Test(.disabled(if: !testHooksAvailable, testHooksUnavailable))
+    func rapidChartRoundTripDoesNotRestoreAbandonedOverride() async throws {
+        #if ATC_TEST_HOOKS
+        let (analysisIDA, chartA) = try await presentationFixture()
+        let (analysisIDB, chartB) = try await presentationFixture(offset: 100)
+        let presenter = AutoChartPresenter(maximumEntries: 0)
+        let sourceA = presenter.present(chartA)
+        let sourceB = presenter.present(chartB)
+        let model = HostedPresentationModel(chart: sourceA, analysisID: analysisIDA)
+        let hooks = AutoChartViewTestHooks()
+        var observed: AutoChartViewTestHookState?
+        var publications: [AutoChartPresentationRequestID] = []
+        hooks.observe = { observed = $0 }
+        hooks.didPublishDeferredPresentation = { publications.append($0) }
+        let harness = HostedViewHarnessForTesting(
+            rootView: HostedPresentationView(model: model, hooks: hooks))
+        let host = harness.host
+        defer { harness.close() }
+        #expect(await waitForHostedChartUpdate(in: host) {
+            observed?.requestID == sourceA.requestID
+        })
+
+        let oldAFormatters = AutoChartFormatters(
+            cacheIdentity: "abandoned-a-override",
+            request: { request, _, _ in
+                "Old A: \(request.value.categoryString() ?? "value")"
+            })
+        model.formatters = oldAFormatters
+        #expect(await waitForHostedChartUpdate(in: host) {
+            observed?.requestID.formatterCallback == oldAFormatters.callbackIdentity
+        })
+        let publicationCountAfterOldA = publications.count
+
+        let bStarted = PresentationCounter()
+        let bRelease = PresentationBlockingGate()
+        defer { bRelease.release() }
+        let blockedBFormatters = AutoChartFormatters(
+            cacheIdentity: "abandoned-b-override",
+            request: { request, _, _ in
+                bStarted.increment()
+                bRelease.wait()
+                return "Old B: \(request.value.categoryString() ?? "value")"
+            })
+        model.chart = sourceB
+        model.analysisID = analysisIDB
+        model.formatters = blockedBFormatters
+        #expect(await waitForHostedChartUpdate(in: host) {
+            bStarted.value > 0
+                && observed?.requestID.preparedChart == chartB.id
+        })
+
+        model.formatters = nil
+        model.chart = sourceA
+        model.analysisID = analysisIDA
+        #expect(await waitForHostedChartUpdate(in: host, timeout: 1) {
+            observed?.requestID == sourceA.requestID
+        })
+        #expect(observed?.requestID.formatterCallback != oldAFormatters.callbackIdentity)
+        bRelease.release()
+        try? await Task.sleep(for: .milliseconds(50))
+        host.layoutSubtreeIfNeeded()
+        #expect(observed?.requestID == sourceA.requestID)
+        #expect(publications.count == publicationCountAfterOldA)
         withExtendedLifetime(presenter) {}
         #endif
     }
@@ -365,14 +656,10 @@ struct PresentedChartViewRegressionTests {
         var publications: [AutoChartPresentationRequestID] = []
         hooks.observe = { observed = $0 }
         hooks.didPublishDeferredPresentation = { publications.append($0) }
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 600, height: 400),
-            styleMask: .borderless, backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false
-        let host = NSHostingView(rootView: HostedPresentationView(model: model, hooks: hooks))
-        window.contentView = host
-        window.orderFront(nil)
-        defer { window.contentView = nil; window.close() }
+        let harness = HostedViewHarnessForTesting(
+            rootView: HostedPresentationView(model: model, hooks: hooks))
+        let host = harness.host
+        defer { harness.close() }
         #expect(await waitForHostedChartUpdate(in: host) { observed != nil })
 
         let mark = try #require(chartA.marks.first)
@@ -451,14 +738,10 @@ struct PresentedChartViewRegressionTests {
         let hooks = AutoChartViewTestHooks()
         var observed: AutoChartViewTestHookState?
         hooks.observe = { observed = $0 }
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 600, height: 400),
-            styleMask: .borderless, backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false
-        let host = NSHostingView(rootView: HostedPresentationView(model: model, hooks: hooks))
-        window.contentView = host
-        window.orderFront(nil)
-        defer { window.contentView = nil; window.close() }
+        let harness = HostedViewHarnessForTesting(
+            rootView: HostedPresentationView(model: model, hooks: hooks))
+        let host = harness.host
+        defer { harness.close() }
 
         #expect(await waitForHostedChartUpdate(in: host) {
             observed?.requestID.formatterCallback == formatters.callbackIdentity
@@ -498,14 +781,10 @@ struct PresentedChartViewRegressionTests {
                 reusedPoint = initialPoint === target.series.first?.dataPoints.first
             }
         }
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 600, height: 400),
-            styleMask: .borderless, backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false
-        let host = NSHostingView(rootView: HostedPresentationView(model: model, hooks: hooks))
-        window.contentView = host
-        window.orderFront(nil)
-        defer { window.contentView = nil; window.close() }
+        let harness = HostedViewHarnessForTesting(
+            rootView: HostedPresentationView(model: model, hooks: hooks))
+        let host = harness.host
+        defer { harness.close() }
 
         #expect(await waitForHostedChartUpdate(in: host) { observations > 0 })
         model.revision += 1
@@ -529,15 +808,13 @@ struct PresentedChartViewRegressionTests {
         let hooks = AutoChartViewTestHooks()
         var observed: AutoChartViewTestHookState?
         var reports = 0
+        var publications: [AutoChartPresentationRequestID] = []
         hooks.observe = { observed = $0; reports += 1 }
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 600, height: 400),
-            styleMask: .borderless, backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false
-        let host = NSHostingView(rootView: HostedPresentationView(model: model, hooks: hooks))
-        window.contentView = host
-        window.orderFront(nil)
-        defer { window.contentView = nil; window.close() }
+        hooks.didPublishDeferredPresentation = { publications.append($0) }
+        let harness = HostedViewHarnessForTesting(
+            rootView: HostedPresentationView(model: model, hooks: hooks))
+        let host = harness.host
+        defer { harness.close() }
         #expect(await waitForHostedChartUpdate(in: host) { observed != nil })
         let initial = try #require(observed)
         #expect(initial.requestID == model.chart.requestID)
@@ -574,17 +851,21 @@ struct PresentedChartViewRegressionTests {
         #expect(overridden.zoomAnchor.wrappedValue == 3)
         #expect(model.selection == savedSelection)
         #expect(overridden.selectionCount == 1)
+        let publicationsBeforeRemovingOverride = publications.count
         model.formatters = nil
         #expect(await waitForHostedChartUpdate(in: host) {
             observed?.requestID == model.chart.requestID
         })
+        try? await Task.sleep(for: .milliseconds(50))
+        host.layoutSubtreeIfNeeded()
+        #expect(publications.count == publicationsBeforeRemovingOverride)
         #expect(observed?.selectedCategory == initialCategory)
         #expect(try #require(observed).zoomScale.wrappedValue == 3)
         #expect(model.selection == savedSelection)
 
         let slowCalls = PresentationCounter()
-        let slowRelease = DispatchGroup()
-        slowRelease.enter()
+        let slowRelease = PresentationBlockingGate()
+        defer { slowRelease.release() }
         let slowFormatters = AutoChartFormatters(
             cacheIdentity: "slow-superseded",
             request: { request, _, _ in
@@ -600,11 +881,16 @@ struct PresentedChartViewRegressionTests {
                 "Latest: \(request.value.categoryString() ?? "value")"
             })
         model.formatters = latestFormatters
-        slowRelease.leave()
         #expect(slowStarted)
-        #expect(await waitForHostedChartUpdate(in: host) {
+        #expect(await waitForHostedChartUpdate(in: host, timeout: 1) {
             observed?.requestID.formatterCallback == latestFormatters.callbackIdentity
         })
+        #expect(!publications.contains {
+            $0.formatterCallback == slowFormatters.callbackIdentity
+        })
+        slowRelease.release()
+        try? await Task.sleep(for: .milliseconds(50))
+        host.layoutSubtreeIfNeeded()
         #expect(observed?.requestID.formatterCallback != slowFormatters.callbackIdentity)
         #expect(observed?.zoomScale.wrappedValue == 3)
 
@@ -668,14 +954,10 @@ struct PresentedChartViewRegressionTests {
         let hooks = AutoChartViewTestHooks()
         var observed: AutoChartViewTestHookState?
         hooks.observe = { observed = $0 }
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 600, height: 400),
-            styleMask: .borderless, backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false
-        let host = NSHostingView(rootView: HostedPresentationView(model: model, hooks: hooks))
-        window.contentView = host
-        window.orderFront(nil)
-        defer { window.contentView = nil; window.close() }
+        let harness = HostedViewHarnessForTesting(
+            rootView: HostedPresentationView(model: model, hooks: hooks))
+        let host = harness.host
+        defer { harness.close() }
         #expect(await waitForHostedChartUpdate(in: host) { observed?.selectedAngle == 5 })
         let initial = try #require(observed)
         initial.zoomAnchor.wrappedValue = 3
@@ -723,8 +1005,47 @@ private struct HostedPresentationView: View {
             textResolver: model.resolver,
             overridePresentationMode: .deferred)
             .environment(\.autoChartViewTestHooks, hooks)
-            .environment(\.autoChartViewTestRevision, model.revision)
+            .environment(\.autoChartViewRevisionForTesting, model.revision)
             .frame(width: 600, height: 400)
+    }
+}
+
+private struct HostedDefaultPresentationView: View {
+    @ObservedObject var model: HostedPresentationModel
+    let hooks: AutoChartViewTestHooks
+    var body: some View {
+        AutoChartView(
+            presentedChart: model.chart,
+            analysisID: model.analysisID,
+            selection: $model.selection,
+            formatters: model.formatters,
+            textResolver: model.resolver)
+            .environment(\.autoChartViewTestHooks, hooks)
+            .environment(\.autoChartViewRevisionForTesting, model.revision)
+            .frame(width: 600, height: 400)
+    }
+}
+
+@MainActor
+private final class HostedViewHarnessForTesting<Content: View> {
+    let window: NSWindow
+    let host: NSHostingView<Content>
+
+    init(rootView: Content, size: NSSize = NSSize(width: 600, height: 400)) {
+        window = NSWindow(
+            contentRect: NSRect(origin: .zero, size: size),
+            styleMask: .borderless,
+            backing: .buffered,
+            defer: false)
+        window.isReleasedWhenClosed = false
+        host = NSHostingView(rootView: rootView)
+        window.contentView = host
+        window.orderFront(nil)
+    }
+
+    func close() {
+        window.contentView = nil
+        window.close()
     }
 }
 

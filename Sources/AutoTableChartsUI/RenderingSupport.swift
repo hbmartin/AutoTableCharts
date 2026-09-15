@@ -42,14 +42,14 @@ extension EnvironmentValues {
     }
 }
 
-private struct AutoChartViewTestRevisionKey: EnvironmentKey {
+private struct AutoChartViewRevisionForTestingKey: EnvironmentKey {
     static let defaultValue = 0
 }
 
 extension EnvironmentValues {
-    var autoChartViewTestRevision: Int {
-        get { self[AutoChartViewTestRevisionKey.self] }
-        set { self[AutoChartViewTestRevisionKey.self] = newValue }
+    var autoChartViewRevisionForTesting: Int {
+        get { self[AutoChartViewRevisionForTestingKey.self] }
+        set { self[AutoChartViewRevisionForTestingKey.self] = newValue }
     }
 }
 #endif

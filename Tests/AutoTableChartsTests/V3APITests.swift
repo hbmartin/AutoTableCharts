@@ -247,9 +247,7 @@ import Accessibility
         #expect(AutoChartPresenter().present(range).makeLazyAudioGraphDescriptor() == nil)
     }
 
-    @Test(.disabled(if: !testHooksAvailable, testHooksUnavailable))
-    func viewOverridesRepresentTheCompletePresentationPayload() async throws {
-        #if ATC_TEST_HOOKS
+    @Test func viewOverridesRepresentTheCompletePresentationPayload() async throws {
         let category = AutoChartColumn(
             id: "category", name: "Category",
             semantics: .dimension(semanticType: .nominal))
@@ -279,30 +277,25 @@ import Accessibility
             formatters: .init(locale: Locale(identifier: "sv_SE")))
         let resolverCalls = V3Counter()
         let formatterCalls = V3Counter()
-        let callbackThreads = V3ThreadRecorder()
         let americanFormatters = AutoChartFormatters(
             locale: Locale(identifier: "en_US"),
             request: { _, _, _ in
                 formatterCalls.increment()
-                callbackThreads.recordCurrentThread()
                 return nil
             })
         let americanResolver = AutoChartTextResolver { message in
             resolverCalls.increment()
-            callbackThreads.recordCurrentThread()
             return "US: \(message.defaultText)"
         }
 
-        let american = try await MainActor.run {
-            let view = AutoChartView(
+        await MainActor.run {
+            _ = AutoChartView(
                 presentedChart: swedish,
                 analysisID: analysis.id,
                 formatters: americanFormatters,
                 textResolver: americanResolver)
             #expect(resolverCalls.value > 0)
             #expect(formatterCalls.value > 0)
-            #expect(callbackThreads.result.allMainThread)
-            return try #require(view.presentedChartForTesting)
         }
         let afterFirstOverride = resolverCalls.value
         let formatterCallsAfterFirstOverride = formatterCalls.value
@@ -313,6 +306,10 @@ import Accessibility
         }
         #expect(resolverCalls.value > afterFirstOverride)
         #expect(formatterCalls.value > formatterCallsAfterFirstOverride)
+        let american = presenter.present(
+            chart,
+            formatters: americanFormatters,
+            textResolver: americanResolver)
 
         #expect(swedish.sharedXCategoryDomain == ["z", "ä"])
         #expect(american.sharedXCategoryDomain == ["ä", "z"])
@@ -351,7 +348,6 @@ import Accessibility
             existingAXDescriptor.series.flatMap(\.dataPoints).map(\.label)
                 == descriptor.series.flatMap(\.points).map(\.label))
         withExtendedLifetime(presenter) {}
-        #endif
     }
 
     @Test func singletonExtremeAudioGraphRangesRemainFiniteAndOrdered() async throws {
@@ -2130,8 +2126,19 @@ private final class ProgressRecorder: @unchecked Sendable {
         #expect(valueFormatterA.callbackIdentity == valueFormatterB.callbackIdentity)
 
         let noValueOverride = AutoChartFormatters(value: nil)
+        let optionalCacheIdentity: String? = "optional-value-format-v1"
+        let compatibleNoOverride = AutoChartFormatters(
+            cacheIdentity: optionalCacheIdentity)
+        let compatibleExplicitNil = AutoChartFormatters(
+            cacheIdentity: "explicit-nil-value-format", value: nil)
+        let compatibleOptionalIdentity = AutoChartFormatters(
+            cacheIdentity: optionalCacheIdentity,
+            value: { _, _, _, _, _ in nil })
         let generatedValueOverride = AutoChartFormatters(value: { _, _, _, _, _ in nil })
         #expect(noValueOverride.callbackIdentity == nil)
+        #expect(compatibleNoOverride.callbackIdentity == nil)
+        #expect(compatibleExplicitNil.callbackIdentity == nil)
+        #expect(compatibleOptionalIdentity.callbackIdentity != nil)
         #expect(generatedValueOverride.callbackIdentity != nil)
     }
 
@@ -2214,26 +2221,26 @@ private final class ProgressRecorder: @unchecked Sendable {
         })
 
         AutoChartConveniencePresentationCache.removeAll()
-        let firstID = AutoChartPresentationRequestID(
+        let firstID = AutoChartPresentationRequest(
             preparedChart: chart.id,
             context: .init(identity: "convenience-v1"),
             formatters: formatters,
-            textResolver: .default)
-        let identicalID = AutoChartPresentationRequestID(
+            textResolver: .default).id
+        let identicalID = AutoChartPresentationRequest(
             preparedChart: chart.id,
             context: .init(identity: "convenience-v1"),
             formatters: formatters,
-            textResolver: .default)
-        let invalidatedID = AutoChartPresentationRequestID(
+            textResolver: .default).id
+        let invalidatedID = AutoChartPresentationRequest(
             preparedChart: chart.id,
             context: .init(identity: "convenience-v2"),
             formatters: formatters,
-            textResolver: .default)
+            textResolver: .default).id
         #expect(firstID == identicalID)
         #expect(firstID != invalidatedID)
         #expect(firstID.context.foundation.localeIdentifier == firstID.context.localeIdentifier)
         #expect(firstID.context.foundation.usesAutoupdatingLocale)
-        #expect(firstID.context.foundation.fixedLocale == nil)
+        #expect(firstID.context.foundation.resolvedLocale == Locale.current)
         #expect(
             firstID.formatterFoundation.timeZoneIdentifier
                 == formatters.timeZone.identifier)
@@ -2345,7 +2352,7 @@ private final class ProgressRecorder: @unchecked Sendable {
         #expect(cancellationStarted.duration(to: clock.now) < .seconds(1))
     }
 
-    @Test func cancelledProgressRestartsDoNotInvokeQueuedResolver() async {
+    @Test func newerProgressResolutionDoesNotWaitForCancelledCallback() async {
         let callback = V3OneShotBlockingCallback()
         defer { callback.release() }
         let resolver = AutoChartTextResolver { message in
@@ -2366,24 +2373,17 @@ private final class ProgressRecorder: @unchecked Sendable {
         first.cancel()
         #expect(await first.value == nil)
 
-        let secondStarted = V3Counter()
         let second = Task {
-            secondStarted.increment()
             return await AutoChartProgressTextResolution.resolve(
                 AutoChartProgressAccessibility.updating,
                 using: resolver)
         }
-        guard await waitForV3Condition({ secondStarted.value == 1 }) else {
-            second.cancel()
-            Issue.record("The replacement progress resolution did not begin.")
-            return
-        }
-        second.cancel()
-        #expect(await second.value == nil)
+        #expect(await second.value == AutoChartProgressAccessibility.updating.defaultText)
+        #expect(callback.completedInvocations == 1)
 
         callback.release()
-        #expect(await waitForV3Condition({ callback.completedInvocations == 1 }))
-        #expect(callback.completedInvocations == 1)
+        #expect(await waitForV3Condition({ callback.completedInvocations == 2 }))
+        #expect(callback.completedInvocations == 2)
         #expect(!callback.didTimeOut)
     }
 
