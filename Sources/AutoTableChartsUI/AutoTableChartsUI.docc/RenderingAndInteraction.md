@@ -19,9 +19,10 @@ identity when the behavior captured by an existing callback changes. A formatter
 or resolver callback receives a generated identity by default; use its
 `cacheIdentity` parameter to let equivalent wrappers constructed during repeated
 view evaluation share entries, and change that identity whenever captured behavior
-changes. Autoupdating locale and time-zone identities are sampled into each request,
-so a system setting change intentionally invalidates the prior payload and starts
-asynchronous re-presentation. The
+changes. Autoupdating locale and time-zone values are frozen once per request and
+the same snapshot supplies both its cache key and every formatted surface. A later
+system setting change therefore creates a new request without allowing the old
+request to cache output under the new locale or time zone. The
 `AutoChartView` and `AutoChartPlot` convenience initializers accept
 `presentationContext` for the same invalidation control and defer memo misses to
 a cancellable presentation task. Call
@@ -31,14 +32,18 @@ owned presenters; use their `removeAll()` method to release those payloads. Pres
 charts whose originating presenter has been released also use this shared bounded
 fallback, so clearing the convenience cache purges those fallback entries.
 
-`presentCancellable` runs formatter and text-resolver callbacks outside the
-main actor as part of cancellable dispatch work. Hosts whose callbacks
-require caller-context execution can use the synchronous `present` method.
+`present` and the presented-chart view's default ``AutoChartOverridePresentationMode/immediate``
+mode run formatter and text-resolver callbacks synchronously on the caller's
+thread. `presentCancellable` and explicit
+``AutoChartOverridePresentationMode/deferred`` presentation run callbacks off-main.
+Each deferred view serializes its presentation and progress-label callbacks.
 
 Deferred convenience views require a mounted SwiftUI lifecycle to run their
 presentation task. Synchronous renderers such as snapshot exporters should call
 ``AutoChartPresenter/present(_:context:formatters:textResolver:)`` first and pass
-the result to the presented-chart `AutoChartView` initializer.
+the result to the presented-chart `AutoChartView` initializer. Overrides supplied
+to that initializer resolve synchronously by default, including uncached overrides
+when the presenter memo is disabled or has evicted the prior payload.
 
 `AutoChartSelectionSet` is ordered and provenance-safe. A click replaces its
 selection; Command-click removes a matched group when all its marks are selected
@@ -58,12 +63,16 @@ formatter, or resolver inherits the corresponding environment value, while an
 initializer argument takes precedence. A view initialized from an already
 presented chart keeps that chart's formatter and resolver unless the initializer
 explicitly overrides one. Exact request matches and exact cached overrides render
-synchronously without invoking host callbacks. An override cache miss keeps the
-previous valid chart visible with an updating indicator while a cancellable task
-re-presents it off the main actor; only the newest request is published. Retained
+synchronously without invoking host callbacks. By default, an override cache miss
+is resolved immediately on the caller's thread. Pass
+`overridePresentationMode: .deferred` to keep the incoming chart visible with an
+updating indicator while a cancellable task re-presents it off the main actor; only
+the newest request is published. Replacing that chart while work is pending shows
+the replacement's immediate valid presentation and keeps the rendered child mounted
+so chart-change interaction resets still run. Retained
 selection is resynchronized to reordered and reformatted categories or donut angles,
 while presentation-only changes preserve zoom. Synchronous renderers and exporters
-must pre-present an override with ``AutoChartPresenter`` before constructing the view.
+do not need to pre-present overrides supplied to a presented-chart view.
 The replacement includes visible order, domains, facets, controls, mark
 accessibility, and Audio Graph, so every surface uses the same labels and formatting.
 

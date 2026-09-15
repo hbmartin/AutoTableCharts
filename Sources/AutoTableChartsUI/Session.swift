@@ -334,11 +334,12 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
             locale: context.locale,
             timeZone: context.timeZone)
         let textResolver = presentationConfiguration.textResolver
-        let requestID = AutoChartPresentationRequestID(
+        let request = AutoChartPresentationRequest(
             preparedChart: chart.id,
             context: context,
             formatters: formatters,
             textResolver: textResolver)
+        let requestID = request.id
         if case .ready(_, let presented) = state,
             presented?.requestID == requestID
         {
@@ -367,9 +368,7 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
             do {
                 let presented = try await presenter.presentCancellable(
                     chart,
-                    context: context,
-                    formatters: formatters,
-                    textResolver: textResolver)
+                    request: request)
                 try Task.checkCancellation()
                 guard let self,
                     self.generation == requestToken,
