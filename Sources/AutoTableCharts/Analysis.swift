@@ -311,7 +311,8 @@ final class AutoChartAnalysisPreparationProvider<RowID: Hashable & Sendable>: @u
             profiles: source.profiles,
             cancellationRequested: { Task.isCancelled })
         try Task.checkCancellation()
-        validationLock.withLock {
+        try validationLock.withLock {
+            try Task.checkCancellation()
             validationByID[recommendationID] = validation.isValid
         }
         return validation.isValid ? recommendation : nil
