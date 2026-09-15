@@ -24,6 +24,13 @@ if let repair = resolution.replacementPreference {
 }
 ```
 
+An old-policy chart choice is rebound by structural specification ID when that
+chart remains valid. In that case `defaultReason` is `.policyVersionRebound` and
+`replacementPreference` supplies its current ID. If the specification is no
+longer available, `.policyVersionChanged` indicates fallback to the primary
+chart. Default catalog picker options include a valid preferred chart outside
+the compact catalog so the shown chart remains selectable.
+
 The decoder also accepts the legacy length-prefixed string representation. New
 encodings use the typed keyed representation.
 

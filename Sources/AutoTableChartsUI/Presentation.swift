@@ -21,6 +21,104 @@ final class AutoChartCancellationToken: @unchecked Sendable {
     func checkCancellation() throws {
         if isCancelled { throw CancellationError() }
     }
+
+    /// Makes cancellation and cache insertion mutually exclusive. A cancellation
+    /// that wins this lock cannot later insert a payload or evict another entry.
+    func commitIfActive<Value>(_ body: () -> Value) -> Value? {
+        lock.withLock {
+            guard !cancelled else { return nil }
+            return body()
+        }
+    }
+}
+
+/// Limits synchronous host callbacks without holding a thread for queued work.
+/// Cancelling a queued job removes it immediately; a running callback keeps its
+/// slot until it returns, while its awaiting task is cancelled promptly.
+final class AutoChartCallbackWorkScheduler: @unchecked Sendable {
+    final class Job: @unchecked Sendable {
+        let cancellation: AutoChartCancellationToken
+        let execute: @Sendable () -> Void
+
+        init(
+            cancellation: AutoChartCancellationToken,
+            execute: @escaping @Sendable () -> Void
+        ) {
+            self.cancellation = cancellation
+            self.execute = execute
+        }
+    }
+
+    private let lock = NSLock()
+    private let queue: DispatchQueue
+    private var maximumConcurrentJobs: Int
+    private var activeJobs = 0
+    private var pendingJobs: [Job] = []
+
+    init(maximumConcurrentJobs: Int, queue: DispatchQueue) {
+        self.maximumConcurrentJobs = max(1, maximumConcurrentJobs)
+        self.queue = queue
+    }
+
+    func setMaximumConcurrentJobs(_ count: Int) {
+        let ready = lock.withLock { () -> [Job] in
+            maximumConcurrentJobs = max(1, count)
+            var jobs: [Job] = []
+            while activeJobs < maximumConcurrentJobs && !pendingJobs.isEmpty {
+                let job = pendingJobs.removeFirst()
+                guard !job.cancellation.isCancelled else { continue }
+                activeJobs += 1
+                jobs.append(job)
+            }
+            return jobs
+        }
+        ready.forEach(start)
+    }
+
+    func submit(_ job: Job) {
+        let shouldStart = lock.withLock { () -> Bool in
+            guard !job.cancellation.isCancelled else { return false }
+            if activeJobs < maximumConcurrentJobs {
+                activeJobs += 1
+                return true
+            }
+            pendingJobs.append(job)
+            return false
+        }
+        if shouldStart { start(job) }
+    }
+
+    func cancel(_ job: Job) {
+        lock.withLock { pendingJobs.removeAll { $0 === job } }
+    }
+
+    #if ATC_TEST_HOOKS
+    var statusForTesting: (active: Int, pending: Int) {
+        lock.withLock { (activeJobs, pendingJobs.count) }
+    }
+    #endif
+
+    private func start(_ job: Job) {
+        queue.async { [self] in
+            defer { finish() }
+            guard !job.cancellation.isCancelled else { return }
+            job.execute()
+        }
+    }
+
+    private func finish() {
+        let next = lock.withLock { () -> Job? in
+            activeJobs -= 1
+            while activeJobs < maximumConcurrentJobs && !pendingJobs.isEmpty {
+                let job = pendingJobs.removeFirst()
+                guard !job.cancellation.isCancelled else { continue }
+                activeJobs += 1
+                return job
+            }
+            return nil
+        }
+        if let next { start(next) }
+    }
 }
 
 private final class AutoChartCancellableWorkRelay<Value: Sendable>: @unchecked Sendable {
@@ -74,6 +172,38 @@ private final class AutoChartCancellableWorkRelay<Value: Sendable>: @unchecked S
 }
 
 enum AutoChartCancellableWork {
+    static func run<Value: Sendable>(
+        on scheduler: AutoChartCallbackWorkScheduler,
+        _ operation: @escaping @Sendable (AutoChartCancellationToken) throws -> Value
+    ) async throws -> Value {
+        try Task.checkCancellation()
+        let callbackContext = AutoChartHostCallbackActivity.currentContext
+        let cancellation = AutoChartCancellationToken()
+        let relay = AutoChartCancellableWorkRelay<Value>()
+        let job = AutoChartCallbackWorkScheduler.Job(cancellation: cancellation) {
+            do {
+                let value = try AutoChartHostCallbackActivity.withContext(callbackContext) {
+                    try cancellation.checkCancellation()
+                    return try operation(cancellation)
+                }
+                try cancellation.checkCancellation()
+                relay.complete(with: .success(value))
+            } catch {
+                relay.complete(with: .failure(error))
+            }
+        }
+        return try await withTaskCancellationHandler {
+            scheduler.submit(job)
+            let value = try await relay.value()
+            try Task.checkCancellation()
+            return value
+        } onCancel: {
+            cancellation.cancel()
+            scheduler.cancel(job)
+            relay.complete(with: .failure(CancellationError()))
+        }
+    }
+
     static func run<Value: Sendable>(
         on queue: DispatchQueue,
         _ operation: @escaping @Sendable (AutoChartCancellationToken) throws -> Value
@@ -477,11 +607,13 @@ public struct AutoChartPresentedChart<RowID: Hashable & Sendable>: Sendable {
     }
 
     func rePresentCancellable(
-        request: AutoChartPresentationRequest
+        request: AutoChartPresentationRequest,
+        scheduler: AutoChartCallbackWorkScheduler? = nil
     ) async throws -> AutoChartPresentedChart<RowID> {
         try await originatingPresenter.active.presentCancellable(
             preparedChart,
-            request: request)
+            request: request,
+            scheduler: scheduler)
     }
 }
 
@@ -600,16 +732,22 @@ public final class AutoChartPresenter: @unchecked Sendable {
     func presentCancellable<RowID: Hashable & Sendable>(
         _ chart: AutoChartPreparedChart<RowID>,
         request: AutoChartPresentationRequest,
-        priority: TaskPriority = .userInitiated
+        priority: TaskPriority = .userInitiated,
+        scheduler: AutoChartCallbackWorkScheduler? = nil
     ) async throws -> AutoChartPresentedChart<RowID> {
-        return try await AutoChartCancellableWork.run(
-            on: DispatchQueue.global(qos: Self.qos(for: priority))
-        ) { cancellation in
-            try self.present(
-                chart,
-                request: request,
-                checkingCancellation: cancellation.checkCancellation)
+        let operation: @Sendable (AutoChartCancellationToken) throws
+            -> AutoChartPresentedChart<RowID> = { cancellation in
+                try self.present(
+                    chart,
+                    request: request,
+                    checkingCancellation: cancellation.checkCancellation,
+                    cancellation: cancellation)
         }
+        if let scheduler {
+            return try await AutoChartCancellableWork.run(on: scheduler, operation)
+        }
+        return try await AutoChartCancellableWork.run(
+            on: DispatchQueue.global(qos: Self.qos(for: priority)), operation)
     }
 
     /// Looks up an exact payload without invoking formatters or resolvers.
@@ -658,7 +796,8 @@ public final class AutoChartPresenter: @unchecked Sendable {
     func present<RowID: Hashable & Sendable>(
         _ chart: AutoChartPreparedChart<RowID>,
         request: AutoChartPresentationRequest,
-        checkingCancellation: () throws -> Void
+        checkingCancellation: () throws -> Void,
+        cancellation: AutoChartCancellationToken? = nil
     ) rethrows -> AutoChartPresentedChart<RowID> {
         try checkingCancellation()
         let formatters = request.resolvedFormatters
@@ -744,18 +883,32 @@ public final class AutoChartPresenter: @unchecked Sendable {
             sharedXCategoryDomain: sharedXCategoryDomain,
             kpi: kpi,
             audioGraphAvailability: audioGraphAvailability)
-        let payload = lock.withLock {
-            if let cached = cachedPayload(for: requestID) { return cached }
-            guard maximumEntries > 0 else { return proposed }
-            entries[requestID] = proposed
-            touch(requestID)
-            while entries.count > maximumEntries, let oldest = recency.first {
-                recency.removeFirst()
-                entries.removeValue(forKey: oldest)
-            }
-            return proposed
-        }
         try checkingCancellation()
+        let insert = {
+            self.lock.withLock {
+                if let cached = self.cachedPayload(for: requestID) { return cached }
+                guard self.maximumEntries > 0 else { return proposed }
+                self.entries[requestID] = proposed
+                self.touch(requestID)
+                while self.entries.count > self.maximumEntries,
+                    let oldest = self.recency.first
+                {
+                    self.recency.removeFirst()
+                    self.entries.removeValue(forKey: oldest)
+                }
+                return proposed
+            }
+        }
+        let payload: AutoChartPresentationPayload
+        if let cancellation {
+            guard let committed = cancellation.commitIfActive(insert) else {
+                try checkingCancellation()
+                preconditionFailure("A cancelled cache commit must throw.")
+            }
+            payload = committed
+        } else {
+            payload = insert()
+        }
         return presentedChart(
             chart,
             payload: payload,

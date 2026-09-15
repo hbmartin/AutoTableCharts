@@ -146,6 +146,7 @@ public enum AutoChartPreparationStrategy: String, Hashable, Codable, Sendable {
 public enum AutoChartPreferenceDefaultReason: Hashable, Codable, Sendable {
     case automatic
     case recommended
+    case policyVersionRebound(previous: Int, current: Int)
     case policyVersionChanged(previous: Int, current: Int)
     case specificationUnavailable
     case noSafeChart
@@ -208,14 +209,18 @@ public struct AutoChartRecommendationCatalog: Hashable, Codable, Sendable,
         let safe = Array(cataloged.filter { seen.insert($0.id).inserted }
             .prefix(Self.maximumCatalogedCount))
         self.cataloged = safe
-        self.catalogIndexByID = Dictionary(
+        let indexByID = Dictionary(
             uniqueKeysWithValues: safe.enumerated().map { ($0.element.id, $0.offset) })
-        let safeIDs = Set(self.catalogIndexByID.keys)
+        self.catalogIndexByID = indexByID
+        let safeIDs = Set(indexByID.keys)
         var featuredIDs: Set<AutoChartRecommendationID> = []
         self.featured = Array(
             featured
-                .filter { item in
-                    safeIDs.contains(item.id) && featuredIDs.insert(item.id).inserted
+                .compactMap { item in
+                    guard let index = indexByID[item.id],
+                        featuredIDs.insert(item.id).inserted
+                    else { return nil }
+                    return safe[index]
                 }
                 .prefix(Self.maximumFeaturedCount))
         self.preferred = preferred.flatMap { item in
@@ -241,6 +246,21 @@ public struct AutoChartRecommendationCatalog: Hashable, Codable, Sendable,
         try container.encodeIfPresent(preferred, forKey: .preferred)
     }
 
+    public static func == (
+        lhs: AutoChartRecommendationCatalog,
+        rhs: AutoChartRecommendationCatalog
+    ) -> Bool {
+        lhs.featured == rhs.featured
+            && lhs.cataloged == rhs.cataloged
+            && lhs.preferred == rhs.preferred
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(featured)
+        hasher.combine(cataloged)
+        hasher.combine(preferred)
+    }
+
     public var startIndex: Int { featured.startIndex }
     public var endIndex: Int { featured.endIndex }
     public subscript(position: Int) -> AutoChartRecommendation { featured[position] }
@@ -254,10 +274,18 @@ public struct AutoChartRecommendationCatalog: Hashable, Codable, Sendable,
             ?? (preferred?.id == id ? preferred : nil)
     }
 
+    package func containsCataloged(
+        _ id: AutoChartRecommendationID
+    ) -> Bool {
+        catalogIndexByID[id] != nil
+    }
+
     public func pickerOptions(
         resolver: AutoChartTextResolver = .default
     ) -> [AutoChartPickerOption] {
-        pickerOptions(for: cataloged, resolver: resolver)
+        pickerOptions(
+            for: cataloged + (preferred.map { [$0] } ?? []),
+            resolver: resolver)
     }
 
     /// Labels only the host's displayed choices, including a valid off-catalog choice.

@@ -424,7 +424,7 @@ private struct CountingChartRowsTable: AutoChartTable {
                 from: JSONEncoder().encode(unicodeLegacy)) == unicodeExpected)
     }
 
-    @Test func resolutionReportsExactAndPolicyDefaulting() async throws {
+    @Test func preferenceResolutionReportsExactAndPolicyRebinding() async throws {
         #expect(AutoTableCharts.recommendationPolicyVersion == 15)
         let dataset = try AutoChartDataset<Int>(
             columns: [v2Category, v2Measure],
@@ -432,50 +432,35 @@ private struct CountingChartRowsTable: AutoChartTable {
         let analysis = try await AutoChartAnalyzer().analyze(dataset)
         let primary = try #require(analysis.primaryChart?.recommendation)
 
-        guard case .defaulted(let noPreference, reason: .noPersistedPreference) =
-            analysis.resolve(nil)
-        else {
-            Issue.record("Expected no-preference default")
-            return
-        }
-        #expect(noPreference.id == primary.id)
+        let automatic = analysis.resolve(.automatic)
+        #expect(automatic.recommendation?.id == primary.id)
+        #expect(automatic.defaultReason == .automatic)
 
-        guard case .exact(let exact) = analysis.resolve(primary.id) else {
-            Issue.record("Expected exact resolution")
-            return
-        }
-        #expect(exact.id == primary.id)
+        let exact = analysis.resolve(.chart(.specific(primary.id)))
+        #expect(exact.recommendation?.id == primary.id)
+        #expect(exact.defaultReason == nil)
 
         let stale = AutoChartRecommendationID(
             policyVersion: 14,
             specificationID: primary.specification.id)
-        guard case .defaulted(
-            let defaulted,
-            reason: .policyVersionChanged(let previous, let current)) =
-            analysis.resolve(stale)
-        else {
-            Issue.record("Expected policy-version default")
-            return
-        }
-        #expect(defaulted.id == primary.id)
-        #expect(previous == 14)
-        #expect(current == 15)
+        let rebound = analysis.resolve(.chart(.specific(stale)))
+        #expect(rebound.recommendation?.id == primary.id)
+        #expect(rebound.defaultReason == .policyVersionRebound(
+            previous: 14, current: 15))
+        #expect(rebound.replacementPreference == .chart(.specific(primary.id)))
 
         let absent = AutoChartRecommendationID(
             policyVersion: AutoTableCharts.recommendationPolicyVersion,
             specificationID: AutoChartSpecificationID(rawValue: "absent-specification"))
-        guard case .defaulted(let unavailable, reason: .specificationUnavailable) =
-            analysis.resolve(absent)
-        else {
-            Issue.record("Expected unavailable-specification default")
-            return
-        }
-        #expect(unavailable.id == primary.id)
+        let unavailable = analysis.resolve(.chart(.specific(absent)))
+        #expect(unavailable.recommendation?.id == primary.id)
+        #expect(unavailable.defaultReason == .specificationUnavailable)
 
         let empty = try AutoChartDataset<Int>(columns: [v2Category], rows: [])
         let fallbackAnalysis = try await AutoChartAnalyzer().analyze(empty)
-        guard case .unavailable(let fallback) = fallbackAnalysis.resolve(nil) else {
-            Issue.record("Expected unavailable fallback resolution")
+        #expect(fallbackAnalysis.resolve(.automatic).usesTable)
+        guard case .tableFallback(let fallback) = fallbackAnalysis.outcome else {
+            Issue.record("Expected table fallback")
             return
         }
         #expect(fallback.message.code == .noChartableRows)

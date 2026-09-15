@@ -260,23 +260,54 @@ public struct AutoChartFormatters: Sendable {
         }
     }
 
-    /// Creates formatters with an optional stable presentation-cache identity and
-    /// compatibility value override.
-    ///
-    /// Separately constructed callbacks receive distinct generated identities by
-    /// default. Supply the same `cacheIdentity` when declarative rendering rebuilds
-    /// an equivalent callback, and change it whenever captured behavior changes.
+    /// Creates formatters with an optional compatibility value override.
+    /// Separately constructed callbacks receive distinct generated identities.
     public init(
         locale: Locale = .autoupdatingCurrent,
         timeZone: TimeZone = .autoupdatingCurrent,
-        cacheIdentity: String? = nil,
         value: ValueFormatter? = nil
+    ) {
+        self.init(
+            locale: locale, timeZone: timeZone,
+            compatibilityCacheIdentity: nil, compatibilityValue: value)
+    }
+
+    /// Creates a compatibility formatter with a stable presentation-cache identity.
+    /// The callback is required so an identity cannot be silently discarded.
+    public init(
+        locale: Locale = .autoupdatingCurrent,
+        timeZone: TimeZone = .autoupdatingCurrent,
+        cacheIdentity: String,
+        value: @escaping ValueFormatter
+    ) {
+        self.init(
+            locale: locale, timeZone: timeZone,
+            compatibilityCacheIdentity: cacheIdentity, compatibilityValue: value)
+    }
+
+    /// Accepts a computed optional identity while still requiring a callback.
+    public init(
+        locale: Locale = .autoupdatingCurrent,
+        timeZone: TimeZone = .autoupdatingCurrent,
+        cacheIdentity: String?,
+        value: @escaping ValueFormatter
+    ) {
+        self.init(
+            locale: locale, timeZone: timeZone,
+            compatibilityCacheIdentity: cacheIdentity, compatibilityValue: value)
+    }
+
+    private init(
+        locale: Locale,
+        timeZone: TimeZone,
+        compatibilityCacheIdentity: String?,
+        compatibilityValue: ValueFormatter?
     ) {
         self.locale = locale
         self.timeZone = timeZone
-        if let value {
+        if let compatibilityValue {
             let requestFormatter: RequestFormatter = { request, locale, timeZone in
-                value(
+                compatibilityValue(
                     Self.legacyColumn(for: request),
                     request.value,
                     request.context,
@@ -284,7 +315,7 @@ public struct AutoChartFormatters: Sendable {
                     timeZone)
             }
             hostOverride = AutoChartHostCallback(
-                cacheIdentity: cacheIdentity, requestFormatter)
+                cacheIdentity: compatibilityCacheIdentity, requestFormatter)
         } else {
             hostOverride = nil
         }

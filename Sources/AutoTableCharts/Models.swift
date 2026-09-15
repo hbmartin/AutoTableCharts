@@ -2547,19 +2547,6 @@ public enum AutoChartRecommendationOutcome: Hashable, Codable, Sendable {
     case tableFallback(AutoChartFallback)
 }
 
-/// Result of resolving a persisted recommendation preference.
-enum AutoChartRecommendationResolution: Sendable {
-    enum DefaultReason: Hashable, Codable, Sendable {
-        case noPersistedPreference
-        case policyVersionChanged(previous: Int, current: Int)
-        case specificationUnavailable
-    }
-
-    case exact(AutoChartRecommendation)
-    case defaulted(AutoChartRecommendation, reason: DefaultReason)
-    case unavailable(AutoChartFallback)
-}
-
 /// Inspectable disposition of one generated chart candidate.
 public struct AutoChartCandidateDecision: Hashable, Codable, Sendable {
     public enum Disposition: Hashable, Codable, Sendable {
