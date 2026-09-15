@@ -1245,6 +1245,29 @@ private final class ProgressRecorder: @unchecked Sendable {
         #expect(options.allSatisfy { $0.label.hasPrefix("localized:") })
     }
 
+    @Test func catalogDeduplicatesConstructionAndDecodedPayloads() throws {
+        let first = recommendation(.bar(category: "category", measure: "value"), score: 10)
+        let duplicate = recommendation(.bar(category: "category", measure: "value"), score: 1)
+        let other = recommendation(.bar(category: "other", measure: "value"), score: 5)
+        let catalog = AutoChartRecommendationCatalog(
+            featured: [first, duplicate, other],
+            cataloged: [first, duplicate, other])
+        #expect(catalog.cataloged.map(\.id) == [first.id, other.id])
+        #expect(catalog.featured.map(\.id) == [first.id, other.id])
+        #expect(catalog.recommendation(for: first.id)?.score == 10)
+        #expect(catalog.pickerOptions().map(\.id) == [first.id, other.id])
+
+        let payload = V3CatalogPayload(
+            featured: [first, duplicate, other],
+            cataloged: [first, duplicate, other],
+            preferred: nil)
+        let decoded = try JSONDecoder().decode(
+            AutoChartRecommendationCatalog.self,
+            from: JSONEncoder().encode(payload))
+        #expect(decoded.cataloged.map(\.id) == [first.id, other.id])
+        #expect(decoded.featured.map(\.id) == [first.id, other.id])
+    }
+
     @Test func analyzerCatalogIsScoreOrderedWhileFeaturedRemainsBounded() async throws {
         let request = try AutoChartRequest(
             table: wideDomainDataset(),
@@ -1437,6 +1460,28 @@ private final class ProgressRecorder: @unchecked Sendable {
         #expect(catalog.cataloged.allSatisfy { constraints.allows($0.specification) })
     }
 
+    @Test func constraintsFilterAggregationsAndParticipateInRequestIdentity() async throws {
+        let dataset = try domainDataset()
+        let unconstrained = try AutoChartRequest(table: dataset)
+        let constraints = AutoChartRecommendationConstraints(
+            includedAggregations: [.none])
+        let request = try AutoChartRequest(table: dataset, constraints: constraints)
+        let analysis = try await AutoChartAnalyzer().analyze(request, preparation: .none)
+        let catalog = try #require(analysis.outcome.catalog)
+
+        #expect(request.id != unconstrained.id)
+        #expect(!catalog.cataloged.isEmpty)
+        #expect(catalog.cataloged.allSatisfy {
+            $0.specification.aggregation == .none
+                && constraints.allows($0.specification)
+        })
+
+        let roundTripped = try JSONDecoder().decode(
+            AutoChartRecommendationConstraints.self,
+            from: JSONEncoder().encode(constraints))
+        #expect(roundTripped == constraints)
+    }
+
     @Test func decisionTraceKeepsCatalogedRecommendationsClassifiedAsRecommended()
         async throws
     {
@@ -1492,6 +1537,13 @@ private final class ProgressRecorder: @unchecked Sendable {
         let resolution = analysis.resolve(.chart(.specific(offList.id)))
         #expect(resolution.recommendation?.id == offList.id)
         #expect(resolution.defaultReason == nil)
+        #expect(resolution.replacementPreference == nil)
+        let stale = AutoChartRecommendationID(
+            policyVersion: AutoTableCharts.recommendationPolicyVersion - 1,
+            specificationID: offList.specification.id)
+        let rebound = analysis.resolve(.chart(.specific(stale)))
+        #expect(rebound.recommendation?.id == offList.id)
+        #expect(rebound.replacementPreference == .chart(.specific(offList.id)))
 
         let prepared = try await analyzer.analyze(
             request,
@@ -1556,7 +1608,8 @@ private final class ProgressRecorder: @unchecked Sendable {
         #expect(staleResolution.defaultReason == .policyVersionChanged(
             previous: 14,
             current: 15))
-        #expect(staleResolution.replacementPreference == .chart(.recommended))
+        #expect(staleResolution.recommendation?.id == primary.id)
+        #expect(staleResolution.replacementPreference == .chart(.specific(primary.id)))
 
         let missing = AutoChartRecommendationID(
             policyVersion: AutoTableCharts.recommendationPolicyVersion,
@@ -1564,6 +1617,20 @@ private final class ProgressRecorder: @unchecked Sendable {
         let missingResolution = analysis.resolve(.chart(.specific(missing)))
         #expect(missingResolution.defaultReason == .specificationUnavailable)
         #expect(missingResolution.replacementPreference == .chart(.recommended))
+    }
+
+    @Test func noSafeChartProducesOneAutomaticReplacement() async throws {
+        let dataset = try AutoChartDataset<Int>(
+            columns: [AutoChartColumn(id: "label", name: "Label",
+                semantics: .dimension(semanticType: .nominal))],
+            rows: [[.text("Only text")]],
+            rowIDs: [0])
+        let analysis = try await AutoChartAnalyzer().analyze(
+            AutoChartRequest(table: dataset), preparation: .none)
+        let choice = AutoChartRecommendationID(
+            policyVersion: AutoTableCharts.recommendationPolicyVersion,
+            specificationID: .init(rawValue: "unavailable"))
+        #expect(analysis.resolve(.chart(.specific(choice))).replacementPreference == .automatic)
     }
 
     @Test func sharedCacheSupportsSynchronousTypedLookupCostStatisticsAndTrim()
@@ -2721,6 +2788,31 @@ private final class ProgressRecorder: @unchecked Sendable {
         let updated = try await readyAnalysis(from: session)
         #expect(updated.primaryChart?.recommendation.id == alternative.id)
         #expect(updated.preparedCharts.count == catalog.cataloged.count)
+    }
+
+    @Test func sameChartPolicyRebindKeepsReadyPresentationAndSelection() async throws {
+        let session = AutoChartSession<Int>(cache: AutoChartCache())
+        let request = try AutoChartRequest(table: domainDataset())
+        let base = try await AutoChartAnalyzer().analyze(request, preparation: .none)
+        let selected = try #require(base.outcome.catalog?.primary)
+        let stale = AutoChartRecommendationID(
+            policyVersion: AutoTableCharts.recommendationPolicyVersion - 1,
+            specificationID: selected.specification.id)
+        session.load(request, preference: .chart(.specific(stale)))
+        let ready = try await readyAnalysis(from: session)
+        let presented = try #require(try await readyPresentation(from: session) { _ in true })
+        session.selection = presented.preparedChart.selections(for: [10], analysisID: ready.id)
+        #expect(!session.selection.isEmpty)
+
+        session.setPreference(.chart(.specific(selected.id)))
+        guard case .ready(let updated, let unchanged?) = session.state else {
+            Issue.record("A policy-only rebind must remain ready synchronously.")
+            return
+        }
+        #expect(unchanged.requestID == presented.requestID)
+        #expect(updated.preferenceResolution?.recommendation?.id == selected.id)
+        #expect(updated.preferenceResolution?.replacementPreference == nil)
+        #expect(session.selection == presented.preparedChart.selections(for: [10], analysisID: ready.id))
     }
 
     @Test func customStateContentAndEnvironmentPresentationAreComposable() async throws {

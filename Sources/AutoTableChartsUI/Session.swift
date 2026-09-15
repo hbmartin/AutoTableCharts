@@ -110,6 +110,20 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
             self.preference = preference
             return
         }
+        if case .ready(let analysis, let presented?) = state,
+            presentationRequestID == nil
+        {
+            let resolution = analysis.resolve(preference)
+            if resolution.recommendation?.id == presented.preparedChart.recommendation.id {
+                self.preference = preference
+                state = .ready(
+                    analysis.replacingPresentation(
+                        preparedCharts: analysis.preparedCharts,
+                        resolution: resolution),
+                    presented)
+                return
+            }
+        }
         start(
             request,
             preference: preference,

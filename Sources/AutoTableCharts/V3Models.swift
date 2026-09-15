@@ -86,17 +86,20 @@ public struct AutoChartPreparedChartID: Hashable, Sendable {
 public struct AutoChartRecommendationConstraints: Hashable, Codable, Sendable {
     public var includedFamilies: Set<AutoChartFamily>?
     public var excludedFamilies: Set<AutoChartFamily>
+    public var includedAggregations: Set<AutoChartAggregation>?
     public var requiredColumns: Set<AutoChartColumnID>
     public var excludedColumns: Set<AutoChartColumnID>
 
     public init(
         includedFamilies: Set<AutoChartFamily>? = nil,
         excludedFamilies: Set<AutoChartFamily> = [],
+        includedAggregations: Set<AutoChartAggregation>? = nil,
         requiredColumns: Set<AutoChartColumnID> = [],
         excludedColumns: Set<AutoChartColumnID> = []
     ) {
         self.includedFamilies = includedFamilies
         self.excludedFamilies = excludedFamilies
+        self.includedAggregations = includedAggregations
         self.requiredColumns = requiredColumns
         self.excludedColumns = excludedColumns
     }
@@ -108,6 +111,11 @@ public struct AutoChartRecommendationConstraints: Hashable, Codable, Sendable {
 
     func allows(_ specification: AutoChartSpecification) -> Bool {
         guard allowsFamily(specification.family) else { return false }
+        if let includedAggregations,
+            !includedAggregations.contains(specification.aggregation)
+        {
+            return false
+        }
         let columns = Set(specification.encoding.columnIDs)
         return requiredColumns.isSubset(of: columns)
             && columns.isDisjoint(with: excludedColumns)
@@ -185,6 +193,7 @@ public struct AutoChartRecommendationCatalog: Hashable, Codable, Sendable,
     public let featured: [AutoChartRecommendation]
     public let cataloged: [AutoChartRecommendation]
     public let preferred: AutoChartRecommendation?
+    private let catalogIndexByID: [AutoChartRecommendationID: Int]
 
     private enum CodingKeys: String, CodingKey {
         case featured, cataloged, preferred
@@ -195,14 +204,22 @@ public struct AutoChartRecommendationCatalog: Hashable, Codable, Sendable,
         cataloged: [AutoChartRecommendation],
         preferred: AutoChartRecommendation? = nil
     ) {
-        let safe = Array(cataloged.prefix(Self.maximumCatalogedCount))
+        var seen: Set<AutoChartRecommendationID> = []
+        let safe = Array(cataloged.filter { seen.insert($0.id).inserted }
+            .prefix(Self.maximumCatalogedCount))
         self.cataloged = safe
+        self.catalogIndexByID = Dictionary(
+            uniqueKeysWithValues: safe.enumerated().map { ($0.element.id, $0.offset) })
+        let safeIDs = Set(self.catalogIndexByID.keys)
+        var featuredIDs: Set<AutoChartRecommendationID> = []
         self.featured = Array(
             featured
-                .filter { item in safe.contains { $0.id == item.id } }
+                .filter { item in
+                    safeIDs.contains(item.id) && featuredIDs.insert(item.id).inserted
+                }
                 .prefix(Self.maximumFeaturedCount))
         self.preferred = preferred.flatMap { item in
-            safe.contains(where: { $0.id == item.id }) ? nil : item
+            safeIDs.contains(item.id) ? nil : item
         }
     }
 
@@ -233,13 +250,22 @@ public struct AutoChartRecommendationCatalog: Hashable, Codable, Sendable,
     public func recommendation(
         for id: AutoChartRecommendationID
     ) -> AutoChartRecommendation? {
-        cataloged.first { $0.id == id } ?? (preferred?.id == id ? preferred : nil)
+        catalogIndexByID[id].map { cataloged[$0] }
+            ?? (preferred?.id == id ? preferred : nil)
     }
 
     public func pickerOptions(
         resolver: AutoChartTextResolver = .default
     ) -> [AutoChartPickerOption] {
-        cataloged.map { recommendation in
+        pickerOptions(for: cataloged, resolver: resolver)
+    }
+
+    /// Labels only the host's displayed choices, including a valid off-catalog choice.
+    public func pickerOptions(
+        for recommendations: [AutoChartRecommendation],
+        resolver: AutoChartTextResolver = .default
+    ) -> [AutoChartPickerOption] {
+        recommendations.map { recommendation in
             AutoChartPickerOption(
                 id: recommendation.id,
                 family: recommendation.specification.family,
