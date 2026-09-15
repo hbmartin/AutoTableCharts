@@ -2641,21 +2641,27 @@ private let date = AutoChartColumn(
         let secondMeasure = AutoChartColumn(
             id: "second-measure", name: "second_measure",
             semantics: .measure(semantics: .init(rollup: .additive)))
+        var rows: [[AutoChartValue]] = []
+        rows.reserveCapacity(8)
+        for offset in 0..<8 {
+            let timestamp = Date(timeIntervalSince1970: Double(offset * 86_400))
+            let categoryValue = offset.isMultiple(of: 2) ? "A" : "B"
+            let firstValue = Double(offset + 1)
+            let secondValue = Double((offset + 1) * 2)
+            rows.append([
+                .date(timestamp), .text(categoryValue),
+                .double(firstValue), .double(secondValue),
+            ])
+        }
         let input = table(
             columns: [date, category, measure, secondMeasure],
-            rows: (0..<8).map { offset in
-                [
-                    .date(Date(timeIntervalSince1970: Double(offset * 86_400))),
-                    .text(offset.isMultiple(of: 2) ? "A" : "B"),
-                    .double(Double(offset + 1)),
-                    .double(Double((offset + 1) * 2)),
-                ]
-            })
+            rows: rows)
         let candidates = AutoChartRecommendationEngine.recommendations(
             for: input,
             options: .init(maximumRecommendations: 20)).candidates
+        let candidateIDs = candidates.map { $0.id }
 
-        #expect(Set(candidates.map(\.id)).count == candidates.count)
+        #expect(Set(candidateIDs).count == candidates.count)
     }
 
     @Test func scalarUsesKPI() {

@@ -256,16 +256,13 @@ final class AutoChartAnalysisPreparationProvider<RowID: Hashable & Sendable>: @u
         analyzer: AutoChartAnalyzer,
         source: AutoChartPreparedSource<RowID>,
         recommendations: [AutoChartRecommendation],
+        recommendationIndexByID: [AutoChartRecommendationID: Int],
         validatedRecommendationIDs: Set<AutoChartRecommendationID>
     ) {
         self.analyzer = analyzer
         self.source = source
         self.recommendations = recommendations
-        var index: [AutoChartRecommendationID: Int] = [:]
-        for (offset, recommendation) in recommendations.enumerated() {
-            if index[recommendation.id] == nil { index[recommendation.id] = offset }
-        }
-        self.recommendationIndexByID = index
+        self.recommendationIndexByID = recommendationIndexByID
         self.validationByID = Dictionary(
             uniqueKeysWithValues: validatedRecommendationIDs.map { ($0, true) })
     }
@@ -369,38 +366,6 @@ public struct AutoChartAnalysis<RowID: Hashable & Sendable>: Sendable {
         self.provider = provider
     }
 
-    func resolve(
-        _ persistedID: AutoChartRecommendationID?
-    ) -> AutoChartRecommendationResolution {
-        switch outcome {
-        case .tableFallback(let fallback):
-            return .unavailable(fallback)
-        case .charts(let catalog):
-            guard let primary = catalog.primary else {
-                let fallback = AutoChartFallback(
-                    message: AutoChartMessage(
-                        category: .fallback,
-                        code: .noSafeChart,
-                        defaultText: "No safe chart is available."))
-                return .unavailable(fallback)
-            }
-            guard let persistedID else {
-                return .defaulted(primary, reason: .noPersistedPreference)
-            }
-            guard persistedID.policyVersion == AutoTableCharts.recommendationPolicyVersion else {
-                return .defaulted(
-                    primary,
-                    reason: .policyVersionChanged(
-                        previous: persistedID.policyVersion,
-                        current: AutoTableCharts.recommendationPolicyVersion))
-            }
-            if let exact = recommendation(for: persistedID) {
-                return .exact(exact)
-            }
-            return .defaulted(primary, reason: .specificationUnavailable)
-        }
-    }
-
     /// Resolves the v3 preference independently from preparation strategy.
     public func resolve(
         _ preference: AutoChartPreference
@@ -433,7 +398,7 @@ public struct AutoChartAnalysis<RowID: Hashable & Sendable>: Sendable {
                 if let rebound = recommendation(for: currentID) {
                     return AutoChartPreferenceResolution(
                         recommendation: rebound,
-                        defaultReason: .policyVersionChanged(
+                        defaultReason: .policyVersionRebound(
                             previous: id.policyVersion,
                             current: AutoTableCharts.recommendationPolicyVersion),
                         replacementPreference: .chart(.specific(currentID)))
@@ -464,14 +429,16 @@ public struct AutoChartAnalysis<RowID: Hashable & Sendable>: Sendable {
             ?? highestRankedPreparedChart(in: preparedCharts)
         let presentedOutcome: AutoChartRecommendationOutcome
         if case .charts(let catalog) = outcome,
-            let resolved = resolution?.recommendation,
-            catalog.recommendation(for: resolved.id) == nil
+            let resolution
         {
+            let preferred = resolution.recommendation.flatMap { resolved in
+                catalog.containsCataloged(resolved.id) ? nil : resolved
+            }
             presentedOutcome = .charts(
                 AutoChartRecommendationCatalog(
                     featured: catalog.featured,
                     cataloged: catalog.cataloged,
-                    preferred: resolved))
+                    preferred: preferred))
         } else {
             presentedOutcome = outcome
         }
@@ -640,11 +607,15 @@ private struct AutoChartCachedAnalysis<RowID: Hashable & Sendable>: Sendable {
     let diagnostics: [AutoChartDiagnostic]
     let trace: AutoChartDecisionTrace?
     let recommendations: [AutoChartRecommendation]
+    let recommendationIndexByID: [AutoChartRecommendationID: Int]
     let validatedRecommendationIDs: Set<AutoChartRecommendationID>
 
-    var estimatedRetainedCost: Int {
-        source.cost + 256 + recommendations.count * 512 + profiles.count * 32
+    var exclusiveRetainedCost: Int {
+        256 + recommendations.count * 512 + profiles.count * 32
+            + recommendationIndexByID.count * 24
     }
+
+    var estimatedRetainedCost: Int { source.cost + exclusiveRetainedCost }
 }
 
 #if ATC_TEST_HOOKS
@@ -1022,7 +993,7 @@ public actor AutoChartAnalyzer {
             if case .charts(let catalog) = base.outcome {
                 recommendations = catalog.cataloged
                     + (resolution.recommendation.map { recommendation in
-                        catalog.cataloged.contains { $0.id == recommendation.id }
+                        catalog.recommendation(for: recommendation.id) != nil
                             ? [] : [recommendation]
                     } ?? [])
             } else {
@@ -1394,6 +1365,12 @@ public actor AutoChartAnalyzer {
                 },
                 candidates: set.decisions)
             : nil
+        var recommendationIndexByID: [AutoChartRecommendationID: Int] = [:]
+        recommendationIndexByID.reserveCapacity(set.candidates.count)
+        for (offset, recommendation) in set.candidates.enumerated()
+        where recommendationIndexByID[recommendation.id] == nil {
+            recommendationIndexByID[recommendation.id] = offset
+        }
         let cached = AutoChartCachedAnalysis(
             id: AutoChartAnalysisID(),
             request: requestID(for: analysisKey),
@@ -1403,6 +1380,7 @@ public actor AutoChartAnalyzer {
             diagnostics: diagnostics,
             trace: trace,
             recommendations: set.candidates,
+            recommendationIndexByID: recommendationIndexByID,
             validatedRecommendationIDs: Set(recommendations.map(\.id)))
         await insertAnalysisIfCurrent(
             cached,
@@ -1998,6 +1976,7 @@ public actor AutoChartAnalyzer {
                 analyzer: self,
                 source: cached.source,
                 recommendations: cached.recommendations,
+                recommendationIndexByID: cached.recommendationIndexByID,
                 validatedRecommendationIDs: cached.validatedRecommendationIDs))
     }
 
@@ -2025,8 +2004,7 @@ public actor AutoChartAnalyzer {
         _ analysis: AutoChartCachedAnalysis<RowID>,
         for key: AnalysisKey
     ) {
-        let cost = 256 + analysis.recommendations.count * 512
-            + analysis.profiles.count * 32
+        let cost = analysis.exclusiveRetainedCost
         // Admitting an entry that cannot coexist with its shared source would
         // make the cost trim evict every other resident entry before finally
         // evicting this one, draining the cache on every oversized analysis.

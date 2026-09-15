@@ -44,34 +44,88 @@ struct AutoChartAudioGraphDescriptor: @unchecked Sendable {
 
 }
 
-final class AutoChartAudioGraphDescriptorCache: @unchecked Sendable {
+/// Callback-free evidence computed once with the presentation payload.
+struct AutoChartAudioGraphAvailability: Sendable {
+    enum XAxis: Sendable {
+        case categorical
+        case numeric
+        case temporal
+    }
+
+    let xAxis: XAxis
+}
+
+/// Memoizes the value descriptor for one presentation at a time.
+private final class AutoChartAudioGraphDescriptorMemo: @unchecked Sendable {
     private let lock = NSLock()
-    private var descriptor: AutoChartAudioGraphDescriptor?
+    private var cached: (AutoChartPresentationRequestID, AutoChartAudioGraphDescriptor)?
 
     func value(
+        for requestID: AutoChartPresentationRequestID,
         building: () -> AutoChartAudioGraphDescriptor
     ) -> AutoChartAudioGraphDescriptor {
-        if let cached = lock.withLock({ descriptor }) { return cached }
-
-        // Host callbacks may re-enter presentation code, so never invoke the
-        // builder while holding the cache lock.
+        if let value = lock.withLock({ cached?.0 == requestID ? cached?.1 : nil }) {
+            return value
+        }
+        // Host callbacks can re-enter presentation; never build under the lock.
         let proposed = building()
         return lock.withLock {
-            if let descriptor { return descriptor }
-            descriptor = proposed
+            if let cached, cached.0 == requestID { return cached.1 }
+            cached = (requestID, proposed)
             return proposed
         }
     }
 }
 
-/// Defers the comparatively expensive value formatting and descriptor assembly
-/// until Accessibility asks SwiftUI for an Audio Graph.
+#if canImport(SwiftUI) && canImport(Accessibility)
+/// Tracks framework-owned AX objects already updated for the current request.
+/// Weak storage keeps neither the descriptor nor a companion value alive.
+private final class AutoChartAudioGraphApplicationTracker: @unchecked Sendable {
+    private let lock = NSLock()
+    private var requestID: AutoChartPresentationRequestID?
+    private let applied = NSHashTable<AXChartDescriptor>.weakObjects()
+
+    func isApplied(_ requestID: AutoChartPresentationRequestID, to target: AXChartDescriptor) -> Bool {
+        lock.withLock { self.requestID == requestID && applied.contains(target) }
+    }
+
+    func record(_ requestID: AutoChartPresentationRequestID, for target: AXChartDescriptor) {
+        lock.withLock {
+            if self.requestID != requestID {
+                self.requestID = requestID
+                applied.removeAllObjects()
+            }
+            applied.add(target)
+        }
+    }
+}
+#endif
+
+/// View-lifetime Audio Graph state, never retained by a presenter payload.
+final class AutoChartAudioGraphViewCache: @unchecked Sendable {
+    fileprivate let descriptors = AutoChartAudioGraphDescriptorMemo()
+    #if canImport(SwiftUI) && canImport(Accessibility)
+    fileprivate let applications = AutoChartAudioGraphApplicationTracker()
+    #endif
+}
+
+#if canImport(Combine)
+import Combine
+extension AutoChartAudioGraphViewCache: ObservableObject {}
+#endif
+
+/// Value formatting stays lazy until Accessibility requests the descriptor.
 struct AutoChartLazyAudioGraphDescriptor: Sendable {
+    let requestID: AutoChartPresentationRequestID
+    let cache: AutoChartAudioGraphViewCache?
     let build: @Sendable () -> AutoChartAudioGraphDescriptor
-    private let cache = AutoChartAudioGraphDescriptorCache()
+
+    func cached(in cache: AutoChartAudioGraphViewCache) -> Self {
+        Self(requestID: requestID, cache: cache, build: build)
+    }
 
     func descriptor() -> AutoChartAudioGraphDescriptor {
-        cache.value(building: build)
+        cache?.descriptors.value(for: requestID, building: build) ?? build()
     }
 }
 
@@ -103,20 +157,20 @@ private func nondegenerateAudioGraphRange(
     let padding = max(abs(value) * 0.05, 1)
     let lower = max(value - padding, -greatest)
     let upper = min(value + padding, greatest)
-    if lower < upper { return lower...upper }
-
-    if value > 0 {
-        return value.nextDown...value
-    } else if value < 0 {
-        return value...value.nextUp
-    } else {
-        return -1...1
-    }
+    return lower...upper
 }
 
 private func audioGraphRange(_ values: [Double]) -> ClosedRange<Double>? {
     guard let minimum = values.min(), let maximum = values.max() else { return nil }
     return nondegenerateAudioGraphRange(minimum...maximum)
+}
+
+private func audioGraphBounds(
+    including value: Double,
+    in bounds: ClosedRange<Double>?
+) -> ClosedRange<Double> {
+    guard let bounds else { return value...value }
+    return min(bounds.lowerBound, value)...max(bounds.upperBound, value)
 }
 
 private func audioGraphMidpoint(_ lower: Double, _ upper: Double) -> Double {
@@ -166,16 +220,15 @@ private func autoChartAudioGraphXAxisKind<RowID: Hashable & Sendable>(
     }
 }
 
-func hasUsableAutoChartAudioGraphData<RowID: Hashable & Sendable>(
+func makeAutoChartAudioGraphAvailability<RowID: Hashable & Sendable>(
     preparedChart: AutoChartPreparedChart<RowID>,
     renderedData: [AutoChartDatum]
-) -> Bool {
+) -> AutoChartAudioGraphAvailability? {
     let specification = preparedChart.recommendation.specification
-    guard ![.kpi, .range].contains(specification.family) else { return false }
+    guard ![.kpi, .range].contains(specification.family) else { return nil }
     let xKind = autoChartAudioGraphXAxisKind(
-        preparedChart: preparedChart,
-        specification: specification)
-    return renderedData.contains { datum in
+        preparedChart: preparedChart, specification: specification)
+    let hasUsableData = renderedData.contains { datum in
         guard audioGraphYValue(datum) != nil else { return false }
         switch xKind {
         case .categorical:
@@ -184,6 +237,17 @@ func hasUsableAutoChartAudioGraphData<RowID: Hashable & Sendable>(
             return audioGraphNumericXValue(datum, kind: xKind) != nil
         }
     }
+    guard hasUsableData else { return nil }
+    let xAxis: AutoChartAudioGraphAvailability.XAxis
+    switch xKind {
+    case .categorical:
+        xAxis = .categorical
+    case .numeric:
+        xAxis = .numeric
+    case .temporal:
+        xAxis = .temporal
+    }
+    return AutoChartAudioGraphAvailability(xAxis: xAxis)
 }
 
 func makeAutoChartAudioGraphDescriptor<RowID: Hashable & Sendable>(
@@ -192,17 +256,14 @@ func makeAutoChartAudioGraphDescriptor<RowID: Hashable & Sendable>(
     resolved: AutoChartResolvedPresentation,
     displayTitle: String,
     formatters: AutoChartFormatters,
-    textResolver: AutoChartTextResolver
-) -> AutoChartAudioGraphDescriptor? {
+    textResolver: AutoChartTextResolver,
+    availability: AutoChartAudioGraphAvailability
+) -> AutoChartAudioGraphDescriptor {
     let specification = preparedChart.recommendation.specification
     let core = preparedChart.core
     let profiles = core.table.profiles
     let presentation = core.presentation
     let measureSemantics = core.measureSemantics
-    guard ![.kpi, .range].contains(specification.family) else { return nil }
-    let xKind = autoChartAudioGraphXAxisKind(
-        preparedChart: preparedChart,
-        specification: specification)
 
     func column(_ id: AutoChartColumnID?) -> AutoChartColumn? {
         id.flatMap { profiles[$0]?.column }
@@ -303,21 +364,23 @@ func makeAutoChartAudioGraphDescriptor<RowID: Hashable & Sendable>(
     var seriesOrder: [AutoChartAudioGraphSeriesKey] = []
     var categoryOrder: [String] = []
     var seenCategories: Set<String> = []
-    var xNumbers: [Double] = []
-    var yNumbers: [Double] = []
+    var xBounds: ClosedRange<Double>?
+    var yBounds: ClosedRange<Double>?
     var additionalNumbers: [Double] = []
     var everyPointHasFiniteSize = specification.encoding.size != nil
 
     for datum in renderedData {
         guard let y = audioGraphYValue(datum) else { continue }
         let x: AutoChartAudioGraphDescriptor.XValue
-        switch xKind {
-        case .numeric, .temporal:
-            guard let value = audioGraphNumericXValue(datum, kind: xKind) else {
-                continue
-            }
+        switch availability.xAxis {
+        case .numeric:
+            guard let value = audioGraphNumericXValue(datum, kind: .numeric) else { continue }
             x = .number(value)
-            xNumbers.append(value)
+            xBounds = audioGraphBounds(including: value, in: xBounds)
+        case .temporal:
+            guard let value = audioGraphNumericXValue(datum, kind: .temporal) else { continue }
+            x = .number(value)
+            xBounds = audioGraphBounds(including: value, in: xBounds)
         case .categorical:
             let value = xCategory(datum)
             x = .category(value)
@@ -343,16 +406,20 @@ func makeAutoChartAudioGraphDescriptor<RowID: Hashable & Sendable>(
         }
         pointsBySeries[key, default: []].append(
             .init(x: x, y: y, label: label, additionalValue: additional))
-        yNumbers.append(y)
+        yBounds = audioGraphBounds(including: y, in: yBounds)
         if let additional { additionalNumbers.append(additional) }
     }
 
-    guard let fallbackYRange = audioGraphRange(yNumbers) else { return nil }
+    guard let fallbackYRange = yBounds.map(nondegenerateAudioGraphRange) else {
+        preconditionFailure("Audio Graph availability changed for immutable chart data.")
+    }
 
     let xAxis: AutoChartAudioGraphDescriptor.XAxis
-    switch xKind {
+    switch availability.xAxis {
     case .temporal:
-        guard let fallbackRange = audioGraphRange(xNumbers) else { return nil }
+        guard let fallbackRange = xBounds.map(nondegenerateAudioGraphRange) else {
+            preconditionFailure("Temporal Audio Graph data requires a finite x value.")
+        }
         let xColumn = column(specification.encoding.x)
         xAxis = .numeric(
             title: resolved.x,
@@ -368,7 +435,9 @@ func makeAutoChartAudioGraphDescriptor<RowID: Hashable & Sendable>(
                     context: .markAccessibility)
             })
     case .numeric:
-        guard let fallbackRange = audioGraphRange(xNumbers) else { return nil }
+        guard let fallbackRange = xBounds.map(nondegenerateAudioGraphRange) else {
+            preconditionFailure("Numeric Audio Graph data requires a finite x value.")
+        }
         let xColumn = column(specification.encoding.x)
         xAxis = .numeric(
             title: resolved.x,
@@ -428,24 +497,23 @@ import SwiftUI
 
 extension AutoChartLazyAudioGraphDescriptor: AXChartDescriptorRepresentable {
     func makeChartDescriptor() -> AXChartDescriptor {
-        descriptor().makeChartDescriptor()
+        let target = descriptor().makeChartDescriptor()
+        cache?.applications.record(requestID, for: target)
+        return target
     }
 
     func updateChartDescriptor(_ chartDescriptor: AXChartDescriptor) {
-        let replacement = descriptor().makeChartDescriptor()
-        chartDescriptor.title = replacement.title
-        chartDescriptor.attributedTitle = replacement.attributedTitle
-        chartDescriptor.summary = replacement.summary
-        chartDescriptor.contentDirection = replacement.contentDirection
-        chartDescriptor.xAxis = replacement.xAxis
-        chartDescriptor.yAxis = replacement.yAxis
-        chartDescriptor.additionalAxes = replacement.additionalAxes
-        chartDescriptor.series = replacement.series
+        guard cache?.applications.isApplied(requestID, to: chartDescriptor) != true else { return }
+        descriptor().updateChartDescriptor(chartDescriptor)
+        cache?.applications.record(requestID, for: chartDescriptor)
     }
 }
 
 extension AutoChartAudioGraphDescriptor: AXChartDescriptorRepresentable {
-    func makeChartDescriptor() -> AXChartDescriptor {
+    private func axesAndSeries() -> (
+        x: any AXDataAxisDescriptor, y: AXNumericDataAxisDescriptor,
+        additional: [any AXDataAxisDescriptor], series: [AXDataSeriesDescriptor]
+    ) {
         let xDescriptor: any AXDataAxisDescriptor = switch xAxis {
         case .categorical(let title, let order):
             AXCategoricalDataAxisDescriptor(title: title, categoryOrder: order)
@@ -495,13 +563,26 @@ extension AutoChartAudioGraphDescriptor: AXChartDescriptorRepresentable {
                     }
                 })
         }
+        return (xDescriptor, yDescriptor, additionalDescriptors, seriesDescriptors)
+    }
+
+    func makeChartDescriptor() -> AXChartDescriptor {
+        let parts = axesAndSeries()
         return AXChartDescriptor(
-            title: title,
-            summary: nil,
-            xAxis: xDescriptor,
-            yAxis: yDescriptor,
-            additionalAxes: additionalDescriptors,
-            series: seriesDescriptors)
+            title: title, summary: nil, xAxis: parts.x, yAxis: parts.y,
+            additionalAxes: parts.additional, series: parts.series)
+    }
+
+    func updateChartDescriptor(_ target: AXChartDescriptor) {
+        let parts = axesAndSeries()
+        target.attributedTitle = nil
+        target.title = title
+        target.summary = nil
+        target.contentDirection = .leftToRight
+        target.xAxis = parts.x
+        target.yAxis = parts.y
+        target.additionalAxes = parts.additional
+        target.series = parts.series
     }
 
     private func numericAxis(
