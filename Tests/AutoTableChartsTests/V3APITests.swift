@@ -2883,13 +2883,30 @@ private final class ProgressRecorder: @unchecked Sendable {
         let alternative = try #require(catalog.cataloged.dropFirst().first)
         #expect(initial.preparedCharts.count == catalog.cataloged.count)
 
-        session.setPreference(.chart(.specific(alternative.id)))
+        #expect(session.setPreference(.chart(.specific(alternative.id))))
         _ = try await readyPresentation(from: session) {
             $0.preparedChart.recommendation.id == alternative.id
         }
         let updated = try await readyAnalysis(from: session)
         #expect(updated.primaryChart?.recommendation.id == alternative.id)
         #expect(updated.preparedCharts.count == catalog.cataloged.count)
+    }
+
+    @Test func unloadedPreferenceChangeDoesNotRestart() {
+        let session = AutoChartSession<Int>(cache: AutoChartCache())
+        #expect(!session.setPreference(.table))
+        #expect(session.preference == .table)
+    }
+
+    @Test func pendingPresentationSamePreferenceDoesNotRestart() async throws {
+        let session = AutoChartSession<Int>(cache: AutoChartCache())
+        let request = try AutoChartRequest(table: domainDataset())
+        session.load(request)
+        _ = try await readyPresentation(from: session) { _ in true }
+        session.setPresentationContext(.init(identity: "new-presentation"))
+        #expect(session.isPresentationPending)
+        #expect(!session.setPreference(session.preference))
+        #expect(session.isPresentationPending)
     }
 
     @Test func sameChartPolicyRebindKeepsReadyPresentationAndSelection() async throws {
@@ -2906,7 +2923,7 @@ private final class ProgressRecorder: @unchecked Sendable {
         session.selection = presented.preparedChart.selections(for: [10], analysisID: ready.id)
         #expect(!session.selection.isEmpty)
 
-        session.setPreference(.chart(.specific(selected.id)))
+        #expect(!session.setPreference(.chart(.specific(selected.id))))
         guard case .ready(let updated, let unchanged?) = session.state else {
             Issue.record("A policy-only rebind must remain ready synchronously.")
             return
@@ -3178,13 +3195,13 @@ private final class ProgressRecorder: @unchecked Sendable {
         session.selection = originalChart.selections(for: [10], analysisID: ready.id)
         #expect(!session.selection.isEmpty)
 
-        session.setPreference(.table)
+        #expect(session.setPreference(.table))
         let fallback = try await fallbackAnalysis(from: session)
         #expect(fallback.id == ready.id)
         #expect(fallback.primaryChart == nil)
         #expect(session.selection.isEmpty)
 
-        session.setPreference(.chart(.recommended))
+        #expect(session.setPreference(.chart(.recommended)))
         let restored = try await readyAnalysis(from: session)
         #expect(restored.id == ready.id)
         #expect(restored.primaryChart?.id == chartID)

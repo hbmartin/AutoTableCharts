@@ -108,10 +108,13 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
     }
 
     /// Reconciles a new preference against the current analysis and prepared-chart cache.
-    public func setPreference(_ preference: AutoChartPreference) {
+    /// Returns true only when this change starts a new session pass. A matching
+    /// ready chart is updated in place, and an unloaded session has no pass to restart.
+    @discardableResult
+    public func setPreference(_ preference: AutoChartPreference) -> Bool {
         guard let request else {
             self.preference = preference
-            return
+            return false
         }
         if case .ready(let displayedAnalysis, let presented?) = state,
             let base: AutoChartAnalysis<RowID> = cache.completedAnalysis(
@@ -144,7 +147,7 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
                         preparedCharts: displayedAnalysis.preparedCharts,
                         resolution: resolution),
                     presented)
-                return
+                return false
             }
         }
         start(
@@ -154,6 +157,7 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
             presentationConfiguration: presentationConfiguration,
             clearsVisibleState: false,
             keepsVisibleReadyChart: true)
+        return true
     }
 
     /// Schedules presentation rebuilding for the current prepared chart without
