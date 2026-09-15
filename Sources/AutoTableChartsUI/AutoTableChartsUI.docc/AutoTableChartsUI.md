@@ -32,6 +32,7 @@ AutoChartSessionView(session: session)
 - ``AutoChartView``
 - ``AutoChartPlot``
 - ``AutoChartPresentation``
+- ``AutoChartOverridePresentationMode``
 - <doc:RenderingAndInteraction>
 
 ### Environment

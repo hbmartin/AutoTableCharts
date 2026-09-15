@@ -127,11 +127,12 @@ enum AutoChartProgressTextResolution {
 
     static func resolve(
         _ message: AutoChartMessage,
-        using resolver: AutoChartTextResolver
+        using resolver: AutoChartTextResolver,
+        on queue: DispatchQueue? = nil
     ) async -> String? {
         guard resolver.callbackIdentity != nil else { return message.defaultText }
         do {
-            return try await AutoChartCancellableWork.run(on: queue) { cancellation in
+            return try await AutoChartCancellableWork.run(on: queue ?? self.queue) { cancellation in
                 try cancellation.checkCancellation()
                 return resolver(message)
             }
@@ -147,6 +148,7 @@ enum AutoChartProgressTextResolution {
 struct AutoChartAccessibleProgressView: View {
     let message: AutoChartMessage
     let textResolver: AutoChartTextResolver?
+    let resolutionQueue: DispatchQueue?
 
     @Environment(\.autoChartTextResolver) private var environmentTextResolver
     @State private var accessibilityText: String
@@ -158,10 +160,12 @@ struct AutoChartAccessibleProgressView: View {
 
     init(
         message: AutoChartMessage,
-        textResolver: AutoChartTextResolver? = nil
+        textResolver: AutoChartTextResolver? = nil,
+        resolutionQueue: DispatchQueue? = nil
     ) {
         self.message = message
         self.textResolver = textResolver
+        self.resolutionQueue = resolutionQueue
         _accessibilityText = State(initialValue: message.defaultText)
     }
 
@@ -179,7 +183,8 @@ struct AutoChartAccessibleProgressView: View {
                 guard let resolver else { return }
                 let resolved = await AutoChartProgressTextResolution.resolve(
                     message,
-                    using: resolver)
+                    using: resolver,
+                    on: resolutionQueue)
                 guard let resolved, !Task.isCancelled else { return }
                 if accessibilityText != resolved {
                     accessibilityText = resolved

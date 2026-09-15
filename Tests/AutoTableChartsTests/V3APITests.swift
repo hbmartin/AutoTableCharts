@@ -247,7 +247,9 @@ import Accessibility
         #expect(AutoChartPresenter().present(range).makeLazyAudioGraphDescriptor() == nil)
     }
 
-    @Test func viewOverridesRepresentTheCompletePresentationPayload() async throws {
+    @Test(.disabled(if: !testHooksAvailable, testHooksUnavailable))
+    func viewOverridesRepresentTheCompletePresentationPayload() async throws {
+        #if ATC_TEST_HOOKS
         let category = AutoChartColumn(
             id: "category", name: "Category",
             semantics: .dimension(semanticType: .nominal))
@@ -291,22 +293,26 @@ import Accessibility
             return "US: \(message.defaultText)"
         }
 
-        await MainActor.run {
-            _ = AutoChartView(
+        let american = try await MainActor.run {
+            let view = AutoChartView(
                 presentedChart: swedish,
                 analysisID: analysis.id,
                 formatters: americanFormatters,
                 textResolver: americanResolver)
-            #expect(resolverCalls.value == 0)
-            #expect(formatterCalls.value == 0)
+            #expect(resolverCalls.value > 0)
+            #expect(formatterCalls.value > 0)
+            #expect(callbackThreads.result.allMainThread)
+            return try #require(view.presentedChartForTesting)
         }
-        let american = try await presenter.presentCancellable(
-            chart,
-            formatters: americanFormatters,
-            textResolver: americanResolver)
-        #expect(resolverCalls.value > 0)
-        #expect(formatterCalls.value > 0)
-        #expect(!callbackThreads.result.observedMainThread)
+        let afterFirstOverride = resolverCalls.value
+        let formatterCallsAfterFirstOverride = formatterCalls.value
+        await MainActor.run {
+            _ = AutoChartView(
+                presentedChart: swedish, analysisID: analysis.id,
+                formatters: americanFormatters, textResolver: americanResolver)
+        }
+        #expect(resolverCalls.value > afterFirstOverride)
+        #expect(formatterCalls.value > formatterCallsAfterFirstOverride)
 
         #expect(swedish.sharedXCategoryDomain == ["z", "ä"])
         #expect(american.sharedXCategoryDomain == ["ä", "z"])
@@ -344,6 +350,8 @@ import Accessibility
         #expect(
             existingAXDescriptor.series.flatMap(\.dataPoints).map(\.label)
                 == descriptor.series.flatMap(\.points).map(\.label))
+        withExtendedLifetime(presenter) {}
+        #endif
     }
 
     @Test func singletonExtremeAudioGraphRangesRemainFiniteAndOrdered() async throws {
@@ -599,16 +607,18 @@ private final class V3ThreadRecorder: @unchecked Sendable {
     private let lock = NSLock()
     private var callbackCount = 0
     private var observedMainThread = false
+    private var allMainThread = true
 
     func recordCurrentThread() {
         lock.withLock {
             callbackCount += 1
             observedMainThread = observedMainThread || Thread.isMainThread
+            allMainThread = allMainThread && Thread.isMainThread
         }
     }
 
-    var result: (count: Int, observedMainThread: Bool) {
-        lock.withLock { (callbackCount, observedMainThread) }
+    var result: (count: Int, observedMainThread: Bool, allMainThread: Bool) {
+        lock.withLock { (callbackCount, observedMainThread, allMainThread) }
     }
 }
 
@@ -2118,6 +2128,11 @@ private final class ProgressRecorder: @unchecked Sendable {
         let valueFormatterB = AutoChartFormatters(
             cacheIdentity: "value-format-v1", value: { _, _, _, _, _ in nil })
         #expect(valueFormatterA.callbackIdentity == valueFormatterB.callbackIdentity)
+
+        let noValueOverride = AutoChartFormatters(value: nil)
+        let generatedValueOverride = AutoChartFormatters(value: { _, _, _, _, _ in nil })
+        #expect(noValueOverride.callbackIdentity == nil)
+        #expect(generatedValueOverride.callbackIdentity != nil)
     }
 
     @Test func presentationContextPreservesAutoupdatingFoundationValues() throws {

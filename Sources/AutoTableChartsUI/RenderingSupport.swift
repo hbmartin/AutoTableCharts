@@ -1,5 +1,8 @@
 #if ATC_TEST_HOOKS && canImport(SwiftUI) && canImport(Charts)
 import SwiftUI
+#if canImport(Accessibility)
+import Accessibility
+#endif
 
 struct AutoChartViewTestHookState {
     let requestID: AutoChartPresentationRequestID
@@ -8,11 +11,24 @@ struct AutoChartViewTestHookState {
     let selectionCount: Int
     let selectedCategory: String?
     let selectedAngle: Double?
+    let displayTitle: String
+    let renderedXLabels: [String]
+    let facetDisplayValues: [String]
+    let sharedXCategoryDomain: [String]
+    let kpiValueText: String?
+    let kpiTitle: String?
+    let kpiAccessibilityText: String?
 }
 
 @MainActor
 final class AutoChartViewTestHooks {
     var observe: (AutoChartViewTestHookState) -> Void = { _ in }
+    var didPublishDeferredPresentation: (AutoChartPresentationRequestID) -> Void = { _ in }
+    #if canImport(Accessibility)
+    var observeAudioGraph: (
+        AutoChartAudioGraphViewCache, AutoChartLazyAudioGraphDescriptor
+    ) -> Void = { _, _ in }
+    #endif
 }
 
 private struct AutoChartViewTestHooksKey: EnvironmentKey {
@@ -23,6 +39,17 @@ extension EnvironmentValues {
     var autoChartViewTestHooks: AutoChartViewTestHooks? {
         get { self[AutoChartViewTestHooksKey.self] }
         set { self[AutoChartViewTestHooksKey.self] = newValue }
+    }
+}
+
+private struct AutoChartViewTestRevisionKey: EnvironmentKey {
+    static let defaultValue = 0
+}
+
+extension EnvironmentValues {
+    var autoChartViewTestRevision: Int {
+        get { self[AutoChartViewTestRevisionKey.self] }
+        set { self[AutoChartViewTestRevisionKey.self] = newValue }
     }
 }
 #endif
