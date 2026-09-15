@@ -212,30 +212,24 @@ public struct AutoChartPresentationContext: Hashable, Codable, Sendable {
 /// A stable snapshot of Foundation values and the effective identifiers they
 /// exposed when presentation work was requested.
 struct AutoChartFoundationPresentationIdentity: Hashable, Sendable {
-    let fixedLocale: Locale?
+    let resolvedLocale: Locale
     let localeIdentifier: String
     let usesAutoupdatingLocale: Bool
-    let fixedTimeZone: TimeZone?
+    let resolvedTimeZone: TimeZone
     let timeZoneIdentifier: String
     let usesAutoupdatingTimeZone: Bool
 
     init(locale: Locale, timeZone: TimeZone) {
         let usesAutoupdatingLocale = locale == .autoupdatingCurrent
         let usesAutoupdatingTimeZone = timeZone == .autoupdatingCurrent
-        self.fixedLocale = usesAutoupdatingLocale ? nil : locale
-        self.localeIdentifier = locale.identifier
+        let resolvedLocale = usesAutoupdatingLocale ? Locale.current : locale
+        let resolvedTimeZone = usesAutoupdatingTimeZone ? TimeZone.current : timeZone
+        self.resolvedLocale = resolvedLocale
+        self.localeIdentifier = resolvedLocale.identifier
         self.usesAutoupdatingLocale = usesAutoupdatingLocale
-        self.fixedTimeZone = usesAutoupdatingTimeZone ? nil : timeZone
-        self.timeZoneIdentifier = timeZone.identifier
+        self.resolvedTimeZone = resolvedTimeZone
+        self.timeZoneIdentifier = resolvedTimeZone.identifier
         self.usesAutoupdatingTimeZone = usesAutoupdatingTimeZone
-    }
-
-    var resolvedLocale: Locale {
-        fixedLocale ?? Locale(identifier: localeIdentifier)
-    }
-
-    var resolvedTimeZone: TimeZone {
-        fixedTimeZone ?? TimeZone(identifier: timeZoneIdentifier) ?? .gmt
     }
 }
 
@@ -265,35 +259,6 @@ struct AutoChartPresentationRequestID: Hashable, Sendable {
     let formatterFoundation: AutoChartFoundationPresentationIdentity
     let formatterCallback: AutoChartHostCallbackCacheIdentity?
     let resolverCallback: AutoChartHostCallbackCacheIdentity?
-
-    init(
-        preparedChart: AutoChartPreparedChartID,
-        context: AutoChartPresentationContext,
-        formatters: AutoChartFormatters,
-        textResolver: AutoChartTextResolver
-    ) {
-        self.preparedChart = preparedChart
-        self.context = AutoChartPresentationContextIdentity(context)
-        self.formatterFoundation = AutoChartFoundationPresentationIdentity(
-            locale: formatters.locale,
-            timeZone: formatters.timeZone)
-        self.formatterCallback = formatters.callbackIdentity
-        self.resolverCallback = textResolver.callbackIdentity
-    }
-
-    init(
-        preparedChart: AutoChartPreparedChartID,
-        context: AutoChartPresentationContextIdentity,
-        formatterFoundation: AutoChartFoundationPresentationIdentity,
-        formatterCallback: AutoChartHostCallbackCacheIdentity?,
-        resolverCallback: AutoChartHostCallbackCacheIdentity?
-    ) {
-        self.preparedChart = preparedChart
-        self.context = context
-        self.formatterFoundation = formatterFoundation
-        self.formatterCallback = formatterCallback
-        self.resolverCallback = resolverCallback
-    }
 }
 
 /// One immutable sampling of every input used to build and identify a payload.
@@ -512,13 +477,11 @@ public struct AutoChartPresentedChart<RowID: Hashable & Sendable>: Sendable {
     }
 
     func rePresentCancellable(
-        request: AutoChartPresentationRequest,
-        queue: DispatchQueue? = nil
+        request: AutoChartPresentationRequest
     ) async throws -> AutoChartPresentedChart<RowID> {
         try await originatingPresenter.active.presentCancellable(
             preparedChart,
-            request: request,
-            queue: queue)
+            request: request)
     }
 }
 
@@ -558,24 +521,30 @@ final class AutoChartPresenterReference: @unchecked Sendable {
 public final class AutoChartPresenter: @unchecked Sendable {
     private let lock = NSLock()
     private let maximumEntries: Int
-    private let releasedPresenterFallback: AutoChartPresenter?
+    #if ATC_TEST_HOOKS
+    private let releasedPresenterFallbackForTesting: AutoChartPresenter?
+    #endif
     private var entries: [AutoChartPresentationRequestID: AutoChartPresentationPayload] = [:]
     private var recency: [AutoChartPresentationRequestID] = []
 
     /// Creates a presenter with a bounded presentation memo.
     public init(maximumEntries: Int = 16) {
         self.maximumEntries = max(0, maximumEntries)
-        self.releasedPresenterFallback = nil
+        #if ATC_TEST_HOOKS
+        self.releasedPresenterFallbackForTesting = nil
+        #endif
     }
 
+    #if ATC_TEST_HOOKS
     /// Test-only construction keeps orphan fallback behavior off process-wide state.
     init(
         maximumEntries: Int = 16,
-        releasedPresenterFallback: AutoChartPresenter
+        releasedPresenterFallbackForTesting: AutoChartPresenter
     ) {
         self.maximumEntries = max(0, maximumEntries)
-        self.releasedPresenterFallback = releasedPresenterFallback
+        self.releasedPresenterFallbackForTesting = releasedPresenterFallbackForTesting
     }
+    #endif
 
     public func present<RowID: Hashable & Sendable>(
         _ chart: AutoChartPreparedChart<RowID>,
@@ -631,12 +600,10 @@ public final class AutoChartPresenter: @unchecked Sendable {
     func presentCancellable<RowID: Hashable & Sendable>(
         _ chart: AutoChartPreparedChart<RowID>,
         request: AutoChartPresentationRequest,
-        priority: TaskPriority = .userInitiated,
-        queue: DispatchQueue? = nil
+        priority: TaskPriority = .userInitiated
     ) async throws -> AutoChartPresentedChart<RowID> {
-        let workQueue = queue ?? DispatchQueue.global(qos: Self.qos(for: priority))
         return try await AutoChartCancellableWork.run(
-            on: workQueue
+            on: DispatchQueue.global(qos: Self.qos(for: priority))
         ) { cancellation in
             try self.present(
                 chart,
@@ -820,7 +787,13 @@ public final class AutoChartPresenter: @unchecked Sendable {
         payload: AutoChartPresentationPayload,
         request: AutoChartPresentationRequest
     ) -> AutoChartPresentedChart<RowID> {
-        AutoChartPresentedChart(
+        #if ATC_TEST_HOOKS
+        let releasedPresenterFallback = releasedPresenterFallbackForTesting
+            ?? autoChartConveniencePresenter
+        #else
+        let releasedPresenterFallback = autoChartConveniencePresenter
+        #endif
+        return AutoChartPresentedChart(
             preparedChart: chart,
             context: request.context,
             title: payload.title,
@@ -837,7 +810,7 @@ public final class AutoChartPresenter: @unchecked Sendable {
             audioGraphAvailability: payload.audioGraphAvailability,
             originatingPresenter: AutoChartPresenterReference(
                 self,
-                fallback: releasedPresenterFallback ?? autoChartConveniencePresenter),
+                fallback: releasedPresenterFallback),
             requestID: request.id)
     }
 }

@@ -19,8 +19,9 @@ identity when the behavior captured by an existing callback changes. A formatter
 or resolver callback receives a generated identity by default; use its
 `cacheIdentity` parameter to let equivalent wrappers constructed during repeated
 view evaluation share entries, and change that identity whenever captured behavior
-changes. Autoupdating locale and time-zone values are frozen once per request and
-the same snapshot supplies both its cache key and every formatted surface. A later
+changes. Autoupdating locale and time-zone values are frozen from `Locale.current`
+and `TimeZone.current` once per request, preserving user formatting preferences;
+the same snapshots supply both the cache key and every formatted surface. A later
 system setting change therefore creates a new request without allowing the old
 request to cache output under the new locale or time zone. The
 `AutoChartView` and `AutoChartPlot` convenience initializers accept
@@ -36,14 +37,21 @@ fallback, so clearing the convenience cache purges those fallback entries.
 mode run formatter and text-resolver callbacks synchronously on the caller's
 thread. `presentCancellable` and explicit
 ``AutoChartOverridePresentationMode/deferred`` presentation run callbacks off-main.
-Each deferred view serializes its presentation and progress-label callbacks.
+Progress-label resolution uses a separate concurrent execution lane. Superseded
+presentation generations may finish their synchronous host callbacks after newer
+work starts, but cancellation prevents their results from being cached or published.
+Callbacks supplied to deferred rendering must therefore honor their `@Sendable`
+contract and permit calls from overlapping generations.
 
 Deferred convenience views require a mounted SwiftUI lifecycle to run their
 presentation task. Synchronous renderers such as snapshot exporters should call
 ``AutoChartPresenter/present(_:context:formatters:textResolver:)`` first and pass
 the result to the presented-chart `AutoChartView` initializer. Overrides supplied
 to that initializer resolve synchronously by default, including uncached overrides
-when the presenter memo is disabled or has evicted the prior payload.
+when the presenter memo is disabled or has evicted the prior payload. Lifecycle-hosted
+views should pass `overridePresentationMode: .deferred`. Hoist formatter and resolver
+values across body evaluations, or give equivalent reconstructed callbacks a stable
+`cacheIdentity`, to avoid repeated synchronous cache misses.
 
 `AutoChartSelectionSet` is ordered and provenance-safe. A click replaces its
 selection; Command-click removes a matched group when all its marks are selected

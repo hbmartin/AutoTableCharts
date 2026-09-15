@@ -260,11 +260,16 @@ public struct AutoChartFormatters: Sendable {
         }
     }
 
-    /// Creates formatters with an optional compatibility value override.
-    /// Separately constructed callbacks receive distinct generated cache identities.
+    /// Creates formatters with an optional stable presentation-cache identity and
+    /// compatibility value override.
+    ///
+    /// Separately constructed callbacks receive distinct generated identities by
+    /// default. Supply the same `cacheIdentity` when declarative rendering rebuilds
+    /// an equivalent callback, and change it whenever captured behavior changes.
     public init(
         locale: Locale = .autoupdatingCurrent,
         timeZone: TimeZone = .autoupdatingCurrent,
+        cacheIdentity: String? = nil,
         value: ValueFormatter? = nil
     ) {
         self.locale = locale
@@ -278,33 +283,11 @@ public struct AutoChartFormatters: Sendable {
                     locale,
                     timeZone)
             }
-            hostOverride = AutoChartHostCallback(requestFormatter)
+            hostOverride = AutoChartHostCallback(
+                cacheIdentity: cacheIdentity, requestFormatter)
         } else {
             hostOverride = nil
         }
-    }
-
-    /// Creates formatters with a compatibility value override and a stable
-    /// presentation-cache identity. Reuse `cacheIdentity` only while the
-    /// callback's captured behavior remains equivalent.
-    public init(
-        locale: Locale = .autoupdatingCurrent,
-        timeZone: TimeZone = .autoupdatingCurrent,
-        cacheIdentity: String,
-        value: @escaping ValueFormatter
-    ) {
-        self.locale = locale
-        self.timeZone = timeZone
-        let requestFormatter: RequestFormatter = { request, locale, timeZone in
-            value(
-                Self.legacyColumn(for: request),
-                request.value,
-                request.context,
-                locale,
-                timeZone)
-        }
-        hostOverride = AutoChartHostCallback(
-            cacheIdentity: cacheIdentity, requestFormatter)
     }
 
     /// Creates formatters with an aggregation-aware host override and an optional

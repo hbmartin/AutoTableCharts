@@ -146,19 +146,15 @@ private enum AutoChartDeferredPresentationSource<RowID: Hashable & Sendable>: Se
         return immediate
     }
 
-    func present(
-        on queue: DispatchQueue
-    ) async throws -> AutoChartPresentedChart<RowID> {
+    func present() async throws -> AutoChartPresentedChart<RowID> {
         switch self {
         case .prepared(let chart, let request):
             return try await autoChartConveniencePresenter.presentCancellable(
                 chart,
-                request: request,
-                queue: queue)
+                request: request)
         case .presented(let source, _, let request):
             return try await source.rePresentCancellable(
-                request: request,
-                queue: queue)
+                request: request)
         }
     }
 }
@@ -207,33 +203,26 @@ struct AutoChartViewPresentationInputs {
     }
 }
 
-private final class AutoChartDeferredPresentationWorker: ObservableObject {
-    let queue = DispatchQueue(
-        label: "io.github.hbmartin.AutoTableCharts.DeferredPresentation",
-        qos: .userInitiated)
-}
-
-private enum AutoChartDeferredPresentationState<RowID: Hashable & Sendable> {
-    case empty
-    case presented(AutoChartPresentedChart<RowID>)
-}
-
 private struct AutoChartDeferredPresentationView<RowID: Hashable & Sendable>: View {
     let source: AutoChartDeferredPresentationSource<RowID>
     let analysisID: AutoChartAnalysisID
     let selection: Binding<AutoChartSelectionSet<RowID>>
     let presentation: AutoChartPresentation
-    @State private var state: AutoChartDeferredPresentationState<RowID> = .empty
-    @StateObject private var worker = AutoChartDeferredPresentationWorker()
+    @State private var presentedChart: AutoChartPresentedChart<RowID>?
     #if ATC_TEST_HOOKS
     @Environment(\.autoChartViewTestHooks) private var viewTestHooks
     #endif
 
     private var visiblePresentedChart: AutoChartPresentedChart<RowID>? {
-        if case .presented(let stored) = state,
-            stored.requestID.preparedChart == source.request.id.preparedChart
+        if let immediate = source.immediatePresentedChart,
+            immediate.requestID == source.request.id
         {
-            return stored
+            return immediate
+        }
+        if let presentedChart,
+            presentedChart.requestID.preparedChart == source.request.id.preparedChart
+        {
+            return presentedChart
         }
         return source.immediatePresentedChart
     }
@@ -253,8 +242,7 @@ private struct AutoChartDeferredPresentationView<RowID: Hashable & Sendable>: Vi
             } else {
                 AutoChartAccessibleProgressView(
                     message: AutoChartProgressAccessibility.preparing,
-                    textResolver: request.textResolver,
-                    resolutionQueue: worker.queue)
+                    textResolver: request.textResolver)
                     .frame(maxWidth: .infinity)
                     .frame(height: presentation.plotHeight)
             }
@@ -263,8 +251,7 @@ private struct AutoChartDeferredPresentationView<RowID: Hashable & Sendable>: Vi
             {
                 AutoChartAccessibleProgressView(
                     message: AutoChartProgressAccessibility.updating,
-                    textResolver: request.textResolver,
-                    resolutionQueue: worker.queue)
+                    textResolver: request.textResolver)
                     .controlSize(.small)
                     .padding(8)
             }
@@ -273,13 +260,16 @@ private struct AutoChartDeferredPresentationView<RowID: Hashable & Sendable>: Vi
             // Exact inputs need no publication. This avoids an otherwise
             // redundant body pass each time an exact cached view mounts.
             guard visible?.requestID != requestID else { return }
+            if presentedChart?.requestID.preparedChart != requestID.preparedChart {
+                presentedChart = nil
+            }
             do {
-                let presented = try await source.present(on: worker.queue)
+                let presented = try await source.present()
                 try Task.checkCancellation()
                 #if ATC_TEST_HOOKS
                 viewTestHooks?.didPublishDeferredPresentation(presented.requestID)
                 #endif
-                state = .presented(presented)
+                presentedChart = presented
             } catch is CancellationError {
                 return
             } catch {
@@ -329,7 +319,7 @@ private struct AutoChartAccessibleChart<Content: View>: View {
     @StateObject private var cache = AutoChartAudioGraphViewCache()
     #if ATC_TEST_HOOKS
     @Environment(\.autoChartViewTestHooks) private var viewTestHooks
-    @Environment(\.autoChartViewTestRevision) private var viewTestRevision
+    @Environment(\.autoChartViewRevisionForTesting) private var viewRevisionForTesting
     #endif
 
     var body: some View {
@@ -343,7 +333,7 @@ private struct AutoChartAccessibleChart<Content: View>: View {
                     .onChange(of: descriptor.requestID) { _, _ in
                         reportAudioGraphForTesting(cachedDescriptor)
                     }
-                    .onChange(of: viewTestRevision) { _, _ in
+                    .onChange(of: viewRevisionForTesting) { _, _ in
                         reportAudioGraphForTesting(cachedDescriptor)
                     }
             }
@@ -426,7 +416,8 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
 
     /// Defers presentation until the view participates in a SwiftUI lifecycle.
     /// For synchronous renderers, resolve the chart with ``AutoChartPresenter``
-    /// and use ``init(presentedChart:analysisID:selection:presentation:formatters:textResolver:)``.
+    /// and use
+    /// ``init(presentedChart:analysisID:selection:presentation:formatters:textResolver:overridePresentationMode:)``.
     public init(
         preparedChart: AutoChartPreparedChart<RowID>,
         analysisID: AutoChartAnalysisID,
@@ -493,51 +484,56 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             ? presentedChart
             : presentedChart.cachedRePresentation(
                 request: request)
-        #if ATC_TEST_HOOKS
-        presentedChartForTesting = nil
-        #endif
         switch overridePresentationMode {
         case .immediate:
             let resolved = cached ?? presentedChart.rePresent(request: request)
-            content = .chart(resolved.preparedChart, resolved.resolvedPresentation)
-            displayTitle = resolved.title
-            renderedData = resolved.renderedData
-            facetPanels = resolved.facetPanels
-            sharedXCategoryDomain = resolved.sharedXCategoryDomain
-            presentedKPI = resolved.kpi
-            #if canImport(Accessibility)
-            presentedAudioGraphDescriptor = resolved.makeLazyAudioGraphDescriptor(cache: nil)
-            #else
-            presentedAudioGraphDescriptor = nil
-            #endif
-            presentationRequestID = resolved.requestID
-            self.formatters = resolved.resolvedFormatters
-            self.textResolver = resolved.textResolver
-            #if ATC_TEST_HOOKS
-            presentedChartForTesting = resolved
-            #endif
+            self.init(
+                resolvedPresentedChart: resolved,
+                analysisID: analysisID,
+                selection: selection,
+                presentation: presentation)
         case .deferred:
-            content = .deferredOverride(.presented(
-                source: presentedChart,
-                immediate: cached ?? presentedChart,
-                request: request))
-            displayTitle = ""
-            renderedData = []
-            facetPanels = []
-            sharedXCategoryDomain = []
-            presentedKPI = nil
-            presentedAudioGraphDescriptor = nil
-            presentationRequestID = nil
-            self.formatters = effectiveFormatters
-            self.textResolver = effectiveTextResolver
+            self.init(
+                deferredOverrideSource: .presented(
+                    source: presentedChart,
+                    immediate: cached ?? presentedChart,
+                    request: request),
+                analysisID: analysisID,
+                selection: selection,
+                presentation: presentation,
+                formatters: effectiveFormatters,
+                textResolver: effectiveTextResolver)
         }
+    }
+
+    private init(
+        deferredOverrideSource: AutoChartDeferredPresentationSource<RowID>,
+        analysisID: AutoChartAnalysisID,
+        selection: Binding<AutoChartSelectionSet<RowID>>,
+        presentation: AutoChartPresentation,
+        formatters: AutoChartFormatters,
+        textResolver: AutoChartTextResolver
+    ) {
+        #if ATC_TEST_HOOKS
+        presentedChartForTesting = nil
+        #endif
+        content = .deferredOverride(deferredOverrideSource)
+        displayTitle = ""
+        renderedData = []
+        facetPanels = []
+        sharedXCategoryDomain = []
+        presentedKPI = nil
+        presentedAudioGraphDescriptor = nil
+        presentationRequestID = nil
         self.analysisID = analysisID
         self._selection = selection
         self.presentation = presentation
+        self.formatters = formatters
+        self.textResolver = textResolver
     }
 
     /// Builds the already-resolved chart inside the stable presented-chart loader.
-    fileprivate init(
+    init(
         resolvedPresentedChart: AutoChartPresentedChart<RowID>,
         analysisID: AutoChartAnalysisID,
         selection: Binding<AutoChartSelectionSet<RowID>>,
@@ -718,12 +714,14 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
                 analysisID: analysisID,
                 selection: $selection,
                 presentation: presentation)
+                .id(preparedChart.id)
         case .deferredOverride(let source):
             AutoChartDeferredPresentationView(
                 source: source,
                 analysisID: analysisID,
                 selection: $selection,
                 presentation: presentation)
+                .id(source.preparedChart.id)
         case .fallback(let fallback):
             VStack(alignment: .leading, spacing: 10) {
                 ContentUnavailableView(
@@ -827,7 +825,10 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         .onChange(of: snapshotFingerprint) { _, _ in
             resetInteractionState()
         }
-        .onAppear { synchronizeInteractionState(from: selection) }
+        .onAppear {
+            clearSelectionOwnedByAnotherChart()
+            synchronizeInteractionState(from: selection)
+        }
         .onChange(of: presentationRequestID) { _, _ in
             synchronizeInteractionState(from: selection)
         }
@@ -2162,6 +2163,15 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     private func clearSelection() {
         synchronizeInteractionBindings(
             category: nil, date: nil, number: nil, angle: nil)
+        selection.removeAll()
+    }
+
+    /// Drops caller-owned interaction state that belongs to a replaced chart.
+    private func clearSelectionOwnedByAnotherChart() {
+        guard !selection.isEmpty,
+            selection.analysisID != analysisID
+                || selection.preparedChartID != preparedChart.id
+        else { return }
         selection.removeAll()
     }
 
