@@ -1,17 +1,18 @@
 #if ATC_TEST_HOOKS && canImport(SwiftUI) && canImport(Charts)
 import SwiftUI
 
-struct AutoChartViewTestState {
+struct AutoChartViewTestHookState {
     let requestID: AutoChartPresentationRequestID
     let zoomScale: Binding<Double>
     let zoomAnchor: Binding<Double>
     let selectionCount: Int
-    let audioGraph: AutoChartLazyAudioGraphDescriptor?
+    let selectedCategory: String?
+    let selectedAngle: Double?
 }
 
 @MainActor
 final class AutoChartViewTestHooks {
-    var observe: (AutoChartViewTestState) -> Void = { _ in }
+    var observe: (AutoChartViewTestHookState) -> Void = { _ in }
 }
 
 private struct AutoChartViewTestHooksKey: EnvironmentKey {

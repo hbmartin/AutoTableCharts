@@ -174,7 +174,7 @@ import Accessibility
         #expect(calls.value == 0)
         #expect(measureRequest.value == nil)
 
-        let cache = AutoChartAudioGraphDescriptorCache()
+        let cache = AutoChartAudioGraphViewCache()
         let lazy = try #require(presented.makeLazyAudioGraphDescriptor(cache: cache))
         _ = lazy.makeChartDescriptor()
         let firstBuildCalls = calls.value
@@ -247,9 +247,7 @@ import Accessibility
         #expect(AutoChartPresenter().present(range).makeLazyAudioGraphDescriptor() == nil)
     }
 
-    @Test(.disabled(if: !testHooksAvailable, testHooksUnavailable))
-    func viewOverridesRepresentTheCompletePresentationPayload() async throws {
-        #if ATC_TEST_HOOKS
+    @Test func viewOverridesRepresentTheCompletePresentationPayload() async throws {
         let category = AutoChartColumn(
             id: "category", name: "Category",
             semantics: .dimension(semanticType: .nominal))
@@ -293,26 +291,22 @@ import Accessibility
             return "US: \(message.defaultText)"
         }
 
-        let american = try await MainActor.run {
-            let view = AutoChartView(
+        await MainActor.run {
+            _ = AutoChartView(
                 presentedChart: swedish,
                 analysisID: analysis.id,
                 formatters: americanFormatters,
                 textResolver: americanResolver)
-            #expect(resolverCalls.value > 0)
-            #expect(formatterCalls.value > 0)
-            #expect(callbackThreads.result.allMainThread)
-            return try #require(view.presentedChartForTesting)
+            #expect(resolverCalls.value == 0)
+            #expect(formatterCalls.value == 0)
         }
-        let afterFirstOverride = resolverCalls.value
-        let formatterCallsAfterFirstOverride = formatterCalls.value
-        await MainActor.run {
-            _ = AutoChartView(
-                presentedChart: swedish, analysisID: analysis.id,
-                formatters: americanFormatters, textResolver: americanResolver)
-        }
-        #expect(resolverCalls.value > afterFirstOverride)
-        #expect(formatterCalls.value > formatterCallsAfterFirstOverride)
+        let american = try await presenter.presentCancellable(
+            chart,
+            formatters: americanFormatters,
+            textResolver: americanResolver)
+        #expect(resolverCalls.value > 0)
+        #expect(formatterCalls.value > 0)
+        #expect(!callbackThreads.result.observedMainThread)
 
         #expect(swedish.sharedXCategoryDomain == ["z", "ä"])
         #expect(american.sharedXCategoryDomain == ["ä", "z"])
@@ -331,7 +325,7 @@ import Accessibility
                 $0.contains("ä") || $0.contains("z")
             })
 
-        let cache = AutoChartAudioGraphDescriptorCache()
+        let cache = AutoChartAudioGraphViewCache()
         let existingAXDescriptor = try #require(
             swedish.makeLazyAudioGraphDescriptor(cache: cache)).makeChartDescriptor()
         let originalFrame = CGRect(x: 1, y: 2, width: 300, height: 200)
@@ -350,7 +344,6 @@ import Accessibility
         #expect(
             existingAXDescriptor.series.flatMap(\.dataPoints).map(\.label)
                 == descriptor.series.flatMap(\.points).map(\.label))
-        #endif
     }
 
     @Test func singletonExtremeAudioGraphRangesRemainFiniteAndOrdered() async throws {
@@ -606,18 +599,16 @@ private final class V3ThreadRecorder: @unchecked Sendable {
     private let lock = NSLock()
     private var callbackCount = 0
     private var observedMainThread = false
-    private var allMainThread = true
 
     func recordCurrentThread() {
         lock.withLock {
             callbackCount += 1
             observedMainThread = observedMainThread || Thread.isMainThread
-            allMainThread = allMainThread && Thread.isMainThread
         }
     }
 
-    var result: (count: Int, observedMainThread: Bool, allMainThread: Bool) {
-        lock.withLock { (callbackCount, observedMainThread, allMainThread) }
+    var result: (count: Int, observedMainThread: Bool) {
+        lock.withLock { (callbackCount, observedMainThread) }
     }
 }
 
@@ -2057,6 +2048,78 @@ private final class ProgressRecorder: @unchecked Sendable {
         #expect(calls.value > afterSecond)
     }
 
+    @Test func explicitCallbackIdentitiesSharePresentationEntries() async throws {
+        let request = try AutoChartRequest(table: domainDataset())
+        let analysis = try await AutoChartAnalyzer().analyze(request)
+        let chart = try await analysis.prepare(
+            .bar(category: "category", measure: "value", aggregation: .sum))
+        let presenter = AutoChartPresenter()
+        let firstFormatterCalls = V3Counter()
+        let secondFormatterCalls = V3Counter()
+        let firstResolverCalls = V3Counter()
+        let secondResolverCalls = V3Counter()
+        let firstFormatters = AutoChartFormatters(
+            cacheIdentity: "domain-format-v1",
+            request: { _, _, _ in
+                firstFormatterCalls.increment()
+                return nil
+            })
+        let secondFormatters = AutoChartFormatters(
+            cacheIdentity: "domain-format-v1",
+            request: { _, _, _ in
+                secondFormatterCalls.increment()
+                return nil
+            })
+        let firstResolver = AutoChartTextResolver(cacheIdentity: "domain-text-v1") {
+            firstResolverCalls.increment()
+            return "first:\($0.defaultText)"
+        }
+        let secondResolver = AutoChartTextResolver(cacheIdentity: "domain-text-v1") {
+            secondResolverCalls.increment()
+            return "second:\($0.defaultText)"
+        }
+
+        let first = presenter.present(
+            chart, formatters: firstFormatters, textResolver: firstResolver)
+        #expect(firstFormatterCalls.value > 0)
+        #expect(firstResolverCalls.value > 0)
+        let second = presenter.present(
+            chart, formatters: secondFormatters, textResolver: secondResolver)
+        #expect(second.requestID == first.requestID)
+        #expect(secondFormatterCalls.value == 0)
+        #expect(secondResolverCalls.value == 0)
+        #expect(second.title == first.title)
+
+        let changedFormatters = AutoChartFormatters(
+            cacheIdentity: "domain-format-v2",
+            request: { _, _, _ in
+                secondFormatterCalls.increment()
+                return nil
+            })
+        let changedResolver = AutoChartTextResolver(cacheIdentity: "domain-text-v2") {
+            secondResolverCalls.increment()
+            return "changed:\($0.defaultText)"
+        }
+        let changed = presenter.present(
+            chart, formatters: changedFormatters, textResolver: changedResolver)
+        #expect(changed.requestID != first.requestID)
+        #expect(secondFormatterCalls.value > 0)
+        #expect(secondResolverCalls.value > 0)
+
+        let generatedFormattersA = AutoChartFormatters(request: { _, _, _ in nil })
+        let generatedFormattersB = AutoChartFormatters(request: { _, _, _ in nil })
+        let generatedResolverA = AutoChartTextResolver { _ in nil }
+        let generatedResolverB = AutoChartTextResolver { _ in nil }
+        #expect(generatedFormattersA.callbackIdentity != generatedFormattersB.callbackIdentity)
+        #expect(generatedResolverA.callbackIdentity != generatedResolverB.callbackIdentity)
+
+        let valueFormatterA = AutoChartFormatters(
+            cacheIdentity: "value-format-v1", value: { _, _, _, _, _ in nil })
+        let valueFormatterB = AutoChartFormatters(
+            cacheIdentity: "value-format-v1", value: { _, _, _, _, _ in nil })
+        #expect(valueFormatterA.callbackIdentity == valueFormatterB.callbackIdentity)
+    }
+
     @Test func presentationContextPreservesAutoupdatingFoundationValues() throws {
         let context = AutoChartPresentationContext(
             locale: .autoupdatingCurrent,
@@ -2065,6 +2128,11 @@ private final class ProgressRecorder: @unchecked Sendable {
         #expect(context.timeZone == TimeZone.autoupdatingCurrent)
         #expect(context.locale != Locale(identifier: context.localeIdentifier))
         #expect(context.timeZone != TimeZone(identifier: context.timeZoneIdentifier))
+        let liveIdentity = AutoChartPresentationContextIdentity(context)
+        #expect(liveIdentity.foundation.usesAutoupdatingLocale)
+        #expect(liveIdentity.foundation.usesAutoupdatingTimeZone)
+        #expect(liveIdentity.foundation.localeIdentifier == Locale.autoupdatingCurrent.identifier)
+        #expect(liveIdentity.foundation.timeZoneIdentifier == TimeZone.autoupdatingCurrent.identifier)
 
         let roundTripped = try JSONDecoder().decode(
             AutoChartPresentationContext.self,

@@ -1,5 +1,38 @@
 import Foundation
 
+#if ATC_TEST_HOOKS
+private final class AutoChartRecommendationComparisonTestHook {
+    private static let key = "AutoTableCharts.recommendation-comparison-hook"
+    private let onComparison: () -> Void
+
+    private init(_ onComparison: @escaping () -> Void) {
+        self.onComparison = onComparison
+    }
+
+    static func record() {
+        (Thread.current.threadDictionary[key]
+            as? AutoChartRecommendationComparisonTestHook)?.onComparison()
+    }
+
+    static func withHook<Value>(
+        _ onComparison: @escaping () -> Void,
+        operation: () -> Value
+    ) -> Value {
+        let dictionary = Thread.current.threadDictionary
+        let previous = dictionary[key]
+        dictionary[key] = AutoChartRecommendationComparisonTestHook(onComparison)
+        defer {
+            if let previous {
+                dictionary[key] = previous
+            } else {
+                dictionary.removeObject(forKey: key)
+            }
+        }
+        return operation()
+    }
+}
+#endif
+
 /// Profiles typed tables and returns a deterministic, semantically safe set of charts.
 ///
 /// The engine generates candidates from table structure, rejects candidates that
@@ -2888,8 +2921,7 @@ enum AutoChartRecommendationEngine {
     private static func balancedFacetBases(
         _ candidates: [AutoChartRecommendation],
         limit: Int,
-        isValid: (AutoChartRecommendation) -> Bool,
-        onComparison: () -> Void = {}
+        isValid: (AutoChartRecommendation) -> Bool
     ) -> [AutoChartRecommendation] {
         guard limit > 0 else { return [] }
         var remaining = Array(candidates.indices)
@@ -2897,6 +2929,7 @@ enum AutoChartRecommendationEngine {
         var xUses: [AutoChartColumnID: Int] = [:]
         var yUses: [AutoChartColumnID: Int] = [:]
         var seriesUses: [AutoChartColumnID: Int] = [:]
+        var reuseScores = Array(repeating: 0, count: candidates.count)
 
         func reuseCount(_ recommendation: AutoChartRecommendation) -> Int {
             let encoding = recommendation.specification.encoding
@@ -2906,11 +2939,13 @@ enum AutoChartRecommendationEngine {
         }
 
         func precedes(_ lhs: Int, _ rhs: Int) -> Bool {
-            onComparison()
+            #if ATC_TEST_HOOKS
+            AutoChartRecommendationComparisonTestHook.record()
+            #endif
             let proposal = candidates[lhs]
             let incumbent = candidates[rhs]
-            let proposalReuse = reuseCount(proposal)
-            let incumbentReuse = reuseCount(incumbent)
+            let proposalReuse = reuseScores[lhs]
+            let incumbentReuse = reuseScores[rhs]
             if proposalReuse != incumbentReuse { return proposalReuse < incumbentReuse }
             if proposal.score != incumbent.score { return proposal.score > incumbent.score }
             if proposal.id != incumbent.id { return proposal.id < incumbent.id }
@@ -2933,6 +2968,9 @@ enum AutoChartRecommendationEngine {
         }
 
         while output.count < limit, !remaining.isEmpty {
+            for index in remaining {
+                reuseScores[index] = reuseCount(candidates[index])
+            }
             // Reuse priorities only change after accepting a candidate. Heapify
             // once per accepted base, then discard invalid picks in O(log n).
             if remaining.count > 1 {
@@ -2962,10 +3000,11 @@ enum AutoChartRecommendationEngine {
         _ candidates: [AutoChartRecommendation],
         limit: Int,
         isValid: (AutoChartRecommendation) -> Bool,
-        onComparison: () -> Void = {}
+        onComparison: @escaping () -> Void = {}
     ) -> [AutoChartRecommendation] {
-        balancedFacetBases(
-            candidates, limit: limit, isValid: isValid, onComparison: onComparison)
+        AutoChartRecommendationComparisonTestHook.withHook(onComparison) {
+            balancedFacetBases(candidates, limit: limit, isValid: isValid)
+        }
     }
     #endif
 

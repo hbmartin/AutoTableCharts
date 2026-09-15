@@ -153,7 +153,7 @@ struct AutoChartAccessibleProgressView: View {
 
     private struct ResolutionID: Hashable {
         let message: AutoChartMessage
-        let resolverCallback: UUID?
+        let resolverCallback: AutoChartHostCallbackCacheIdentity?
     }
 
     init(
@@ -284,8 +284,8 @@ public struct AutoChartSessionView<
     private struct EnvironmentPresentationIdentity: Hashable {
         var context: AutoChartPresentationContextIdentity?
         var formatterFoundation: AutoChartFoundationPresentationIdentity?
-        var formatterCallback: UUID?
-        var resolverCallback: UUID?
+        var formatterCallback: AutoChartHostCallbackCacheIdentity?
+        var resolverCallback: AutoChartHostCallbackCacheIdentity?
     }
 
     public init(

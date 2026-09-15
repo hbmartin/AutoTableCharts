@@ -2100,11 +2100,22 @@ enum AutoChartCategoryDisambiguationKind: String, Sendable {
     }
 }
 
+/// Cache identity for host callbacks. Generated identities preserve the safe
+/// default that separately constructed wrappers represent distinct behavior;
+/// explicit identities let declarative callers opt into stable memoization.
+package enum AutoChartHostCallbackCacheIdentity: Hashable, Sendable {
+    case generated(UUID)
+    case explicit(String)
+}
+
 /// Reference identity used to recognize recursion through one host callback.
 final class AutoChartHostCallbackToken: Sendable {
-    /// Remains unique even after the token itself is released, so bounded caches
-    /// do not confuse a later allocation that happens to reuse its address.
-    let identity = UUID()
+    let cacheIdentity: AutoChartHostCallbackCacheIdentity
+
+    init(cacheIdentity: String? = nil) {
+        self.cacheIdentity = cacheIdentity.map(AutoChartHostCallbackCacheIdentity.explicit)
+            ?? .generated(UUID())
+    }
 }
 
 /// Keeps a host callback body and its recursion identity paired so invalid
@@ -2113,10 +2124,11 @@ final class AutoChartHostCallbackToken: Sendable {
 /// suppressing a different wrapper.
 struct AutoChartHostCallback<Body: Sendable>: Sendable {
     let body: Body
-    let token = AutoChartHostCallbackToken()
+    let token: AutoChartHostCallbackToken
 
-    init(_ body: Body) {
+    init(cacheIdentity: String? = nil, _ body: Body) {
         self.body = body
+        self.token = AutoChartHostCallbackToken(cacheIdentity: cacheIdentity)
     }
 }
 
@@ -2310,8 +2322,16 @@ public struct AutoChartTextResolver: Sendable {
     private typealias ResolveValue = @Sendable (AutoChartMessage) -> String?
     private let hostCallback: AutoChartHostCallback<ResolveValue>?
 
-    public init(_ resolve: @escaping @Sendable (AutoChartMessage) -> String?) {
-        hostCallback = AutoChartHostCallback(resolve)
+    /// Creates a resolver with an optional stable presentation-cache identity.
+    ///
+    /// Separately constructed resolvers use distinct generated identities by
+    /// default. Supply the same `cacheIdentity` for equivalent callbacks created
+    /// repeatedly by a declarative view. Change it whenever captured behavior changes.
+    public init(
+        cacheIdentity: String? = nil,
+        _ resolve: @escaping @Sendable (AutoChartMessage) -> String?
+    ) {
+        hostCallback = AutoChartHostCallback(cacheIdentity: cacheIdentity, resolve)
     }
 
     private init() {
@@ -2322,11 +2342,10 @@ public struct AutoChartTextResolver: Sendable {
         resolve(message) ?? message.defaultText
     }
 
-    /// Stable for copies of the same resolver and distinct for newly supplied
-    /// host callbacks. Presentation caches use this alongside the caller's
-    /// explicit context identity.
-    package var callbackIdentity: UUID? {
-        hostCallback?.token.identity
+    /// Stable for copies and for separately constructed callbacks that explicitly
+    /// share a cache identity. Otherwise distinct for newly supplied callbacks.
+    package var callbackIdentity: AutoChartHostCallbackCacheIdentity? {
+        hostCallback?.token.cacheIdentity
     }
 
     func resolve(_ message: AutoChartMessage) -> String? {
