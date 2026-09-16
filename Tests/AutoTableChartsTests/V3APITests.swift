@@ -2301,6 +2301,18 @@ private final class ProgressRecorder: @unchecked Sendable {
         #expect(noValueOverride.callbackIdentity == nil)
         #expect(compatibleOptionalIdentity.callbackIdentity != nil)
         #expect(generatedValueOverride.callbackIdentity != nil)
+
+        let identityWithoutValue = AutoChartFormatters(cacheIdentity: "unused-value")
+        let identityWithNilValue = AutoChartFormatters(
+            cacheIdentity: "unused-value", value: nil)
+        let optionalValue: AutoChartFormatters.ValueFormatter? = {
+            _, _, _, _, _ in nil
+        }
+        let identityWithOptionalValue = AutoChartFormatters(
+            cacheIdentity: optionalCacheIdentity, value: optionalValue)
+        #expect(identityWithoutValue.callbackIdentity == nil)
+        #expect(identityWithNilValue.callbackIdentity == nil)
+        #expect(identityWithOptionalValue.callbackIdentity != nil)
     }
 
     @Test func presentationContextPreservesAutoupdatingFoundationValues() throws {
@@ -3168,6 +3180,155 @@ private final class ProgressRecorder: @unchecked Sendable {
         #expect(final.primaryChart?.recommendation.id
             == original.preparedChart.recommendation.id)
         #expect(presented.requestID == visible.requestID)
+    }
+
+    @Test func pendingChartRemainsPresentationTargetThroughContextChanges() async throws {
+        let session = AutoChartSession<Int>(cache: AutoChartCache())
+        let request = try AutoChartRequest(table: domainDataset())
+        session.load(request)
+        let initial = try await readyAnalysis(from: session)
+        let original = try await readyPresentation(from: session) { _ in true }
+        let alternative = try #require(initial.outcome.catalog?.cataloged.first {
+            $0.id != original.preparedChart.recommendation.id
+        })
+        let callback = V3OneShotBlockingCallback(startsArmed: false)
+        defer { callback.release() }
+        let formatters = AutoChartFormatters(
+            cacheIdentity: "pending-target-context",
+            request: { _, _, _ in callback.invoke(); return nil })
+        session.setPresentationContext(
+            .init(identity: "target-before"), formatters: formatters)
+        _ = try await readyPresentation(from: session) {
+            $0.context.identity == "target-before"
+        }
+
+        callback.arm()
+        session.setPreference(.chart(.specific(alternative.id)))
+        #expect(session.isChartUpdatePending)
+        #expect(await waitForV3Condition {
+            callback.isBlocked && session.isPresentationPending
+        })
+        session.setPresentationContext(
+            .init(identity: "target-after"), formatters: formatters)
+        let final = try await readyPresentation(from: session) {
+            $0.preparedChart.recommendation.id == alternative.id
+                && $0.context.identity == "target-after"
+        }
+        #expect(final.preparedChart.recommendation.id == alternative.id)
+        #expect(session.preference == .chart(.specific(alternative.id)))
+        #expect(!session.isChartUpdatePending)
+    }
+
+    @Test func revertingPendingPreferenceAppliesLatestPresentationSettings()
+        async throws
+    {
+        let session = AutoChartSession<Int>(cache: AutoChartCache())
+        let request = try AutoChartRequest(table: domainDataset())
+        session.load(request)
+        let initial = try await readyAnalysis(from: session)
+        let original = try await readyPresentation(from: session) { _ in true }
+        let alternative = try #require(initial.outcome.catalog?.cataloged.first {
+            $0.id != original.preparedChart.recommendation.id
+        })
+        let formatters = AutoChartFormatters(
+            cacheIdentity: "reverted-latest-formatters",
+            request: { _, _, _ in nil })
+
+        session.setPreference(.chart(.specific(alternative.id)))
+        #expect(session.isChartUpdatePending)
+        #expect(!session.isPresentationPending)
+        session.setPresentationContext(
+            .init(identity: "reverted-latest"), formatters: formatters)
+        session.setPreference(.chart(.specific(original.preparedChart.recommendation.id)))
+        let final = try await readyPresentation(from: session) {
+            $0.preparedChart.id == original.preparedChart.id
+                && $0.context.identity == "reverted-latest"
+                && $0.requestID.formatterCallback == formatters.callbackIdentity
+        }
+        #expect(final.context.identity == "reverted-latest")
+        #expect(!session.isChartUpdatePending)
+    }
+
+    @Test(.disabled(if: !testHooksAvailable, testHooksUnavailable))
+    func failedReplacementClearsSelectionAndPendingTarget() async throws {
+        #if ATC_TEST_HOOKS
+        let session = AutoChartSession<Int>(cache: AutoChartCache())
+        let request = try AutoChartRequest(table: domainDataset())
+        session.load(request)
+        let initial = try await readyAnalysis(from: session)
+        let original = try await readyPresentation(from: session) { _ in true }
+        let alternative = try #require(initial.outcome.catalog?.cataloged.first {
+            $0.id != original.preparedChart.recommendation.id
+        })
+        session.selection = original.preparedChart.selections(
+            for: [10], analysisID: initial.id)
+        #expect(!session.selection.isEmpty)
+        session.presentationFailureForTesting = AutoChartFailure(
+            stage: .presentationPreparation,
+            kind: .internalFailure,
+            isRetryable: true,
+            diagnosticID: "ATC.test.presentationFailure",
+            message: "Injected presentation failure")
+        session.setPreference(.chart(.specific(alternative.id)))
+        #expect(session.isChartUpdatePending)
+        _ = try await sessionFailure(from: session)
+        #expect(session.selection.isEmpty)
+        #expect(!session.isChartUpdatePending)
+        #expect(!session.isPresentationPending)
+        #endif
+    }
+
+    @Test(.disabled(if: !testHooksAvailable, testHooksUnavailable))
+    func backgroundFoundationNotificationsReachSessionOnMain() async throws {
+        #if ATC_TEST_HOOKS
+        #if os(macOS)
+        let session = AutoChartSession<Int>(cache: AutoChartCache())
+        session.load(try AutoChartRequest(table: domainDataset()))
+        _ = try await readyPresentation(from: session) { _ in true }
+        let threads = V3ThreadRecorder()
+        session.environmentApplicationForTesting = { threads.recordCurrentThread() }
+        let harness = HostedViewHarnessForTesting(
+            rootView: AutoChartSessionView(session: session))
+        defer { harness.close() }
+        #expect(await waitForHostedChartUpdate(in: harness.host) {
+            threads.result.count > 0
+        })
+        let mountedCount = threads.result.count
+        NotificationCenter.default.post(
+            name: NSLocale.currentLocaleDidChangeNotification, object: nil)
+        #expect(await waitForHostedChartUpdate(in: harness.host) {
+            threads.result.count >= mountedCount + 1
+        })
+        let before = threads.result.count
+        await Task.detached {
+            NotificationCenter.default.post(
+                name: NSLocale.currentLocaleDidChangeNotification, object: nil)
+        }.value
+        #expect(await waitForHostedChartUpdate(in: harness.host) {
+            threads.result.count >= before + 1
+        })
+        await Task.detached {
+            NotificationCenter.default.post(name: .NSSystemTimeZoneDidChange, object: nil)
+        }.value
+        #expect(await waitForHostedChartUpdate(in: harness.host) {
+            threads.result.count >= before + 2
+        })
+        #expect(threads.result.allMainThread)
+        #endif
+        #endif
+    }
+
+    @Test func cancellingAReadySessionClearsItsSelection() async throws {
+        let session = AutoChartSession<Int>(cache: AutoChartCache())
+        session.load(try AutoChartRequest(table: domainDataset()))
+        let analysis = try await readyAnalysis(from: session)
+        let chart = try await readyPresentation(from: session) { _ in true }
+        session.selection = chart.preparedChart.selections(
+            for: [10], analysisID: analysis.id)
+        #expect(!session.selection.isEmpty)
+        session.cancel()
+        #expect(session.selection.isEmpty)
+        #expect(!session.isChartUpdatePending)
     }
 
     @Test func primaryStrategyDoesNotShortcutAnAlternativePreference() async throws {

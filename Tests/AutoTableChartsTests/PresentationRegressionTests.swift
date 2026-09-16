@@ -20,6 +20,23 @@ private final class PresentationCounter: @unchecked Sendable {
     var value: Int { lock.withLock { count } }
 }
 
+private final class PresentationMainThreadProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    private var allMain = true
+
+    func record() {
+        lock.withLock {
+            count += 1
+            allMain = allMain && Thread.isMainThread
+        }
+    }
+
+    var result: (count: Int, allMain: Bool) {
+        lock.withLock { (count, allMain) }
+    }
+}
+
 private final class PresentationBlockingGate: @unchecked Sendable {
     private let lock = NSLock()
     private let group = DispatchGroup()
@@ -592,7 +609,8 @@ struct PresentedChartViewRegressionTests {
         var observed: AutoChartViewTestHookState?
         hooks.observe = { observed = $0 }
         let harness = HostedViewHarnessForTesting(
-            rootView: HostedPresentationView(model: model, hooks: hooks))
+            rootView: HostedPresentationView(
+                model: model, hooks: hooks, scheduling: .serial))
         let host = harness.host
         defer { harness.close() }
 
@@ -643,8 +661,7 @@ struct PresentedChartViewRegressionTests {
         var observed: AutoChartViewTestHookState?
         hooks.observe = { observed = $0 }
         let harness = HostedViewHarnessForTesting(
-            rootView: HostedPresentationView(
-                model: model, hooks: hooks, scheduling: .overlapping))
+            rootView: HostedPresentationView(model: model, hooks: hooks))
         let host = harness.host
         defer { harness.close() }
 
@@ -699,8 +716,7 @@ struct PresentedChartViewRegressionTests {
         var observed: AutoChartViewTestHookState?
         hooks.observe = { observed = $0 }
         let harness = HostedViewHarnessForTesting(
-            rootView: HostedPresentationView(
-                model: model, hooks: hooks, scheduling: .overlapping))
+            rootView: HostedPresentationView(model: model, hooks: hooks))
         let host = harness.host
         defer { harness.close() }
 
@@ -712,6 +728,81 @@ struct PresentedChartViewRegressionTests {
                 && observed?.requestID.resolverCallback == resolver.callbackIdentity
         })
         progressRelease.release()
+        withExtendedLifetime(presenter) {}
+        #endif
+    }
+
+    @Test(.disabled(if: !testHooksAvailable, testHooksUnavailable))
+    func independentProgressViewsDoNotShareAResolverSlot() async throws {
+        #if ATC_TEST_HOOKS
+        let slowCalls = PresentationCounter()
+        let fastCalls = PresentationCounter()
+        let slowGate = PresentationBlockingGate()
+        defer { slowGate.release() }
+        let slow = AutoChartTextResolver(cacheIdentity: "slow-session-label") { message in
+            slowCalls.increment()
+            slowGate.wait()
+            return "Slow: \(message.defaultText)"
+        }
+        let fast = AutoChartTextResolver(cacheIdentity: "fast-session-label") { message in
+            fastCalls.increment()
+            return "Fast: \(message.defaultText)"
+        }
+        let harness = HostedViewHarnessForTesting(rootView: HStack {
+            AutoChartAccessibleProgressView(
+                message: AutoChartProgressAccessibility.preparing,
+                textResolver: slow)
+            AutoChartAccessibleProgressView(
+                message: AutoChartProgressAccessibility.preparing,
+                textResolver: fast)
+        })
+        defer { harness.close() }
+        #expect(await waitForHostedChartUpdate(in: harness.host) {
+            slowCalls.value > 0 && fastCalls.value > 0 && !slowGate.isOpen
+        })
+        #endif
+    }
+
+    @Test(.disabled(if: !testHooksAvailable, testHooksUnavailable))
+    func backgroundFoundationNotificationsReachRenderingOnMain() async throws {
+        #if ATC_TEST_HOOKS
+        let (analysisID, chart) = try await presentationFixture()
+        let presenter = AutoChartPresenter()
+        let model = HostedPresentationModel(
+            chart: presenter.present(chart), analysisID: analysisID)
+        let hooks = AutoChartViewTestHooks()
+        let threads = PresentationMainThreadProbe()
+        var ownerDidAppear = false
+        hooks.presentationOwnerDidAppearForTesting = { ownerDidAppear = true }
+        hooks.foundationNotificationForTesting = { threads.record() }
+        var observed: AutoChartViewTestHookState?
+        hooks.observe = { observed = $0 }
+        let harness = HostedViewHarnessForTesting(
+            rootView: HostedDefaultPresentationView(model: model, hooks: hooks))
+        defer { harness.close() }
+        #expect(await waitForHostedChartUpdate(in: harness.host) {
+            observed != nil && ownerDidAppear
+        })
+        NotificationCenter.default.post(
+            name: NSLocale.currentLocaleDidChangeNotification, object: nil)
+        #expect(await waitForHostedChartUpdate(in: harness.host) {
+            threads.result.count > 0
+        })
+        let before = threads.result.count
+        await Task.detached {
+            NotificationCenter.default.post(
+                name: NSLocale.currentLocaleDidChangeNotification, object: nil)
+        }.value
+        #expect(await waitForHostedChartUpdate(in: harness.host) {
+            threads.result.count >= before + 1
+        })
+        await Task.detached {
+            NotificationCenter.default.post(name: .NSSystemTimeZoneDidChange, object: nil)
+        }.value
+        #expect(await waitForHostedChartUpdate(in: harness.host) {
+            threads.result.count >= before + 2
+        })
+        #expect(threads.result.allMain)
         withExtendedLifetime(presenter) {}
         #endif
     }
@@ -969,6 +1060,7 @@ struct PresentedChartViewRegressionTests {
         #expect(model.selection.unionedSourceRows == linkedRows)
         #expect(observedB?.selectionCount == 0)
         #expect(observedB?.hasSelectionSummary == false)
+        #expect(observedB?.hasForeignSelectionNotice == true)
         #expect(observedA?.selectionCount == 1)
 
         model.secondaryChart = presenter.present(chartC)
@@ -985,6 +1077,36 @@ struct PresentedChartViewRegressionTests {
                 && observedB?.selectionCount == 0
         })
         #expect(model.selection == saved)
+        withExtendedLifetime(presenter) {}
+        #endif
+    }
+
+    @Test(.disabled(if: !testHooksAvailable, testHooksUnavailable))
+    func foreignSelectionNoticeClearsAHostOwnedBinding() async throws {
+        #if ATC_TEST_HOOKS
+        let (analysisIDA, chartA) = try await presentationFixture()
+        let (analysisIDB, chartB) = try await presentationFixture(offset: 100)
+        let presenter = AutoChartPresenter()
+        let model = HostedPresentationModel(
+            chart: presenter.present(chartB), analysisID: analysisIDB)
+        let mark = try #require(chartA.marks.first)
+        model.selection = chartA.selections(
+            for: mark.sourceRowIDs, analysisID: analysisIDA)
+        let hooks = AutoChartViewTestHooks()
+        var observed: AutoChartViewTestHookState?
+        hooks.observe = { observed = $0 }
+        let harness = HostedViewHarnessForTesting(
+            rootView: HostedPresentationView(model: model, hooks: hooks))
+        defer { harness.close() }
+        #expect(await waitForHostedChartUpdate(in: harness.host) {
+            observed?.hasForeignSelectionNotice == true
+        })
+        #expect(!model.selection.isEmpty)
+        let pressClear = try #require(hooks.pressForeignSelectionClearForTesting)
+        pressClear()
+        #expect(await waitForHostedChartUpdate(in: harness.host) {
+            model.selection.isEmpty && observed?.hasForeignSelectionNotice == false
+        })
         withExtendedLifetime(presenter) {}
         #endif
     }
@@ -1060,6 +1182,52 @@ struct PresentedChartViewRegressionTests {
         })
         #expect(observed?.zoomScale.wrappedValue == 1)
         #expect(model.selection == savedSelection)
+        withExtendedLifetime(presenter) {}
+        #endif
+    }
+
+    @Test(.disabled(if: !testHooksAvailable, testHooksUnavailable))
+    func equivalentReanalysisKeepsZoomButResetsSelectionProvenance() async throws {
+        #if ATC_TEST_HOOKS
+        let (analysisIDA, chartA) = try await presentationFixture()
+        let (analysisIDB, chartB) = try await presentationFixture()
+        let (analysisIDC, chartC) = try await presentationFixture(offset: 100)
+        #expect(chartA.id != chartB.id)
+        #expect(chartA.core.fingerprint == chartB.core.fingerprint)
+        let presenter = AutoChartPresenter()
+        let model = HostedPresentationModel(
+            chart: presenter.present(chartA), analysisID: analysisIDA)
+        let hooks = AutoChartViewTestHooks()
+        var observed: AutoChartViewTestHookState?
+        hooks.observe = { observed = $0 }
+        let harness = HostedViewHarnessForTesting(
+            rootView: HostedPresentationView(model: model, hooks: hooks))
+        defer { harness.close() }
+        #expect(await waitForHostedChartUpdate(in: harness.host) { observed != nil })
+        let first = try #require(observed)
+        first.zoomAnchor.wrappedValue = 3
+        first.zoomScale.wrappedValue = 3
+        let mark = try #require(chartA.marks.first)
+        model.selection = chartA.selections(
+            for: mark.sourceRowIDs, analysisID: analysisIDA)
+        #expect(await waitForHostedChartUpdate(in: harness.host) {
+            observed?.zoomScale.wrappedValue == 3 && observed?.selectionCount == 1
+        })
+
+        model.chart = presenter.present(chartB)
+        model.analysisID = analysisIDB
+        #expect(await waitForHostedChartUpdate(in: harness.host) {
+            observed?.requestID.preparedChart == chartB.id
+                && observed?.zoomScale.wrappedValue == 3
+                && observed?.selectionCount == 0
+                && observed?.hasForeignSelectionNotice == true
+        })
+        model.chart = presenter.present(chartC)
+        model.analysisID = analysisIDC
+        #expect(await waitForHostedChartUpdate(in: harness.host) {
+            observed?.requestID.preparedChart == chartC.id
+                && observed?.zoomScale.wrappedValue == 1
+        })
         withExtendedLifetime(presenter) {}
         #endif
     }
@@ -1162,8 +1330,7 @@ struct PresentedChartViewRegressionTests {
         hooks.didPublishDeferredPresentation = { publications.append($0) }
         hooks.didFinishDeferredPresentation = { finished.append(($0, $1)) }
         let harness = HostedViewHarnessForTesting(
-            rootView: HostedPresentationView(
-                model: model, hooks: hooks, scheduling: .overlapping))
+            rootView: HostedPresentationView(model: model, hooks: hooks))
         let host = harness.host
         defer { harness.close() }
         #expect(await waitForHostedChartUpdate(in: host) { observed != nil })
@@ -1393,18 +1560,22 @@ private struct HostedSharedSelectionView: View {
 private struct HostedPresentationView: View {
     @ObservedObject var model: HostedPresentationModel
     let hooks: AutoChartViewTestHooks
-    var scheduling: AutoChartDeferredCallbackScheduling = .serial
-    var body: some View {
-        AutoChartView(
+    var scheduling: AutoChartDeferredCallbackScheduling? = nil
+    @ViewBuilder var body: some View {
+        let chart = AutoChartView(
             presentedChart: model.chart, analysisID: model.analysisID,
             selection: $model.selection,
             formatters: model.formatters,
             textResolver: model.resolver,
             overridePresentationMode: .deferred)
-            .autoChartDeferredCallbackScheduling(scheduling)
             .environment(\.autoChartViewTestHooks, hooks)
             .environment(\.autoChartViewRevisionForTesting, model.revision)
             .frame(width: 600, height: 400)
+        if let scheduling {
+            chart.autoChartDeferredCallbackScheduling(scheduling)
+        } else {
+            chart
+        }
     }
 }
 

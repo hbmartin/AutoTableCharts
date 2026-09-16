@@ -43,9 +43,10 @@ public struct AutoChartTheme: @unchecked Sendable {
 /// An already running callback cannot be interrupted; cancelled queued calls
 /// are removed before they start.
 public enum AutoChartDeferredCallbackScheduling: Hashable, Sendable {
-    /// Preserves the per-view one-at-a-time callback guarantee.
+    /// Preserves the per-view one-at-a-time callback guarantee, including labels.
     case serial
-    /// Lets one newer callback proceed past a blocked older callback.
+    /// Lets one newer presentation proceed past a blocked older callback and
+    /// resolves progress labels on an independent lane.
     case overlapping
 
     var maximumConcurrentJobs: Int { self == .serial ? 1 : 2 }
@@ -72,7 +73,7 @@ private struct AutoChartThemeKey: EnvironmentKey {
 }
 
 private struct AutoChartDeferredCallbackSchedulingKey: EnvironmentKey {
-    static let defaultValue = AutoChartDeferredCallbackScheduling.serial
+    static let defaultValue = AutoChartDeferredCallbackScheduling.overlapping
 }
 
 extension EnvironmentValues {
@@ -145,20 +146,17 @@ enum AutoChartProgressAccessibility {
 }
 
 enum AutoChartProgressTextResolution {
-    private static let scheduler = AutoChartCallbackWorkScheduler(
-        maximumConcurrentJobs: 1,
-        queue: DispatchQueue.global(qos: .userInitiated))
-
     static func resolve(
         _ message: AutoChartMessage,
         using resolver: AutoChartTextResolver,
         on scheduler: AutoChartCallbackWorkScheduler? = nil
     ) async -> String? {
         guard resolver.callbackIdentity != nil else { return message.defaultText }
+        let workScheduler = scheduler ?? AutoChartCallbackWorkScheduler(
+            maximumConcurrentJobs: 2,
+            queue: DispatchQueue.global(qos: .userInitiated))
         do {
-            return try await AutoChartCancellableWork.run(
-                on: scheduler ?? Self.scheduler
-            ) { cancellation in
+            return try await AutoChartCancellableWork.run(on: workScheduler) { cancellation in
                 try cancellation.checkCancellation()
                 return resolver(message)
             }
@@ -171,6 +169,12 @@ enum AutoChartProgressTextResolution {
     }
 }
 
+private final class AutoChartProgressResolutionWorker: ObservableObject {
+    let scheduler = AutoChartCallbackWorkScheduler(
+        maximumConcurrentJobs: 2,
+        queue: DispatchQueue.global(qos: .userInitiated))
+}
+
 struct AutoChartAccessibleProgressView: View {
     let message: AutoChartMessage
     let textResolver: AutoChartTextResolver?
@@ -178,10 +182,12 @@ struct AutoChartAccessibleProgressView: View {
 
     @Environment(\.autoChartTextResolver) private var environmentTextResolver
     @State private var accessibilityText: String
+    @StateObject private var worker = AutoChartProgressResolutionWorker()
 
     private struct ResolutionID: Hashable {
         let message: AutoChartMessage
         let resolverCallback: AutoChartHostCallbackCacheIdentity?
+        let scheduler: ObjectIdentifier
     }
 
     init(
@@ -197,11 +203,13 @@ struct AutoChartAccessibleProgressView: View {
 
     var body: some View {
         let resolver = textResolver ?? environmentTextResolver
+        let resolutionScheduler = scheduler ?? worker.scheduler
         ProgressView()
             .accessibilityLabel(accessibilityText)
             .task(id: ResolutionID(
                 message: message,
-                resolverCallback: resolver?.callbackIdentity)
+                resolverCallback: resolver?.callbackIdentity,
+                scheduler: ObjectIdentifier(resolutionScheduler))
             ) {
                 if accessibilityText != message.defaultText {
                     accessibilityText = message.defaultText
@@ -210,7 +218,7 @@ struct AutoChartAccessibleProgressView: View {
                 let resolved = await AutoChartProgressTextResolution.resolve(
                     message,
                     using: resolver,
-                    on: scheduler)
+                    on: resolutionScheduler)
                 guard let resolved, !Task.isCancelled else { return }
                 if accessibilityText != resolved {
                     accessibilityText = resolved
@@ -355,9 +363,7 @@ public struct AutoChartSessionView<
                             selection: $session.selection,
                             presentation: .explorer())
                             .foregroundStyle(theme.legendColor)
-                        if session.isPresentationPending
-                            || session.isPreferenceUpdatePending
-                        {
+                        if session.isChartUpdatePending {
                             AutoChartAccessibleProgressView(
                                 message: AutoChartProgressAccessibility.updating,
                                 textResolver: session.presentationTextResolver)
@@ -382,11 +388,13 @@ public struct AutoChartSessionView<
             applyEnvironmentPresentation()
         }
         .onReceive(NotificationCenter.default.publisher(
-            for: NSLocale.currentLocaleDidChangeNotification)) { _ in
+            for: NSLocale.currentLocaleDidChangeNotification)
+            .receive(on: DispatchQueue.main)) { _ in
             applyEnvironmentPresentation()
         }
         .onReceive(NotificationCenter.default.publisher(
-            for: .NSSystemTimeZoneDidChange)) { _ in
+            for: .NSSystemTimeZoneDidChange)
+            .receive(on: DispatchQueue.main)) { _ in
             applyEnvironmentPresentation()
         }
     }

@@ -63,14 +63,7 @@ final class AutoChartCallbackWorkScheduler: @unchecked Sendable {
     func setMaximumConcurrentJobs(_ count: Int) {
         let ready = lock.withLock { () -> [Job] in
             maximumConcurrentJobs = max(1, count)
-            var jobs: [Job] = []
-            while activeJobs < maximumConcurrentJobs && !pendingJobs.isEmpty {
-                let job = pendingJobs.removeFirst()
-                guard !job.cancellation.isCancelled else { continue }
-                activeJobs += 1
-                jobs.append(job)
-            }
-            return jobs
+            return drainReadyJobsLocked()
         }
         ready.forEach(start)
     }
@@ -107,17 +100,23 @@ final class AutoChartCallbackWorkScheduler: @unchecked Sendable {
     }
 
     private func finish() {
-        let next = lock.withLock { () -> Job? in
+        let ready = lock.withLock { () -> [Job] in
             activeJobs -= 1
-            while activeJobs < maximumConcurrentJobs && !pendingJobs.isEmpty {
-                let job = pendingJobs.removeFirst()
-                guard !job.cancellation.isCancelled else { continue }
-                activeJobs += 1
-                return job
-            }
-            return nil
+            return drainReadyJobsLocked()
         }
-        if let next { start(next) }
+        ready.forEach(start)
+    }
+
+    /// Called only while `lock` is held; dispatch happens after releasing it.
+    private func drainReadyJobsLocked() -> [Job] {
+        var ready: [Job] = []
+        while activeJobs < maximumConcurrentJobs && !pendingJobs.isEmpty {
+            let job = pendingJobs.removeFirst()
+            guard !job.cancellation.isCancelled else { continue }
+            activeJobs += 1
+            ready.append(job)
+        }
+        return ready
     }
 }
 

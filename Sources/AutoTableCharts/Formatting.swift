@@ -272,25 +272,13 @@ public struct AutoChartFormatters: Sendable {
             compatibilityCacheIdentity: nil, compatibilityValue: value)
     }
 
-    /// Creates a compatibility formatter with a stable presentation-cache identity.
-    /// The callback is required so an identity cannot be silently discarded.
-    public init(
-        locale: Locale = .autoupdatingCurrent,
-        timeZone: TimeZone = .autoupdatingCurrent,
-        cacheIdentity: String,
-        value: @escaping ValueFormatter
-    ) {
-        self.init(
-            locale: locale, timeZone: timeZone,
-            compatibilityCacheIdentity: cacheIdentity, compatibilityValue: value)
-    }
-
-    /// Accepts a computed optional identity while still requiring a callback.
+    /// Compatibility initializer accepting an optional identity and callback.
+    /// An identity has no effect when the callback is absent.
     public init(
         locale: Locale = .autoupdatingCurrent,
         timeZone: TimeZone = .autoupdatingCurrent,
         cacheIdentity: String?,
-        value: @escaping ValueFormatter
+        value: ValueFormatter? = nil
     ) {
         self.init(
             locale: locale, timeZone: timeZone,
