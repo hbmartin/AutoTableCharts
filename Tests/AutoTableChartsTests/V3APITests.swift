@@ -709,6 +709,81 @@ private actor V3AsyncTestGate {
     }
 }
 
+#if ATC_TEST_HOOKS
+private struct V3PreparationGateFixture {
+    let cache: AutoChartCache
+    let request: AutoChartRequest<Int>
+    let gate: V3AsyncTestGate
+}
+
+@MainActor
+private func makeV3PreparationGateFixture(
+    warm: Bool
+) async throws -> V3PreparationGateFixture {
+    let gate = V3AsyncTestGate()
+    let cache = AutoChartCache(
+        testHooks: .chartPreparation { await gate.pause() })
+    let request = try AutoChartRequest(table: domainDataset())
+    if warm {
+        _ = try await AutoChartAnalyzer(cache: cache).analyze(
+            request, preparation: .none)
+    }
+    return V3PreparationGateFixture(cache: cache, request: request, gate: gate)
+}
+
+@MainActor
+private func verifySamePreferenceDoesNotRestartPreparation(
+    warm: Bool
+) async throws {
+    let fixture = try await makeV3PreparationGateFixture(warm: warm)
+    let attempts = V3Counter()
+    let session = AutoChartSession<Int>(cache: fixture.cache)
+    session.attemptDidStartForTesting = { attempts.increment() }
+    session.load(fixture.request, preparation: .primary)
+    defer {
+        session.cancel()
+        Task { await fixture.gate.release() }
+    }
+
+    guard await fixture.gate.waitUntilPaused() else {
+        Issue.record(
+            warm
+                ? "Warm preparation did not reach its test gate."
+                : "Cold analysis did not reach its preparation gate.")
+        return
+    }
+    if warm {
+        guard case .preparing = session.state else {
+            Issue.record("Warm preparation must remain in preparing state.")
+            return
+        }
+    } else {
+        guard case .analyzing = session.state else {
+            Issue.record("Cold preparation must remain in analyzing state.")
+            return
+        }
+    }
+
+    #expect(attempts.value == 1)
+    session.setPreference(session.preference)
+    #expect(attempts.value == 1)
+    if warm {
+        guard case .preparing = session.state else {
+            Issue.record("Same preference restarted warm preparation.")
+            return
+        }
+    } else {
+        guard case .analyzing = session.state else {
+            Issue.record("Same preference restarted cold analysis.")
+            return
+        }
+    }
+
+    await fixture.gate.release()
+    _ = try await readyAnalysis(from: session)
+}
+#endif
+
 @MainActor
 private func waitForV3Condition(
     timeout: Duration = .seconds(2),
@@ -2470,7 +2545,7 @@ private final class ProgressRecorder: @unchecked Sendable {
 }
 
 @MainActor
-@Suite struct V3SessionTests {
+@Suite(.serialized) struct V3SessionTests {
     @Test func cancellableValidationStopsInsideARowScan() throws {
         let dataset = try domainDataset()
         let snapshot = AutoChartSnapshot(dataset)
@@ -2528,28 +2603,40 @@ private final class ProgressRecorder: @unchecked Sendable {
         unlisted.cancel()
     }
 
-    @Test func unloadRemovesTheRequestBehindLaterPreferenceChanges() async throws {
+    @Test func unloadForgetsRequestStateButRetainsSessionPreference() async throws {
         let cache = AutoChartCache()
         let request = try AutoChartRequest(table: domainDataset())
         let session = AutoChartSession<Int>(cache: cache)
-        session.load(request, preference: .automatic)
-        _ = try await readyAnalysis(from: session)
+        session.load(request, preference: .chart(.recommended))
+        let ready = try await readyAnalysis(from: session)
+        let presented = try await readyPresentation(from: session) { _ in true }
         #expect(session.currentRecommendation != nil)
+        session.selection = presented.preparedChart.selections(
+            for: [10], analysisID: ready.id)
+        #expect(!session.selection.isEmpty)
 
         session.unload()
         #expect(session.currentRecommendation == nil)
         #expect(session.selection.isEmpty)
+        #expect(session.preference == .chart(.recommended))
         guard case .idle = session.state else {
             Issue.record("Unloading must leave the session idle.")
             return
         }
-        session.setPreference(.chart(.recommended))
-        #expect(session.preference == .chart(.recommended))
         session.retry()
         guard case .idle = session.state else {
-            Issue.record("An unloaded request restarted after a preference change.")
+            Issue.record("An unloaded request restarted during retry.")
             return
         }
+
+        let replacement = try AutoChartRequest(
+            table: domainDataset(
+                key: .trusted(identity: "unload-replacement", revision: "1")))
+        session.load(replacement)
+        let inherited = try await readyAnalysis(from: session)
+        #expect(inherited.request == replacement.id)
+        #expect(session.preference == .chart(.recommended))
+        #expect(inherited.preferenceResolution?.defaultReason == .recommended)
     }
 
     @Test(
@@ -2851,15 +2938,12 @@ private final class ProgressRecorder: @unchecked Sendable {
         .timeLimit(.minutes(1)))
     func sessionProgressPreservesAttemptModeAndReportsColdPreparation() async throws {
         #if ATC_TEST_HOOKS
-        let coldGate = V3AsyncTestGate()
-        let coldCache = AutoChartCache(
-            testHooks: .chartPreparation { await coldGate.pause() })
-        let coldRequest = try AutoChartRequest(table: domainDataset())
-        let coldSession = AutoChartSession<Int>(cache: coldCache)
-        coldSession.load(coldRequest, preparation: .primary)
-        guard await coldGate.waitUntilPaused() else {
+        let cold = try await makeV3PreparationGateFixture(warm: false)
+        let coldSession = AutoChartSession<Int>(cache: cold.cache)
+        coldSession.load(cold.request, preparation: .primary)
+        guard await cold.gate.waitUntilPaused() else {
             coldSession.cancel()
-            await coldGate.release()
+            await cold.gate.release()
             Issue.record("Cold chart preparation did not reach its test gate.")
             return
         }
@@ -2870,32 +2954,27 @@ private final class ProgressRecorder: @unchecked Sendable {
         guard observedColdProgress,
             case .analyzing(let coldProgress) = coldSession.state
         else {
-            await coldGate.release()
+            await cold.gate.release()
             Issue.record("Cold chart preparation must remain in analyzing mode.")
             return
         }
         #expect(coldProgress?.phase == .chartPreparation)
-        await coldGate.release()
+        await cold.gate.release()
         _ = try await readyAnalysis(from: coldSession)
 
-        let warmGate = V3AsyncTestGate()
-        let warmCache = AutoChartCache(
-            testHooks: .chartPreparation { await warmGate.pause() })
-        let warmRequest = try AutoChartRequest(table: domainDataset())
-        _ = try await AutoChartAnalyzer(cache: warmCache).analyze(
-            warmRequest, preparation: .none)
-        let progressToken = warmCache.registerProgress(for: warmRequest.id) { _ in }
-        warmCache.reportProgress(
+        let warm = try await makeV3PreparationGateFixture(warm: true)
+        let progressToken = warm.cache.registerProgress(for: warm.request.id) { _ in }
+        warm.cache.reportProgress(
             AutoChartProgress(phase: .recommendation),
-            for: warmRequest.id,
+            for: warm.request.id,
             fallback: nil)
 
-        let warmSession = AutoChartSession<Int>(cache: warmCache)
-        warmSession.load(warmRequest, preparation: .primary)
-        guard await warmGate.waitUntilPaused() else {
+        let warmSession = AutoChartSession<Int>(cache: warm.cache)
+        warmSession.load(warm.request, preparation: .primary)
+        guard await warm.gate.waitUntilPaused() else {
             warmSession.cancel()
-            await warmGate.release()
-            warmCache.unregisterProgress(for: warmRequest.id, token: progressToken)
+            await warm.gate.release()
+            warm.cache.unregisterProgress(for: warm.request.id, token: progressToken)
             Issue.record("Warm chart preparation did not reach its test gate.")
             return
         }
@@ -2906,14 +2985,14 @@ private final class ProgressRecorder: @unchecked Sendable {
         guard observedWarmProgress,
             case .preparing(_, let warmProgress) = warmSession.state
         else {
-            await warmGate.release()
-            warmCache.unregisterProgress(for: warmRequest.id, token: progressToken)
+            await warm.gate.release()
+            warm.cache.unregisterProgress(for: warm.request.id, token: progressToken)
             Issue.record("Replayed analysis progress must not regress warm preparation.")
             return
         }
         #expect(warmProgress?.phase == .chartPreparation)
-        await warmGate.release()
-        warmCache.unregisterProgress(for: warmRequest.id, token: progressToken)
+        await warm.gate.release()
+        warm.cache.unregisterProgress(for: warm.request.id, token: progressToken)
         _ = try await readyAnalysis(from: warmSession)
         #endif
     }
@@ -3048,81 +3127,14 @@ private final class ProgressRecorder: @unchecked Sendable {
     @Test(
         .disabled(if: !testHooksAvailable, testHooksUnavailable),
         .timeLimit(.minutes(1)))
-    func equivalentPreferenceDoesNotRestartAnalyzingOrPreparingWork() async throws {
+    func samePreferenceDoesNotRestartAnalyzingOrPreparingWork() async throws {
         #if ATC_TEST_HOOKS
-        let coldGate = V3AsyncTestGate()
-        let coldStarts = V3Counter()
-        let coldCache = AutoChartCache(
-            testHooks: .chartPreparation {
-                coldStarts.increment()
-                await coldGate.pause()
-            })
-        let coldRequest = try AutoChartRequest(table: domainDataset())
-        let coldSession = AutoChartSession<Int>(cache: coldCache)
-        coldSession.load(coldRequest, preparation: .primary)
-        guard await coldGate.waitUntilPaused() else {
-            coldSession.cancel()
-            await coldGate.release()
-            Issue.record("Cold analysis did not reach its preparation gate.")
-            return
-        }
-        guard case .analyzing = coldSession.state else {
-            coldSession.cancel()
-            await coldGate.release()
-            Issue.record("Cold preparation must remain in analyzing state.")
-            return
-        }
-        coldSession.setPreference(coldSession.preference)
-        await Task.yield()
-        #expect(coldStarts.value == 1)
-        guard case .analyzing = coldSession.state else {
-            coldSession.cancel()
-            await coldGate.release()
-            Issue.record("Equivalent preference restarted cold analysis.")
-            return
-        }
-        await coldGate.release()
-        _ = try await readyAnalysis(from: coldSession)
-
-        let warmGate = V3AsyncTestGate()
-        let warmStarts = V3Counter()
-        let warmCache = AutoChartCache(
-            testHooks: .chartPreparation {
-                warmStarts.increment()
-                await warmGate.pause()
-            })
-        let warmRequest = try AutoChartRequest(table: domainDataset())
-        _ = try await AutoChartAnalyzer(cache: warmCache).analyze(
-            warmRequest, preparation: .none)
-        let warmSession = AutoChartSession<Int>(cache: warmCache)
-        warmSession.load(warmRequest, preparation: .primary)
-        guard await warmGate.waitUntilPaused() else {
-            warmSession.cancel()
-            await warmGate.release()
-            Issue.record("Warm preparation did not reach its test gate.")
-            return
-        }
-        guard case .preparing = warmSession.state else {
-            warmSession.cancel()
-            await warmGate.release()
-            Issue.record("Warm preparation must remain in preparing state.")
-            return
-        }
-        warmSession.setPreference(warmSession.preference)
-        await Task.yield()
-        #expect(warmStarts.value == 1)
-        guard case .preparing = warmSession.state else {
-            warmSession.cancel()
-            await warmGate.release()
-            Issue.record("Equivalent preference restarted warm preparation.")
-            return
-        }
-        await warmGate.release()
-        _ = try await readyAnalysis(from: warmSession)
+        try await verifySamePreferenceDoesNotRestartPreparation(warm: false)
+        try await verifySamePreferenceDoesNotRestartPreparation(warm: true)
         #endif
     }
 
-    @Test func equivalentPreferenceDoesNotRestartTerminalOrCancelledStates()
+    @Test func samePreferenceDoesNotRestartTerminalOrCancelledStates()
         async throws
     {
         let request = try AutoChartRequest(table: domainDataset())
@@ -3136,7 +3148,7 @@ private final class ProgressRecorder: @unchecked Sendable {
         guard case .ready(let unchangedAnalysis, let unchangedPresentation?) =
             readySession.state
         else {
-            Issue.record("Equivalent ready preference changed session state.")
+            Issue.record("Same ready preference changed session state.")
             return
         }
         #expect(unchangedAnalysis.id == readyAnalysisValue.id)
@@ -3149,7 +3161,7 @@ private final class ProgressRecorder: @unchecked Sendable {
         let fallback = try await fallbackAnalysis(from: fallbackSession)
         fallbackSession.setPreference(fallbackSession.preference)
         guard case .fallback(let unchangedFallback, _) = fallbackSession.state else {
-            Issue.record("Equivalent fallback preference restarted analysis.")
+            Issue.record("Same fallback preference restarted analysis.")
             return
         }
         #expect(unchangedFallback.id == fallback.id)
@@ -3168,7 +3180,7 @@ private final class ProgressRecorder: @unchecked Sendable {
         let failure = try await sessionFailure(from: failedSession)
         failedSession.setPreference(failedSession.preference)
         guard case .failed(let unchangedFailure) = failedSession.state else {
-            Issue.record("Equivalent failed preference started another attempt.")
+            Issue.record("Same failed preference started another attempt.")
             return
         }
         #expect(unchangedFailure.episodeID == failure.episodeID)
@@ -3176,7 +3188,7 @@ private final class ProgressRecorder: @unchecked Sendable {
         readySession.cancel()
         readySession.setPreference(readySession.preference)
         guard case .idle = readySession.state else {
-            Issue.record("Equivalent preference restarted a cancelled session.")
+            Issue.record("Same preference restarted a cancelled session.")
             return
         }
         readySession.setPreference(.table)
@@ -3204,7 +3216,7 @@ private final class ProgressRecorder: @unchecked Sendable {
         #expect(session.isPresentationPending)
         session.setPreference(session.preference)
         guard case .ready(_, let stillVisible?) = session.state else {
-            Issue.record("An equivalent preference must keep the ready chart visible.")
+            Issue.record("The same preference must keep the ready chart visible.")
             return
         }
         #expect(stillVisible.requestID == original.requestID)
@@ -3666,7 +3678,9 @@ private final class ProgressRecorder: @unchecked Sendable {
         #expect(restored.primaryChart?.id == chartID)
     }
 
-    @Test func retryStartsANewFailureEpisodeAndCancellationStaysIdle() async throws {
+    @Test func retryStartsNewFailureEpisodesAndResumesCancelledRequests()
+        async throws
+    {
         let reads = V3Counter()
         let invalid = CountingTable(
             chartRows: [
@@ -3693,17 +3707,32 @@ private final class ProgressRecorder: @unchecked Sendable {
         #expect(fourth.episodeID != third.episodeID)
         #expect(session.preference == .chart(.recommended))
 
+        session.cancel()
+        session.retry()
+        let resumedFailure = try await sessionFailure(from: session)
+        #expect(resumedFailure.episodeID == fourth.episodeID)
+        #expect(session.preference == .chart(.recommended))
+
         session.load(try AutoChartRequest(table: domainDataset()))
+        let ready = try await readyAnalysis(from: session)
+        let retainedRecommendation = try #require(session.currentRecommendation)
         session.cancel()
         guard case .idle = session.state else {
             Issue.record("Cancellation must return the session to idle.")
             return
         }
+        #expect(session.currentRecommendation?.id == retainedRecommendation.id)
         await Task.yield()
         guard case .idle = session.state else {
             Issue.record("Cancelled work must not publish a failure.")
             return
         }
+
+        session.retry()
+        #expect(session.currentRecommendation?.id == retainedRecommendation.id)
+        let resumed = try await readyAnalysis(from: session)
+        #expect(resumed.id == ready.id)
+        #expect(session.preference == .chart(.recommended))
     }
 
     @Test func supersededFailureCannotReplaceANewerReadyRequest() async throws {

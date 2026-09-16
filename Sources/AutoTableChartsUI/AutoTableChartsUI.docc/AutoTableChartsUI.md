@@ -13,7 +13,7 @@ let cache = AutoChartCache()
 let session = AutoChartSession<Int>(cache: cache)
 
 AutoChartSessionView(session: session)
-    .task { session.load(request, preference: .automatic) }
+    .task { session.load(request) }
 ```
 
 ## Topics
