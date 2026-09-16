@@ -7,11 +7,10 @@ Render memoized presentation data and link chart marks to source rows.
 ``AutoChartSession`` publishes analyzing, preparing, ready, fallback, and failed
 states while preventing superseded work from replacing newer state. Two
 sessions can share one core cache while retaining independent preferences and
-selections. When a ready chart remains visible during presentation-only work,
-``AutoChartSession/isPresentationPending`` reports that the visible payload is
-being replaced. Same-request preference changes also keep that chart visible
-until the new choice is ready. `AutoChartSessionView` displays a compact updating
-indicator in either case.
+selections. ``AutoChartSession/isPresentationPending`` reports presentation-only
+work. ``AutoChartSession/isChartUpdatePending`` also includes preference work
+while a ready chart remains visible. `AutoChartSessionView` displays a compact
+updating indicator until the new choice is ready.
 
 ``AutoChartPresenter`` performs localization, formatting, ordering, and
 histogram label resolution before a resolved chart body is evaluated. Its bounded
@@ -41,14 +40,14 @@ fallback, so clearing the convenience cache purges those fallback entries.
 mode run formatter and text-resolver callbacks synchronously on the caller's
 thread. `presentCancellable` and explicit
 ``AutoChartOverridePresentationMode/deferred`` presentation run callbacks off-main.
-Each mounted deferred chart serializes its presentation and progress-label host
-callbacks by default. Use `autoChartDeferredCallbackScheduling(.overlapping)`
-to allow two callbacks from that chart to run at once. Cancelled queued calls are
-removed before starting; a synchronous callback already running may finish, but
-its cancelled result is not published. Work cancelled before cache commit cannot
-populate or evict cache entries. Outside a deferred chart, progress-label callbacks
-use a process-wide serial scheduler. Hosts opting into overlap must make their
-callbacks safe for concurrent calls.
+Mounted deferred charts allow two presentation callbacks by default, so a newer
+request can pass one blocked cancelled callback. Progress labels use a separate
+view-owned lane. Use `autoChartDeferredCallbackScheduling(.serial)` when host
+callbacks must run one at a time, including progress labels. Cancelled queued
+calls are removed before starting; a synchronous callback already running may
+finish, but its cancelled result is not published or cached. Two blocked
+presentation callbacks can still occupy both bounded slots. Progress labels
+outside deferred charts also use view-owned scheduling.
 
 Deferred convenience views require a mounted SwiftUI lifecycle to run their
 presentation task. Synchronous renderers such as snapshot exporters should call
@@ -68,8 +67,10 @@ External row-ID updates select every intersecting mark and retain each mark's fu
 source-row lineage, so aggregate selections stay consistent with chart-originated
 selections. External binding updates are reflected by chart highlighting. When
 charts share a selection binding, each chart ignores selections with foreign
-analysis or prepared-chart provenance. The binding owner decides when to clear
-it; sessions clear their own selections when accepting a different chart.
+analysis or prepared-chart provenance for highlighting. With selection chrome
+enabled, a foreign selection is identified and can be cleared by the user.
+Sessions clear their own selections when accepting a different chart or leaving
+the visible-chart state after failure or cancellation.
 
 Use the environment modifiers `autoChartPresentationContext(_:)`,
 `autoChartFormatters(_:)`, `autoChartTextResolver(_:)`,
@@ -87,10 +88,11 @@ is resolved immediately on the caller's thread. Pass
 `overridePresentationMode: .deferred` to keep the incoming chart visible with an
 updating indicator while a cancellable task re-presents it off the main actor; only
 the newest request is published. Replacing that chart while work is pending shows
-the replacement's immediate valid presentation. A different prepared-chart ID
-remounts the rendered child and resets its local interaction state. Retained
-selection is resynchronized to reordered and reformatted categories or donut angles,
-while presentation-only changes preserve zoom. Synchronous renderers and exporters
+the replacement's immediate valid presentation. A different logical chart
+structure or snapshot content resets zoom; equivalent reanalysis can retain it
+even when prepared-chart identity changes. Selection bindings still resynchronize
+to chart provenance, reordered categories, and donut angles. Presentation-only
+changes preserve zoom. Synchronous renderers and exporters
 do not need to pre-present overrides supplied to a presented-chart view.
 The replacement includes visible order, domains, facets, controls, mark
 accessibility, and Audio Graph, so every surface uses the same labels and formatting.

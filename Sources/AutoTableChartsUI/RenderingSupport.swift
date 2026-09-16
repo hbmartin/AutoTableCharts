@@ -10,6 +10,7 @@ struct AutoChartViewTestHookState {
     let zoomAnchor: Binding<Double>
     let selectionCount: Int
     let hasSelectionSummary: Bool
+    let hasForeignSelectionNotice: Bool
     let selectedCategory: String?
     let selectedAngle: Double?
     let displayTitle: String
@@ -30,7 +31,10 @@ enum AutoChartDeferredPresentationOutcome: Equatable {
 @MainActor
 final class AutoChartViewTestHooks {
     var observe: (AutoChartViewTestHookState) -> Void = { _ in }
+    var pressForeignSelectionClearForTesting: (() -> Void)?
     var callbackSchedulerForTesting: AutoChartCallbackWorkScheduler?
+    var presentationOwnerDidAppearForTesting: () -> Void = {}
+    var foundationNotificationForTesting: () -> Void = {}
     var didPublishDeferredPresentation: (AutoChartPresentationRequestID) -> Void = { _ in }
     var didFinishDeferredPresentation: (
         AutoChartPresentationRequestID, AutoChartDeferredPresentationOutcome

@@ -1888,6 +1888,7 @@ public struct AutoChartMessage: Hashable, Codable, Sendable {
         public static let presentationPending = Self(rawValue: "presentationPending")
         public static let presentationUpdating = Self(rawValue: "presentationUpdating")
         public static let clearSelection = Self(rawValue: "clearSelection")
+        public static let foreignSelection = Self(rawValue: "foreignSelection")
         public static let resetZoom = Self(rawValue: "resetZoom")
         public static let selectionSummary = Self(rawValue: "selectionSummary")
         public static let selectionValue = Self(rawValue: "selectionValue")

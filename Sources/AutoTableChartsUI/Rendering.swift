@@ -112,7 +112,10 @@ public struct AutoChartPresentation: Hashable, Sendable {
 
 private enum AutoChartViewContent<RowID: Hashable & Sendable>: Sendable {
     case deferred(AutoChartPreparedChart<RowID>, AutoChartPresentationContext?)
-    case deferredOverride(AutoChartDeferredPresentationSource<RowID>)
+    case deferredOverride(
+        source: AutoChartPresentedChart<RowID>,
+        formatters: AutoChartFormatters,
+        textResolver: AutoChartTextResolver)
     case immediateOverride(
         source: AutoChartPresentedChart<RowID>,
         resolved: AutoChartPresentedChart<RowID>,
@@ -155,20 +158,6 @@ private enum AutoChartDeferredPresentationSource<RowID: Hashable & Sendable>: Se
     var sourcePresentationID: AutoChartPresentationRequestID? {
         guard case .presented(let source, _, _) = self else { return nil }
         return source.requestID
-    }
-
-    func resampling(
-        formatters: AutoChartFormatters,
-        textResolver: AutoChartTextResolver
-    ) -> Self {
-        guard case .presented(let source, _, _) = self else { return self }
-        let request = source.presentationRequest(
-            formatters: formatters,
-            textResolver: textResolver)
-        let immediate = request.id == source.requestID
-            ? source
-            : source.cachedRePresentation(request: request) ?? source
-        return .presented(source: source, immediate: immediate, request: request)
     }
 
     func present(on scheduler: AutoChartCallbackWorkScheduler) async throws
@@ -234,7 +223,10 @@ struct AutoChartViewPresentationInputs {
 
 private final class AutoChartDeferredPresentationWorker: ObservableObject {
     let scheduler = AutoChartCallbackWorkScheduler(
-        maximumConcurrentJobs: 1,
+        maximumConcurrentJobs: 2,
+        queue: DispatchQueue.global(qos: .userInitiated))
+    let progressScheduler = AutoChartCallbackWorkScheduler(
+        maximumConcurrentJobs: 2,
         queue: DispatchQueue.global(qos: .userInitiated))
 }
 
@@ -245,6 +237,7 @@ private struct AutoChartDeferredPresentationView<RowID: Hashable & Sendable>: Vi
     let presentation: AutoChartPresentation
     private struct StoredPresentation {
         let chart: AutoChartPresentedChart<RowID>
+        let preparedChartID: AutoChartPreparedChartID
         let sourcePresentationID: AutoChartPresentationRequestID?
     }
     private struct TaskID: Hashable {
@@ -265,6 +258,7 @@ private struct AutoChartDeferredPresentationView<RowID: Hashable & Sendable>: Vi
             return immediate
         }
         if let storedPresentation,
+            storedPresentation.preparedChartID == source.preparedChart.id,
             storedPresentation.sourcePresentationID == source.sourcePresentationID
         {
             return storedPresentation.chart
@@ -277,6 +271,8 @@ private struct AutoChartDeferredPresentationView<RowID: Hashable & Sendable>: Vi
         let request = source.request
         let requestID = request.id
         let visible = visiblePresentedChart
+        let labelScheduler = callbackScheduling == .serial
+            ? worker.scheduler : worker.progressScheduler
         ZStack(alignment: .topTrailing) {
             if let presentedChart = visible {
                 AutoChartView(
@@ -288,7 +284,7 @@ private struct AutoChartDeferredPresentationView<RowID: Hashable & Sendable>: Vi
                 AutoChartAccessibleProgressView(
                     message: AutoChartProgressAccessibility.preparing,
                     textResolver: request.textResolver,
-                    scheduler: worker.scheduler)
+                    scheduler: labelScheduler)
                     .frame(maxWidth: .infinity)
                     .frame(height: presentation.plotHeight)
             }
@@ -298,7 +294,7 @@ private struct AutoChartDeferredPresentationView<RowID: Hashable & Sendable>: Vi
                 AutoChartAccessibleProgressView(
                     message: AutoChartProgressAccessibility.updating,
                     textResolver: request.textResolver,
-                    scheduler: worker.scheduler)
+                    scheduler: labelScheduler)
                     .controlSize(.small)
                     .padding(8)
             }
@@ -314,6 +310,7 @@ private struct AutoChartDeferredPresentationView<RowID: Hashable & Sendable>: Vi
             guard visible?.requestID != requestID else {
                 if let storedPresentation,
                     storedPresentation.chart.requestID != requestID
+                        || storedPresentation.preparedChartID != source.preparedChart.id
                         || storedPresentation.sourcePresentationID
                             != source.sourcePresentationID
                 {
@@ -325,7 +322,8 @@ private struct AutoChartDeferredPresentationView<RowID: Hashable & Sendable>: Vi
                 return
             }
             if let storedPresentation,
-                storedPresentation.sourcePresentationID != source.sourcePresentationID
+                storedPresentation.preparedChartID != source.preparedChart.id
+                    || storedPresentation.sourcePresentationID != source.sourcePresentationID
             {
                 self.storedPresentation = nil
             }
@@ -337,6 +335,7 @@ private struct AutoChartDeferredPresentationView<RowID: Hashable & Sendable>: Vi
                 #endif
                 storedPresentation = StoredPresentation(
                     chart: presented,
+                    preparedChartID: source.preparedChart.id,
                     sourcePresentationID: source.sourcePresentationID)
                 #if ATC_TEST_HOOKS
                 viewTestHooks?.didFinishDeferredPresentation(requestID, .published)
@@ -429,6 +428,39 @@ private struct AutoChartAccessibleChart<Content: View>: View {
 }
 #endif
 
+@MainActor
+private final class AutoChartFoundationSettingsObserver: ObservableObject {
+    @Published private(set) var revision = 0
+    private var observerTokens: [NSObjectProtocol] = []
+    private var generation = 0
+
+    func start(onChange: @escaping @MainActor () -> Void) {
+        guard observerTokens.isEmpty else { return }
+        generation &+= 1
+        let token = generation
+        for name in [
+            NSLocale.currentLocaleDidChangeNotification,
+            Notification.Name.NSSystemTimeZoneDidChange
+        ] {
+            observerTokens.append(NotificationCenter.default.addObserver(
+                forName: name, object: nil, queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    guard let self, self.generation == token else { return }
+                    self.revision &+= 1
+                    onChange()
+                }
+            })
+        }
+    }
+
+    func stop() {
+        generation &+= 1
+        observerTokens.forEach(NotificationCenter.default.removeObserver)
+        observerTokens.removeAll()
+    }
+}
+
 /// Convenience composition of a prepared plot and optional package chrome.
 public struct AutoChartView<RowID: Hashable & Sendable>: View {
     #if ATC_TEST_HOOKS
@@ -465,6 +497,10 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
             to: analysisID, preparedChartID: preparedChart.id)
     }
 
+    private var hasForeignSelection: Bool {
+        !selection.isEmpty && !ownsSelection
+    }
+
     @State private var selectedCategory: String?
     @State private var selectedDate: Date?
     @State private var selectedNumber: Double?
@@ -475,7 +511,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     @State private var pendingAngleSynchronization: Double?? = nil
     @State private var zoomScale = 1.0
     @State private var zoomAnchor = 1.0
-    @State private var foundationSettingsRevision = 0
+    @StateObject private var foundationSettingsObserver = AutoChartFoundationSettingsObserver()
     @Environment(\.autoChartPalette) private var palette
     @Environment(\.autoChartTheme) private var theme
     @Environment(\.autoChartPresentationContext) private var environmentPresentationContext
@@ -567,15 +603,14 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     ) {
         let effectiveFormatters = formatters ?? presentedChart.formatters
         let effectiveTextResolver = textResolver ?? presentedChart.textResolver
-        let request = presentedChart.presentationRequest(
-            formatters: effectiveFormatters,
-            textResolver: effectiveTextResolver)
-        let cached = request.id == presentedChart.requestID
-            ? presentedChart
-            : presentedChart.cachedRePresentation(
-                request: request)
         switch overridePresentationMode {
         case .immediate:
+            let request = presentedChart.presentationRequest(
+                formatters: effectiveFormatters,
+                textResolver: effectiveTextResolver)
+            let cached = request.id == presentedChart.requestID
+                ? presentedChart
+                : presentedChart.cachedRePresentation(request: request)
             let resolved = cached ?? presentedChart.rePresent(request: request)
             self.init(
                 resolvedPresentedChart: resolved,
@@ -589,10 +624,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
                 textResolver: effectiveTextResolver)
         case .deferred:
             self.init(
-                deferredOverrideSource: .presented(
-                    source: presentedChart,
-                    immediate: cached ?? presentedChart,
-                    request: request),
+                deferredOverrideSource: presentedChart,
                 analysisID: analysisID,
                 selection: selection,
                 presentation: presentation,
@@ -602,7 +634,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     }
 
     private init(
-        deferredOverrideSource: AutoChartDeferredPresentationSource<RowID>,
+        deferredOverrideSource: AutoChartPresentedChart<RowID>,
         analysisID: AutoChartAnalysisID,
         selection: Binding<AutoChartSelectionSet<RowID>>,
         presentation: AutoChartPresentation,
@@ -612,7 +644,10 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         #if ATC_TEST_HOOKS
         presentedChartForTesting = nil
         #endif
-        content = .deferredOverride(deferredOverrideSource)
+        content = .deferredOverride(
+            source: deferredOverrideSource,
+            formatters: formatters,
+            textResolver: textResolver)
         displayTitle = ""
         renderedData = []
         facetPanels = []
@@ -733,7 +768,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         switch content {
         case .deferred(let chart, _), .chart(let chart, _):
             return chart
-        case .deferredOverride(let source):
+        case .deferredOverride(let source, _, _):
             return source.preparedChart
         case .immediateOverride(let source, _, _, _):
             return source.preparedChart
@@ -757,7 +792,20 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     private var sharedXDateDomain: ClosedRange<Date>? { renderPresentation.sharedXDateDomain }
     private var sharedXNumberDomain: ClosedRange<Double>? { renderPresentation.sharedXNumberDomain }
     private var facetBaseFamily: AutoChartFamily? { renderPresentation.facetBaseFamily }
-    private var snapshotFingerprint: Int { preparedChart.core.fingerprint }
+    private struct ZoomIdentity: Hashable {
+        let specification: AutoChartSpecificationID
+        let contentFingerprint: Int
+    }
+
+    private static func zoomIdentity(
+        for chart: AutoChartPreparedChart<RowID>
+    ) -> ZoomIdentity {
+        ZoomIdentity(
+            specification: chart.recommendation.specification.id,
+            contentFingerprint: chart.core.fingerprint)
+    }
+
+    private var zoomIdentity: ZoomIdentity { Self.zoomIdentity(for: preparedChart) }
     private var xTitle: String { resolvedPresentation.x }
     private var yTitle: String { resolvedPresentation.y }
     private var seriesTitle: String { resolvedPresentation.series }
@@ -781,6 +829,15 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
     private var isCompact: Bool { presentation.typography == .compact }
     private var interactions: AutoChartInteractions { presentation.interactions }
 
+    private var ownsPresentationRebuilding: Bool {
+        switch content {
+        case .deferred, .deferredOverride, .immediateOverride:
+            return true
+        case .chart, .fallback:
+            return false
+        }
+    }
+
     private func resolvedColumn(_ id: AutoChartColumnID?) -> AutoChartColumn? {
         id.flatMap { preparedChart.core.table.profiles[$0]?.column }
     }
@@ -797,8 +854,28 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
 
     @ViewBuilder
     public var body: some View {
+        if ownsPresentationRebuilding {
+            renderedBody
+                .onAppear {
+                    foundationSettingsObserver.start {
+                        #if ATC_TEST_HOOKS
+                        viewTestHooks?.foundationNotificationForTesting()
+                        #endif
+                    }
+                    #if ATC_TEST_HOOKS
+                    viewTestHooks?.presentationOwnerDidAppearForTesting()
+                    #endif
+                }
+                .onDisappear { foundationSettingsObserver.stop() }
+        } else {
+            renderedBody
+        }
+    }
+
+    @ViewBuilder
+    private var renderedBody: some View {
         Group {
-        let _ = foundationSettingsRevision
+        let _ = foundationSettingsObserver.revision
         switch content {
         case .deferred(let preparedChart, let explicitContext):
             let inputs = effectivePresentationInputs(explicit: explicitContext)
@@ -813,17 +890,23 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
                 analysisID: analysisID,
                 selection: $selection,
                 presentation: presentation)
-                .id(preparedChart.id)
-        case .deferredOverride(let source):
-            let refreshed = source.resampling(
-                formatters: formatters ?? effectiveFormatters,
-                textResolver: textResolver ?? effectiveTextResolver)
+                .id(Self.zoomIdentity(for: preparedChart))
+        case .deferredOverride(let source, let sourceFormatters, let sourceTextResolver):
+            let request = source.presentationRequest(
+                formatters: sourceFormatters,
+                textResolver: sourceTextResolver)
+            let immediate = request.id == source.requestID
+                ? source
+                : source.cachedRePresentation(request: request) ?? source
             AutoChartDeferredPresentationView(
-                source: refreshed,
+                source: .presented(
+                    source: source,
+                    immediate: immediate,
+                    request: request),
                 analysisID: analysisID,
                 selection: $selection,
                 presentation: presentation)
-                .id(refreshed.preparedChart.id)
+                .id(Self.zoomIdentity(for: source.preparedChart))
         case .immediateOverride(
             let source, let resolved, let sourceFormatters, let sourceTextResolver):
             let request = source.presentationRequest(
@@ -838,7 +921,7 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
                 analysisID: analysisID,
                 selection: $selection,
                 presentation: presentation)
-                .id(refreshed.preparedChart.id)
+                .id(Self.zoomIdentity(for: refreshed.preparedChart))
         case .fallback(let fallback):
             VStack(alignment: .leading, spacing: 10) {
                 ContentUnavailableView(
@@ -894,6 +977,26 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
                     .accessibilityElement(children: .combine)
                     .accessibilityLabel(summary.accessibilityDescription)
                 }
+                if presentation.chrome.contains(.selectionSummary), hasForeignSelection {
+                    let message = AutoChartMessage(
+                        category: .interface,
+                        code: .foreignSelection,
+                        defaultText: "Selection from another chart")
+                    HStack {
+                        Text(effectiveTextResolver(message))
+                            .font(theme.labelFont)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Button(effectiveTextResolver(.init(
+                            category: .interface,
+                            code: .clearSelection,
+                            defaultText: "Clear"))) { clearSelection() }
+                            .buttonStyle(.borderless)
+                            .accessibilityIdentifier("auto-chart-clear-foreign-selection")
+                    }
+                    .accessibilityElement(children: .contain)
+                    .accessibilityIdentifier("auto-chart-foreign-selection")
+                }
                 if presentation.chrome.contains(.zoomControls), zoomScale > 1.01 {
                     Button(effectiveTextResolver(.init(
                         category: .interface,
@@ -938,17 +1041,15 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         .foregroundStyle(theme.legendColor)
         .chartForegroundStyleScale(
             range: palette.marks.isEmpty ? theme.markColors : palette.marks)
-        .onChange(of: recommendation.id) { _, _ in
-            resetInteractionState()
-        }
-        .onChange(of: snapshotFingerprint) { _, _ in
+        .onChange(of: zoomIdentity) { _, _ in
             resetInteractionState()
         }
         .onAppear {
             synchronizeInteractionState(from: selection)
         }
         .onChange(of: selectionOwnershipID) { _, _ in
-            resetInteractionState()
+            synchronizeInteractionBindings(
+                category: nil, date: nil, number: nil, angle: nil)
             synchronizeInteractionState(from: selection)
         }
         .onChange(of: presentationRequestID) { _, _ in
@@ -984,25 +1085,22 @@ public struct AutoChartView<RowID: Hashable & Sendable>: View {
         #endif
         }
         }
-        .onReceive(NotificationCenter.default.publisher(
-            for: NSLocale.currentLocaleDidChangeNotification)) { _ in
-            foundationSettingsRevision &+= 1
-        }
-        .onReceive(NotificationCenter.default.publisher(
-            for: .NSSystemTimeZoneDidChange)) { _ in
-            foundationSettingsRevision &+= 1
-        }
     }
 
     #if ATC_TEST_HOOKS
     private func reportViewStateForTesting() {
         guard let viewTestHooks, let presentedChartForTesting else { return }
+        viewTestHooks.pressForeignSelectionClearForTesting =
+            hasForeignSelection && presentation.chrome.contains(.selectionSummary)
+            ? { clearSelection() } : nil
         viewTestHooks.observe(AutoChartViewTestHookState(
             requestID: presentedChartForTesting.requestID,
             zoomScale: $zoomScale,
             zoomAnchor: $zoomAnchor,
             selectionCount: ownsSelection ? selection.count : 0,
             hasSelectionSummary: ownsSelection
+                && presentation.chrome.contains(.selectionSummary),
+            hasForeignSelectionNotice: hasForeignSelection
                 && presentation.chrome.contains(.selectionSummary),
             selectedCategory: selectedCategory,
             selectedAngle: selectedAngle,
