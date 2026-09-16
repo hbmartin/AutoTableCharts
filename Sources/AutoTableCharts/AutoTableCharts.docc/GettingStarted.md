@@ -67,7 +67,7 @@ the charts selected by the preparation strategy.
 import AutoTableChartsUI
 
 let session = AutoChartSession<Int>(cache: cache)
-session.load(request, preference: .automatic)
+session.load(request)
 ```
 
 `AutoChartSession` owns supersession, cancellation, preference-aware
@@ -85,8 +85,10 @@ session.load(request, preference: .automatic) // Explicit values win.
 ```
 
 Reapplying the stored preference does not restart analyzing, preparation, or a
-terminal state; use `session.retry()` to repeat an unchanged attempt. `cancel()`
-retains the request, while `unload()` forgets it. Observe `state`,
+terminal state. A retry after failure starts a new failure episode; after
+`cancel()`, it resumes the retained request without resetting shared failure
+history. `unload()` forgets request-specific state while preserving the session
+preference. Observe `state`,
 `isChartUpdatePending`, and `isPresentationPending` for lifecycle UI. The
 session preserves selection only while its prepared chart remains authoritative
 and clears selection on replacement, fallback, failure, cancellation, or unload.

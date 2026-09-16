@@ -49,7 +49,7 @@ struct ResultChart: View {
 
     var body: some View {
         AutoChartSessionView(session: session)
-            .task { session.load(request, preference: .automatic) }
+            .task { session.load(request) }
     }
 }
 ```

@@ -84,6 +84,7 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
     private var presentationTarget: PresentationTarget?
     private var preferenceUpdatePending = false
     #if ATC_TEST_HOOKS
+    @ObservationIgnored package var attemptDidStartForTesting: (() -> Void)?
     @ObservationIgnored package var presentationFailureForTesting: AutoChartFailure?
     @ObservationIgnored package var environmentApplicationForTesting: (() -> Void)?
     #endif
@@ -307,22 +308,35 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         }
     }
 
-    /// Starts a fresh attempt after a retryable failure, including when the
-    /// preference has not changed.
+    /// Restarts the retained request using the stored preference.
+    ///
+    /// A failed attempt begins a new failure episode. After ``cancel()``, this
+    /// resumes the cancelled request without resetting shared failure history or
+    /// clearing its request-scoped recommendation.
     public func retry() {
         retry(preference: preference)
     }
 
-    /// Starts a fresh attempt with a new preference after a retryable failure.
+    /// Restarts the retained request using an explicit preference.
+    ///
+    /// A failed attempt begins a new failure episode. After ``cancel()``, this
+    /// resumes the cancelled request without resetting shared failure history or
+    /// clearing its request-scoped recommendation.
     public func retry(preference: AutoChartPreference) {
         guard let request else { return }
-        cache.beginRetry(for: request.id)
+        let resumesCancelledRequest: Bool
+        if case .idle = state {
+            resumesCancelledRequest = true
+        } else {
+            resumesCancelledRequest = false
+            cache.beginRetry(for: request.id)
+        }
         start(
             request,
             preference: preference,
             preparation: strategy,
             presentationConfiguration: presentationConfiguration,
-            clearsVisibleState: true)
+            clearsVisibleState: !resumesCancelledRequest)
     }
 
     /// Cancels the current attempt and clears selection without forgetting the request.
@@ -344,14 +358,14 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         state = .idle
     }
 
-    /// Ends ownership of the current request. Unlike `cancel`, a later
-    /// preference change cannot restart the unloaded request.
+    /// Ends ownership of the current request while preserving the session's
+    /// stored preference. Unlike `cancel`, a later preference change cannot
+    /// restart the unloaded request.
     public func unload() {
         cancel()
         request = nil
         selection.removeAll()
         currentRecommendation = nil
-        preference = .automatic
     }
 
     #if ATC_TEST_HOOKS
@@ -376,6 +390,9 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         clearsVisibleState: Bool,
         keepsVisibleReadyChart: Bool = false
     ) {
+        #if ATC_TEST_HOOKS
+        attemptDidStartForTesting?()
+        #endif
         let keepsReadyChart: Bool
         if keepsVisibleReadyChart, case .ready(_, let presented) = state,
             presented != nil,
