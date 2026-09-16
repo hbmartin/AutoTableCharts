@@ -103,10 +103,34 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         recommendationTask?.cancel()
     }
 
-    /// Starts or supersedes a request. Replacement requests clear visible state immediately.
+    /// Starts or supersedes a request using the session's stored preference.
+    ///
+    /// A preference set before the first request, or retained from a prior request,
+    /// becomes the default when this overload is used. Replacement requests clear
+    /// visible state immediately.
     public func load(
         _ request: AutoChartRequest<RowID>,
-        preference: AutoChartPreference = .automatic,
+        preparation: AutoChartPreparationStrategy = .preferredOrPrimary,
+        presentationContext: AutoChartPresentationContext = .init(),
+        formatters: AutoChartFormatters? = nil,
+        textResolver: AutoChartTextResolver = .default
+    ) {
+        load(
+            request,
+            preference: preference,
+            preparation: preparation,
+            presentationContext: presentationContext,
+            formatters: formatters,
+            textResolver: textResolver)
+    }
+
+    /// Starts or supersedes a request with an explicit preference.
+    ///
+    /// The supplied preference replaces the session's stored preference.
+    /// Replacement requests clear visible state immediately.
+    public func load(
+        _ request: AutoChartRequest<RowID>,
+        preference: AutoChartPreference,
         preparation: AutoChartPreparationStrategy = .preferredOrPrimary,
         presentationContext: AutoChartPresentationContext = .init(),
         formatters: AutoChartFormatters? = nil,
@@ -125,18 +149,23 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
     }
 
     /// Selects and prepares an alternative without changing analysis identity.
+    /// Selecting the stored preference is a no-op.
     public func select(_ recommendationID: AutoChartRecommendationID) {
         setPreference(.chart(.specific(recommendationID)))
     }
 
     /// Reconciles a new preference against the current analysis and prepared-chart cache.
-    /// Returns true only when this change starts a new session pass. A matching
-    /// ready chart is updated in place, and an unloaded session has no pass to restart.
-    @discardableResult
-    public func setPreference(_ preference: AutoChartPreference) -> Bool {
+    ///
+    /// Reapplying the stored preference is always a no-op; call ``retry()`` to
+    /// start another attempt with an unchanged preference. Before a request is
+    /// loaded, this stores the default used by ``load(_:preparation:presentationContext:formatters:textResolver:)``.
+    /// After ``cancel()``, a different preference may restart the retained request;
+    /// after ``unload()``, it is stored without starting work.
+    public func setPreference(_ preference: AutoChartPreference) {
+        guard preference != self.preference else { return }
         guard let request else {
             self.preference = preference
-            return false
+            return
         }
         if case .ready(let displayedAnalysis, let presented?) = state,
             let base: AutoChartAnalysis<RowID> = cache.completedAnalysis(
@@ -165,7 +194,7 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
                     for: updated,
                     chart: presented.preparedChart,
                     keepsVisiblePresentation: true)
-                return false
+                return
             }
         }
         start(
@@ -175,7 +204,6 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
             presentationConfiguration: presentationConfiguration,
             clearsVisibleState: false,
             keepsVisibleReadyChart: true)
-        return true
     }
 
     /// Schedules presentation rebuilding for the current prepared chart without
@@ -279,7 +307,8 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         }
     }
 
-    /// Starts a fresh attempt after a retryable failure.
+    /// Starts a fresh attempt after a retryable failure, including when the
+    /// preference has not changed.
     public func retry() {
         retry(preference: preference)
     }
@@ -296,7 +325,9 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
             clearsVisibleState: true)
     }
 
-    /// Cancels the current attempt. Cancellation never becomes a failure state.
+    /// Cancels the current attempt and clears selection without forgetting the request.
+    /// Cancellation never becomes a failure state. A later different preference
+    /// may start new work for the retained request; use ``unload()`` to prevent that.
     public func cancel() {
         generation &+= 1
         presentationGeneration &+= 1

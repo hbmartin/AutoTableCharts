@@ -13,11 +13,12 @@ fi
 
 case "$1" in
   with-hooks)
-    swift_test_arguments=(-c release -Xswiftc -DATC_TEST_HOOKS)
+    # Keep main-actor UI work from starving async session-test deadlines.
+    swift_test_arguments=(-c release --no-parallel -Xswiftc -DATC_TEST_HOOKS)
     expected_state="executed"
     ;;
   without-hooks)
-    swift_test_arguments=(-c release)
+    swift_test_arguments=(-c release --no-parallel)
     expected_state="skipped"
     ;;
   *)
