@@ -75,6 +75,22 @@ preparation, warm-cache adoption, retries, and alternative selection. Use
 `AutoChartSessionView` for package defaults or switch on session state to retain
 an existing table and failure UI.
 
+Set a preference before loading when it should become the session default:
+
+```swift
+session.setPreference(.chart(.recommended))
+session.load(request) // Uses the stored preference.
+
+session.load(request, preference: .automatic) // Explicit values win.
+```
+
+Reapplying the stored preference does not restart analyzing, preparation, or a
+terminal state; use `session.retry()` to repeat an unchanged attempt. `cancel()`
+retains the request, while `unload()` forgets it. Observe `state`,
+`isChartUpdatePending`, and `isPresentationPending` for lifecycle UI. The
+session preserves selection only while its prepared chart remains authoritative
+and clears selection on replacement, fallback, failure, cancellation, or unload.
+
 ### Prepare an alternative
 
 ```swift
