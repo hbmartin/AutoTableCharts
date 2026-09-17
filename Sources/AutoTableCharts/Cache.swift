@@ -176,16 +176,10 @@ public final class AutoChartCache: @unchecked Sendable {
                 failureRecency.touch(key)
                 return existing
             }
-            let replacement = AutoChartFailure(
-                stage: proposed.stage,
-                kind: proposed.kind,
-                isRetryable: proposed.isRetryable,
-                diagnosticID: proposed.diagnosticID,
-                message: proposed.message)
-            failures[key] = replacement
+            failures[key] = proposed
             failureRecency.touch(key)
             trimFailuresLocked()
-            return replacement
+            return proposed
         }
     }
 

@@ -88,8 +88,11 @@ Reapplying the stored preference does not restart analyzing, preparation, or a
 terminal state. A retry after failure starts a new failure episode even if
 `cancel()` was called after the failure. Retrying a nonfailed cancelled attempt
 with the same preference resumes it without resetting shared failure history.
-Every retry with an unchanged preference preserves `currentRecommendation`,
-including uncached retries; changing the request or preference clears it.
+Every retry with an unchanged preference preserves `currentRecommendation`
+synchronously, including uncached retries and retries after cancelling a failed
+attempt. The session retains its last analysis for the active request until that
+request is replaced or unloaded; changing the request or preference clears the
+recommendation.
 `unload()` forgets request-specific state and loaded presentation callbacks while
 preserving the session preference, active environment overrides, and knowledge of
 failure episodes already shown. Loading that request again therefore starts a new

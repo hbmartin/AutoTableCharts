@@ -632,6 +632,9 @@ public struct AutoChartAnalysis<RowID: Hashable & Sendable>: Sendable {
     ///   ``AutoChartCache/trim(to:)`` afterwards. An invalid specification
     ///   is never cached.
     ///
+    /// A successful validation also retires the matching chart-preparation
+    /// failure episode. An invalid validation result does not retire an episode.
+    ///
     /// - Throws: `CancellationError` if the calling task is cancelled. An
     ///   invalid specification is reported through the returned result, not by
     ///   throwing. Repeated analyzer resets can throw
