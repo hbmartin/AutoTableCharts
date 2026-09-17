@@ -351,6 +351,8 @@ public struct AutoChartAnalysis<RowID: Hashable & Sendable>: Sendable {
     public let preferenceResolution: AutoChartPreferenceResolution?
 
     private let provider: AutoChartAnalysisPreparationProvider<RowID>
+    private let preparationDidSucceed:
+        (@Sendable (AutoChartRecommendationID) -> Void)?
 
     package var sharedSourceIdentifier: ObjectIdentifier {
         ObjectIdentifier(provider.source)
@@ -373,7 +375,9 @@ public struct AutoChartAnalysis<RowID: Hashable & Sendable>: Sendable {
         primaryChart: AutoChartPreparedChart<RowID>?,
         preparedCharts: [AutoChartRecommendationID: AutoChartPreparedChart<RowID>] = [:],
         preferenceResolution: AutoChartPreferenceResolution? = nil,
-        provider: AutoChartAnalysisPreparationProvider<RowID>
+        provider: AutoChartAnalysisPreparationProvider<RowID>,
+        preparationDidSucceed:
+            (@Sendable (AutoChartRecommendationID) -> Void)? = nil
     ) {
         self.id = id
         self.request = request
@@ -386,6 +390,7 @@ public struct AutoChartAnalysis<RowID: Hashable & Sendable>: Sendable {
         self.preparedCharts = preparedCharts
         self.preferenceResolution = preferenceResolution
         self.provider = provider
+        self.preparationDidSucceed = preparationDidSucceed
     }
 
     /// Resolves the v3 preference independently from preparation strategy.
@@ -518,7 +523,30 @@ public struct AutoChartAnalysis<RowID: Hashable & Sendable>: Sendable {
             primaryChart: primary,
             preparedCharts: preparedCharts,
             preferenceResolution: resolution,
-            provider: provider)
+            provider: provider,
+            preparationDidSucceed: preparationDidSucceed)
+    }
+
+    package func recordingPreparationSuccess(in cache: AutoChartCache) -> Self {
+        let requestID = request
+        return Self(
+            id: id,
+            request: request,
+            estimatedRetainedCost: estimatedRetainedCost,
+            outcome: outcome,
+            profiles: columnProfiles,
+            diagnostics: diagnostics,
+            decisionTrace: decisionTrace,
+            primaryChart: primaryChart,
+            preparedCharts: preparedCharts,
+            preferenceResolution: preferenceResolution,
+            provider: provider,
+            preparationDidSucceed: { [weak cache] recommendationID in
+                cache?.recordSuccess(
+                    for: AutoChartFailureScope(
+                        requestID: requestID,
+                        recommendationID: recommendationID))
+            })
     }
 
     private func recommendation(
@@ -628,7 +656,9 @@ public struct AutoChartAnalysis<RowID: Hashable & Sendable>: Sendable {
     public func prepare(
         _ recommendationID: AutoChartRecommendationID
     ) async throws -> AutoChartPreparedChart<RowID> {
-        try await provider.prepare(recommendationID)
+        let prepared = try await provider.prepare(recommendationID)
+        preparationDidSucceed?(recommendationID)
+        return prepared
     }
 
     /// Validates and prepares a caller-provided specification.
@@ -1029,9 +1059,12 @@ public actor AutoChartAnalyzer {
         }
         let engine = cache?.engine ?? self
         let base: AutoChartAnalysis<RowID>
+        let reusedCompletedAnalysis: Bool
         if let cached: AutoChartAnalysis<RowID> = cache?.completedAnalysis(for: request.id) {
             base = cached
+            reusedCompletedAnalysis = true
         } else {
+            reusedCompletedAnalysis = false
             let dataset: AutoChartDataset<RowID>
             do {
                 reportProgress(AutoChartProgress(phase: .materialization))
@@ -1058,11 +1091,16 @@ public actor AutoChartAnalyzer {
                         options: request.options,
                         constraints: request.constraints)
                 }
-                base = analyzed.replacingPresentation(
+                let requestAnalysis = analyzed.replacingPresentation(
                     request: request.id,
                     preparedCharts: [:],
                     resolution: nil)
-                cache?.store(base)
+                if let cache {
+                    base = requestAnalysis.recordingPreparationSuccess(in: cache)
+                    cache.store(base)
+                } else {
+                    base = requestAnalysis
+                }
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
@@ -1075,7 +1113,9 @@ public actor AutoChartAnalyzer {
             }
         }
 
-        cache?.recordSuccess(for: AutoChartFailureScope(requestID: request.id))
+        if reusedCompletedAnalysis {
+            cache?.recordSuccess(for: AutoChartFailureScope(requestID: request.id))
+        }
 
         let resolution = base.resolve(preference)
         guard !resolution.usesTable, strategy != .none else {
@@ -1098,10 +1138,6 @@ public actor AutoChartAnalyzer {
                     totalUnitCount: recommendations.count))
             do {
                 prepared[recommendation.id] = try await base.prepare(recommendation.id)
-                cache?.recordSuccess(
-                    for: AutoChartFailureScope(
-                        requestID: request.id,
-                        recommendationID: recommendation.id))
             } catch is CancellationError {
                 throw CancellationError()
             } catch {

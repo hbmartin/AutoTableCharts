@@ -781,7 +781,7 @@ private func verifySamePreferenceDoesNotRestartPreparation(
 
     #expect(attempts.value == 1)
     #expect(fixture.preparationStarts.value == 1)
-    #expect(!session.setPreference(session.preference))
+    session.setPreference(session.preference)
     #expect(attempts.value == 1)
     #expect(fixture.preparationStarts.value == 1)
     guard hasExpectedV3PreparationState(session, warm: warm) else {
@@ -1928,9 +1928,7 @@ private final class ProgressRecorder: @unchecked Sendable {
             for: requestID,
             error: failure(),
             stage: .recommendation,
-            episodeContext: .init(
-                observedEpisodes: [:],
-                restartsAttemptedScopes: false))
+            episodeContext: .coalescing)
         #expect(freshSession.episodeID == shared.episodeID)
 
         let observedSession = cache.coalescedFailure(
@@ -1938,8 +1936,7 @@ private final class ProgressRecorder: @unchecked Sendable {
             error: failure(),
             stage: .recommendation,
             episodeContext: .init(
-                observedEpisodes: [scope: shared.episodeID],
-                restartsAttemptedScopes: false))
+                episodesToReplace: [scope: shared.episodeID]))
         #expect(observedSession.episodeID != shared.episodeID)
 
         let explicitRetry = cache.coalescedFailure(
@@ -1947,9 +1944,37 @@ private final class ProgressRecorder: @unchecked Sendable {
             error: failure(),
             stage: .recommendation,
             episodeContext: .init(
-                observedEpisodes: [:],
-                restartsAttemptedScopes: true))
+                episodesToReplace: [scope: observedSession.episodeID]))
         #expect(explicitRetry.episodeID != observedSession.episodeID)
+
+        let concurrentRetry = cache.coalescedFailure(
+            for: requestID,
+            error: failure(),
+            stage: .recommendation,
+            episodeContext: .init(
+                episodesToReplace: [scope: observedSession.episodeID]))
+        #expect(concurrentRetry.episodeID == explicitRetry.episodeID)
+    }
+
+    @Test func recreatedRecordsNeverReuseAnIncomingFailureEpisode() {
+        let cache = AutoChartCache()
+        let requestID = AutoChartRequestID(value: 8)
+        let incoming = AutoChartFailure(
+            stage: .recommendation,
+            kind: .internalFailure,
+            isRetryable: true,
+            diagnosticID: "ATC.test.cacheOwnedEpisode",
+            message: "Controlled cache-owned episode failure")
+
+        let first = cache.coalescedFailure(
+            for: requestID, error: incoming, stage: .recommendation)
+        cache.beginRetry(for: requestID)
+        let recreated = cache.coalescedFailure(
+            for: requestID, error: incoming, stage: .recommendation)
+
+        #expect(first.episodeID != incoming.episodeID)
+        #expect(recreated.episodeID != incoming.episodeID)
+        #expect(recreated.episodeID != first.episodeID)
     }
 
     @Test func successfulWorkRetiresOnlyItsExactFailureScopes() async throws {
@@ -2010,6 +2035,7 @@ private final class ProgressRecorder: @unchecked Sendable {
 
     @MainActor
     @Test(
+        .serializedMainActorRegression,
         .disabled(if: !testHooksAvailable, testHooksUnavailable),
         .timeLimit(.minutes(1)))
     func chartPreparationFailureEpisodesAreScopedToRecommendation()
@@ -2106,8 +2132,66 @@ private final class ProgressRecorder: @unchecked Sendable {
         #endif
     }
 
+    @Test(
+        .disabled(if: !testHooksAvailable, testHooksUnavailable),
+        .timeLimit(.minutes(1)))
+    func directPreparationSuccessRetiresItsRecommendationEpisode() async throws {
+        #if ATC_TEST_HOOKS
+        let calls = V3Counter()
+        let cache = AutoChartCache(
+            configuration: .init(
+                preparedCharts: .init(maximumEntries: 0)),
+            testHooks: .chartPreparationByRecommendation { _ in
+                calls.increment()
+                if calls.value != 2 {
+                    throw AutoChartFailure(
+                        stage: .chartPreparation,
+                        kind: .internalFailure,
+                        isRetryable: true,
+                        diagnosticID: "ATC.test.directPreparationSuccess",
+                        message: "Controlled direct-preparation failure")
+                }
+            })
+        let analyzer = AutoChartAnalyzer(cache: cache)
+        let request = try AutoChartRequest(table: domainDataset())
+        let base = try await analyzer.analyze(request, preparation: .none)
+        let selected = try #require(base.outcome.catalog?.primary)
+
+        let firstResult = await captureResult {
+            try await analyzer.analyze(
+                request,
+                preference: .chart(.specific(selected.id)),
+                preparation: .preferredOrPrimary)
+        }
+        guard case .failure(let firstError) = firstResult,
+            let first = firstError as? AutoChartFailure
+        else {
+            Issue.record("The first controlled preparation did not fail.")
+            return
+        }
+
+        _ = try await base.prepare(selected.id)
+
+        let repeatedResult = await captureResult {
+            try await analyzer.analyze(
+                request,
+                preference: .chart(.specific(selected.id)),
+                preparation: .preferredOrPrimary)
+        }
+        guard case .failure(let repeatedError) = repeatedResult,
+            let repeated = repeatedError as? AutoChartFailure
+        else {
+            Issue.record("The repeated controlled preparation did not fail.")
+            return
+        }
+        #expect(repeated.episodeID != first.episodeID)
+        #expect(calls.value == 3)
+        #endif
+    }
+
     @MainActor
     @Test(
+        .serializedMainActorRegression,
         .disabled(if: !testHooksAvailable, testHooksUnavailable),
         .timeLimit(.minutes(1)))
     func retryingCancelledNonfailureResumesSharedFailureHistory()
@@ -2115,18 +2199,20 @@ private final class ProgressRecorder: @unchecked Sendable {
     {
         #if ATC_TEST_HOOKS
         let gate = V3AsyncTestGate()
-        let controlledFailure = AutoChartFailure(
-            stage: .chartPreparation,
-            kind: .internalFailure,
-            isRetryable: true,
-            diagnosticID: "ATC.test.cancelledRetry",
-            message: "Controlled cancelled-retry failure")
+        let controlledFailure: @Sendable () -> AutoChartFailure = {
+            AutoChartFailure(
+                stage: .chartPreparation,
+                kind: .internalFailure,
+                isRetryable: true,
+                diagnosticID: "ATC.test.cancelledRetry",
+                message: "Controlled cancelled-retry failure")
+        }
         let cache = AutoChartCache(
             configuration: .init(
                 preparedCharts: .init(maximumEntries: 0)),
             testHooks: .chartPreparationByRecommendation { _ in
                 await gate.pause()
-                throw controlledFailure
+                throw controlledFailure()
             })
         let request = try AutoChartRequest(table: domainDataset())
         let base = try await AutoChartAnalyzer(cache: cache).analyze(
@@ -2135,7 +2221,7 @@ private final class ProgressRecorder: @unchecked Sendable {
         let sharedFailure = cache.coalescedFailure(
             for: request.id,
             recommendationID: selected.id,
-            error: controlledFailure,
+            error: controlledFailure(),
             stage: .chartPreparation)
         let session = AutoChartSession<Int>(cache: cache)
 
@@ -2176,8 +2262,13 @@ private final class ProgressRecorder: @unchecked Sendable {
         let cache = AutoChartCache(
             configuration: .init(analyses: .init(maximumEntries: 2)))
         let firstID = AutoChartRequestID(value: 1)
-        let secondID = AutoChartRequestID(value: 2)
-        let thirdID = AutoChartRequestID(value: 3)
+        let scopedID = AutoChartRequestID(value: 2)
+        let firstRecommendationID = AutoChartRecommendationID(
+            policyVersion: AutoTableCharts.recommendationPolicyVersion,
+            specificationID: .init(rawValue: "failure-capacity-first"))
+        let secondRecommendationID = AutoChartRecommendationID(
+            policyVersion: AutoTableCharts.recommendationPolicyVersion,
+            specificationID: .init(rawValue: "failure-capacity-second"))
         func failure() -> AutoChartFailure {
             AutoChartFailure(
                 stage: .profiling,
@@ -2190,11 +2281,20 @@ private final class ProgressRecorder: @unchecked Sendable {
         let first = cache.coalescedFailure(
             for: firstID, error: failure(), stage: .profiling)
         _ = cache.coalescedFailure(
-            for: secondID, error: failure(), stage: .profiling)
+            for: scopedID,
+            recommendationID: firstRecommendationID,
+            error: failure(),
+            stage: .chartPreparation)
         let third = cache.coalescedFailure(
-            for: thirdID, error: failure(), stage: .profiling)
+            for: scopedID,
+            recommendationID: secondRecommendationID,
+            error: failure(),
+            stage: .chartPreparation)
         let repeatedThird = cache.coalescedFailure(
-            for: thirdID, error: failure(), stage: .profiling)
+            for: scopedID,
+            recommendationID: secondRecommendationID,
+            error: failure(),
+            stage: .chartPreparation)
         #expect(repeatedThird.episodeID == third.episodeID)
 
         let recreatedFirst = cache.coalescedFailure(
@@ -3220,11 +3320,16 @@ private final class ProgressRecorder: @unchecked Sendable {
         let alternative = try #require(
             catalogSource.outcome.catalog?.cataloged.first { $0.id != primary.id })
         let gate = V3AsyncTestGate()
+        let replacementHooksFinished = V3Counter()
+        let uncancelledReplacements = V3Counter()
         let cache = AutoChartCache(
-            configuration: .init(
-                preparedCharts: .init(maximumEntries: 0)),
+            configuration: .uncached,
             testHooks: .chartPreparationByRecommendation { recommendationID in
-                if recommendationID == alternative.id { await gate.pause() }
+                guard recommendationID == alternative.id else { return }
+                defer { replacementHooksFinished.increment() }
+                await gate.pause()
+                try Task.checkCancellation()
+                uncancelledReplacements.increment()
             })
 
         let cancelled = AutoChartSession<Int>(cache: cache)
@@ -3234,6 +3339,7 @@ private final class ProgressRecorder: @unchecked Sendable {
             preparation: .preferredOrPrimary)
         let cancelledAnalysis = try await readyAnalysis(from: cancelled)
         let cancelledPresentation = try await readyPresentation(from: cancelled) { _ in true }
+        #expect(cache.completedAnalysis(for: request.id, as: Int.self) == nil)
         cancelled.selection = cancelledPresentation.preparedChart.selections(
             for: [10], analysisID: cancelledAnalysis.id)
         cancelled.setPreference(.chart(.specific(alternative.id)))
@@ -3259,6 +3365,10 @@ private final class ProgressRecorder: @unchecked Sendable {
         #expect(!cancelled.isChartUpdatePending)
         #expect(!cancelled.isPresentationPending)
         await gate.release()
+        #expect(await waitForV3Condition {
+            replacementHooksFinished.value == 1
+        })
+        #expect(uncancelledReplacements.value == 0)
 
         let failed = AutoChartSession<Int>(cache: cache)
         failed.load(
@@ -3293,7 +3403,10 @@ private final class ProgressRecorder: @unchecked Sendable {
         #expect(!failed.isChartUpdatePending)
         #expect(!failed.isPresentationPending)
         await gate.release()
-        await Task.yield()
+        #expect(await waitForV3Condition {
+            replacementHooksFinished.value == 2
+        })
+        #expect(uncancelledReplacements.value == 0)
         guard case .failed = failed.state else {
             Issue.record("Cancelled replacement work replaced the terminal failure.")
             return
@@ -3316,7 +3429,7 @@ private final class ProgressRecorder: @unchecked Sendable {
                 Issue.record("The attempt hook ran before state installation.")
                 return
             }
-            #expect(session.setPreference(.table))
+            session.setPreference(.table)
         }
         defer { session.attemptDidStartForTesting = nil }
 
@@ -3754,12 +3867,13 @@ private final class ProgressRecorder: @unchecked Sendable {
         #expect(updated.preparedCharts.count == catalog.cataloged.count)
     }
 
-    @Test func unloadedPreferenceSetterReportsNoRestart() {
+    @Test func preferenceSetterRetainsVoidFunctionCompatibility() {
         let session = AutoChartSession<Int>(cache: AutoChartCache())
-        let setter: (AutoChartPreference) -> Bool = session.setPreference
-        #expect(!setter(.table))
+        let setter: (AutoChartPreference) -> Void = session.setPreference
+        setter(.table)
         #expect(session.preference == .table)
-        #expect(!setter(.table))
+        setter(.table)
+        #expect(session.preference == .table)
     }
 
     @Test func preloadedPreferenceBecomesOmittedLoadDefaultAndExplicitValueWins()
@@ -3799,7 +3913,7 @@ private final class ProgressRecorder: @unchecked Sendable {
         let readyAnalysisValue = try await readyAnalysis(from: readySession)
         let readyPresentationValue = try await readyPresentation(
             from: readySession) { _ in true }
-        #expect(!readySession.setPreference(readySession.preference))
+        readySession.setPreference(readySession.preference)
         guard case .ready(let unchangedAnalysis, let unchangedPresentation?) =
             readySession.state
         else {
@@ -3814,7 +3928,7 @@ private final class ProgressRecorder: @unchecked Sendable {
         let fallbackSession = AutoChartSession<Int>(cache: AutoChartCache())
         fallbackSession.load(request, preference: .table)
         let fallback = try await fallbackAnalysis(from: fallbackSession)
-        #expect(!fallbackSession.setPreference(fallbackSession.preference))
+        fallbackSession.setPreference(fallbackSession.preference)
         guard case .fallback(let unchangedFallback, _) = fallbackSession.state else {
             Issue.record("Same fallback preference restarted analysis.")
             return
@@ -3833,7 +3947,7 @@ private final class ProgressRecorder: @unchecked Sendable {
         let failedSession = AutoChartSession<Int>(cache: AutoChartCache())
         failedSession.load(try AutoChartRequest(table: invalid))
         let failure = try await sessionFailure(from: failedSession)
-        #expect(!failedSession.setPreference(failedSession.preference))
+        failedSession.setPreference(failedSession.preference)
         guard case .failed(let unchangedFailure) = failedSession.state else {
             Issue.record("Same failed preference started another attempt.")
             return
@@ -3841,12 +3955,12 @@ private final class ProgressRecorder: @unchecked Sendable {
         #expect(unchangedFailure.episodeID == failure.episodeID)
 
         readySession.cancel()
-        #expect(!readySession.setPreference(readySession.preference))
+        readySession.setPreference(readySession.preference)
         guard case .idle = readySession.state else {
             Issue.record("Same preference restarted a cancelled session.")
             return
         }
-        #expect(readySession.setPreference(.table))
+        readySession.setPreference(.table)
         _ = try await fallbackAnalysis(from: readySession)
         #expect(readySession.preference == .table)
     }
@@ -3900,7 +4014,7 @@ private final class ProgressRecorder: @unchecked Sendable {
         session.selection = presented.preparedChart.selections(for: [10], analysisID: ready.id)
         #expect(!session.selection.isEmpty)
 
-        #expect(!session.setPreference(.chart(.specific(selected.id))))
+        session.setPreference(.chart(.specific(selected.id)))
         guard case .ready(let updated, let unchanged?) = session.state else {
             Issue.record("A policy-only rebind must remain ready synchronously.")
             return
@@ -3920,8 +4034,8 @@ private final class ProgressRecorder: @unchecked Sendable {
         let presented = try await readyPresentation(from: session) { _ in true }
         await cache.trim(to: .minimum)
 
-        #expect(session.setPreference(.chart(.specific(
-            presented.preparedChart.recommendation.id))))
+        session.setPreference(.chart(.specific(
+            presented.preparedChart.recommendation.id)))
         #expect(session.isChartUpdatePending)
         _ = try await readyPresentation(from: session) {
             $0.preparedChart.id != presented.preparedChart.id
@@ -3941,7 +4055,7 @@ private final class ProgressRecorder: @unchecked Sendable {
             policyVersion: AutoTableCharts.recommendationPolicyVersion,
             specificationID: .init(rawValue: "off-catalog-restart"))
 
-        #expect(session.setPreference(.chart(.specific(unavailable))))
+        session.setPreference(.chart(.specific(unavailable)))
         #expect(session.isChartUpdatePending)
         #expect(await waitForV3Condition { !session.isChartUpdatePending })
         guard case .ready(_, let final?) = session.state else {
@@ -4372,6 +4486,141 @@ private final class ProgressRecorder: @unchecked Sendable {
         let restored = try await readyAnalysis(from: session)
         #expect(restored.id == ready.id)
         #expect(restored.primaryChart?.id == chartID)
+    }
+
+    @MainActor
+    @Test(
+        .disabled(if: !testHooksAvailable, testHooksUnavailable),
+        .timeLimit(.minutes(1)))
+    func retryAfterCancelledFailureRestartsUnobservedScopes() async throws {
+        #if ATC_TEST_HOOKS
+        let request = try AutoChartRequest(table: domainDataset())
+        let catalogSource = try await AutoChartAnalyzer().analyze(
+            request, preparation: .none)
+        let first = try #require(catalogSource.outcome.catalog?.primary)
+        let second = try #require(
+            catalogSource.outcome.catalog?.cataloged.first { $0.id != first.id })
+        let firstAttempts = V3Counter()
+        let cache = AutoChartCache(
+            configuration: .init(
+                preparedCharts: .init(maximumEntries: 0)),
+            testHooks: .chartPreparationByRecommendation { recommendationID in
+                if recommendationID == first.id {
+                    firstAttempts.increment()
+                    if firstAttempts.value == 1 {
+                        throw AutoChartFailure(
+                            stage: .chartPreparation,
+                            kind: .internalFailure,
+                            isRetryable: true,
+                            diagnosticID: "ATC.test.cancelledFailure.first",
+                            message: "Controlled first-scope failure")
+                    }
+                } else if recommendationID == second.id {
+                    throw AutoChartFailure(
+                        stage: .chartPreparation,
+                        kind: .internalFailure,
+                        isRetryable: true,
+                        diagnosticID: "ATC.test.cancelledFailure.second",
+                        message: "Controlled second-scope failure")
+                }
+            })
+        let retainedSecond = cache.coalescedFailure(
+            for: request.id,
+            recommendationID: second.id,
+            error: AutoChartFailure(
+                stage: .chartPreparation,
+                kind: .internalFailure,
+                isRetryable: true,
+                diagnosticID: "ATC.test.cancelledFailure.second",
+                message: "Controlled second-scope failure"),
+            stage: .chartPreparation)
+        let session = AutoChartSession<Int>(cache: cache)
+
+        session.load(request, preparation: .allCataloged)
+        _ = try await sessionFailure(from: session)
+        session.cancel()
+        session.retry()
+        let retried = try await sessionFailure(from: session)
+
+        #expect(firstAttempts.value == 2)
+        #expect(retried.diagnosticID == "ATC.test.cancelledFailure.second")
+        #expect(retried.episodeID != retainedSecond.episodeID)
+        #endif
+    }
+
+    @MainActor
+    @Test(
+        .disabled(if: !testHooksAvailable, testHooksUnavailable),
+        .timeLimit(.minutes(1)))
+    func concurrentSessionRetriesShareOneNewFailureEpisode() async throws {
+        #if ATC_TEST_HOOKS
+        let gate = V3AsyncTestGate()
+        let cache = AutoChartCache(
+            configuration: .init(
+                preparedCharts: .init(maximumEntries: 0)),
+            testHooks: .chartPreparationByRecommendation { _ in
+                await gate.pause()
+                throw AutoChartFailure(
+                    stage: .chartPreparation,
+                    kind: .internalFailure,
+                    isRetryable: true,
+                    diagnosticID: "ATC.test.concurrentSessionRetry",
+                    message: "Controlled concurrent-retry failure")
+            })
+        let request = try AutoChartRequest(table: domainDataset())
+        let base = try await AutoChartAnalyzer(cache: cache).analyze(
+            request, preparation: .none)
+        let selected = try #require(base.outcome.catalog?.primary)
+        let firstSession = AutoChartSession<Int>(cache: cache)
+        let secondSession = AutoChartSession<Int>(cache: cache)
+
+        firstSession.load(
+            request,
+            preference: .chart(.specific(selected.id)),
+            preparation: .preferredOrPrimary)
+        secondSession.load(
+            request,
+            preference: .chart(.specific(selected.id)),
+            preparation: .preferredOrPrimary)
+        guard await gate.waitUntilPaused() else {
+            firstSession.cancel()
+            secondSession.cancel()
+            await gate.release()
+            Issue.record("The initial shared failure did not reach its gate.")
+            return
+        }
+        await gate.release()
+        let initialFirst = try await sessionFailure(from: firstSession)
+        let initialSecond = try await sessionFailure(from: secondSession)
+        #expect(initialFirst.episodeID == initialSecond.episodeID)
+
+        firstSession.retry()
+        secondSession.retry()
+        guard await gate.waitUntilPaused() else {
+            firstSession.cancel()
+            secondSession.cancel()
+            await gate.release()
+            Issue.record("The concurrent retries did not reach their gate.")
+            return
+        }
+        await gate.release()
+        let retriedFirst = try await sessionFailure(from: firstSession)
+        let retriedSecond = try await sessionFailure(from: secondSession)
+        #expect(retriedFirst.episodeID != initialFirst.episodeID)
+        #expect(retriedFirst.episodeID == retriedSecond.episodeID)
+
+        firstSession.retry()
+        guard await gate.waitUntilPaused() else {
+            firstSession.cancel()
+            secondSession.cancel()
+            await gate.release()
+            Issue.record("The sequential retry did not reach its gate.")
+            return
+        }
+        await gate.release()
+        let sequential = try await sessionFailure(from: firstSession)
+        #expect(sequential.episodeID != retriedFirst.episodeID)
+        #endif
     }
 
     @Test func everyNewAttemptAfterFailureStartsANewFailureEpisode()
