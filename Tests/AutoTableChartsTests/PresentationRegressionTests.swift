@@ -449,7 +449,7 @@ private func presentationFixture(offset: Double = 0) async throws -> (
 }
 
 #if os(macOS)
-@Suite(.serialized) @MainActor
+@Suite(.serializedMainActorRegression) @MainActor
 struct PresentedChartViewRegressionTests {
     @Test func uncachedOverrideExportsSynchronouslyWithoutSpinner() async throws {
         let (analysisID, chart) = try await presentationFixture()

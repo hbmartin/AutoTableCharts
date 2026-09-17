@@ -85,11 +85,12 @@ session.load(request, preference: .automatic) // Explicit values win.
 ```
 
 Reapplying the stored preference does not restart analyzing, preparation, or a
-terminal state. A retry after failure starts a new failure episode; after
-`cancel()`, it resumes the retained request without resetting shared failure
-history. `unload()` forgets request-specific state while preserving the session
-preference. Observe `state`,
-`isChartUpdatePending`, and `isPresentationPending` for lifecycle UI. The
+terminal state. A retry after failure starts a new failure episode even if
+`cancel()` was called after the failure. Retrying a nonfailed cancelled attempt
+with the same preference resumes it without resetting shared failure history.
+`unload()` forgets request-specific state and loaded presentation callbacks while
+preserving the session preference and active environment overrides. Observe
+`state`, `isChartUpdatePending`, and `isPresentationPending` for lifecycle UI. The
 session preserves selection only while its prepared chart remains authoritative
 and clears selection on replacement, fallback, failure, cancellation, or unload.
 
