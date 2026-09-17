@@ -1909,6 +1909,70 @@ private final class ProgressRecorder: @unchecked Sendable {
         #expect(retryFailure.episodeID != failures[0].episodeID)
     }
 
+    #if ATC_TEST_HOOKS
+    @MainActor
+    @Test func chartPreparationFailureEpisodesAreScopedToRecommendation()
+        async throws
+    {
+        let cache = AutoChartCache(
+            testHooks: .chartPreparationByRecommendation { _ in
+                throw AutoChartFailure(
+                    stage: .chartPreparation,
+                    kind: .internalFailure,
+                    isRetryable: true,
+                    diagnosticID: "ATC.test.chartPreparation",
+                    message: "Controlled chart preparation failure")
+            })
+        let analyzer = AutoChartAnalyzer(cache: cache)
+        let request = try AutoChartRequest(table: domainDataset())
+        let base = try await analyzer.analyze(request, preparation: .none)
+        let catalog = try #require(base.outcome.catalog)
+        let first = try #require(catalog.cataloged.first)
+        let second = try #require(catalog.cataloged.dropFirst().first)
+
+        func failure(
+            for recommendation: AutoChartRecommendation
+        ) async throws -> AutoChartFailure {
+            let result = await captureResult {
+                try await analyzer.analyze(
+                    request,
+                    preference: .chart(.specific(recommendation.id)),
+                    preparation: .preferredOrPrimary)
+            }
+            guard case .failure(let error) = result,
+                let failure = error as? AutoChartFailure
+            else {
+                Issue.record("Expected chart preparation to fail.")
+                throw CancellationError()
+            }
+            return failure
+        }
+
+        let firstEpisode = try await failure(for: first)
+        let repeatedFirstEpisode = try await failure(for: first)
+        let secondEpisode = try await failure(for: second)
+        #expect(repeatedFirstEpisode.episodeID == firstEpisode.episodeID)
+        #expect(secondEpisode.episodeID != firstEpisode.episodeID)
+
+        let session = AutoChartSession<Int>(cache: cache)
+        session.load(
+            request,
+            preference: .chart(.specific(first.id)),
+            preparation: .preferredOrPrimary)
+        let sessionFirstEpisode = try await sessionFailure(from: session)
+        #expect(sessionFirstEpisode.episodeID == firstEpisode.episodeID)
+        session.retry()
+        let retriedFirstEpisode = try await sessionFailure(from: session)
+        let retainedSecondEpisode = try await failure(for: second)
+        #expect(retriedFirstEpisode.episodeID != firstEpisode.episodeID)
+        #expect(retainedSecondEpisode.episodeID == secondEpisode.episodeID)
+
+        cache.beginRetry(for: request.id)
+        let requestWideRetryEpisode = try await failure(for: second)
+        #expect(requestWideRetryEpisode.episodeID != secondEpisode.episodeID)
+    }
+    #endif
+
     @Test func sharedCacheBoundsFailureEpisodesAndKeepsProgressSubscribers() async {
         let cache = AutoChartCache(
             configuration: .init(analyses: .init(maximumEntries: 2)))

@@ -81,6 +81,7 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
     @ObservationIgnored private var presentationTask: Task<Void, Never>?
     @ObservationIgnored private var recommendationTask: Task<Void, Never>?
     @ObservationIgnored private var failedRequestID: AutoChartRequestID?
+    @ObservationIgnored private var failedStage: AutoChartFailureStage?
     private var presentationRequestID: AutoChartPresentationRequestID?
     private var presentationTarget: PresentationTarget?
     private var preferenceUpdatePending = false
@@ -367,6 +368,7 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         cancel()
         request = nil
         failedRequestID = nil
+        failedStage = nil
         currentRecommendation = nil
         strategy = .preferredOrPrimary
         loadedPresentationConfiguration = PresentationConfiguration()
@@ -407,9 +409,25 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
             keepsReadyChart = false
         }
         if failedRequestID == request.id {
-            cache.beginRetry(for: request.id)
+            if failedStage == .chartPreparation,
+                let completed: AutoChartAnalysis<RowID> = cache.completedAnalysis(
+                    for: request.id)
+            {
+                let resolution = completed.resolve(preference)
+                let recommendationIDs = Set(
+                    completed.preparationRecommendations(
+                        strategy: preparation,
+                        resolution: resolution
+                    ).map(\.id))
+                cache.beginRetry(
+                    for: request.id,
+                    recommendationIDs: recommendationIDs)
+            } else {
+                cache.beginRetry(for: request.id, recommendationIDs: nil)
+            }
         }
         failedRequestID = nil
+        failedStage = nil
         #if ATC_TEST_HOOKS
         attemptDidStartForTesting?()
         #endif
@@ -527,6 +545,7 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         for requestID: AutoChartRequestID
     ) {
         failedRequestID = requestID
+        failedStage = failure.stage
         state = .failed(failure)
     }
 
