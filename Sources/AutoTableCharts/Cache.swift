@@ -33,20 +33,18 @@ package struct AutoChartFailureScope: Hashable, Sendable {
 }
 
 package struct AutoChartFailureEpisodeContext: Sendable {
-    package static let coalescing = Self(
-        observedEpisodes: [:],
-        restartsAttemptedScopes: false)
+    package static let coalescing = Self(episodesToReplace: [:])
 
-    package let observedEpisodes: [AutoChartFailureScope: UUID]
-    package let restartsAttemptedScopes: Bool
+    package let episodesToReplace: [AutoChartFailureScope: UUID]
 
-    package init(
-        observedEpisodes: [AutoChartFailureScope: UUID],
-        restartsAttemptedScopes: Bool
-    ) {
-        self.observedEpisodes = observedEpisodes
-        self.restartsAttemptedScopes = restartsAttemptedScopes
+    package init(episodesToReplace: [AutoChartFailureScope: UUID]) {
+        self.episodesToReplace = episodesToReplace
     }
+}
+
+package struct AutoChartFailureEpisodeState: Sendable {
+    package let observedEpisodes: [AutoChartFailureScope: UUID]
+    package let context: AutoChartFailureEpisodeContext
 }
 
 private struct AutoChartRecencyOrder<Key: Hashable> {
@@ -82,7 +80,7 @@ private struct AutoChartRecencyOrder<Key: Hashable> {
         newest = nil
     }
 
-    private mutating func remove(_ key: Key) {
+    mutating func remove(_ key: Key) {
         guard let links = linksByKey.removeValue(forKey: key) else { return }
         if let older = links.older {
             linksByKey[older]?.newer = links.newer
@@ -109,7 +107,7 @@ public final class AutoChartCache: @unchecked Sendable {
     private var completed: [AutoChartRequestID: AutoChartCompletedAnalysisBox] = [:]
     private var recency = AutoChartRecencyOrder<AutoChartRequestID>()
     private var failures: [AutoChartFailureScope: AutoChartFailure] = [:]
-    private var failureRecency: [AutoChartFailureScope] = []
+    private var failureRecency = AutoChartRecencyOrder<AutoChartFailureScope>()
     private var progressEntries: [AutoChartRequestID: AutoChartProgressEntry] = [:]
 
     let engine: AutoChartAnalyzer
@@ -148,16 +146,13 @@ public final class AutoChartCache: @unchecked Sendable {
     func store<RowID>(_ analysis: AutoChartAnalysis<RowID>) {
         lock.lock()
         defer { lock.unlock() }
+        removeFailureLocked(
+            for: AutoChartFailureScope(requestID: analysis.request))
         guard configuration.analyses.maximumEntries > 0,
             configuration.maximumRetainedCost > 0,
             analysis.estimatedRetainedCost <= configuration.maximumRetainedCost
         else { return }
         completed[analysis.request] = AutoChartCompletedAnalysisBox(analysis)
-        let requestFailureKey = AutoChartFailureScope(
-            requestID: analysis.request,
-            recommendationID: nil)
-        failures.removeValue(forKey: requestFailureKey)
-        failureRecency.removeAll { $0 == requestFailureKey }
         recency.touch(analysis.request)
         trimCompletedLocked()
     }
@@ -176,27 +171,19 @@ public final class AutoChartCache: @unchecked Sendable {
             let proposed = AutoChartFailure.wrapping(error, stage: stage)
             if let existing = failures[key],
                 existing.diagnosticID == proposed.diagnosticID,
-                !episodeContext.restartsAttemptedScopes,
-                episodeContext.observedEpisodes[key] != existing.episodeID
+                episodeContext.episodesToReplace[key] != existing.episodeID
             {
-                failureRecency.removeAll { $0 == key }
-                failureRecency.append(key)
+                failureRecency.touch(key)
                 return existing
             }
-            let replacement: AutoChartFailure
-            if failures[key] != nil {
-                replacement = AutoChartFailure(
-                    stage: proposed.stage,
-                    kind: proposed.kind,
-                    isRetryable: proposed.isRetryable,
-                    diagnosticID: proposed.diagnosticID,
-                    message: proposed.message)
-            } else {
-                replacement = proposed
-            }
+            let replacement = AutoChartFailure(
+                stage: proposed.stage,
+                kind: proposed.kind,
+                isRetryable: proposed.isRetryable,
+                diagnosticID: proposed.diagnosticID,
+                message: proposed.message)
             failures[key] = replacement
-            failureRecency.removeAll { $0 == key }
-            failureRecency.append(key)
+            failureRecency.touch(key)
             trimFailuresLocked()
             return replacement
         }
@@ -204,31 +191,51 @@ public final class AutoChartCache: @unchecked Sendable {
 
     package func recordSuccess(for scope: AutoChartFailureScope) {
         lock.withLock {
-            failures.removeValue(forKey: scope)
-            failureRecency.removeAll { $0 == scope }
+            removeFailureLocked(for: scope)
         }
     }
 
-    package func failureScopes(
+    package func failureEpisodeState(
         for requestID: AutoChartRequestID,
-        episodeID: UUID
-    ) -> Set<AutoChartFailureScope> {
+        observedEpisodes: [AutoChartFailureScope: UUID],
+        restartsCurrentEpisodes: Bool
+    ) -> AutoChartFailureEpisodeState {
         lock.withLock {
-            Set(failures.compactMap { scope, failure in
-                scope.requestID == requestID && failure.episodeID == episodeID
-                    ? scope
-                    : nil
-            })
-        }
-    }
-
-    package func currentFailureEpisodes(
-        matching observed: [AutoChartFailureScope: UUID]
-    ) -> [AutoChartFailureScope: UUID] {
-        lock.withLock {
-            observed.filter { scope, episodeID in
+            let liveObserved = observedEpisodes.filter { scope, episodeID in
                 failures[scope]?.episodeID == episodeID
             }
+            let episodesToReplace: [AutoChartFailureScope: UUID]
+            if restartsCurrentEpisodes {
+                episodesToReplace = failures.reduce(into: [:]) { result, entry in
+                    guard entry.key.requestID == requestID else { return }
+                    result[entry.key] = entry.value.episodeID
+                }
+            } else {
+                episodesToReplace = liveObserved.filter {
+                    $0.key.requestID == requestID
+                }
+            }
+            return AutoChartFailureEpisodeState(
+                observedEpisodes: liveObserved,
+                context: AutoChartFailureEpisodeContext(
+                    episodesToReplace: episodesToReplace))
+        }
+    }
+
+    package func recordingFailureEpisode(
+        for requestID: AutoChartRequestID,
+        episodeID: UUID,
+        observedEpisodes: [AutoChartFailureScope: UUID]
+    ) -> [AutoChartFailureScope: UUID] {
+        lock.withLock {
+            var liveObserved = observedEpisodes.filter { scope, observedEpisodeID in
+                failures[scope]?.episodeID == observedEpisodeID
+            }
+            for (scope, failure) in failures
+            where scope.requestID == requestID && failure.episodeID == episodeID {
+                liveObserved[scope] = episodeID
+            }
+            return liveObserved
         }
     }
 
@@ -286,33 +293,8 @@ public final class AutoChartCache: @unchecked Sendable {
     /// attempt-aware episode handling internally.
     public func beginRetry(for requestID: AutoChartRequestID) {
         lock.withLock {
-            failures = failures.filter { $0.key.requestID != requestID }
-            failureRecency.removeAll { $0.requestID == requestID }
-        }
-    }
-
-    /// Ends only the request-level episode or the listed recommendation episodes.
-    package func beginRetry(
-        for requestID: AutoChartRequestID,
-        recommendationIDs: Set<AutoChartRecommendationID>?
-    ) {
-        lock.withLock {
-            let keys: Set<AutoChartFailureScope>
-            if let recommendationIDs {
-                keys = Set(recommendationIDs.map {
-                    AutoChartFailureScope(
-                        requestID: requestID,
-                        recommendationID: $0)
-                })
-            } else {
-                keys = [AutoChartFailureScope(
-                    requestID: requestID,
-                    recommendationID: nil)]
-            }
-            for key in keys {
-                failures.removeValue(forKey: key)
-            }
-            failureRecency.removeAll { keys.contains($0) }
+            let keys = failures.keys.filter { $0.requestID == requestID }
+            for key in keys { removeFailureLocked(for: key) }
         }
     }
 
@@ -327,7 +309,7 @@ public final class AutoChartCache: @unchecked Sendable {
                 completed.removeAll(keepingCapacity: false)
                 recency.removeAll()
                 failures.removeAll(keepingCapacity: false)
-                failureRecency.removeAll(keepingCapacity: false)
+                failureRecency.removeAll()
             } else {
                 trimCompletedLocked()
                 trimFailuresLocked()
@@ -341,7 +323,7 @@ public final class AutoChartCache: @unchecked Sendable {
             completed.removeAll(keepingCapacity: false)
             recency.removeAll()
             failures.removeAll(keepingCapacity: false)
-            failureRecency.removeAll(keepingCapacity: false)
+            failureRecency.removeAll()
             progressEntries = progressEntries.mapValues { entry in
                 var entry = entry
                 entry.current = nil
@@ -408,9 +390,15 @@ public final class AutoChartCache: @unchecked Sendable {
 
     private func trimFailuresLocked() {
         let maximumFailures = max(1, configuration.analyses.maximumEntries)
-        while failures.count > maximumFailures, let oldest = failureRecency.first {
-            failureRecency.removeFirst()
+        while failures.count > maximumFailures,
+            let oldest = failureRecency.popOldest()
+        {
             failures.removeValue(forKey: oldest)
         }
+    }
+
+    private func removeFailureLocked(for scope: AutoChartFailureScope) {
+        failures.removeValue(forKey: scope)
+        failureRecency.remove(scope)
     }
 }

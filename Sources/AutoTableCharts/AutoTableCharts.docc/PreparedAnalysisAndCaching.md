@@ -58,11 +58,18 @@ retained failure, it receives a new episode while another fresh session may stil
 join the cache's current episode. This session history is pruned against the
 cache's bounded live failure records and ends with the session.
 
+Request and recommendation scopes each consume one failure-record slot. The
+cache retains at most `max(1, configuration.analyses.maximumEntries)` live
+failure records and evicts them by least-recent use.
+
 An explicit session retry starts new episodes for the request and recommendation
 scopes that the new attempt actually reaches. The exception is retrying a
 nonfailed, cancelled attempt with the same preference, which resumes ordinary
 coalescing. Cancellation, unload, and supersession publish no failure themselves.
-Presentation-only and uncached failures receive independent episode identifiers.
+Presentation-only failures and failures produced without a shared
+``AutoChartCache`` receive independent episode identifiers. A cache configured
+with ``AutoChartAnalyzerConfiguration/uncached`` retains no analysis results but
+still retains one failure record for coalescing.
 ``AutoChartCache/beginRetry(for:)`` remains a request-wide operation for callers
 that intentionally want to end every retained request and recommendation episode;
 sessions use attempt-scoped handling instead.
