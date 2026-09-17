@@ -166,6 +166,20 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
     /// After ``cancel()``, a different preference may restart the retained request;
     /// after ``unload()``, it is stored without starting work.
     public func setPreference(_ preference: AutoChartPreference) {
+        setPreference(preference, onAttemptStart: {})
+    }
+
+    /// Reconciles a new preference and reports when it starts replacement work.
+    ///
+    /// `onAttemptStart` runs synchronously, exactly once, after a changed
+    /// preference starts new analysis or preparation work. It does not run when
+    /// the preference is unchanged, no request is loaded, or the current
+    /// prepared chart can be reused, including while presentation-only work is
+    /// pending.
+    public func setPreference(
+        _ preference: AutoChartPreference,
+        onAttemptStart: () -> Void
+    ) {
         guard preference != self.preference else { return }
         guard let request else {
             self.preference = preference
@@ -208,6 +222,7 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
             presentationConfiguration: presentationConfiguration,
             clearsVisibleState: false,
             keepsVisibleReadyChart: true)
+        onAttemptStart()
     }
 
     /// Schedules presentation rebuilding for the current prepared chart without
