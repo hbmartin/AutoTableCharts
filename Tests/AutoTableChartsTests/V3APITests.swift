@@ -563,6 +563,27 @@ private func wideDomainDataset() throws -> AutoChartDataset<Int> {
         key: .trusted(identity: "wide-v3-fixture", revision: "1"))
 }
 
+private func offCatalogRecommendation(
+    in dataset: AutoChartDataset<Int>,
+    request: AutoChartRequest<Int>,
+    catalog: AutoChartRecommendationCatalog
+) throws -> AutoChartRecommendation {
+    var options = request.options
+    options.maximumRecommendations = AutoChartRecommendationCatalog.maximumCatalogedCount
+    let catalogIDs = Set(catalog.cataloged.map(\.id))
+    let candidates = AutoChartRecommendationEngine.recommendations(
+        for: dataset,
+        context: request.context,
+        options: options,
+        constraints: request.constraints).candidates
+    return try #require(candidates.first { recommendation in
+        !catalogIDs.contains(recommendation.id)
+            && AutoChartRecommendationEngine.validate(
+                specification: recommendation.specification,
+                for: dataset).isValid
+    })
+}
+
 private func recommendation(
     _ specification: AutoChartSpecification,
     score: Double = 1
@@ -667,14 +688,16 @@ private final class V3ThreadRecorder: @unchecked Sendable {
 
 private actor V3AsyncTestGate {
     private var releaseContinuations: [UUID: CheckedContinuation<Void, Never>] = [:]
+    private var remainsOpen = false
 
     var activePauseCount: Int { releaseContinuations.count }
 
     func pause() async {
+        if remainsOpen { return }
         let token = UUID()
         await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
-                if Task.isCancelled {
+                if remainsOpen || Task.isCancelled {
                     continuation.resume()
                 } else {
                     releaseContinuations[token] = continuation
@@ -702,6 +725,11 @@ private actor V3AsyncTestGate {
         let continuations = Array(releaseContinuations.values)
         releaseContinuations.removeAll()
         continuations.forEach { $0.resume() }
+    }
+
+    func open() {
+        remainsOpen = true
+        release()
     }
 
     private func cancelPause(_ token: UUID) {
@@ -3215,14 +3243,13 @@ private final class ProgressRecorder: @unchecked Sendable {
         async throws
     {
         #if ATC_TEST_HOOKS
-        let cache = AutoChartCache(configuration: .uncached)
+        let cache = AutoChartCache()
         let request = try AutoChartRequest(table: domainDataset())
-        let base = try await AutoChartAnalyzer().analyze(
+        let base = try await AutoChartAnalyzer(cache: cache).analyze(
             request, preparation: .none)
         let selected = try #require(base.outcome.catalog?.primary)
         let session = AutoChartSession<Int>(cache: cache)
         session.load(request, preference: .chart(.specific(selected.id)))
-        _ = try await readyAnalysis(from: session)
         #expect(session.currentRecommendation?.id == selected.id)
         session.failCurrentAttemptForTesting(AutoChartFailure(
             stage: .chartPreparation,
@@ -3237,20 +3264,10 @@ private final class ProgressRecorder: @unchecked Sendable {
         #expect(session.currentRecommendation?.id == selected.id)
 
         session.retry(preference: .chart(.specific(selected.id)))
-        guard case .analyzing = session.state else {
-            Issue.record("The same selected type did not start uncached analysis.")
+        guard case .preparing = session.state else {
+            Issue.record("The same selected type did not start cached preparation.")
             return
         }
-        #expect(session.currentRecommendation?.id == selected.id)
-        session.failCurrentAttemptForTesting(AutoChartFailure(
-            stage: .chartPreparation,
-            kind: .internalFailure,
-            isRetryable: true,
-            diagnosticID: "ATC.test.retryableFailure.directRetry",
-            message: "A controlled direct-retry failure."))
-        session.cancel()
-
-        session.retry(preference: .chart(.specific(selected.id)))
         #expect(session.currentRecommendation?.id == selected.id)
         session.cancel()
 
@@ -3270,6 +3287,35 @@ private final class ProgressRecorder: @unchecked Sendable {
         #endif
     }
 
+    @Test(.timeLimit(.minutes(1)))
+    func cachedRetrySynchronouslyRetainsAnOffCatalogRecommendation() async throws {
+        let dataset = try wideDomainDataset()
+        let request = try AutoChartRequest(table: dataset)
+        let cache = AutoChartCache()
+        let base = try await AutoChartAnalyzer(cache: cache).analyze(
+            request, preparation: .none)
+        let catalog = try #require(base.outcome.catalog)
+        let offCatalog = try offCatalogRecommendation(
+            in: dataset, request: request, catalog: catalog)
+        let session = AutoChartSession<Int>(cache: cache)
+        defer { session.cancel() }
+
+        session.load(
+            request,
+            preference: .chart(.specific(offCatalog.id)),
+            preparation: .preferredOrPrimary)
+        _ = try await readyAnalysis(from: session)
+        #expect(session.currentRecommendation?.id == offCatalog.id)
+
+        session.retry()
+
+        guard case .preparing = session.state else {
+            Issue.record("The cached retry did not begin preparation immediately.")
+            return
+        }
+        #expect(session.currentRecommendation?.id == offCatalog.id)
+    }
+
     @Test(
         .disabled(if: !testHooksAvailable, testHooksUnavailable),
         .timeLimit(.minutes(1)))
@@ -3277,40 +3323,68 @@ private final class ProgressRecorder: @unchecked Sendable {
         #if ATC_TEST_HOOKS
         let dataset = try wideDomainDataset()
         let request = try AutoChartRequest(table: dataset)
-        let session = AutoChartSession<Int>(
-            cache: AutoChartCache(configuration: .uncached))
-        session.load(request)
-        let ready = try await readyAnalysis(from: session)
-        let catalog = try #require(ready.outcome.catalog)
-
-        var catalogOptions = request.options
-        catalogOptions.maximumRecommendations =
-            AutoChartRecommendationCatalog.maximumCatalogedCount
-        let catalogIDs = Set(catalog.cataloged.map(\.id))
-        let candidates = AutoChartRecommendationEngine.recommendations(
-            for: dataset,
-            context: request.context,
-            options: catalogOptions,
-            constraints: request.constraints).candidates
-        let offCatalog = try #require(candidates.first { recommendation in
-            !catalogIDs.contains(recommendation.id)
-                && AutoChartRecommendationEngine.validate(
-                    specification: recommendation.specification,
-                    for: dataset).isValid
-        })
-
-        session.setPreference(.chart(.specific(offCatalog.id)))
-        #expect(session.currentRecommendation == nil)
-        session.failCurrentAttemptForTesting(AutoChartFailure(
+        let source = try await AutoChartAnalyzer().analyze(
+            request, preparation: .none)
+        let catalog = try #require(source.outcome.catalog)
+        let offCatalog = try offCatalogRecommendation(
+            in: dataset, request: request, catalog: catalog)
+        let preparationGate = V3AsyncTestGate()
+        let initialResolutionGate = V3AsyncTestGate()
+        let restorationGate = V3AsyncTestGate()
+        let controlledFailure = AutoChartFailure(
             stage: .chartPreparation,
             kind: .internalFailure,
             isRetryable: true,
             diagnosticID: "ATC.test.pendingOffCatalogRecommendation",
-            message: "Controlled pending off-catalog failure"))
-        guard case .failed = session.state else {
-            Issue.record("The controlled off-catalog failure was not published.")
+            message: "Controlled pending off-catalog failure")
+        let cache = AutoChartCache(
+            configuration: .uncached,
+            testHooks: .chartPreparationByRecommendation { recommendationID in
+                guard recommendationID == offCatalog.id else { return }
+                await preparationGate.pause()
+                try Task.checkCancellation()
+                throw controlledFailure
+            })
+        let session = AutoChartSession<Int>(cache: cache)
+        defer {
+            session.cancel()
+            Task {
+                await preparationGate.open()
+                await initialResolutionGate.open()
+                await restorationGate.open()
+            }
+        }
+        session.load(request)
+        _ = try await readyAnalysis(from: session)
+        session.recommendationResolutionWillBeginForTesting = { [weak session] in
+            let isFailed = await MainActor.run {
+                guard let session else { return false }
+                return if case .failed = session.state { true } else { false }
+            }
+            if isFailed {
+                await restorationGate.pause()
+            } else {
+                await initialResolutionGate.pause()
+            }
+        }
+
+        session.setPreference(.chart(.specific(offCatalog.id)))
+        #expect(session.currentRecommendation == nil)
+        guard await initialResolutionGate.waitUntilPaused(),
+            await preparationGate.waitUntilPaused()
+        else {
+            Issue.record("The off-catalog attempt did not reach its test gates.")
             return
         }
+        await preparationGate.open()
+        let published = try await sessionFailure(from: session)
+        #expect(published.diagnosticID == controlledFailure.diagnosticID)
+        guard await restorationGate.waitUntilPaused() else {
+            Issue.record("The failed attempt did not restart recommendation resolution.")
+            return
+        }
+        session.recommendationResolutionWillBeginForTesting = nil
+        await restorationGate.open()
 
         #expect(await waitForV3Condition {
             session.currentRecommendation?.id == offCatalog.id
@@ -3320,6 +3394,183 @@ private final class ProgressRecorder: @unchecked Sendable {
             return
         }
         #expect(session.preference == .chart(.specific(offCatalog.id)))
+        #endif
+    }
+
+    @Test(
+        .disabled(if: !testHooksAvailable, testHooksUnavailable),
+        .timeLimit(.minutes(1)))
+    func uncachedRetryAndReloadRetainPendingOffCatalogAnalysis() async throws {
+        #if ATC_TEST_HOOKS
+        for usesLoad in [false, true] {
+            let transition = usesLoad ? "load" : "retry"
+            let dataset = try wideDomainDataset()
+            let request = try AutoChartRequest(table: dataset)
+            let source = try await AutoChartAnalyzer().analyze(
+                request, preparation: .none)
+            let catalog = try #require(source.outcome.catalog)
+            let offCatalog = try offCatalogRecommendation(
+                in: dataset, request: request, catalog: catalog)
+            let preparationGate = V3AsyncTestGate()
+            let resolutionGate = V3AsyncTestGate()
+            let restorationGate = V3AsyncTestGate()
+            let preparationStarts = V3Counter()
+            let resolutionStarts = V3Counter()
+            let controlledFailure = AutoChartFailure(
+                stage: .chartPreparation,
+                kind: .internalFailure,
+                isRetryable: true,
+                diagnosticID: "ATC.test.pendingOffCatalogRecommendation.\(transition)",
+                message: "Controlled \(transition) off-catalog failure")
+            let cache = AutoChartCache(
+                configuration: .uncached,
+                testHooks: .chartPreparationByRecommendation { recommendationID in
+                    guard recommendationID == offCatalog.id else { return }
+                    preparationStarts.increment()
+                    await preparationGate.pause()
+                    try Task.checkCancellation()
+                    throw controlledFailure
+                })
+            let session = AutoChartSession<Int>(cache: cache)
+            session.load(request)
+            _ = try await readyAnalysis(from: session)
+            session.recommendationResolutionWillBeginForTesting = { [weak session] in
+                let isFailed = await MainActor.run {
+                    guard let session else { return false }
+                    return if case .failed = session.state { true } else { false }
+                }
+                if isFailed {
+                    await restorationGate.pause()
+                } else {
+                    resolutionStarts.increment()
+                    await resolutionGate.pause()
+                }
+            }
+
+            session.setPreference(.chart(.specific(offCatalog.id)))
+            #expect(await waitForV3Condition {
+                preparationStarts.value == 1 && resolutionStarts.value == 1
+            }, Comment(rawValue: transition))
+            if usesLoad {
+                session.load(
+                    request,
+                    preference: .chart(.specific(offCatalog.id)))
+            } else {
+                session.retry()
+            }
+            #expect(await waitForV3Condition {
+                preparationStarts.value >= 2 && resolutionStarts.value >= 2
+            }, Comment(rawValue: transition))
+            await preparationGate.open()
+            let published = try await sessionFailure(from: session)
+            #expect(
+                published.diagnosticID == controlledFailure.diagnosticID,
+                Comment(rawValue: transition))
+            guard await restorationGate.waitUntilPaused() else {
+                session.cancel()
+                await resolutionGate.open()
+                Issue.record("The \(transition) failure did not restart resolution.")
+                continue
+            }
+            session.recommendationResolutionWillBeginForTesting = nil
+            await resolutionGate.open()
+            await restorationGate.open()
+            #expect(await waitForV3Condition {
+                session.currentRecommendation?.id == offCatalog.id
+            }, Comment(rawValue: transition))
+            guard case .failed = session.state else {
+                Issue.record("Resolution replaced the \(transition) failure.")
+                session.cancel()
+                continue
+            }
+            session.cancel()
+        }
+        #endif
+    }
+
+    @Test(
+        .disabled(if: !testHooksAvailable, testHooksUnavailable),
+        .timeLimit(.minutes(1)))
+    func cancelledFailureRestorationResumesFromLastKnownAnalysis() async throws {
+        #if ATC_TEST_HOOKS
+        let dataset = try wideDomainDataset()
+        let request = try AutoChartRequest(table: dataset)
+        let source = try await AutoChartAnalyzer().analyze(
+            request, preparation: .none)
+        let catalog = try #require(source.outcome.catalog)
+        let offCatalog = try offCatalogRecommendation(
+            in: dataset, request: request, catalog: catalog)
+        let preparationGate = V3AsyncTestGate()
+        let initialResolutionGate = V3AsyncTestGate()
+        let restorationGate = V3AsyncTestGate()
+        let controlledFailure = AutoChartFailure(
+            stage: .chartPreparation,
+            kind: .internalFailure,
+            isRetryable: true,
+            diagnosticID: "ATC.test.cancelledOffCatalogRestoration",
+            message: "Controlled cancelled off-catalog restoration failure")
+        let cache = AutoChartCache(
+            configuration: .uncached,
+            testHooks: .chartPreparationByRecommendation { recommendationID in
+                guard recommendationID == offCatalog.id else { return }
+                await preparationGate.pause()
+                try Task.checkCancellation()
+                throw controlledFailure
+            })
+        let session = AutoChartSession<Int>(cache: cache)
+        defer {
+            session.cancel()
+            Task {
+                await preparationGate.open()
+                await initialResolutionGate.open()
+                await restorationGate.open()
+            }
+        }
+        session.load(request)
+        _ = try await readyAnalysis(from: session)
+        session.recommendationResolutionWillBeginForTesting = { [weak session] in
+            let isFailed = await MainActor.run {
+                guard let session else { return false }
+                return if case .failed = session.state { true } else { false }
+            }
+            if isFailed {
+                await restorationGate.pause()
+            } else {
+                await initialResolutionGate.pause()
+            }
+        }
+
+        session.setPreference(.chart(.specific(offCatalog.id)))
+        guard await initialResolutionGate.waitUntilPaused(),
+            await preparationGate.waitUntilPaused()
+        else {
+            Issue.record("The cancellation case did not reach its test gates.")
+            return
+        }
+        await preparationGate.open()
+        _ = try await sessionFailure(from: session)
+        guard await restorationGate.waitUntilPaused() else {
+            Issue.record("The failed attempt did not begin pending restoration.")
+            return
+        }
+
+        session.cancel()
+        session.recommendationResolutionWillBeginForTesting = nil
+        await initialResolutionGate.open()
+        await restorationGate.open()
+        guard case .idle = session.state else {
+            Issue.record("Cancelling the failure did not return the session to idle.")
+            return
+        }
+        #expect(session.currentRecommendation == nil)
+
+        session.retry()
+        #expect(await waitForV3Condition {
+            session.currentRecommendation?.id == offCatalog.id
+        })
+        let repeated = try await sessionFailure(from: session)
+        #expect(repeated.diagnosticID == controlledFailure.diagnosticID)
+        #expect(session.currentRecommendation?.id == offCatalog.id)
         #endif
     }
 
