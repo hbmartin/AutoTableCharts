@@ -460,6 +460,31 @@ public struct AutoChartAnalysis<RowID: Hashable & Sendable>: Sendable {
         }
     }
 
+    package func preparationRecommendations(
+        strategy: AutoChartPreparationStrategy,
+        resolution: AutoChartPreferenceResolution
+    ) -> [AutoChartRecommendation] {
+        guard !resolution.usesTable else { return [] }
+        switch strategy {
+        case .none:
+            return []
+        case .primary:
+            if case .charts(let catalog) = outcome, let primary = catalog.primary {
+                return [primary]
+            }
+            return []
+        case .preferredOrPrimary:
+            return resolution.recommendation.map { [$0] } ?? []
+        case .allCataloged:
+            guard case .charts(let catalog) = outcome else { return [] }
+            return catalog.cataloged
+                + (resolution.recommendation.map { recommendation in
+                    catalog.recommendation(for: recommendation.id) == nil
+                        ? [recommendation] : []
+                } ?? [])
+        }
+    }
+
     package func replacingPresentation(
         request: AutoChartRequestID? = nil,
         preparedCharts: [AutoChartRecommendationID: AutoChartPreparedChart<RowID>],
@@ -675,11 +700,13 @@ private struct AutoChartCachedAnalysis<RowID: Hashable & Sendable>: Sendable {
 #if ATC_TEST_HOOKS
 /// Internal synchronization points used only by deterministic concurrency tests.
 struct AutoChartAnalyzerTestHooks: Sendable {
-    let chartPreparationWillBegin: (@Sendable () async -> Void)?
+    let chartPreparationWillBegin:
+        (@Sendable (AutoChartRecommendationID) async throws -> Void)?
     let keyedMaterializationWillBegin: (@Sendable () async -> Void)?
 
     init(
-        chartPreparationWillBegin: (@Sendable () async -> Void)?,
+        chartPreparationWillBegin:
+            (@Sendable (AutoChartRecommendationID) async throws -> Void)?,
         keyedMaterializationWillBegin: (@Sendable () async -> Void)?
     ) {
         self.chartPreparationWillBegin = chartPreparationWillBegin
@@ -692,6 +719,14 @@ struct AutoChartAnalyzerTestHooks: Sendable {
 
     static func chartPreparation(
         _ hook: @escaping @Sendable () async -> Void
+    ) -> Self {
+        Self(
+            chartPreparationWillBegin: { _ in await hook() },
+            keyedMaterializationWillBegin: nil)
+    }
+
+    static func chartPreparationByRecommendation(
+        _ hook: @escaping @Sendable (AutoChartRecommendationID) async throws -> Void
     ) -> Self {
         Self(
             chartPreparationWillBegin: hook,
@@ -957,6 +992,21 @@ public actor AutoChartAnalyzer {
         preparation strategy: AutoChartPreparationStrategy = .preferredOrPrimary,
         progress: (@Sendable (AutoChartProgress) -> Void)? = nil
     ) async throws -> AutoChartAnalysis<RowID> {
+        try await analyze(
+            request,
+            preference: preference,
+            preparation: strategy,
+            progress: progress,
+            failureEpisodes: .coalescing)
+    }
+
+    package nonisolated func analyze<RowID: Hashable & Sendable>(
+        _ request: AutoChartRequest<RowID>,
+        preference: AutoChartPreference,
+        preparation strategy: AutoChartPreparationStrategy,
+        progress: (@Sendable (AutoChartProgress) -> Void)?,
+        failureEpisodes: AutoChartFailureEpisodeContext
+    ) async throws -> AutoChartAnalysis<RowID> {
         guard request.policyVersion == AutoTableCharts.recommendationPolicyVersion else {
             throw AutoChartFailure(
                 stage: .recommendation,
@@ -993,7 +1043,8 @@ public actor AutoChartAnalyzer {
                 throw cache?.coalescedFailure(
                     for: request.id,
                     error: error,
-                    stage: .materialization)
+                    stage: .materialization,
+                    episodeContext: failureEpisodes)
                     ?? AutoChartFailure.wrapping(error, stage: .materialization)
             }
 
@@ -1018,10 +1069,13 @@ public actor AutoChartAnalyzer {
                 throw cache?.coalescedFailure(
                     for: request.id,
                     error: error,
-                    stage: .recommendation)
+                    stage: .recommendation,
+                    episodeContext: failureEpisodes)
                     ?? AutoChartFailure.wrapping(error, stage: .recommendation)
             }
         }
+
+        cache?.recordSuccess(for: AutoChartFailureScope(requestID: request.id))
 
         let resolution = base.resolve(preference)
         guard !resolution.usesTable, strategy != .none else {
@@ -1031,59 +1085,44 @@ public actor AutoChartAnalyzer {
                 resolution: resolution)
         }
 
-        let recommendations: [AutoChartRecommendation]
-        switch strategy {
-        case .none:
-            recommendations = []
-        case .primary:
-            if case .charts(let catalog) = base.outcome, let primary = catalog.primary {
-                recommendations = [primary]
-            } else {
-                recommendations = []
-            }
-        case .preferredOrPrimary:
-            recommendations = resolution.recommendation.map { [$0] } ?? []
-        case .allCataloged:
-            if case .charts(let catalog) = base.outcome {
-                recommendations = catalog.cataloged
-                    + (resolution.recommendation.map { recommendation in
-                        catalog.recommendation(for: recommendation.id) != nil
-                            ? [] : [recommendation]
-                    } ?? [])
-            } else {
-                recommendations = []
-            }
-        }
-
-        do {
-            var prepared: [AutoChartRecommendationID: AutoChartPreparedChart<RowID>] = [:]
-            for (index, recommendation) in recommendations.enumerated() {
-                try Task.checkCancellation()
-                reportProgress(
-                    AutoChartProgress(
-                        phase: .chartPreparation,
-                        completedUnitCount: index,
-                        totalUnitCount: recommendations.count))
-                prepared[recommendation.id] = try await base.prepare(recommendation.id)
-            }
+        let recommendations = base.preparationRecommendations(
+            strategy: strategy,
+            resolution: resolution)
+        var prepared: [AutoChartRecommendationID: AutoChartPreparedChart<RowID>] = [:]
+        for (index, recommendation) in recommendations.enumerated() {
+            try Task.checkCancellation()
             reportProgress(
                 AutoChartProgress(
                     phase: .chartPreparation,
-                    completedUnitCount: recommendations.count,
+                    completedUnitCount: index,
                     totalUnitCount: recommendations.count))
-            return base.replacingPresentation(
-                request: request.id,
-                preparedCharts: prepared,
-                resolution: resolution)
-        } catch is CancellationError {
-            throw CancellationError()
-        } catch {
-            throw cache?.coalescedFailure(
-                for: request.id,
-                error: error,
-                stage: .chartPreparation)
-                ?? AutoChartFailure.wrapping(error, stage: .chartPreparation)
+            do {
+                prepared[recommendation.id] = try await base.prepare(recommendation.id)
+                cache?.recordSuccess(
+                    for: AutoChartFailureScope(
+                        requestID: request.id,
+                        recommendationID: recommendation.id))
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                throw cache?.coalescedFailure(
+                    for: request.id,
+                    recommendationID: recommendation.id,
+                    error: error,
+                    stage: .chartPreparation,
+                    episodeContext: failureEpisodes)
+                    ?? AutoChartFailure.wrapping(error, stage: .chartPreparation)
+            }
         }
+        reportProgress(
+            AutoChartProgress(
+                phase: .chartPreparation,
+                completedUnitCount: recommendations.count,
+                totalUnitCount: recommendations.count))
+        return base.replacingPresentation(
+            request: request.id,
+            preparedCharts: prepared,
+            resolution: resolution)
     }
 
     static func retryingGenerationInvalidations<Result: Sendable>(
@@ -1850,7 +1889,7 @@ public actor AutoChartAnalyzer {
             [recommendation, source, key, preparedEpoch] in
             try Task.checkCancellation()
             #if ATC_TEST_HOOKS
-            await preparationHook?()
+            try await preparationHook?(recommendation.id)
             try Task.checkCancellation()
             #endif
             let core = try AutoChartRenderCore.prepare(
