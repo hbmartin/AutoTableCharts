@@ -88,11 +88,14 @@ Reapplying the stored preference does not restart analyzing, preparation, or a
 terminal state. A retry after failure starts a new failure episode even if
 `cancel()` was called after the failure. Retrying a nonfailed cancelled attempt
 with the same preference resumes it without resetting shared failure history.
+Every retry with an unchanged preference preserves `currentRecommendation`,
+including uncached retries; changing the request or preference clears it.
 `unload()` forgets request-specific state and loaded presentation callbacks while
 preserving the session preference, active environment overrides, and knowledge of
 failure episodes already shown. Loading that request again therefore starts a new
 episode if the same failure recurs; a newly created session sharing the cache can
-still join the current episode.
+still join the current episode. Loading or selecting a scope the session has not
+previously observed joins the cache's current episode instead of replacing it.
 
 Observe `state`, `currentRecommendation`, `isChartUpdatePending`, and
 `isPresentationPending` for lifecycle UI. `currentRecommendation` is the requested

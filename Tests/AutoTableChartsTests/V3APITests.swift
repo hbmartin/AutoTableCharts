@@ -2135,57 +2135,149 @@ private final class ProgressRecorder: @unchecked Sendable {
     @Test(
         .disabled(if: !testHooksAvailable, testHooksUnavailable),
         .timeLimit(.minutes(1)))
-    func directPreparationSuccessRetiresItsRecommendationEpisode() async throws {
+    func everyDirectPreparationSuccessRetiresItsRecommendationEpisode()
+        async throws
+    {
         #if ATC_TEST_HOOKS
-        let calls = V3Counter()
-        let cache = AutoChartCache(
+        func verifySuccess(
+            _ label: String,
+            operation: (AutoChartAnalysis<Int>, AutoChartRecommendation) async throws -> Void
+        ) async throws {
+            let calls = V3Counter()
+            let cache = AutoChartCache(
+                configuration: .init(
+                    preparedCharts: .init(maximumEntries: 0)),
+                testHooks: .chartPreparationByRecommendation { _ in
+                    calls.increment()
+                    if calls.value != 2 {
+                        throw AutoChartFailure(
+                            stage: .chartPreparation,
+                            kind: .internalFailure,
+                            isRetryable: true,
+                            diagnosticID: "ATC.test.directPreparationSuccess.\(label)",
+                            message: "Controlled \(label) preparation failure")
+                    }
+                })
+            let analyzer = AutoChartAnalyzer(cache: cache)
+            let request = try AutoChartRequest(table: domainDataset())
+            let base = try await analyzer.analyze(request, preparation: .none)
+            let selected = try #require(base.outcome.catalog?.primary)
+            let unrelated = try #require(
+                base.outcome.catalog?.cataloged.first { $0.id != selected.id })
+            let unrelatedFailure = cache.coalescedFailure(
+                for: request.id,
+                recommendationID: unrelated.id,
+                error: AutoChartFailure(
+                    stage: .chartPreparation,
+                    kind: .internalFailure,
+                    isRetryable: true,
+                    diagnosticID: "ATC.test.directPreparationSuccess.unrelated",
+                    message: "Controlled unrelated preparation failure"),
+                stage: .chartPreparation)
+
+            func failure() async throws -> AutoChartFailure {
+                let result = await captureResult {
+                    try await analyzer.analyze(
+                        request,
+                        preference: .chart(.specific(selected.id)),
+                        preparation: .preferredOrPrimary)
+                }
+                guard case .failure(let error) = result,
+                    let failure = error as? AutoChartFailure
+                else {
+                    Issue.record("The controlled \(label) preparation did not fail.")
+                    throw CancellationError()
+                }
+                return failure
+            }
+
+            let first = try await failure()
+            try await operation(base, selected)
+            let repeated = try await failure()
+            let retainedUnrelated = cache.coalescedFailure(
+                for: request.id,
+                recommendationID: unrelated.id,
+                error: AutoChartFailure(
+                    stage: .chartPreparation,
+                    kind: .internalFailure,
+                    isRetryable: true,
+                    diagnosticID: "ATC.test.directPreparationSuccess.unrelated",
+                    message: "Controlled unrelated preparation failure"),
+                stage: .chartPreparation)
+
+            #expect(repeated.episodeID != first.episodeID, Comment(rawValue: label))
+            #expect(
+                retainedUnrelated.episodeID == unrelatedFailure.episodeID,
+                Comment(rawValue: label))
+            #expect(calls.value == 3, Comment(rawValue: label))
+        }
+
+        try await verifySuccess("identifier") { analysis, recommendation in
+            _ = try await analysis.prepare(recommendation.id)
+        }
+        try await verifySuccess("specification") { analysis, recommendation in
+            _ = try await analysis.prepare(recommendation.specification)
+        }
+        try await verifySuccess("validation") { analysis, recommendation in
+            let validation = try await analysis.validation(
+                for: recommendation.specification)
+            #expect(validation.isValid)
+        }
+        #endif
+    }
+
+    @Test(
+        .disabled(if: !testHooksAvailable, testHooksUnavailable),
+        .timeLimit(.minutes(1)))
+    func noSharedCacheStartsFreshEpisodesForExistingFailures() async throws {
+        #if ATC_TEST_HOOKS
+        let incoming = AutoChartFailure(
+            stage: .chartPreparation,
+            kind: .internalFailure,
+            isRetryable: true,
+            diagnosticID: "ATC.test.noSharedCacheEpisode",
+            message: "Controlled no-shared-cache failure")
+        let request = try AutoChartRequest(table: domainDataset())
+        let catalogSource = try await AutoChartAnalyzer().analyze(
+            request, preparation: .none)
+        let selected = try #require(catalogSource.outcome.catalog?.primary)
+
+        func failure(from analyzer: AutoChartAnalyzer) async throws
+            -> AutoChartFailure
+        {
+            let result = await captureResult {
+                try await analyzer.analyze(
+                    request,
+                    preference: .chart(.specific(selected.id)),
+                    preparation: .preferredOrPrimary)
+            }
+            guard case .failure(let error) = result,
+                let failure = error as? AutoChartFailure
+            else {
+                Issue.record("Expected controlled chart preparation to fail.")
+                throw CancellationError()
+            }
+            return failure
+        }
+
+        let direct = AutoChartAnalyzer(
             configuration: .init(
                 preparedCharts: .init(maximumEntries: 0)),
-            testHooks: .chartPreparationByRecommendation { _ in
-                calls.increment()
-                if calls.value != 2 {
-                    throw AutoChartFailure(
-                        stage: .chartPreparation,
-                        kind: .internalFailure,
-                        isRetryable: true,
-                        diagnosticID: "ATC.test.directPreparationSuccess",
-                        message: "Controlled direct-preparation failure")
-                }
-            })
-        let analyzer = AutoChartAnalyzer(cache: cache)
-        let request = try AutoChartRequest(table: domainDataset())
-        let base = try await analyzer.analyze(request, preparation: .none)
-        let selected = try #require(base.outcome.catalog?.primary)
+            testHooks: .chartPreparationByRecommendation { _ in throw incoming })
+        let directFirst = try await failure(from: direct)
+        let directSecond = try await failure(from: direct)
+        #expect(directFirst.episodeID != incoming.episodeID)
+        #expect(directSecond.episodeID != incoming.episodeID)
+        #expect(directSecond.episodeID != directFirst.episodeID)
 
-        let firstResult = await captureResult {
-            try await analyzer.analyze(
-                request,
-                preference: .chart(.specific(selected.id)),
-                preparation: .preferredOrPrimary)
-        }
-        guard case .failure(let firstError) = firstResult,
-            let first = firstError as? AutoChartFailure
-        else {
-            Issue.record("The first controlled preparation did not fail.")
-            return
-        }
-
-        _ = try await base.prepare(selected.id)
-
-        let repeatedResult = await captureResult {
-            try await analyzer.analyze(
-                request,
-                preference: .chart(.specific(selected.id)),
-                preparation: .preferredOrPrimary)
-        }
-        guard case .failure(let repeatedError) = repeatedResult,
-            let repeated = repeatedError as? AutoChartFailure
-        else {
-            Issue.record("The repeated controlled preparation did not fail.")
-            return
-        }
-        #expect(repeated.episodeID != first.episodeID)
-        #expect(calls.value == 3)
+        let sharedCache = AutoChartCache(
+            configuration: .uncached,
+            testHooks: .chartPreparationByRecommendation { _ in throw incoming })
+        let shared = AutoChartAnalyzer(cache: sharedCache)
+        let sharedFirst = try await failure(from: shared)
+        let sharedSecond = try await failure(from: shared)
+        #expect(sharedFirst.episodeID != incoming.episodeID)
+        #expect(sharedSecond.episodeID == sharedFirst.episodeID)
         #endif
     }
 
@@ -3123,13 +3215,14 @@ private final class ProgressRecorder: @unchecked Sendable {
         async throws
     {
         #if ATC_TEST_HOOKS
-        let cache = AutoChartCache()
+        let cache = AutoChartCache(configuration: .uncached)
         let request = try AutoChartRequest(table: domainDataset())
-        let base = try await AutoChartAnalyzer(cache: cache).analyze(
+        let base = try await AutoChartAnalyzer().analyze(
             request, preparation: .none)
         let selected = try #require(base.outcome.catalog?.primary)
         let session = AutoChartSession<Int>(cache: cache)
         session.load(request, preference: .chart(.specific(selected.id)))
+        _ = try await readyAnalysis(from: session)
         #expect(session.currentRecommendation?.id == selected.id)
         session.failCurrentAttemptForTesting(AutoChartFailure(
             stage: .chartPreparation,
@@ -3144,10 +3237,20 @@ private final class ProgressRecorder: @unchecked Sendable {
         #expect(session.currentRecommendation?.id == selected.id)
 
         session.retry(preference: .chart(.specific(selected.id)))
-        guard case .preparing = session.state else {
-            Issue.record("The same selected type did not start cached preparation.")
+        guard case .analyzing = session.state else {
+            Issue.record("The same selected type did not start uncached analysis.")
             return
         }
+        #expect(session.currentRecommendation?.id == selected.id)
+        session.failCurrentAttemptForTesting(AutoChartFailure(
+            stage: .chartPreparation,
+            kind: .internalFailure,
+            isRetryable: true,
+            diagnosticID: "ATC.test.retryableFailure.directRetry",
+            message: "A controlled direct-retry failure."))
+        session.cancel()
+
+        session.retry(preference: .chart(.specific(selected.id)))
         #expect(session.currentRecommendation?.id == selected.id)
         session.cancel()
 
@@ -3164,6 +3267,59 @@ private final class ProgressRecorder: @unchecked Sendable {
             return
         }
         #expect(session.currentRecommendation == nil)
+        #endif
+    }
+
+    @Test(
+        .disabled(if: !testHooksAvailable, testHooksUnavailable),
+        .timeLimit(.minutes(1)))
+    func uncachedFailureRestoresAPendingOffCatalogRecommendation() async throws {
+        #if ATC_TEST_HOOKS
+        let dataset = try wideDomainDataset()
+        let request = try AutoChartRequest(table: dataset)
+        let session = AutoChartSession<Int>(
+            cache: AutoChartCache(configuration: .uncached))
+        session.load(request)
+        let ready = try await readyAnalysis(from: session)
+        let catalog = try #require(ready.outcome.catalog)
+
+        var catalogOptions = request.options
+        catalogOptions.maximumRecommendations =
+            AutoChartRecommendationCatalog.maximumCatalogedCount
+        let catalogIDs = Set(catalog.cataloged.map(\.id))
+        let candidates = AutoChartRecommendationEngine.recommendations(
+            for: dataset,
+            context: request.context,
+            options: catalogOptions,
+            constraints: request.constraints).candidates
+        let offCatalog = try #require(candidates.first { recommendation in
+            !catalogIDs.contains(recommendation.id)
+                && AutoChartRecommendationEngine.validate(
+                    specification: recommendation.specification,
+                    for: dataset).isValid
+        })
+
+        session.setPreference(.chart(.specific(offCatalog.id)))
+        #expect(session.currentRecommendation == nil)
+        session.failCurrentAttemptForTesting(AutoChartFailure(
+            stage: .chartPreparation,
+            kind: .internalFailure,
+            isRetryable: true,
+            diagnosticID: "ATC.test.pendingOffCatalogRecommendation",
+            message: "Controlled pending off-catalog failure"))
+        guard case .failed = session.state else {
+            Issue.record("The controlled off-catalog failure was not published.")
+            return
+        }
+
+        #expect(await waitForV3Condition {
+            session.currentRecommendation?.id == offCatalog.id
+        })
+        guard case .failed = session.state else {
+            Issue.record("Recommendation restoration replaced the terminal failure.")
+            return
+        }
+        #expect(session.preference == .chart(.specific(offCatalog.id)))
         #endif
     }
 
@@ -4459,6 +4615,7 @@ private final class ProgressRecorder: @unchecked Sendable {
             return
         }
         #expect(session.selection.isEmpty)
+        #expect(session.currentRecommendation == nil)
         let final = try await readyAnalysis(from: session)
         #expect(final.request == replacement.id)
     }
@@ -4486,6 +4643,81 @@ private final class ProgressRecorder: @unchecked Sendable {
         let restored = try await readyAnalysis(from: session)
         #expect(restored.id == ready.id)
         #expect(restored.primaryChart?.id == chartID)
+    }
+
+    @MainActor
+    @Test(
+        .disabled(if: !testHooksAvailable, testHooksUnavailable),
+        .timeLimit(.minutes(1)))
+    func ordinaryPostFailureTransitionsJoinUnobservedEpisodes() async throws {
+        #if ATC_TEST_HOOKS
+        for usesLoad in [false, true] {
+            let transition = usesLoad ? "load" : "setPreference"
+            let request = try AutoChartRequest(table: domainDataset())
+            let cache = AutoChartCache(
+                configuration: .init(
+                    preparedCharts: .init(maximumEntries: 0)),
+                testHooks: .chartPreparationByRecommendation { _ in
+                    throw AutoChartFailure(
+                        stage: .chartPreparation,
+                        kind: .internalFailure,
+                        isRetryable: true,
+                        diagnosticID: "ATC.test.unobservedEpisode.\(transition)",
+                        message: "Controlled \(transition) preparation failure")
+                })
+            let base = try await AutoChartAnalyzer(cache: cache).analyze(
+                request, preparation: .none)
+            let first = try #require(base.outcome.catalog?.primary)
+            let second = try #require(
+                base.outcome.catalog?.cataloged.first { $0.id != first.id })
+            let firstSession = AutoChartSession<Int>(cache: cache)
+            let secondSession = AutoChartSession<Int>(cache: cache)
+
+            secondSession.load(
+                request,
+                preference: .chart(.specific(second.id)),
+                preparation: .preferredOrPrimary)
+            let secondEpisode = try await sessionFailure(from: secondSession)
+            firstSession.load(
+                request,
+                preference: .chart(.specific(first.id)),
+                preparation: .preferredOrPrimary)
+            let firstEpisode = try await sessionFailure(from: firstSession)
+            #expect(
+                firstEpisode.episodeID != secondEpisode.episodeID,
+                Comment(rawValue: transition))
+
+            if usesLoad {
+                firstSession.load(
+                    request,
+                    preference: .chart(.specific(second.id)),
+                    preparation: .preferredOrPrimary)
+            } else {
+                firstSession.setPreference(.chart(.specific(second.id)))
+            }
+            let joined = try await sessionFailure(from: firstSession)
+            #expect(
+                joined.episodeID == secondEpisode.episodeID,
+                Comment(rawValue: transition))
+
+            let freshSession = AutoChartSession<Int>(cache: cache)
+            freshSession.load(
+                request,
+                preference: .chart(.specific(second.id)),
+                preparation: .preferredOrPrimary)
+            let fresh = try await sessionFailure(from: freshSession)
+            #expect(
+                fresh.episodeID == secondEpisode.episodeID,
+                Comment(rawValue: transition))
+            guard case .failed(let stillVisible) = secondSession.state else {
+                Issue.record("The original \(transition) observer lost its failure.")
+                continue
+            }
+            #expect(
+                stillVisible.episodeID == secondEpisode.episodeID,
+                Comment(rawValue: transition))
+        }
+        #endif
     }
 
     @MainActor

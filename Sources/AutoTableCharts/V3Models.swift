@@ -383,7 +383,14 @@ public struct AutoChartFailure: LocalizedError, Hashable, Codable, Sendable {
     }
 
     static func wrapping(_ error: any Error, stage: AutoChartFailureStage) -> Self {
-        if let failure = error as? AutoChartFailure { return failure }
+        if let failure = error as? AutoChartFailure {
+            return Self(
+                stage: failure.stage,
+                kind: failure.kind,
+                isRetryable: failure.isRetryable,
+                diagnosticID: failure.diagnosticID,
+                message: failure.message)
+        }
         let kind: AutoChartFailureKind
         let retryable: Bool
         switch error {

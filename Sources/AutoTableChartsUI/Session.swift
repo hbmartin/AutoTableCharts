@@ -316,7 +316,9 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
     /// A failed attempt begins a new failure episode, even if ``cancel()`` was
     /// called after the failure. Cancelling a nonfailed attempt and retrying with
     /// the same preference resumes it without resetting shared failure history or
-    /// clearing its request-scoped recommendation.
+    /// clearing its request-scoped recommendation. Retrying with an unchanged
+    /// preference preserves that recommendation even when the failed attempt was
+    /// not cancelled first.
     public func retry() {
         retry(preference: preference)
     }
@@ -326,8 +328,9 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
     /// A failed attempt begins a new failure episode, even if ``cancel()`` was
     /// called after the failure. Cancelling a nonfailed attempt and retrying with
     /// the same preference resumes it without resetting shared failure history or
-    /// clearing its request-scoped recommendation. A changed preference clears
-    /// that retained recommendation before work begins.
+    /// clearing its request-scoped recommendation. Any retry with an unchanged
+    /// preference preserves that recommendation; a changed preference clears it
+    /// before work begins.
     public func retry(preference: AutoChartPreference) {
         guard let request else { return }
         let isIdle = if case .idle = state { true } else { false }
@@ -383,6 +386,7 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         keepsVisibleReadyChart: Bool = false,
         restartsAttemptedFailureEpisodes: Bool = false
     ) {
+        let changesRequest = self.request?.id != request.id
         let changesPreference = preference != self.preference
         let keepsReadyChart: Bool
         if keepsVisibleReadyChart, case .ready(_, let presented) = state,
@@ -400,16 +404,14 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         } else {
             nil
         }
-        let restartsCurrentEpisodes = restartsAttemptedFailureEpisodes
-            || failedRequestID == request.id
         let failureEpisodeContext: AutoChartFailureEpisodeContext
-        if observedFailureEpisodes.isEmpty, !restartsCurrentEpisodes {
+        if observedFailureEpisodes.isEmpty, !restartsAttemptedFailureEpisodes {
             failureEpisodeContext = .coalescing
         } else {
             let episodeState = cache.failureEpisodeState(
                 for: request.id,
                 observedEpisodes: observedFailureEpisodes,
-                restartsCurrentEpisodes: restartsCurrentEpisodes)
+                restartsCurrentEpisodes: restartsAttemptedFailureEpisodes)
             observedFailureEpisodes = episodeState.observedEpisodes
             failureEpisodeContext = episodeState.context
         }
@@ -423,12 +425,13 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         self.strategy = preparation
         self.presentationConfiguration = presentationConfiguration
         preferenceUpdatePending = keepsReadyChart
-        if clearsVisibleState || changesPreference {
+        if changesRequest || changesPreference {
             currentRecommendation = nil
         }
         let completed: AutoChartAnalysis<RowID>? = cache.completedAnalysis(
             for: request.id)
-        if let recommendationSource = completed ?? visibleAnalysis {
+        let recommendationSource = completed ?? visibleAnalysis
+        if let recommendationSource {
             beginRecommendationResolution(
                 for: recommendationSource,
                 preference: preference,
@@ -493,11 +496,10 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
                 // Supersession and explicit cancellation intentionally publish no failure.
             } catch let failure as AutoChartFailure {
                 guard let self, self.generation == token else { return }
-                self.publishFailure(failure, for: request.id)
-                self.restoreRecommendationFromCache(
-                    request: request,
-                    preference: preference,
-                    token: self.generation)
+                self.publishFailure(
+                    failure,
+                    for: request.id,
+                    recommendationSource: recommendationSource)
             } catch {
                 guard let self, self.generation == token else { return }
                 self.publishFailure(
@@ -507,11 +509,8 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
                         isRetryable: true,
                         diagnosticID: "ATC.session.internalFailure",
                         message: String(describing: error)),
-                    for: request.id)
-                self.restoreRecommendationFromCache(
-                    request: request,
-                    preference: preference,
-                    token: self.generation)
+                    for: request.id,
+                    recommendationSource: recommendationSource)
             }
         }
         #if ATC_TEST_HOOKS
@@ -525,8 +524,11 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
 
     private func publishFailure(
         _ failure: AutoChartFailure,
-        for requestID: AutoChartRequestID
+        for requestID: AutoChartRequestID,
+        recommendationSource: AutoChartAnalysis<RowID>? = nil
     ) {
+        let retainedRecommendationSource = recommendationSource
+            ?? recommendationSourceFromState(for: requestID)
         cancelInFlightWork(clearsSelection: true)
         failedRequestID = requestID
         observedFailureEpisodes = cache.recordingFailureEpisode(
@@ -534,6 +536,12 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
             episodeID: failure.episodeID,
             observedEpisodes: observedFailureEpisodes)
         state = .failed(failure)
+        guard let request, request.id == requestID else { return }
+        restoreRecommendation(
+            request: request,
+            preference: preference,
+            token: generation,
+            fallback: retainedRecommendationSource)
     }
 
     private func cancelInFlightWork(clearsSelection: Bool) {
@@ -551,18 +559,36 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         if clearsSelection, !selection.isEmpty { selection.removeAll() }
     }
 
-    private func restoreRecommendationFromCache(
+    private func restoreRecommendation(
         request: AutoChartRequest<RowID>,
         preference: AutoChartPreference,
-        token: UInt64
+        token: UInt64,
+        fallback: AutoChartAnalysis<RowID>?
     ) {
         guard currentRecommendation == nil,
-            recommendationTask == nil,
-            let completed: AutoChartAnalysis<RowID> = cache.completedAnalysis(
-                for: request.id)
+            recommendationTask == nil
+        else { return }
+        let completed: AutoChartAnalysis<RowID>? = cache.completedAnalysis(
+            for: request.id)
+        guard let source = completed
+            ?? fallback.flatMap({ $0.request == request.id ? $0 : nil })
         else { return }
         beginRecommendationResolution(
-            for: completed, preference: preference, token: token)
+            for: source, preference: preference, token: token)
+    }
+
+    private func recommendationSourceFromState(
+        for requestID: AutoChartRequestID
+    ) -> AutoChartAnalysis<RowID>? {
+        let analysis: AutoChartAnalysis<RowID>?
+        switch state {
+        case .preparing(let current, _), .ready(let current, _),
+            .fallback(let current, _):
+            analysis = current
+        case .idle, .analyzing, .failed:
+            analysis = nil
+        }
+        return analysis?.request == requestID ? analysis : nil
     }
 
     private func beginRecommendationResolution(

@@ -48,15 +48,17 @@ analysis lookup is synchronous.
 The cache coalesces equivalent failures independently for request work and for
 each recommendation's chart preparation. Successful request work retires only the
 request-scoped episode; successful chart preparation retires only that
-recommendation's episode. Other specification failures for the request remain
-available for callers that are still observing them.
+recommendation's episode, including preparation performed by
+`prepare(_:)` or successful `validation(for:)`. Other specification failures for
+the request remain available for callers that are still observing them.
 
 Direct analyzer calls and fresh sessions join a matching retained episode. A
 session remembers the episodes it has already published across cancellation,
 unload, and request supersession. If that session later encounters the same
 retained failure, it receives a new episode while another fresh session may still
-join the cache's current episode. This session history is pruned against the
-cache's bounded live failure records and ends with the session.
+join the cache's current episode. Loading or selecting a different chart does not
+restart episodes that the session has never observed. This session history is
+pruned against the cache's bounded live failure records and ends with the session.
 
 Request and recommendation scopes each consume one failure-record slot. The
 cache retains at most `max(1, configuration.analyses.maximumEntries)` live
@@ -66,10 +68,11 @@ An explicit session retry starts new episodes for the request and recommendation
 scopes that the new attempt actually reaches. The exception is retrying a
 nonfailed, cancelled attempt with the same preference, which resumes ordinary
 coalescing. Cancellation, unload, and supersession publish no failure themselves.
-Presentation-only failures and failures produced without a shared
-``AutoChartCache`` receive independent episode identifiers. A cache configured
-with ``AutoChartAnalyzerConfiguration/uncached`` retains no analysis results but
-still retains one failure record for coalescing.
+Presentation-only failures and every failed attempt produced without a shared
+``AutoChartCache`` receive independent episode identifiers, even when the
+underlying error is already an ``AutoChartFailure``. A cache configured with
+``AutoChartAnalyzerConfiguration/uncached`` retains no analysis results but still
+retains one failure record for coalescing.
 ``AutoChartCache/beginRetry(for:)`` remains a request-wide operation for callers
 that intentionally want to end every retained request and recommendation episode;
 sessions use attempt-scoped handling instead.
