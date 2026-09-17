@@ -19,9 +19,34 @@ private struct AutoChartProgressEntry {
     var callbacks: [UUID: @Sendable (AutoChartProgress) -> Void] = [:]
 }
 
-private struct AutoChartFailureKey: Hashable {
-    let requestID: AutoChartRequestID
-    let recommendationID: AutoChartRecommendationID?
+package struct AutoChartFailureScope: Hashable, Sendable {
+    package let requestID: AutoChartRequestID
+    package let recommendationID: AutoChartRecommendationID?
+
+    package init(
+        requestID: AutoChartRequestID,
+        recommendationID: AutoChartRecommendationID? = nil
+    ) {
+        self.requestID = requestID
+        self.recommendationID = recommendationID
+    }
+}
+
+package struct AutoChartFailureEpisodeContext: Sendable {
+    package static let coalescing = Self(
+        observedEpisodes: [:],
+        restartsAttemptedScopes: false)
+
+    package let observedEpisodes: [AutoChartFailureScope: UUID]
+    package let restartsAttemptedScopes: Bool
+
+    package init(
+        observedEpisodes: [AutoChartFailureScope: UUID],
+        restartsAttemptedScopes: Bool
+    ) {
+        self.observedEpisodes = observedEpisodes
+        self.restartsAttemptedScopes = restartsAttemptedScopes
+    }
 }
 
 private struct AutoChartRecencyOrder<Key: Hashable> {
@@ -83,8 +108,8 @@ public final class AutoChartCache: @unchecked Sendable {
     private let lock = NSLock()
     private var completed: [AutoChartRequestID: AutoChartCompletedAnalysisBox] = [:]
     private var recency = AutoChartRecencyOrder<AutoChartRequestID>()
-    private var failures: [AutoChartFailureKey: AutoChartFailure] = [:]
-    private var failureRecency: [AutoChartFailureKey] = []
+    private var failures: [AutoChartFailureScope: AutoChartFailure] = [:]
+    private var failureRecency: [AutoChartFailureScope] = []
     private var progressEntries: [AutoChartRequestID: AutoChartProgressEntry] = [:]
 
     let engine: AutoChartAnalyzer
@@ -128,7 +153,7 @@ public final class AutoChartCache: @unchecked Sendable {
             analysis.estimatedRetainedCost <= configuration.maximumRetainedCost
         else { return }
         completed[analysis.request] = AutoChartCompletedAnalysisBox(analysis)
-        let requestFailureKey = AutoChartFailureKey(
+        let requestFailureKey = AutoChartFailureScope(
             requestID: analysis.request,
             recommendationID: nil)
         failures.removeValue(forKey: requestFailureKey)
@@ -141,25 +166,69 @@ public final class AutoChartCache: @unchecked Sendable {
         for requestID: AutoChartRequestID,
         recommendationID: AutoChartRecommendationID? = nil,
         error: any Error,
-        stage: AutoChartFailureStage
+        stage: AutoChartFailureStage,
+        episodeContext: AutoChartFailureEpisodeContext = .coalescing
     ) -> AutoChartFailure {
         lock.withLock {
-            let key = AutoChartFailureKey(
+            let key = AutoChartFailureScope(
                 requestID: requestID,
                 recommendationID: recommendationID)
             let proposed = AutoChartFailure.wrapping(error, stage: stage)
             if let existing = failures[key],
-                existing.diagnosticID == proposed.diagnosticID
+                existing.diagnosticID == proposed.diagnosticID,
+                !episodeContext.restartsAttemptedScopes,
+                episodeContext.observedEpisodes[key] != existing.episodeID
             {
                 failureRecency.removeAll { $0 == key }
                 failureRecency.append(key)
                 return existing
             }
-            failures[key] = proposed
+            let replacement: AutoChartFailure
+            if failures[key] != nil {
+                replacement = AutoChartFailure(
+                    stage: proposed.stage,
+                    kind: proposed.kind,
+                    isRetryable: proposed.isRetryable,
+                    diagnosticID: proposed.diagnosticID,
+                    message: proposed.message)
+            } else {
+                replacement = proposed
+            }
+            failures[key] = replacement
             failureRecency.removeAll { $0 == key }
             failureRecency.append(key)
             trimFailuresLocked()
-            return proposed
+            return replacement
+        }
+    }
+
+    package func recordSuccess(for scope: AutoChartFailureScope) {
+        lock.withLock {
+            failures.removeValue(forKey: scope)
+            failureRecency.removeAll { $0 == scope }
+        }
+    }
+
+    package func failureScopes(
+        for requestID: AutoChartRequestID,
+        episodeID: UUID
+    ) -> Set<AutoChartFailureScope> {
+        lock.withLock {
+            Set(failures.compactMap { scope, failure in
+                scope.requestID == requestID && failure.episodeID == episodeID
+                    ? scope
+                    : nil
+            })
+        }
+    }
+
+    package func currentFailureEpisodes(
+        matching observed: [AutoChartFailureScope: UUID]
+    ) -> [AutoChartFailureScope: UUID] {
+        lock.withLock {
+            observed.filter { scope, episodeID in
+                failures[scope]?.episodeID == episodeID
+            }
         }
     }
 
@@ -210,10 +279,11 @@ public final class AutoChartCache: @unchecked Sendable {
         }
     }
 
-    /// Ends every failure episode for a request before an explicit retry attempt.
+    /// Ends every retained failure episode for a request.
     ///
-    /// This request-wide behavior is retained for source compatibility. Sessions
-    /// use the package-scoped overload to clear only the work they will retry.
+    /// Call this before a request-wide explicit retry when all request and chart
+    /// preparation failures should begin new episodes. UI sessions apply narrower
+    /// attempt-aware episode handling internally.
     public func beginRetry(for requestID: AutoChartRequestID) {
         lock.withLock {
             failures = failures.filter { $0.key.requestID != requestID }
@@ -227,15 +297,15 @@ public final class AutoChartCache: @unchecked Sendable {
         recommendationIDs: Set<AutoChartRecommendationID>?
     ) {
         lock.withLock {
-            let keys: Set<AutoChartFailureKey>
+            let keys: Set<AutoChartFailureScope>
             if let recommendationIDs {
                 keys = Set(recommendationIDs.map {
-                    AutoChartFailureKey(
+                    AutoChartFailureScope(
                         requestID: requestID,
                         recommendationID: $0)
                 })
             } else {
-                keys = [AutoChartFailureKey(
+                keys = [AutoChartFailureScope(
                     requestID: requestID,
                     recommendationID: nil)]
             }

@@ -992,6 +992,21 @@ public actor AutoChartAnalyzer {
         preparation strategy: AutoChartPreparationStrategy = .preferredOrPrimary,
         progress: (@Sendable (AutoChartProgress) -> Void)? = nil
     ) async throws -> AutoChartAnalysis<RowID> {
+        try await analyze(
+            request,
+            preference: preference,
+            preparation: strategy,
+            progress: progress,
+            failureEpisodes: .coalescing)
+    }
+
+    package nonisolated func analyze<RowID: Hashable & Sendable>(
+        _ request: AutoChartRequest<RowID>,
+        preference: AutoChartPreference,
+        preparation strategy: AutoChartPreparationStrategy,
+        progress: (@Sendable (AutoChartProgress) -> Void)?,
+        failureEpisodes: AutoChartFailureEpisodeContext
+    ) async throws -> AutoChartAnalysis<RowID> {
         guard request.policyVersion == AutoTableCharts.recommendationPolicyVersion else {
             throw AutoChartFailure(
                 stage: .recommendation,
@@ -1028,7 +1043,8 @@ public actor AutoChartAnalyzer {
                 throw cache?.coalescedFailure(
                     for: request.id,
                     error: error,
-                    stage: .materialization)
+                    stage: .materialization,
+                    episodeContext: failureEpisodes)
                     ?? AutoChartFailure.wrapping(error, stage: .materialization)
             }
 
@@ -1053,10 +1069,13 @@ public actor AutoChartAnalyzer {
                 throw cache?.coalescedFailure(
                     for: request.id,
                     error: error,
-                    stage: .recommendation)
+                    stage: .recommendation,
+                    episodeContext: failureEpisodes)
                     ?? AutoChartFailure.wrapping(error, stage: .recommendation)
             }
         }
+
+        cache?.recordSuccess(for: AutoChartFailureScope(requestID: request.id))
 
         let resolution = base.resolve(preference)
         guard !resolution.usesTable, strategy != .none else {
@@ -1079,6 +1098,10 @@ public actor AutoChartAnalyzer {
                     totalUnitCount: recommendations.count))
             do {
                 prepared[recommendation.id] = try await base.prepare(recommendation.id)
+                cache?.recordSuccess(
+                    for: AutoChartFailureScope(
+                        requestID: request.id,
+                        recommendationID: recommendation.id))
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
@@ -1086,7 +1109,8 @@ public actor AutoChartAnalyzer {
                     for: request.id,
                     recommendationID: recommendation.id,
                     error: error,
-                    stage: .chartPreparation)
+                    stage: .chartPreparation,
+                    episodeContext: failureEpisodes)
                     ?? AutoChartFailure.wrapping(error, stage: .chartPreparation)
             }
         }

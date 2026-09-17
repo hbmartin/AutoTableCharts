@@ -17,8 +17,8 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
 
     public private(set) var state: State = .idle
     public private(set) var preference: AutoChartPreference = .automatic
-    /// The chart choice for this request, including while cached preparation is
-    /// pending or a retryable attempt has failed.
+    /// The requested chart choice, including while a prior chart remains visible,
+    /// cached preparation is pending, or a retryable attempt has failed.
     public private(set) var currentRecommendation: AutoChartRecommendation?
     public var selection = AutoChartSelectionSet<RowID>()
 
@@ -80,8 +80,8 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
     @ObservationIgnored private var task: Task<Void, Never>?
     @ObservationIgnored private var presentationTask: Task<Void, Never>?
     @ObservationIgnored private var recommendationTask: Task<Void, Never>?
-    @ObservationIgnored private var failedRequestID: AutoChartRequestID?
-    @ObservationIgnored private var failedStage: AutoChartFailureStage?
+    @ObservationIgnored private var observedFailureEpisodes:
+        [AutoChartFailureScope: UUID] = [:]
     private var presentationRequestID: AutoChartPresentationRequestID?
     private var presentationTarget: PresentationTarget?
     private var preferenceUpdatePending = false
@@ -164,11 +164,14 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
     /// loaded, this stores the default used by ``load(_:preparation:presentationContext:formatters:textResolver:)``.
     /// After ``cancel()``, a different preference may restart the retained request;
     /// after ``unload()``, it is stored without starting work.
-    public func setPreference(_ preference: AutoChartPreference) {
-        guard preference != self.preference else { return }
+    /// - Returns: `true` exactly when applying the preference starts new analysis or
+    ///   preparation work; otherwise, `false`.
+    @discardableResult
+    public func setPreference(_ preference: AutoChartPreference) -> Bool {
+        guard preference != self.preference else { return false }
         guard let request else {
             self.preference = preference
-            return
+            return false
         }
         if case .ready(let displayedAnalysis, let presented?) = state,
             let base: AutoChartAnalysis<RowID> = cache.completedAnalysis(
@@ -197,7 +200,7 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
                     for: updated,
                     chart: presented.preparedChart,
                     keepsVisiblePresentation: true)
-                return
+                return false
             }
         }
         start(
@@ -207,6 +210,7 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
             presentationConfiguration: presentationConfiguration,
             clearsVisibleState: false,
             keepsVisibleReadyChart: true)
+        return true
     }
 
     /// Schedules presentation rebuilding for the current prepared chart without
@@ -331,14 +335,14 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         guard let request else { return }
         let isIdle = if case .idle = state { true } else { false }
         let resumesCancelledRequest = isIdle
-            && failedRequestID != request.id
             && preference == self.preference
         start(
             request,
             preference: preference,
             preparation: strategy,
             presentationConfiguration: presentationConfiguration,
-            clearsVisibleState: !resumesCancelledRequest)
+            clearsVisibleState: !resumesCancelledRequest,
+            restartsAttemptedFailureEpisodes: !resumesCancelledRequest)
     }
 
     /// Cancels the current attempt and clears selection without forgetting the request.
@@ -367,10 +371,7 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
     public func unload() {
         cancel()
         request = nil
-        failedRequestID = nil
-        failedStage = nil
         currentRecommendation = nil
-        strategy = .preferredOrPrimary
         loadedPresentationConfiguration = PresentationConfiguration()
         presentationConfiguration = effectivePresentationConfiguration
     }
@@ -378,14 +379,9 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
     #if ATC_TEST_HOOKS
     /// Injects a terminal attempt after analysis for deterministic host UI tests.
     public func failCurrentAttemptForTesting(_ failure: AutoChartFailure) {
-        guard let request else { return }
-        generation &+= 1
-        task?.cancel()
-        task = nil
-        presentationGeneration &+= 1
-        presentationTask?.cancel()
-        presentationTask = nil
-        presentationRequestID = nil
+        guard let request else {
+            preconditionFailure("A session failure requires a loaded request.")
+        }
         publishFailure(failure, for: request.id)
     }
     #endif
@@ -396,7 +392,8 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         preparation: AutoChartPreparationStrategy,
         presentationConfiguration: PresentationConfiguration,
         clearsVisibleState: Bool,
-        keepsVisibleReadyChart: Bool = false
+        keepsVisibleReadyChart: Bool = false,
+        restartsAttemptedFailureEpisodes: Bool = false
     ) {
         let changesPreference = preference != self.preference
         let keepsReadyChart: Bool
@@ -408,29 +405,13 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         } else {
             keepsReadyChart = false
         }
-        if failedRequestID == request.id {
-            if failedStage == .chartPreparation,
-                let completed: AutoChartAnalysis<RowID> = cache.completedAnalysis(
-                    for: request.id)
-            {
-                let resolution = completed.resolve(preference)
-                let recommendationIDs = Set(
-                    completed.preparationRecommendations(
-                        strategy: preparation,
-                        resolution: resolution
-                    ).map(\.id))
-                cache.beginRetry(
-                    for: request.id,
-                    recommendationIDs: recommendationIDs)
-            } else {
-                cache.beginRetry(for: request.id, recommendationIDs: nil)
-            }
-        }
-        failedRequestID = nil
-        failedStage = nil
-        #if ATC_TEST_HOOKS
-        attemptDidStartForTesting?()
-        #endif
+        observedFailureEpisodes = cache.currentFailureEpisodes(
+            matching: observedFailureEpisodes)
+        let failureEpisodeContext = AutoChartFailureEpisodeContext(
+            observedEpisodes: observedFailureEpisodes.filter {
+                $0.key.requestID == request.id
+            },
+            restartsAttemptedScopes: restartsAttemptedFailureEpisodes)
         generation &+= 1
         let token = generation
         task?.cancel()
@@ -446,10 +427,12 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         self.strategy = preparation
         self.presentationConfiguration = presentationConfiguration
         preferenceUpdatePending = keepsReadyChart
-        let shouldClearVisibleState = clearsVisibleState
+        if clearsVisibleState || changesPreference {
+            currentRecommendation = nil
+        }
+        let shouldClearSelection = clearsVisibleState
             || (changesPreference && !keepsReadyChart)
-        if shouldClearVisibleState { currentRecommendation = nil }
-        if shouldClearVisibleState, !selection.isEmpty {
+        if shouldClearSelection, !selection.isEmpty {
             selection.removeAll()
         }
         let completedForPreparation: AutoChartAnalysis<RowID>?
@@ -459,10 +442,8 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
             Self.canPrepareChart(for: preference, in: completed)
         {
             completedForPreparation = completed
-            if !keepsReadyChart {
-                beginRecommendationResolution(
-                    for: completed, preference: preference, token: token)
-            }
+            beginRecommendationResolution(
+                for: completed, preference: preference, token: token)
             if !keepsReadyChart { state = .preparing(completed, nil) }
         } else {
             completedForPreparation = nil
@@ -489,7 +470,8 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
                                 self.state = .analyzing(progress)
                             }
                         }
-                    })
+                    },
+                    failureEpisodes: failureEpisodeContext)
                 try Task.checkCancellation()
                 guard let self, self.generation == token else { return }
                 self.task = nil
@@ -515,19 +497,13 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
                 // Supersession and explicit cancellation intentionally publish no failure.
             } catch let failure as AutoChartFailure {
                 guard let self, self.generation == token else { return }
-                self.task = nil
-                self.preferenceUpdatePending = false
-                self.restoreRecommendationFromCache(
-                    request: request, preference: preference, token: token)
-                if !self.selection.isEmpty { self.selection.removeAll() }
                 self.publishFailure(failure, for: request.id)
+                self.restoreRecommendationFromCache(
+                    request: request,
+                    preference: preference,
+                    token: self.generation)
             } catch {
                 guard let self, self.generation == token else { return }
-                self.task = nil
-                self.preferenceUpdatePending = false
-                self.restoreRecommendationFromCache(
-                    request: request, preference: preference, token: token)
-                if !self.selection.isEmpty { self.selection.removeAll() }
                 self.publishFailure(
                     AutoChartFailure(
                         stage: .recommendation,
@@ -536,16 +512,45 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
                         diagnosticID: "ATC.session.internalFailure",
                         message: String(describing: error)),
                     for: request.id)
+                self.restoreRecommendationFromCache(
+                    request: request,
+                    preference: preference,
+                    token: self.generation)
             }
         }
+        #if ATC_TEST_HOOKS
+        if let attemptDidStartForTesting, !AttemptHookScope.isInvoking {
+            AttemptHookScope.$isInvoking.withValue(true) {
+                attemptDidStartForTesting()
+            }
+        }
+        #endif
     }
 
     private func publishFailure(
         _ failure: AutoChartFailure,
         for requestID: AutoChartRequestID
     ) {
-        failedRequestID = requestID
-        failedStage = failure.stage
+        generation &+= 1
+        presentationGeneration &+= 1
+        task?.cancel()
+        presentationTask?.cancel()
+        recommendationTask?.cancel()
+        task = nil
+        presentationTask = nil
+        recommendationTask = nil
+        presentationRequestID = nil
+        presentationTarget = nil
+        preferenceUpdatePending = false
+        if !selection.isEmpty { selection.removeAll() }
+        observedFailureEpisodes = cache.currentFailureEpisodes(
+            matching: observedFailureEpisodes)
+        for scope in cache.failureScopes(
+            for: requestID,
+            episodeID: failure.episodeID)
+        {
+            observedFailureEpisodes[scope] = failure.episodeID
+        }
         state = .failed(failure)
     }
 
@@ -694,10 +699,6 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
                 guard let self,
                     self.presentationGeneration == presentationToken
                 else { return }
-                self.presentationTask = nil
-                self.presentationRequestID = nil
-                self.presentationTarget = nil
-                if !self.selection.isEmpty { self.selection.removeAll() }
                 self.publishFailure(
                     AutoChartFailure(
                         stage: .presentationPreparation,
@@ -758,3 +759,9 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         }
     }
 }
+
+#if ATC_TEST_HOOKS
+private enum AttemptHookScope {
+    @TaskLocal static var isInvoking = false
+}
+#endif

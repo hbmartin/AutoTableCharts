@@ -89,10 +89,18 @@ terminal state. A retry after failure starts a new failure episode even if
 `cancel()` was called after the failure. Retrying a nonfailed cancelled attempt
 with the same preference resumes it without resetting shared failure history.
 `unload()` forgets request-specific state and loaded presentation callbacks while
-preserving the session preference and active environment overrides. Observe
-`state`, `isChartUpdatePending`, and `isPresentationPending` for lifecycle UI. The
-session preserves selection only while its prepared chart remains authoritative
-and clears selection on replacement, fallback, failure, cancellation, or unload.
+preserving the session preference, active environment overrides, and knowledge of
+failure episodes already shown. Loading that request again therefore starts a new
+episode if the same failure recurs; a newly created session sharing the cache can
+still join the current episode.
+
+Observe `state`, `currentRecommendation`, `isChartUpdatePending`, and
+`isPresentationPending` for lifecycle UI. `currentRecommendation` is the requested
+or pending choice. During a preference change, `state` can continue to carry the
+previously presented chart while `currentRecommendation` immediately describes
+its replacement. The session preserves selection only while its prepared chart
+remains authoritative and clears selection on replacement, fallback, failure,
+cancellation, or unload.
 
 ### Prepare an alternative
 
