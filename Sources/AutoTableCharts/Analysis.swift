@@ -640,7 +640,9 @@ public struct AutoChartAnalysis<RowID: Hashable & Sendable>: Sendable {
         for specification: AutoChartSpecification
     ) async throws -> AutoChartValidationResult {
         do {
-            return try await provider.prepare(specification).validation
+            let prepared = try await provider.prepare(specification)
+            recordPreparationSuccess(prepared)
+            return prepared.validation
         } catch AutoChartPreparationError.invalidSpecification(let validation) {
             try Task.checkCancellation()
             return validation
@@ -657,7 +659,7 @@ public struct AutoChartAnalysis<RowID: Hashable & Sendable>: Sendable {
         _ recommendationID: AutoChartRecommendationID
     ) async throws -> AutoChartPreparedChart<RowID> {
         let prepared = try await provider.prepare(recommendationID)
-        preparationDidSucceed?(recommendationID)
+        recordPreparationSuccess(prepared)
         return prepared
     }
 
@@ -670,7 +672,15 @@ public struct AutoChartAnalysis<RowID: Hashable & Sendable>: Sendable {
     public func prepare(
         _ specification: AutoChartSpecification
     ) async throws -> AutoChartPreparedChart<RowID> {
-        try await provider.prepare(specification)
+        let prepared = try await provider.prepare(specification)
+        recordPreparationSuccess(prepared)
+        return prepared
+    }
+
+    private func recordPreparationSuccess(
+        _ prepared: AutoChartPreparedChart<RowID>
+    ) {
+        preparationDidSucceed?(prepared.recommendation.id)
     }
 }
 
