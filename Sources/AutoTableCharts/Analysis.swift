@@ -654,6 +654,9 @@ public struct AutoChartAnalysis<RowID: Hashable & Sendable>: Sendable {
 
     /// Prepares the recommendation identified by `recommendationID`.
     ///
+    /// A successful preparation also retires the matching chart-preparation
+    /// failure episode.
+    ///
     /// - Throws: `CancellationError` if the calling task is cancelled, or
     ///   ``AutoChartPreparationError/recommendationUnavailable(_:)`` if this
     ///   analysis does not contain the identifier. Repeated analyzer resets can
@@ -667,6 +670,9 @@ public struct AutoChartAnalysis<RowID: Hashable & Sendable>: Sendable {
     }
 
     /// Validates and prepares a caller-provided specification.
+    ///
+    /// A successful preparation also retires the matching chart-preparation
+    /// failure episode.
     ///
     /// - Throws: `CancellationError` if the calling task is cancelled, or
     ///   ``AutoChartPreparationError/invalidSpecification(_:)`` if the
@@ -1040,7 +1046,8 @@ public actor AutoChartAnalyzer {
             preference: preference,
             preparation: strategy,
             progress: progress,
-            failureEpisodes: .coalescing)
+            failureEpisodes: .coalescing,
+            preferenceResolution: nil)
     }
 
     package nonisolated func analyze<RowID: Hashable & Sendable>(
@@ -1048,7 +1055,9 @@ public actor AutoChartAnalyzer {
         preference: AutoChartPreference,
         preparation strategy: AutoChartPreparationStrategy,
         progress: (@Sendable (AutoChartProgress) -> Void)?,
-        failureEpisodes: AutoChartFailureEpisodeContext
+        failureEpisodes: AutoChartFailureEpisodeContext,
+        preferenceResolution:
+            (@Sendable (AutoChartPreferenceResolution) async -> Void)?
     ) async throws -> AutoChartAnalysis<RowID> {
         guard request.policyVersion == AutoTableCharts.recommendationPolicyVersion else {
             throw AutoChartFailure(
@@ -1131,6 +1140,11 @@ public actor AutoChartAnalyzer {
         }
 
         let resolution = base.resolve(preference)
+        try Task.checkCancellation()
+        if let preferenceResolution {
+            await preferenceResolution(resolution)
+            try Task.checkCancellation()
+        }
         guard !resolution.usesTable, strategy != .none else {
             return base.replacingPresentation(
                 request: request.id,
