@@ -2,6 +2,22 @@ import Foundation
 import Observation
 import AutoTableCharts
 
+/// The effect of applying a preference to an ``AutoChartSession``.
+public enum AutoChartPreferenceApplication: Hashable, Sendable {
+    /// The supplied preference already matched the session's stored preference.
+    case unchanged
+    /// The preference was stored as the default for a future load.
+    case stored
+    /// The preference was reconciled using an existing prepared chart.
+    ///
+    /// Presentation-only work may still be pending or begin after this result.
+    case reusedPreparedChart
+    /// A replacement session pass was installed and remained current on return.
+    case startedReplacement
+    /// A replacement pass started but synchronous reentrancy replaced it before return.
+    case superseded
+}
+
 /// Main-actor lifecycle owner for one independently displayed chart result.
 @MainActor
 @Observable
@@ -90,6 +106,9 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
     @ObservationIgnored package var attemptDidStartForTesting: (() -> Void)?
     @ObservationIgnored package var presentationFailureForTesting: AutoChartFailure?
     @ObservationIgnored package var environmentApplicationForTesting: (() -> Void)?
+    package var hasRecommendationTaskForTesting: Bool {
+        recommendationTask != nil
+    }
     #endif
 
     public init(
@@ -144,7 +163,7 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
             context: presentationContext,
             formatters: formatters,
             textResolver: textResolver)
-        start(
+        _ = start(
             request,
             preference: preference,
             preparation: preparation,
@@ -166,63 +185,90 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
     /// After ``cancel()``, a different preference may restart the retained request;
     /// after ``unload()``, it is stored without starting work.
     public func setPreference(_ preference: AutoChartPreference) {
-        setPreference(preference, onAttemptStart: {})
+        _ = applyPreference(preference)
     }
 
-    /// Reconciles a new preference and reports when it starts replacement work.
+    /// Reconciles a new preference and reports how it was applied.
     ///
-    /// `onAttemptStart` runs synchronously, exactly once, after a changed
-    /// preference starts new analysis or preparation work. It does not run when
-    /// the preference is unchanged, no request is loaded, or the current
-    /// prepared chart can be reused, including while presentation-only work is
-    /// pending.
-    public func setPreference(
-        _ preference: AutoChartPreference,
-        onAttemptStart: () -> Void
-    ) {
-        guard preference != self.preference else { return }
+    /// A replacement is a new asynchronous session pass. Cached transitions such
+    /// as switching to table presentation still count as replacements. Reusing a
+    /// prepared chart does not, even when presentation-only work remains pending.
+    public func applyPreference(
+        _ preference: AutoChartPreference
+    ) -> AutoChartPreferenceApplication {
+        guard preference != self.preference else { return .unchanged }
         guard let request else {
             self.preference = preference
-            return
+            return .stored
         }
-        if case .ready(let displayedAnalysis, let presented?) = state,
+        if let reusableState = reusablePreparedChartState,
             let base: AutoChartAnalysis<RowID> = cache.completedAnalysis(
                 for: request.id),
-            base.id == displayedAnalysis.id,
-            Self.canResolveFromCatalog(preference, in: base),
-            Self.canReusePreparedChart(
-                presented.preparedChart, strategy: strategy,
-                analysis: displayedAnalysis, base: base)
+            base.id == reusableState.analysis.id,
+            Self.canResolveFromCatalog(preference, in: base)
         {
             let resolution = base.resolve(preference)
-            if resolution.recommendation?.id == presented.preparedChart.recommendation.id {
-                if preferenceUpdatePending {
-                    generation &+= 1
-                    task?.cancel()
-                    task = nil
-                    preferenceUpdatePending = false
-                }
+            if let recommendation = resolution.recommendation,
+                let chart = reusableState.analysis.preparedCharts[recommendation.id],
+                Self.canReusePreparedChart(
+                    chart, strategy: strategy,
+                    analysis: reusableState.analysis, base: base)
+            {
+                cancelPreferenceWork()
                 self.preference = preference
-                currentRecommendation = resolution.recommendation
+                currentRecommendation = recommendation
                 let updated = base.replacingPresentation(
-                    preparedCharts: displayedAnalysis.preparedCharts,
+                    preparedCharts: reusableState.analysis.preparedCharts,
                     resolution: resolution)
-                state = .ready(updated, presented)
+                if let progress = reusableState.presentationProgress {
+                    state = .preparing(updated, progress)
+                } else {
+                    state = .ready(updated, reusableState.presented)
+                }
                 schedulePresentation(
                     for: updated,
-                    chart: presented.preparedChart,
-                    keepsVisiblePresentation: true)
-                return
+                    chart: chart,
+                    keepsVisiblePresentation: reusableState.presented != nil)
+                return .reusedPreparedChart
             }
         }
-        start(
+        let token = start(
             request,
             preference: preference,
             preparation: strategy,
             presentationConfiguration: presentationConfiguration,
             clearsVisibleState: false,
             keepsVisibleReadyChart: true)
-        onAttemptStart()
+        guard generation == token,
+            self.request?.id == request.id,
+            self.preference == preference
+        else { return .superseded }
+        return .startedReplacement
+    }
+
+    private var reusablePreparedChartState: (
+        analysis: AutoChartAnalysis<RowID>,
+        presented: AutoChartPresentedChart<RowID>?,
+        presentationProgress: AutoChartProgress?
+    )? {
+        switch state {
+        case .ready(let analysis, let presented):
+            return (analysis, presented, nil)
+        case .preparing(let analysis, let progress)
+            where progress?.phase == .presentationPreparation:
+            return (analysis, nil, progress)
+        default:
+            return nil
+        }
+    }
+
+    private func cancelPreferenceWork() {
+        generation &+= 1
+        task?.cancel()
+        recommendationTask?.cancel()
+        task = nil
+        recommendationTask = nil
+        preferenceUpdatePending = false
     }
 
     /// Schedules presentation rebuilding for the current prepared chart without
@@ -353,7 +399,7 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         let resumesCancelledRequest = isIdle
             && failedRequestID != request.id
             && preference == self.preference
-        start(
+        _ = start(
             request,
             preference: preference,
             preparation: strategy,
@@ -401,7 +447,7 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         clearsVisibleState: Bool,
         keepsVisibleReadyChart: Bool = false,
         restartsAttemptedFailureEpisodes: Bool = false
-    ) {
+    ) -> UInt64 {
         let changesRequest = self.request?.id != request.id
         let changesPreference = preference != self.preference
         let keepsReadyChart: Bool
@@ -548,6 +594,7 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
             }
         }
         #endif
+        return token
     }
 
     private func publishFailure(
@@ -745,12 +792,16 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
                 self.presentationRequestID = nil
                 self.presentationTarget = nil
                 let latestAnalysis: AutoChartAnalysis<RowID>
-                if case .ready(let current, _) = self.state,
-                    current.id == analysis.id,
-                    current.primaryChart?.id == chart.id
-                {
+                switch self.state {
+                case .ready(let current, _)
+                    where current.id == analysis.id
+                        && current.primaryChart?.id == chart.id:
                     latestAnalysis = current
-                } else {
+                case .preparing(let current, _)
+                    where current.id == analysis.id
+                        && current.primaryChart?.id == chart.id:
+                    latestAnalysis = current
+                default:
                     latestAnalysis = analysis
                 }
                 if !self.selection.belongs(
