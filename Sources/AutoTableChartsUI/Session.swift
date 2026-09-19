@@ -14,7 +14,9 @@ public enum AutoChartPreferenceApplication: Hashable, Sendable {
     case reusedPreparedChart
     /// A replacement session pass was installed and remained current on return.
     case startedReplacement
-    /// A replacement pass started but synchronous reentrancy replaced it before return.
+    /// A replacement pass started but synchronous reentrancy made it noncurrent.
+    ///
+    /// This includes replacement, retry, cancellation, and unload operations.
     case superseded
 }
 
@@ -26,6 +28,10 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         case idle
         case analyzing(AutoChartProgress?)
         case preparing(AutoChartAnalysis<RowID>, AutoChartProgress?)
+        /// Analysis and presentation for the currently visible chart.
+        ///
+        /// When a replacement is pending, ``currentRecommendation`` describes
+        /// the requested chart while these associated values remain paired.
         case ready(AutoChartAnalysis<RowID>, AutoChartPresentedChart<RowID>?)
         case fallback(AutoChartAnalysis<RowID>, AutoChartFallback?)
         case failed(AutoChartFailure)
@@ -201,35 +207,33 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
             self.preference = preference
             return .stored
         }
-        if let reusableState = reusablePreparedChartState,
-            let base: AutoChartAnalysis<RowID> = cache.completedAnalysis(
+        if let base: AutoChartAnalysis<RowID> = cache.completedAnalysis(
                 for: request.id),
-            base.id == reusableState.analysis.id,
-            Self.canResolveFromCatalog(preference, in: base)
+            Self.canResolvePreparedChartFromCatalog(preference, in: base)
         {
             let resolution = base.resolve(preference)
-            if let recommendation = resolution.recommendation,
-                let chart = reusableState.analysis.preparedCharts[recommendation.id],
-                Self.canReusePreparedChart(
-                    chart, strategy: strategy,
-                    analysis: reusableState.analysis, base: base)
-            {
-                cancelPreferenceWork()
-                self.preference = preference
-                currentRecommendation = recommendation
-                let updated = base.replacingPresentation(
-                    preparedCharts: reusableState.analysis.preparedCharts,
-                    resolution: resolution)
-                if let progress = reusableState.presentationProgress {
-                    state = .preparing(updated, progress)
-                } else {
-                    state = .ready(updated, reusableState.presented)
+            if let recommendation = resolution.recommendation {
+                for analysis in reusablePreparedChartAnalyses
+                where analysis.id == base.id {
+                    guard let chart = analysis.preparedCharts[recommendation.id],
+                        Self.canReusePreparedChart(
+                            chart, strategy: strategy,
+                            analysis: analysis, base: base)
+                    else { continue }
+                    _ = cancelInFlightWork(
+                        clearsSelection: false,
+                        preservesPresentation: true)
+                    self.preference = preference
+                    currentRecommendation = recommendation
+                    let updated = base.replacingPresentation(
+                        preparedCharts: analysis.preparedCharts,
+                        resolution: resolution)
+                    schedulePresentation(
+                        for: updated,
+                        chart: chart,
+                        keepsVisiblePresentation: readyState?.presented != nil)
+                    return .reusedPreparedChart
                 }
-                schedulePresentation(
-                    for: updated,
-                    chart: chart,
-                    keepsVisiblePresentation: reusableState.presented != nil)
-                return .reusedPreparedChart
             }
         }
         let token = start(
@@ -239,36 +243,31 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
             presentationConfiguration: presentationConfiguration,
             clearsVisibleState: false,
             keepsVisibleReadyChart: true)
-        guard generation == token,
-            self.request?.id == request.id,
-            self.preference == preference
-        else { return .superseded }
+        guard generation == token else { return .superseded }
+        assert(self.request?.id == request.id)
+        assert(self.preference == preference)
         return .startedReplacement
     }
 
-    private var reusablePreparedChartState: (
+    private var readyState: (
         analysis: AutoChartAnalysis<RowID>,
-        presented: AutoChartPresentedChart<RowID>?,
-        presentationProgress: AutoChartProgress?
+        presented: AutoChartPresentedChart<RowID>?
     )? {
-        switch state {
-        case .ready(let analysis, let presented):
-            return (analysis, presented, nil)
-        case .preparing(let analysis, let progress)
-            where progress?.phase == .presentationPreparation:
-            return (analysis, nil, progress)
-        default:
+        guard case .ready(let analysis, let presented) = state else {
             return nil
         }
+        return (analysis, presented)
     }
 
-    private func cancelPreferenceWork() {
-        generation &+= 1
-        task?.cancel()
-        recommendationTask?.cancel()
-        task = nil
-        recommendationTask = nil
-        preferenceUpdatePending = false
+    private var reusablePreparedChartAnalyses: [AutoChartAnalysis<RowID>] {
+        var analyses: [AutoChartAnalysis<RowID>] = []
+        if task == nil, let presentationTarget {
+            analyses.append(presentationTarget.analysis)
+        }
+        if let readyState {
+            analyses.append(readyState.analysis)
+        }
+        return analyses
     }
 
     /// Schedules presentation rebuilding for the current prepared chart without
@@ -349,27 +348,20 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
                 keepsVisiblePresentation: presentationTarget.keepsVisiblePresentation)
             return
         }
-        switch state {
-        case .ready(let analysis, _):
+        if let readyState {
+            let analysis = readyState.analysis
             guard let chart = analysis.primaryChart else { return }
             schedulePresentation(
                 for: analysis,
                 chart: chart,
                 keepsVisiblePresentation: true)
-        case .preparing(let analysis, let progress)
-            where progress?.phase == .presentationPreparation:
-            guard let chart = analysis.primaryChart else { return }
-            schedulePresentation(
-                for: analysis,
-                chart: chart,
-                keepsVisiblePresentation: false)
-        default:
-            presentationGeneration &+= 1
-            presentationTask?.cancel()
-            presentationTask = nil
-            presentationRequestID = nil
-            presentationTarget = nil
+            return
         }
+        presentationGeneration &+= 1
+        presentationTask?.cancel()
+        presentationTask = nil
+        presentationRequestID = nil
+        presentationTarget = nil
     }
 
     /// Restarts the retained request using the stored preference.
@@ -480,8 +472,8 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         failedRequestID = nil
         let shouldClearSelection = clearsVisibleState
             || (changesPreference && !keepsReadyChart)
-        cancelInFlightWork(clearsSelection: shouldClearSelection)
-        let token = generation
+        let token = cancelInFlightWork(clearsSelection: shouldClearSelection)
+        guard generation == token else { return token }
         self.request = request
         self.preference = preference
         self.strategy = preparation
@@ -619,19 +611,27 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
             fallback: retainedRecommendationSource)
     }
 
-    private func cancelInFlightWork(clearsSelection: Bool) {
+    @discardableResult
+    private func cancelInFlightWork(
+        clearsSelection: Bool,
+        preservesPresentation: Bool = false
+    ) -> UInt64 {
         generation &+= 1
-        presentationGeneration &+= 1
+        let token = generation
         task?.cancel()
-        presentationTask?.cancel()
         recommendationTask?.cancel()
         task = nil
-        presentationTask = nil
         recommendationTask = nil
-        presentationRequestID = nil
-        presentationTarget = nil
         preferenceUpdatePending = false
+        if !preservesPresentation {
+            presentationGeneration &+= 1
+            presentationTask?.cancel()
+            presentationTask = nil
+            presentationRequestID = nil
+            presentationTarget = nil
+        }
         if clearsSelection, !selection.isEmpty { selection.removeAll() }
+        return token
     }
 
     private func restoreRecommendation(
@@ -746,7 +746,7 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
             formatters: formatters,
             textResolver: textResolver)
         let requestID = request.id
-        if case .ready(_, let presented?) = state,
+        if let readyState, let presented = readyState.presented,
             presented.requestID == requestID
         {
             if presentationRequestID != nil {
@@ -762,17 +762,22 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
             state = .ready(analysis, presented)
             return
         }
-        guard presentationRequestID != requestID else { return }
+        guard presentationRequestID != requestID else {
+            publishPendingPresentationState(
+                analysis: analysis,
+                chart: chart,
+                keepsVisiblePresentation: keepsVisiblePresentation)
+            return
+        }
 
         presentationGeneration &+= 1
         let presentationToken = presentationGeneration
         presentationTask?.cancel()
         presentationRequestID = requestID
-        if !keepsVisiblePresentation {
-            state = .preparing(
-                analysis,
-                AutoChartProgress(phase: .presentationPreparation))
-        }
+        publishPendingPresentationState(
+            analysis: analysis,
+            chart: chart,
+            keepsVisiblePresentation: keepsVisiblePresentation)
         let presenter = presenter
         presentationTask = Task { [weak self, presenter] in
             do {
@@ -788,22 +793,11 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
                 guard let self,
                     self.presentationGeneration == presentationToken
                 else { return }
+                let latestAnalysis = self.presentationAnalysis(
+                    for: chart, fallback: analysis)
                 self.presentationTask = nil
                 self.presentationRequestID = nil
                 self.presentationTarget = nil
-                let latestAnalysis: AutoChartAnalysis<RowID>
-                switch self.state {
-                case .ready(let current, _)
-                    where current.id == analysis.id
-                        && current.primaryChart?.id == chart.id:
-                    latestAnalysis = current
-                case .preparing(let current, _)
-                    where current.id == analysis.id
-                        && current.primaryChart?.id == chart.id:
-                    latestAnalysis = current
-                default:
-                    latestAnalysis = analysis
-                }
                 if !self.selection.belongs(
                     to: latestAnalysis.id, preparedChartID: chart.id)
                 {
@@ -833,6 +827,48 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         }
     }
 
+    private func publishPendingPresentationState(
+        analysis: AutoChartAnalysis<RowID>,
+        chart: AutoChartPreparedChart<RowID>,
+        keepsVisiblePresentation: Bool
+    ) {
+        if keepsVisiblePresentation {
+            guard let readyState, let presented = readyState.presented,
+                presented.preparedChart.id == chart.id
+            else { return }
+            state = .ready(analysis, presented)
+        } else {
+            state = .preparing(
+                analysis,
+                AutoChartProgress(phase: .presentationPreparation))
+        }
+    }
+
+    private func presentationAnalysis(
+        for chart: AutoChartPreparedChart<RowID>,
+        fallback: AutoChartAnalysis<RowID>
+    ) -> AutoChartAnalysis<RowID> {
+        if let presentationTarget,
+            presentationTarget.analysis.id == fallback.id,
+            presentationTarget.chart.id == chart.id
+        {
+            return presentationTarget.analysis
+        }
+        if let readyState,
+            readyState.analysis.id == fallback.id,
+            readyState.analysis.primaryChart?.id == chart.id
+        {
+            return readyState.analysis
+        }
+        if case .preparing(let analysis, _) = state,
+            analysis.id == fallback.id,
+            analysis.primaryChart?.id == chart.id
+        {
+            return analysis
+        }
+        return fallback
+    }
+
     private static func canPrepareChart(
         for preference: AutoChartPreference,
         in analysis: AutoChartAnalysis<RowID>
@@ -842,14 +878,16 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         return catalog.primary != nil
     }
 
-    private static func canResolveFromCatalog(
+    private static func canResolvePreparedChartFromCatalog(
         _ preference: AutoChartPreference,
         in analysis: AutoChartAnalysis<RowID>
     ) -> Bool {
         guard case .charts(let catalog) = analysis.outcome else { return false }
         switch preference {
-        case .automatic, .table, .chart(.recommended):
+        case .automatic, .chart(.recommended):
             return true
+        case .table:
+            return false
         case .chart(.specific(let id)):
             let currentID = AutoChartRecommendationID(
                 policyVersion: AutoTableCharts.recommendationPolicyVersion,
@@ -864,9 +902,7 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         analysis: AutoChartAnalysis<RowID>,
         base: AutoChartAnalysis<RowID>
     ) -> Bool {
-        guard analysis.preparedCharts[chart.recommendation.id]?.id == chart.id,
-            case .charts(let catalog) = base.outcome
-        else { return false }
+        guard case .charts(let catalog) = base.outcome else { return false }
         switch strategy {
         case .none:
             return false

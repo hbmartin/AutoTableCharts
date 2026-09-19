@@ -21,6 +21,8 @@ AutoChartSessionView(session: session)
 ### Lifecycle
 
 - ``AutoChartSession``
+- ``AutoChartSession/applyPreference(_:)``
+- ``AutoChartPreferenceApplication``
 - ``AutoChartSessionView``
 - ``AutoChartPreparationPlaceholder``
 

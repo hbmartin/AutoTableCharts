@@ -1,5 +1,6 @@
 import Dispatch
 import Foundation
+import Observation
 import SwiftUI
 import Testing
 
@@ -617,6 +618,19 @@ private final class V3Counter: @unchecked Sendable {
 
     func increment() { lock.withLock { stored += 1 } }
     var value: Int { lock.withLock { stored } }
+}
+
+private final class V3OneShotDecision: @unchecked Sendable {
+    private let lock = NSLock()
+    private var isAvailable = true
+
+    func take() -> Bool {
+        lock.withLock {
+            guard isAvailable else { return false }
+            isAvailable = false
+            return true
+        }
+    }
 }
 
 private final class V3LockedBox<Value>: @unchecked Sendable {
@@ -3835,6 +3849,126 @@ private final class ProgressRecorder: @unchecked Sendable {
         #endif
     }
 
+    @Test(
+        .disabled(if: !testHooksAvailable, testHooksUnavailable),
+        .timeLimit(.minutes(1)))
+    func loadAttemptHookRunsAfterStateInstallation() throws {
+        #if ATC_TEST_HOOKS
+        let session = AutoChartSession<Int>(cache: AutoChartCache())
+        let calls = V3Counter()
+        session.attemptDidStartForTesting = {
+            calls.increment()
+            guard case .analyzing = session.state else {
+                Issue.record("The load hook ran before analyzing state installation.")
+                return
+            }
+        }
+        defer {
+            session.attemptDidStartForTesting = nil
+            session.cancel()
+        }
+
+        session.load(try AutoChartRequest(table: domainDataset()))
+        #expect(calls.value == 1)
+        #endif
+    }
+
+    @Test(
+        .disabled(if: !testHooksAvailable, testHooksUnavailable),
+        .timeLimit(.minutes(1)))
+    func selectionObserverCannotShareAReplacementGeneration() async throws {
+        #if ATC_TEST_HOOKS
+        let request = try AutoChartRequest(table: domainDataset())
+        let catalogSource = try await AutoChartAnalyzer().analyze(
+            request, preparation: .none)
+        let catalog = try #require(catalogSource.outcome.catalog)
+        let primary = try #require(catalog.primary)
+        let alternative = try #require(catalog.cataloged.first {
+            $0.id != primary.id
+        })
+        let preparationGate = V3AsyncTestGate()
+        let preparationStarts = V3Counter()
+        let cache = AutoChartCache(
+            testHooks: .chartPreparationByRecommendation { recommendationID in
+                guard recommendationID == alternative.id else { return }
+                preparationStarts.increment()
+                await preparationGate.pause()
+            })
+        let session = AutoChartSession<Int>(cache: cache)
+        defer {
+            session.cancel()
+            Task { await preparationGate.open() }
+        }
+        session.load(request)
+        let initial = try await readyAnalysis(from: session)
+        let presented = try await readyPresentation(from: session) { _ in true }
+        session.cancel()
+        session.selection = presented.preparedChart.selections(
+            for: [10], analysisID: initial.id)
+        #expect(!session.selection.isEmpty)
+
+        let observation = V3OneShotDecision()
+        let innerApplication = V3LockedBox<AutoChartPreferenceApplication>()
+        withObservationTracking {
+            _ = session.selection
+        } onChange: {
+            MainActor.assumeIsolated {
+                guard observation.take() else { return }
+                innerApplication.store(session.applyPreference(.table))
+            }
+        }
+
+        let outerApplication = session.applyPreference(
+            .chart(.specific(alternative.id)))
+        #expect(innerApplication.value == .startedReplacement)
+        #expect(outerApplication == .superseded)
+        #expect(session.preference == .table)
+        _ = try await fallbackAnalysis(from: session)
+        #expect(preparationStarts.value == 0)
+        #expect(await preparationGate.activePauseCount == 0)
+        #endif
+    }
+
+    @Test(
+        .disabled(if: !testHooksAvailable, testHooksUnavailable),
+        .timeLimit(.minutes(1)))
+    func synchronousCancellationAndUnloadReportSuperseded() async throws {
+        #if ATC_TEST_HOOKS
+        for unloads in [false, true] {
+            let session = AutoChartSession<Int>(cache: AutoChartCache())
+            let request = try AutoChartRequest(table: domainDataset())
+            session.load(request)
+            let analysis = try await readyAnalysis(from: session)
+            let presented = try await readyPresentation(from: session) { _ in true }
+            let alternative = try #require(
+                analysis.outcome.catalog?.cataloged.first {
+                    $0.id != presented.preparedChart.recommendation.id
+                })
+            session.attemptDidStartForTesting = {
+                if unloads {
+                    session.unload()
+                } else {
+                    session.cancel()
+                }
+            }
+
+            let application = session.applyPreference(
+                .chart(.specific(alternative.id)))
+            #expect(application == .superseded)
+            guard case .idle = session.state else {
+                Issue.record("Synchronous cancellation did not leave idle state.")
+                continue
+            }
+            #expect(!session.isChartUpdatePending)
+            #expect(!session.isPresentationPending)
+            session.attemptDidStartForTesting = nil
+            if unloads {
+                #expect(session.applyPreference(.table) == .stored)
+            }
+        }
+        #endif
+    }
+
     @Test func cancelledProgressTextResolutionDoesNotStartResolver() async {
         let gate = V3AsyncTestGate()
         let calls = V3Counter()
@@ -4264,7 +4398,7 @@ private final class ProgressRecorder: @unchecked Sendable {
 
     @Test func preferenceSetterRetainsVoidFunctionCompatibility() {
         let session = AutoChartSession<Int>(cache: AutoChartCache())
-        let setter = session.setPreference
+        let setter: (AutoChartPreference) -> Void = session.setPreference
         setter(.table)
         #expect(session.preference == .table)
         setter(.table)
@@ -4339,6 +4473,101 @@ private final class ProgressRecorder: @unchecked Sendable {
         }
         let final = try await readyAnalysis(from: session)
         #expect(final.preferenceResolution?.recommendation?.id == recommendation.id)
+    }
+
+    @Test func reusedDifferentChartKeepsVisibleAnalysisPaired() async throws {
+        let callback = V3OneShotBlockingCallback(startsArmed: false)
+        defer { callback.release() }
+        let formatters = AutoChartFormatters(
+            cacheIdentity: "paired-reused-chart",
+            request: { _, _, _ in callback.invoke(); return nil })
+        let session = AutoChartSession<Int>(cache: AutoChartCache())
+        let request = try AutoChartRequest(table: domainDataset())
+        session.load(
+            request,
+            preparation: .allCataloged,
+            formatters: formatters)
+        let initial = try await readyAnalysis(from: session)
+        let original = try await readyPresentation(from: session) { _ in true }
+        let alternative = try #require(initial.outcome.catalog?.cataloged.first {
+            $0.id != original.preparedChart.recommendation.id
+        })
+
+        callback.arm()
+        #expect(
+            session.applyPreference(.chart(.specific(alternative.id)))
+                == .reusedPreparedChart)
+        #expect(await waitForV3Condition {
+            callback.isBlocked && session.isPresentationPending
+        })
+        guard case .ready(let visibleAnalysis, let stillVisible?) = session.state else {
+            Issue.record("Prepared-chart reuse did not keep the visible pair ready.")
+            return
+        }
+        #expect(visibleAnalysis.primaryChart?.id == original.preparedChart.id)
+        #expect(stillVisible.preparedChart.id == original.preparedChart.id)
+        #expect(session.currentRecommendation?.id == alternative.id)
+        #expect(session.isChartUpdatePending)
+
+        callback.release()
+        let replacement = try await readyPresentation(from: session) {
+            $0.preparedChart.recommendation.id == alternative.id
+        }
+        let final = try await readyAnalysis(from: session)
+        #expect(final.primaryChart?.id == replacement.preparedChart.id)
+        #expect(final.preferenceResolution?.recommendation?.id == alternative.id)
+    }
+
+    @Test func pendingPresentationTargetIsReusedForEquivalentPreference()
+        async throws
+    {
+        let request = try AutoChartRequest(table: domainDataset())
+        let source = try await AutoChartAnalyzer().analyze(
+            request, preparation: .none)
+        let catalog = try #require(source.outcome.catalog)
+        let primary = try #require(catalog.primary)
+        let initialChoice = try #require(catalog.cataloged.first {
+            $0.id != primary.id
+        })
+        let callback = V3OneShotBlockingCallback(startsArmed: false)
+        defer { callback.release() }
+        let formatters = AutoChartFormatters(
+            cacheIdentity: "pending-target-reuse",
+            request: { _, _, _ in callback.invoke(); return nil })
+        let session = AutoChartSession<Int>(cache: AutoChartCache())
+        session.load(
+            request,
+            preference: .chart(.specific(initialChoice.id)),
+            formatters: formatters)
+        let initial = try await readyAnalysis(from: session)
+        let original = try await readyPresentation(from: session) { _ in true }
+
+        callback.arm()
+        #expect(session.applyPreference(.automatic) == .startedReplacement)
+        #expect(await waitForV3Condition {
+            callback.isBlocked && session.isPresentationPending
+        })
+        #expect(
+            session.applyPreference(.chart(.recommended))
+                == .reusedPreparedChart)
+        guard case .ready(let visibleAnalysis, let stillVisible?) = session.state else {
+            Issue.record("Pending-target reuse did not retain the visible chart.")
+            return
+        }
+        #expect(visibleAnalysis.id == initial.id)
+        #expect(visibleAnalysis.primaryChart?.id == original.preparedChart.id)
+        #expect(stillVisible.preparedChart.id == original.preparedChart.id)
+        #expect(session.currentRecommendation?.id == primary.id)
+        #expect(session.isPresentationPending)
+
+        callback.release()
+        let finalPresentation = try await readyPresentation(from: session) {
+            $0.preparedChart.recommendation.id == primary.id
+        }
+        let final = try await readyAnalysis(from: session)
+        #expect(final.primaryChart?.id == finalPresentation.preparedChart.id)
+        #expect(final.preferenceResolution?.defaultReason == .recommended)
+        #expect(session.preference == .chart(.recommended))
     }
 
     @Test(
