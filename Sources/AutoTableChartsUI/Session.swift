@@ -208,32 +208,32 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
             return .stored
         }
         if let base: AutoChartAnalysis<RowID> = cache.completedAnalysis(
-                for: request.id),
-            Self.canResolvePreparedChartFromCatalog(preference, in: base)
+            for: request.id)
         {
-            let resolution = base.resolve(preference)
-            if let recommendation = resolution.recommendation {
-                for analysis in reusablePreparedChartAnalyses
-                where analysis.id == base.id {
-                    guard let chart = analysis.preparedCharts[recommendation.id],
-                        Self.canReusePreparedChart(
-                            chart, strategy: strategy,
-                            analysis: analysis, base: base)
-                    else { continue }
-                    _ = cancelInFlightWork(
-                        clearsSelection: false,
-                        preservesPresentation: true)
-                    self.preference = preference
-                    currentRecommendation = recommendation
-                    let updated = base.replacingPresentation(
-                        preparedCharts: analysis.preparedCharts,
-                        resolution: resolution)
-                    schedulePresentation(
-                        for: updated,
-                        chart: chart,
-                        keepsVisiblePresentation: readyState?.presented != nil)
-                    return .reusedPreparedChart
-                }
+            for analysis in reusablePreparedChartAnalyses
+            where analysis.id == base.id
+                && Self.canResolveKnownPreparedChart(preference, in: analysis)
+            {
+                let resolution = analysis.resolve(preference)
+                guard let recommendation = resolution.recommendation,
+                    let chart = analysis.preparedCharts[recommendation.id],
+                    Self.canReusePreparedChart(
+                        chart, strategy: strategy,
+                        analysis: analysis, base: base)
+                else { continue }
+                _ = cancelInFlightWork(
+                    clearsSelection: false,
+                    preservesPresentation: true)
+                self.preference = preference
+                currentRecommendation = recommendation
+                let updated = base.replacingPresentation(
+                    preparedCharts: analysis.preparedCharts,
+                    resolution: resolution)
+                schedulePresentation(
+                    for: updated,
+                    chart: chart,
+                    keepsVisiblePresentation: readyState?.presented != nil)
+                return .reusedPreparedChart
             }
         }
         let token = start(
@@ -878,7 +878,7 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         return catalog.primary != nil
     }
 
-    private static func canResolvePreparedChartFromCatalog(
+    private static func canResolveKnownPreparedChart(
         _ preference: AutoChartPreference,
         in analysis: AutoChartAnalysis<RowID>
     ) -> Bool {
@@ -892,7 +892,7 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
             let currentID = AutoChartRecommendationID(
                 policyVersion: AutoTableCharts.recommendationPolicyVersion,
                 specificationID: id.specificationID)
-            return catalog.containsCataloged(currentID)
+            return catalog.recommendation(for: currentID) != nil
         }
     }
 

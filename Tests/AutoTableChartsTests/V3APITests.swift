@@ -4518,6 +4518,49 @@ private final class ProgressRecorder: @unchecked Sendable {
         #expect(final.preferenceResolution?.recommendation?.id == alternative.id)
     }
 
+    @Test func sameOffCatalogPolicyRebindReusesPreparedChart() async throws {
+        let dataset = try wideDomainDataset()
+        let request = try AutoChartRequest(table: dataset)
+        let source = try await AutoChartAnalyzer().analyze(
+            request, preparation: .none)
+        let catalog = try #require(source.outcome.catalog)
+        let selected = try offCatalogRecommendation(
+            in: dataset, request: request, catalog: catalog)
+        let stale = AutoChartRecommendationID(
+            policyVersion: AutoTableCharts.recommendationPolicyVersion - 1,
+            specificationID: selected.specification.id)
+        let session = AutoChartSession<Int>(cache: AutoChartCache())
+        defer { session.cancel() }
+
+        session.load(
+            request,
+            preference: .chart(.specific(stale)),
+            preparation: .preferredOrPrimary)
+        let initial = try await readyAnalysis(from: session)
+        let presented = try await readyPresentation(from: session) { _ in true }
+        session.selection = presented.preparedChart.selections(
+            for: [0], analysisID: initial.id)
+        let savedSelection = session.selection
+
+        let application = session.applyPreference(
+            .chart(.specific(selected.id)))
+
+        #expect(application == .reusedPreparedChart)
+        guard case .ready(let updated, let unchanged?) = session.state else {
+            Issue.record("The off-catalog rebind must remain ready synchronously.")
+            return
+        }
+        #expect(updated.id == initial.id)
+        #expect(updated.primaryChart?.id == presented.preparedChart.id)
+        #expect(unchanged.requestID == presented.requestID)
+        #expect(session.selection == savedSelection)
+        #expect(session.preference == .chart(.specific(selected.id)))
+        #expect(updated.preferenceResolution?.recommendation?.id == selected.id)
+        #expect(updated.preferenceResolution?.replacementPreference == nil)
+        #expect(!session.isChartUpdatePending)
+        #expect(!session.isPresentationPending)
+    }
+
     @Test func pendingPresentationTargetIsReusedForEquivalentPreference()
         async throws
     {
