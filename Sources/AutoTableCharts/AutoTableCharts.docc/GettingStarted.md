@@ -75,6 +75,23 @@ preparation, warm-cache adoption, retries, and alternative selection. Use
 `AutoChartSessionView` for package defaults or switch on session state to retain
 an existing table and failure UI.
 
+`load` returns the synchronous lifecycle result when a host needs it:
+
+```swift
+switch session.load(request) {
+case .started:
+    // The request was installed and is current on return.
+    break
+case .superseded:
+    // Synchronous observation replaced, cancelled, or unloaded the request.
+    break
+}
+```
+
+The result describes installation, not eventual asynchronous completion. Calls
+that intentionally ignore it remain valid. A function reference that previously
+expected a `Void`-returning `load` method must adopt `AutoChartLoadApplication`.
+
 Set a preference before loading when it should become the session default:
 
 ```swift
@@ -97,7 +114,7 @@ case .startedReplacement:
     // A new asynchronous pass is current.
     break
 case .superseded:
-    // Synchronous reentrancy replaced, retried, cancelled, or unloaded the pass.
+    // Synchronous reentrancy replaced, retried, cancelled, or unloaded the application.
     break
 }
 ```
