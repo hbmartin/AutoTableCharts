@@ -75,6 +75,23 @@ preparation, warm-cache adoption, retries, and alternative selection. Use
 `AutoChartSessionView` for package defaults or switch on session state to retain
 an existing table and failure UI.
 
+`load` returns the synchronous lifecycle result when a host needs it:
+
+```swift
+switch session.load(request) {
+case .started:
+    // The request was installed and is current on return.
+    break
+case .superseded:
+    // Synchronous observation replaced, cancelled, or unloaded the request.
+    break
+}
+```
+
+The result describes installation, not eventual asynchronous completion. Calls
+that intentionally ignore it remain valid. A function reference that previously
+expected a `Void`-returning `load` method must adopt `AutoChartLoadApplication`.
+
 Set a preference before loading when it should become the session default:
 
 ```swift
@@ -82,6 +99,24 @@ session.setPreference(.chart(.recommended))
 session.load(request) // Uses the stored preference.
 
 session.load(request, preference: .automatic) // Explicit values win.
+```
+
+Use `applyPreference(_:)` when the host needs the synchronous lifecycle result:
+
+```swift
+switch session.applyPreference(.chart(.recommended)) {
+case .unchanged, .stored:
+    break
+case .reusedPreparedChart:
+    // Analysis is reusable; presentation-only work may remain pending.
+    break
+case .startedReplacement:
+    // A new asynchronous pass is current.
+    break
+case .superseded:
+    // Synchronous reentrancy replaced, retried, cancelled, or unloaded the application.
+    break
+}
 ```
 
 Reapplying the stored preference does not restart analyzing, preparation, or a
@@ -104,9 +139,11 @@ Observe `state`, `currentRecommendation`, `isChartUpdatePending`, and
 `isPresentationPending` for lifecycle UI. `currentRecommendation` is the requested
 or pending choice. During a preference change, `state` can continue to carry the
 previously presented chart while `currentRecommendation` immediately describes
-its replacement. The session preserves selection only while its prepared chart
-remains authoritative and clears selection on replacement, fallback, failure,
-cancellation, or unload.
+its replacement. In a ready state, the analysis and presented payload always
+describe the same visible prepared chart; a different prepared presentation target
+does not replace that pair until presentation completes. The session preserves
+selection only while its prepared chart remains authoritative and clears selection
+on replacement, fallback, failure, cancellation, or unload.
 
 ### Prepare an alternative
 
