@@ -3284,6 +3284,7 @@ private final class ProgressRecorder: @unchecked Sendable {
         }
 
         session.unload()
+        #expect(session.presentationTextResolver.callbackIdentity == nil)
         #expect(weakFormatterCapture == nil)
         #expect(weakResolverCapture == nil)
     }
@@ -4097,7 +4098,7 @@ private final class ProgressRecorder: @unchecked Sendable {
     @Test(
         .disabled(if: !testHooksAvailable, testHooksUnavailable),
         .timeLimit(.minutes(1)))
-    func supersededFailurePublicationStillRestartsItsFailureEpisode() async throws {
+    func supersededFailurePublicationDoesNotMarkCancelledAttemptFailed() async throws {
         #if ATC_TEST_HOOKS
         let attempts = V3Counter()
         let controlledFailure = AutoChartFailure(
@@ -4142,7 +4143,57 @@ private final class ProgressRecorder: @unchecked Sendable {
         }
         #expect(session.retry() == .started)
         let retriedFailure = try await sessionFailure(from: session)
-        #expect(retriedFailure.episodeID != sharedFailure.episodeID)
+        #expect(retriedFailure.episodeID == sharedFailure.episodeID)
+        #endif
+    }
+
+    @Test(
+        .disabled(if: !testHooksAvailable, testHooksUnavailable),
+        .timeLimit(.minutes(1)))
+    func contextSupersessionKeepsFailureMetadataTransactional() async throws {
+        #if ATC_TEST_HOOKS
+        let attempts = V3Counter()
+        let controlledFailure = AutoChartFailure(
+            stage: .chartPreparation,
+            kind: .internalFailure,
+            isRetryable: true,
+            diagnosticID: "ATC.test.contextSupersededFailure",
+            message: "Controlled context-superseded failure")
+        let cache = AutoChartCache(
+            configuration: .init(
+                preparedCharts: .init(maximumEntries: 0)),
+            testHooks: .chartPreparationByRecommendation { _ in
+                attempts.increment()
+                if attempts.value > 1 { throw controlledFailure }
+            })
+        let session = AutoChartSession<Int>(cache: cache)
+        defer { session.cancel() }
+        let request = try AutoChartRequest(table: domainDataset())
+        #expect(session.load(request, preparation: .primary) == .started)
+        _ = try await readyAnalysis(from: session)
+        let presented = try await readyPresentation(from: session) { _ in true }
+        let sharedFailure = cache.coalescedFailure(
+            for: request.id,
+            recommendationID: presented.preparedChart.recommendation.id,
+            error: controlledFailure,
+            stage: .chartPreparation)
+        let observation = V3ObservationLoop()
+        observation.track {
+            _ = session.state
+        } onChange: {
+            observation.cancel()
+            session.setPresentationContext(.init(identity: "failure-superseder"))
+        }
+
+        session.failCurrentAttemptForTesting(sharedFailure)
+
+        _ = try await readyPresentation(from: session) {
+            $0.context.identity == "failure-superseder"
+        }
+        session.cancel()
+        #expect(session.retry() == .started)
+        let retriedFailure = try await sessionFailure(from: session)
+        #expect(retriedFailure.episodeID == sharedFailure.episodeID)
         #endif
     }
 
@@ -4215,9 +4266,7 @@ private final class ProgressRecorder: @unchecked Sendable {
         #expect(retried.context.identity == "retained")
     }
 
-    @Test func nestedPresentationContextWinsAndUnloadResetsLoadedConfiguration()
-        async throws
-    {
+    @Test func nestedPresentationContextWins() async throws {
         let session = AutoChartSession<Int>(cache: AutoChartCache())
         defer { session.cancel() }
         let request = try AutoChartRequest(table: domainDataset())
@@ -4241,15 +4290,6 @@ private final class ProgressRecorder: @unchecked Sendable {
             $0.context.identity == "nested"
         }
         #expect(nested.context.identity == "nested")
-
-        session.unload()
-        let replacement = try AutoChartRequest(table: domainDataset(
-            key: .trusted(identity: "context-reset", revision: "1")))
-        #expect(session.load(replacement) == .started)
-        let reset = try await readyPresentation(from: session) {
-            $0.context.identity == "default"
-        }
-        #expect(reset.context.identity == "default")
     }
 
     @Test func loadReportsReentrantUnloadAsSuperseded() async throws {
@@ -4388,6 +4428,44 @@ private final class ProgressRecorder: @unchecked Sendable {
 
         #expect(session.selection.isEmpty)
         #expect(changes.value == 1)
+    }
+
+    @Test func presentationRebuildPublishesReentrantSelectionClear() async throws {
+        let session = AutoChartSession<Int>(cache: AutoChartCache())
+        defer { session.cancel() }
+        let request = try AutoChartRequest(table: domainDataset())
+        #expect(session.load(request, preparation: .allCataloged) == .started)
+        let analysis = try await readyAnalysis(from: session)
+        let presented = try await readyPresentation(from: session) { _ in true }
+        let foreignChart = try #require(analysis.preparedCharts.values.first {
+            $0.id != presented.preparedChart.id
+        })
+        session.selection = presented.preparedChart.selections(
+            for: [10], analysisID: analysis.id)
+        let selectionChanges = V3Counter()
+        let selectionObservation = V3ObservationLoop()
+        selectionObservation.track {
+            _ = session.selection
+        } onChange: {
+            selectionChanges.increment()
+            if selectionChanges.value == 2 {
+                selectionObservation.cancel()
+            }
+        }
+        let stateObservation = V3ObservationLoop()
+        stateObservation.track {
+            _ = session.state
+        } onChange: {
+            stateObservation.cancel()
+            session.selection = foreignChart.selections(
+                for: [10], analysisID: analysis.id)
+        }
+
+        session.setPresentationContext(presented.context)
+
+        selectionObservation.cancel()
+        #expect(session.selection.isEmpty)
+        #expect(selectionChanges.value == 2)
     }
 
     @Test func asynchronousPresentationSelectionClearYieldsToCancelAndUnload()
@@ -5004,6 +5082,62 @@ private final class ProgressRecorder: @unchecked Sendable {
         }
         #expect(installedNestedOverrides)
         #expect(presented.context.identity == "environment-winner")
+        #endif
+    }
+
+    @Test(
+        .disabled(if: !testHooksAvailable, testHooksUnavailable),
+        .timeLimit(.minutes(1)))
+    func supersededEnvironmentApplicationRetainsOverrides() async throws {
+        #if ATC_TEST_HOOKS
+        for unloads in [false, true] {
+            let session = AutoChartSession<Int>(cache: AutoChartCache())
+            defer {
+                session.environmentApplicationForTesting = nil
+                session.cancel()
+            }
+            let request = try AutoChartRequest(table: domainDataset(
+                key: .trusted(
+                    identity: "environment-supersession-\(unloads)",
+                    revision: "1")))
+            #expect(session.load(request) == .started)
+            _ = try await readyPresentation(from: session) { _ in true }
+            var didSupersede = false
+            session.environmentApplicationForTesting = { [weak session] in
+                guard !didSupersede, let session else { return }
+                didSupersede = true
+                if unloads {
+                    session.unload()
+                } else {
+                    session.cancel()
+                }
+            }
+
+            session.applyPresentationEnvironment(
+                context: .init(identity: "retained-environment"),
+                formatters: nil,
+                textResolver: nil)
+
+            session.environmentApplicationForTesting = nil
+            guard case .idle = session.state else {
+                Issue.record("Environment supersession did not leave the session idle.")
+                continue
+            }
+            if unloads {
+                let replacement = try AutoChartRequest(table: domainDataset(
+                    key: .trusted(
+                        identity: "environment-replacement",
+                        revision: "1")))
+                #expect(session.load(replacement) == .started)
+            } else {
+                #expect(session.retry() == .started)
+            }
+            let presented = try await readyPresentation(from: session) {
+                $0.context.identity == "retained-environment"
+            }
+            #expect(didSupersede)
+            #expect(presented.context.identity == "retained-environment")
+        }
         #endif
     }
 

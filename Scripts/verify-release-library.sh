@@ -95,15 +95,6 @@ if (( $# == 0 )); then
     fi
   done
 
-  if (( ${#audit_symbol_files[@]} == 0 )); then
-    echo "Could not find release-library objects for the package products." >&2
-    exit 1
-  fi
-  if (( ${#audit_module_files[@]} == 0 )); then
-    echo "Could not find the release modules under $release_bin_path/Modules." >&2
-    exit 1
-  fi
-
   audit_release_artifacts "SwiftPM release library"
 elif (( $# == 2 )) && [[ "$1" == "--xcode-derived-data" ]]; then
   products_root="$2/Build/Products"

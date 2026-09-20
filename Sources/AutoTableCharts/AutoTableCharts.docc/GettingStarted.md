@@ -135,6 +135,11 @@ case .superseded:
 }
 ```
 
+The result describes synchronous installation, not eventual asynchronous
+completion. Calls that intentionally ignore it remain valid. A function reference
+that previously expected a `Void`-returning `retry` method must adopt
+`AutoChartRetryApplication`.
+
 Reapplying the stored preference does not restart analyzing, preparation, or a
 terminal state. A retry after failure starts a new failure episode even if
 `cancel()` was called after the failure. Retrying a nonfailed cancelled attempt
