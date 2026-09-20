@@ -12,6 +12,18 @@ work. ``AutoChartSession/isChartUpdatePending`` also includes preference work
 while a ready chart remains visible. `AutoChartSessionView` displays a compact
 updating indicator until the new choice is ready.
 
+Both `load` overloads return ``AutoChartLoadApplication``. A `.started` result
+means the request remains current at synchronous return; `.superseded` means an
+Observation callback replaced, cancelled, or unloaded it during installation.
+The result does not promise that later asynchronous work will remain current.
+
+Use ``AutoChartSession/applyPreference(_:)`` when the host needs to distinguish an
+unchanged or stored preference from prepared-chart reuse, a newly started pass, or
+a pass made noncurrent by synchronous reentrancy. Prepared-chart reuse may leave
+presentation work pending. During that interval, a ready state's analysis and
+presented payload continue to describe the same visible chart, while
+``AutoChartSession/currentRecommendation`` describes the requested replacement.
+
 ``AutoChartPresenter`` performs localization, formatting, ordering, and
 histogram label resolution before a resolved chart body is evaluated. Its bounded
 memo is keyed by prepared-chart identity, ``AutoChartPresentationContext``, the
