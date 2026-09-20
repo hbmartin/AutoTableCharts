@@ -10,6 +10,16 @@ public enum AutoChartLoadApplication: Hashable, Sendable {
     case superseded
 }
 
+/// The synchronous effect of retrying a retained request in an ``AutoChartSession``.
+public enum AutoChartRetryApplication: Hashable, Sendable {
+    /// The session does not retain a request to retry.
+    case noRequest
+    /// The retry was installed and remained current when the call returned.
+    case started
+    /// Synchronous reentrancy replaced, cancelled, or unloaded the retry.
+    case superseded
+}
+
 /// The effect of applying a preference to an ``AutoChartSession``.
 public enum AutoChartPreferenceApplication: Hashable, Sendable {
     /// The supplied preference already matched the session's stored preference.
@@ -109,8 +119,7 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
     /// presentation work. Initial loading and preparation are reflected in state.
     public var isChartUpdatePending: Bool {
         access(keyPath: \.isChartUpdatePending)
-        guard case .ready(_, let presented?) = publishedValues.state else { return false }
-        _ = presented
+        guard case .ready(_, .some(_)) = publishedValues.state else { return false }
         return preferenceUpdatePending || presentationRequestID != nil
     }
 
@@ -303,7 +312,7 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         formatters: AutoChartFormatters? = nil,
         textResolver: AutoChartTextResolver = .default
     ) -> AutoChartLoadApplication {
-        let loadedPresentationConfiguration = PresentationConfiguration(
+        let requestedPresentationConfiguration = PresentationConfiguration(
             context: presentationContext,
             formatters: formatters,
             textResolver: textResolver)
@@ -311,9 +320,9 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
             request,
             preference: preference,
             preparation: preparation,
-            presentationConfiguration: loadedPresentationConfiguration.applying(
+            presentationConfiguration: requestedPresentationConfiguration.applying(
                 environmentPresentationOverrides),
-            loadedPresentationConfiguration: loadedPresentationConfiguration,
+            loadedPresentationConfiguration: requestedPresentationConfiguration,
             clearsVisibleState: self.request?.id != request.id)
         guard generation == startToken.generation,
             lifecycleRevision == startToken.lifecycleRevision,
@@ -434,7 +443,7 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         analysis: AutoChartAnalysis<RowID>,
         presented: AutoChartPresentedChart<RowID>?
     )? {
-        guard case .ready(let analysis, let presented) = state else {
+        guard case .ready(let analysis, let presented) = publishedValues.state else {
             return nil
         }
         return (analysis, presented)
@@ -454,55 +463,50 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
     /// Schedules presentation rebuilding for the current prepared chart without
     /// replacing formatter or text-resolver configuration. The current ready
     /// presentation remains visible until its replacement is available.
+    /// The context remains stored if synchronous reentrancy supersedes rebuilding.
     public func setPresentationContext(_ context: AutoChartPresentationContext) {
-        var loaded = loadedPresentationConfiguration
-        loaded.context = context
-        rebuildPresentation(
-            loaded.applying(environmentPresentationOverrides),
-            loadedPresentationConfiguration: loaded)
+        var configuration = loadedPresentationConfiguration
+        configuration.context = context
+        installLoadedPresentationConfiguration(configuration)
     }
 
     /// Replaces the context and formatter configuration while preserving the
     /// text resolver supplied by `load` or a prior presentation update.
+    /// The configuration remains stored if synchronous reentrancy supersedes rebuilding.
     public func setPresentationContext(
         _ context: AutoChartPresentationContext,
         formatters: AutoChartFormatters?
     ) {
-        var loaded = loadedPresentationConfiguration
-        loaded.context = context
-        loaded.formatters = formatters
-        rebuildPresentation(
-            loaded.applying(environmentPresentationOverrides),
-            loadedPresentationConfiguration: loaded)
+        var configuration = loadedPresentationConfiguration
+        configuration.context = context
+        configuration.formatters = formatters
+        installLoadedPresentationConfiguration(configuration)
     }
 
     /// Replaces the context and text resolver while preserving the formatter
     /// configuration supplied by `load` or a prior presentation update.
+    /// The configuration remains stored if synchronous reentrancy supersedes rebuilding.
     public func setPresentationContext(
         _ context: AutoChartPresentationContext,
         textResolver: AutoChartTextResolver
     ) {
-        var loaded = loadedPresentationConfiguration
-        loaded.context = context
-        loaded.textResolver = textResolver
-        rebuildPresentation(
-            loaded.applying(environmentPresentationOverrides),
-            loadedPresentationConfiguration: loaded)
+        var configuration = loadedPresentationConfiguration
+        configuration.context = context
+        configuration.textResolver = textResolver
+        installLoadedPresentationConfiguration(configuration)
     }
 
     /// Replaces the complete presentation configuration without repeating analysis.
+    /// The configuration remains stored if synchronous reentrancy supersedes rebuilding.
     public func setPresentationContext(
         _ context: AutoChartPresentationContext,
         formatters: AutoChartFormatters?,
         textResolver: AutoChartTextResolver
     ) {
-        let loaded = PresentationConfiguration(
+        installLoadedPresentationConfiguration(PresentationConfiguration(
             context: context,
             formatters: formatters,
-            textResolver: textResolver)
-        rebuildPresentation(
-            loaded.applying(environmentPresentationOverrides),
-            loadedPresentationConfiguration: loaded)
+            textResolver: textResolver))
     }
 
     /// Applies optional SwiftUI environment overrides on top of the values
@@ -516,58 +520,72 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         #if ATC_TEST_HOOKS
         environmentApplicationForTesting?()
         #endif
-        let overrides = PresentationOverrides(
+        guard lifecycleRevision == revision else { return }
+        let newOverrides = PresentationOverrides(
             context: context,
             formatters: formatters,
             textResolver: textResolver)
-        rebuildPresentation(
-            loadedPresentationConfiguration.applying(overrides),
-            environmentPresentationOverrides: overrides,
-            reservedRevision: revision)
+        environmentPresentationOverrides = newOverrides
+        presentationConfiguration = loadedPresentationConfiguration.applying(newOverrides)
+        rebuildPresentation(reservedRevision: revision)
     }
 
     private var effectivePresentationConfiguration: PresentationConfiguration {
         loadedPresentationConfiguration.applying(environmentPresentationOverrides)
     }
 
-    private func rebuildPresentation(
-        _ configuration: PresentationConfiguration,
-        loadedPresentationConfiguration: PresentationConfiguration? = nil,
-        environmentPresentationOverrides: PresentationOverrides? = nil,
-        reservedRevision: UInt64? = nil
+    private func installLoadedPresentationConfiguration(
+        _ configuration: PresentationConfiguration
     ) {
-        let revision = reservedRevision ?? reserveLifecycleRevision()
+        let revision = reserveLifecycleRevision()
+        loadedPresentationConfiguration = configuration
+        presentationConfiguration = effectivePresentationConfiguration
+        rebuildPresentation(reservedRevision: revision)
+    }
+
+    private func rebuildPresentation(reservedRevision revision: UInt64) {
+        guard lifecycleRevision == revision else { return }
+        let target: PresentationTarget?
+        let clearsPresentationWork: Bool
+        if preferenceUpdatePending {
+            target = nil
+            clearsPresentationWork = false
+        } else if let presentationTarget {
+            target = presentationTarget
+            clearsPresentationWork = false
+        } else if let readyState, let chart = readyState.analysis.primaryChart {
+            target = PresentationTarget(
+                analysis: readyState.analysis,
+                chart: chart,
+                keepsVisiblePresentation: true)
+            clearsPresentationWork = false
+        } else {
+            target = nil
+            clearsPresentationWork = true
+        }
+        var changes: PublishedChanges = [
+            .state, .presentationPending, .chartUpdatePending,
+            .presentationTextResolver,
+        ]
+        if let target,
+            presentationWillClearSelection(
+                analysis: target.analysis,
+                chart: target.chart)
+        {
+            changes.insert(.selection)
+        }
         publish(
             revision: revision,
-            changes: [
-                .state, .presentationPending, .chartUpdatePending,
-                .presentationTextResolver,
-            ]) {
-            if let loadedPresentationConfiguration {
-                self.loadedPresentationConfiguration = loadedPresentationConfiguration
-            }
-            if let environmentPresentationOverrides {
-                self.environmentPresentationOverrides = environmentPresentationOverrides
-            }
-            self.presentationConfiguration = configuration
-            if self.preferenceUpdatePending { return }
-            if let presentationTarget = self.presentationTarget {
+            changes: changes
+        ) {
+            if let target {
                 self.installPresentation(
-                    for: presentationTarget.analysis,
-                    chart: presentationTarget.chart,
-                    keepsVisiblePresentation:
-                        presentationTarget.keepsVisiblePresentation)
+                    for: target.analysis,
+                    chart: target.chart,
+                    keepsVisiblePresentation: target.keepsVisiblePresentation)
                 return
             }
-            if let readyState = self.readyState,
-                let chart = readyState.analysis.primaryChart
-            {
-                self.installPresentation(
-                    for: readyState.analysis,
-                    chart: chart,
-                    keepsVisiblePresentation: true)
-                return
-            }
+            guard clearsPresentationWork else { return }
             self.presentationGeneration &+= 1
             self.presentationTask?.cancel()
             self.presentationTask = nil
@@ -584,8 +602,10 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
     /// clearing its request-scoped recommendation. Once preference resolution
     /// completes, retrying with an unchanged preference preserves that
     /// recommendation synchronously, including after cancelling a failed attempt.
-    public func retry() {
-        retry(preference: preference)
+    /// The result reports whether a request existed and the retry remained current.
+    @discardableResult
+    public func retry() -> AutoChartRetryApplication {
+        retry(preference: publishedValues.preference)
     }
 
     /// Restarts the retained request using an explicit preference.
@@ -597,19 +617,29 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
     /// completes, any retry with an unchanged preference preserves that
     /// recommendation synchronously, including after cancelling a failed attempt;
     /// a changed preference clears it before work begins.
-    public func retry(preference: AutoChartPreference) {
-        guard let request else { return }
-        let isIdle = if case .idle = state { true } else { false }
+    /// The result reports whether a request existed and the retry remained current.
+    @discardableResult
+    public func retry(
+        preference: AutoChartPreference
+    ) -> AutoChartRetryApplication {
+        guard let request else { return .noRequest }
+        let isIdle = if case .idle = publishedValues.state { true } else { false }
         let resumesCancelledRequest = isIdle
             && failedRequestID != request.id
-            && preference == self.preference
-        _ = start(
+            && preference == publishedValues.preference
+        let startToken = start(
             request,
             preference: preference,
             preparation: strategy,
             presentationConfiguration: presentationConfiguration,
             clearsVisibleState: !resumesCancelledRequest,
             restartsAttemptedFailureEpisodes: !resumesCancelledRequest)
+        guard generation == startToken.generation,
+            lifecycleRevision == startToken.lifecycleRevision,
+            self.request?.id == request.id,
+            publishedValues.preference == preference
+        else { return .superseded }
+        return .started
     }
 
     /// Cancels the current attempt and clears selection without forgetting the request.
@@ -669,16 +699,19 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         _ request: AutoChartRequest<RowID>,
         preference: AutoChartPreference,
         preparation: AutoChartPreparationStrategy,
-        presentationConfiguration: PresentationConfiguration,
-        loadedPresentationConfiguration: PresentationConfiguration? = nil,
+        presentationConfiguration newPresentationConfiguration:
+            PresentationConfiguration,
+        loadedPresentationConfiguration newLoadedPresentationConfiguration:
+            PresentationConfiguration? = nil,
         clearsVisibleState: Bool,
         keepsVisibleReadyChart: Bool = false,
         restartsAttemptedFailureEpisodes: Bool = false
     ) -> StartToken {
         let changesRequest = self.request?.id != request.id
-        let changesPreference = preference != self.preference
+        let changesPreference = preference != publishedValues.preference
         let keepsReadyChart: Bool
-        if keepsVisibleReadyChart, case .ready(_, let presented) = state,
+        if keepsVisibleReadyChart,
+            case .ready(_, let presented) = publishedValues.state,
             presented != nil,
             self.request?.id == request.id
         {
@@ -687,7 +720,7 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
             keepsReadyChart = false
         }
         let visibleAnalysis: AutoChartAnalysis<RowID>? = if keepsReadyChart,
-            case .ready(let analysis, _) = state
+            case .ready(let analysis, _) = publishedValues.state
         {
             analysis
         } else {
@@ -730,16 +763,16 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         if !keepsReadyChart { changes.insert(.state) }
         if changesPreference { changes.insert(.preference) }
         if shouldClearSelection, !selection.isEmpty { changes.insert(.selection) }
-        let installed = publish(revision: revision, changes: changes) {
+        let installed = publish(revision: revision, changes: changes) { [self] in
             self.cancelInFlightWork(
                 generation: token,
                 clearsSelection: shouldClearSelection)
             self.request = request
             self.publishedValues.preference = preference
             self.strategy = preparation
-            self.presentationConfiguration = presentationConfiguration
-            if let loadedPresentationConfiguration {
-                self.loadedPresentationConfiguration = loadedPresentationConfiguration
+            self.presentationConfiguration = newPresentationConfiguration
+            if let newLoadedPresentationConfiguration {
+                self.loadedPresentationConfiguration = newLoadedPresentationConfiguration
             }
             self.observedFailureEpisodes = nextObservedFailureEpisodes
             self.failedRequestID = nil
@@ -770,27 +803,33 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
                         progress: { [weak self] progress in
                             Task { @MainActor [weak self] in
                                 guard let self, self.generation == token else { return }
+                                let nextState: State
+                                if let completedForPreparation {
+                                    guard progress.phase == .chartPreparation
+                                            || progress.phase
+                                                == .presentationPreparation,
+                                        case .preparing(
+                                            let current,
+                                            let currentProgress
+                                        ) = self.publishedValues.state,
+                                        current.id == completedForPreparation.id,
+                                        currentProgress != progress
+                                    else { return }
+                                    nextState = .preparing(current, progress)
+                                } else {
+                                    guard case .analyzing(let currentProgress) =
+                                            self.publishedValues.state,
+                                        currentProgress != progress
+                                    else { return }
+                                    nextState = .analyzing(progress)
+                                }
                                 let progressRevision = self.reserveLifecycleRevision()
                                 self.publish(
                                     revision: progressRevision,
                                     changes: [.state]
                                 ) {
                                     guard self.generation == token else { return }
-                                    if let completedForPreparation {
-                                        guard progress.phase == .chartPreparation
-                                                || progress.phase
-                                                    == .presentationPreparation,
-                                            case .preparing(let current, _) =
-                                                self.publishedValues.state,
-                                            current.id == completedForPreparation.id
-                                        else { return }
-                                        self.publishedValues.state = .preparing(
-                                            current, progress)
-                                    } else if case .analyzing =
-                                        self.publishedValues.state
-                                    {
-                                        self.publishedValues.state = .analyzing(progress)
-                                    }
+                                    self.publishedValues.state = nextState
                                 }
                             }
                         },
@@ -908,6 +947,8 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
             for: requestID,
             episodeID: failure.episodeID,
             observedEpisodes: observedFailureEpisodes)
+        failedRequestID = requestID
+        observedFailureEpisodes = nextObservedFailureEpisodes
         let revision = reserveLifecycleRevision()
         let generation = self.generation &+ 1
         var changes: PublishedChanges = [
@@ -919,8 +960,6 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
             self.cancelInFlightWork(
                 generation: generation,
                 clearsSelection: true)
-            self.failedRequestID = requestID
-            self.observedFailureEpisodes = nextObservedFailureEpisodes
             self.publishedValues.state = .failed(failure)
             guard let request = self.request, request.id == requestID else { return }
             self.restoreRecommendation(
@@ -1235,7 +1274,7 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         {
             return readyState.analysis
         }
-        if case .preparing(let analysis, _) = state,
+        if case .preparing(let analysis, _) = publishedValues.state,
             analysis.id == fallback.id,
             analysis.primaryChart?.id == chart.id
         {
