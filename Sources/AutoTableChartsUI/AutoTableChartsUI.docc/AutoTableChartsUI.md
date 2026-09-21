@@ -22,6 +22,9 @@ AutoChartSessionView(session: session)
 
 - ``AutoChartSession``
 - ``AutoChartLoadApplication``
+- ``AutoChartSession/retry()``
+- ``AutoChartSession/retry(preference:)``
+- ``AutoChartRetryApplication``
 - ``AutoChartSession/applyPreference(_:)``
 - ``AutoChartPreferenceApplication``
 - ``AutoChartSessionView``

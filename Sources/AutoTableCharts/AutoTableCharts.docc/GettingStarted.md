@@ -119,6 +119,27 @@ case .superseded:
 }
 ```
 
+`retry` likewise reports its synchronous lifecycle result:
+
+```swift
+switch session.retry() {
+case .noRequest:
+    // The session had no retained request to restart.
+    break
+case .started:
+    // The retry was installed and is current on return.
+    break
+case .superseded:
+    // Synchronous observation replaced, cancelled, or unloaded the retry.
+    break
+}
+```
+
+The result describes synchronous installation, not eventual asynchronous
+completion. Calls that intentionally ignore it remain valid. A function reference
+that previously expected a `Void`-returning `retry` method must adopt
+`AutoChartRetryApplication`.
+
 Reapplying the stored preference does not restart analyzing, preparation, or a
 terminal state. A retry after failure starts a new failure episode even if
 `cancel()` was called after the failure. Retrying a nonfailed cancelled attempt
@@ -144,6 +165,11 @@ describe the same visible prepared chart; a different prepared presentation targ
 does not replace that pair until presentation completes. The session preserves
 selection only while its prepared chart remains authoritative and clears selection
 on replacement, fallback, failure, cancellation, or unload.
+
+Presentation-context setters store their loaded configuration before observable
+rebuilding begins. If a synchronous observer cancels or supersedes that rebuilding,
+the retained request still uses the newest configuration on a later retry. `unload()`
+resets loaded presentation configuration while preserving environment overrides.
 
 ### Prepare an alternative
 

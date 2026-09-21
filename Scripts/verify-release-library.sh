@@ -59,6 +59,9 @@ if (( $# == 0 )); then
   shopt -s nullglob
   for target_name in AutoTableCharts AutoTableChartsUI; do
     target_symbol_files=("$release_bin_path/$target_name.build"/*.o)
+    if [[ -f "$release_bin_path/$target_name.o" ]]; then
+      target_symbol_files+=("$release_bin_path/$target_name.o")
+    fi
     if (( ${#target_symbol_files[@]} == 0 )); then
       echo "Could not find release-library objects for $target_name." >&2
       exit 1
@@ -69,33 +72,28 @@ if (( $# == 0 )); then
 
   for module_name in AutoTableCharts AutoTableChartsUI; do
     module_file_count_before=${#audit_module_files[@]}
-    release_module_path="$release_bin_path/Modules/$module_name.swiftmodule"
-    if [[ -f "$release_module_path" ]]; then
-      audit_module_files+=("$release_module_path")
-    elif [[ -d "$release_module_path" ]]; then
-      while IFS= read -r -d '' artifact; do
-        audit_module_files+=("$artifact")
-      done < <(
-        find "$release_module_path" \
-          -type f \
-          \( -name '*.swiftmodule' -o -name '*.swiftinterface' \) \
-        -print0
-      )
-    fi
+    for release_module_path in \
+      "$release_bin_path/Modules/$module_name.swiftmodule" \
+      "$release_bin_path/$module_name.swiftmodule"
+    do
+      if [[ -f "$release_module_path" ]]; then
+        audit_module_files+=("$release_module_path")
+      elif [[ -d "$release_module_path" ]]; then
+        while IFS= read -r -d '' artifact; do
+          audit_module_files+=("$artifact")
+        done < <(
+          find "$release_module_path" \
+            -type f \
+            \( -name '*.swiftmodule' -o -name '*.swiftinterface' \) \
+          -print0
+        )
+      fi
+    done
     if (( ${#audit_module_files[@]} == module_file_count_before )); then
       echo "Could not find the release module for $module_name." >&2
       exit 1
     fi
   done
-
-  if (( ${#audit_symbol_files[@]} == 0 )); then
-    echo "Could not find release-library objects for the package products." >&2
-    exit 1
-  fi
-  if (( ${#audit_module_files[@]} == 0 )); then
-    echo "Could not find the release modules under $release_bin_path/Modules." >&2
-    exit 1
-  fi
 
   audit_release_artifacts "SwiftPM release library"
 elif (( $# == 2 )) && [[ "$1" == "--xcode-derived-data" ]]; then
