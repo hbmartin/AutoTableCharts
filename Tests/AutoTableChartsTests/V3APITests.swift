@@ -5026,7 +5026,8 @@ private final class ProgressRecorder: @unchecked Sendable {
             Issue.record("Replayed analysis progress must not regress warm preparation.")
             return
         }
-        #expect(warmProgress?.phase == .chartPreparation)
+        let expectedWarmProgress = try #require(warmProgress)
+        #expect(expectedWarmProgress.phase == .chartPreparation)
         let unexpectedStateChanges = V3Counter()
         let observation = V3ObservationLoop()
         observation.track {
@@ -5041,12 +5042,20 @@ private final class ProgressRecorder: @unchecked Sendable {
             for: warm.request.id,
             fallback: nil)
         try? await Task.sleep(for: .milliseconds(25))
+        #expect(unexpectedStateChanges.value == 0)
+        warm.cache.reportProgress(
+            expectedWarmProgress,
+            for: warm.request.id,
+            fallback: nil)
+        try? await Task.sleep(for: .milliseconds(25))
         observation.cancel()
         #expect(unexpectedStateChanges.value == 0)
-        guard case .preparing = warmSession.state else {
+        guard case .preparing(_, let finalWarmProgress) = warmSession.state,
+            finalWarmProgress == expectedWarmProgress
+        else {
             await warm.gate.release()
             warm.cache.unregisterProgress(for: warm.request.id, token: progressToken)
-            Issue.record("Irrelevant warm progress changed session state.")
+            Issue.record("Irrelevant or duplicate warm progress changed session state.")
             return
         }
         await warm.gate.release()
@@ -5259,6 +5268,39 @@ private final class ProgressRecorder: @unchecked Sendable {
         #expect(session.preference == .table)
         setter(.table)
         #expect(session.preference == .table)
+    }
+
+    @Test func lifecycleEntryPointsDoNotRegisterInternalObservableReads()
+        async throws
+    {
+        let preferenceSession = AutoChartSession<Int>(cache: AutoChartCache())
+        let unexpectedPreferenceChanges = V3Counter()
+        withObservationTracking {
+            #expect(preferenceSession.applyPreference(.automatic) == .unchanged)
+        } onChange: {
+            unexpectedPreferenceChanges.increment()
+        }
+
+        #expect(preferenceSession.applyPreference(.table) == .stored)
+        #expect(unexpectedPreferenceChanges.value == 0)
+
+        let stateSession = AutoChartSession<Int>(cache: AutoChartCache())
+        defer { stateSession.cancel() }
+        let request = try AutoChartRequest(table: domainDataset(
+            key: .trusted(identity: "untracked-lifecycle-read", revision: "1")))
+        #expect(stateSession.load(request) == .started)
+        _ = try await readyPresentation(from: stateSession) { _ in true }
+        let unexpectedStateChanges = V3Counter()
+        withObservationTracking {
+            let result = stateSession.applyPreferenceResult(.automatic)
+            #expect(result.application == .unchanged)
+            #expect(!result.changesVisibleChart)
+        } onChange: {
+            unexpectedStateChanges.increment()
+        }
+
+        stateSession.cancel()
+        #expect(unexpectedStateChanges.value == 0)
     }
 
     @Test func lifecycleEntryPointsRetainResultFunctionShapes() {

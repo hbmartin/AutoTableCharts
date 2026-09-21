@@ -109,6 +109,9 @@ swift test
 # neither its object symbols nor serialized module metadata contains test hooks.
 Scripts/verify-release-library.sh
 
+# Exercise current and legacy SwiftPM artifact discovery with isolated fixtures.
+Scripts/test-verify-release-library.sh
+
 # Verify both halves of the hook-dependent test contract from one manifest:
 # explicit skips without hooks and actual execution with hooks.
 Scripts/verify-release-tests.sh without-hooks

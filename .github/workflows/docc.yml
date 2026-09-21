@@ -85,6 +85,9 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v7
 
+      - name: Test release-library artifact discovery
+        run: Scripts/test-verify-release-library.sh
+
       - name: Verify release library excludes test hooks
         run: Scripts/verify-release-library.sh
 
