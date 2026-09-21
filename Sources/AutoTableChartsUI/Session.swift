@@ -39,6 +39,31 @@ public enum AutoChartPreferenceApplication: Hashable, Sendable {
     case superseded
 }
 
+/// The synchronous effect of applying a preference to an ``AutoChartSession``.
+///
+/// This extends ``AutoChartPreferenceApplication`` with the presentation detail
+/// hosts need when deciding whether to restore selection for the chart that will
+/// be visible after synchronous lifecycle reentrancy settles.
+public struct AutoChartPreferenceApplicationResult: Hashable, Sendable {
+    /// How the preference was applied to the session lifecycle.
+    public let application: AutoChartPreferenceApplication
+
+    /// Whether the chart visible when application began will be replaced or removed.
+    ///
+    /// This is `false` when no chart was visible at call entry. For superseded
+    /// applications, the value describes the effective synchronous target left by
+    /// the superseding operation rather than the abandoned application.
+    public let changesVisibleChart: Bool
+
+    public init(
+        application: AutoChartPreferenceApplication,
+        changesVisibleChart: Bool
+    ) {
+        self.application = application
+        self.changesVisibleChart = changesVisibleChart
+    }
+}
+
 private struct AutoChartSessionPublishedChanges: OptionSet {
     let rawValue: UInt8
 
@@ -158,6 +183,12 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
     private struct StartToken {
         let generation: UInt64
         let lifecycleRevision: UInt64
+    }
+
+    private enum EffectiveChartTarget: Equatable {
+        case prepared(AutoChartPreparedChartID)
+        case unresolved
+        case none
     }
 
     private let cache: AutoChartCache
@@ -357,6 +388,37 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
     public func applyPreference(
         _ preference: AutoChartPreference
     ) -> AutoChartPreferenceApplication {
+        applyPreferenceResult(preference).application
+    }
+
+    /// Reconciles a new preference and reports both its lifecycle application and
+    /// whether it changes the chart visible at call entry.
+    ///
+    /// A pending prepared target is compared by prepared-chart identity. An
+    /// unresolved replacement counts as a change when a chart was visible, while
+    /// table fallback, cancellation, and unload leave no effective chart target.
+    public func applyPreferenceResult(
+        _ preference: AutoChartPreference
+    ) -> AutoChartPreferenceApplicationResult {
+        let visiblePreparedChartID = readyState?.presented?.preparedChart.id
+        let application = applyPreferenceApplication(preference)
+        let changesVisibleChart: Bool
+        if application == .unchanged || application == .stored {
+            changesVisibleChart = false
+        } else if let visiblePreparedChartID {
+            changesVisibleChart = effectiveChartTarget
+                != .prepared(visiblePreparedChartID)
+        } else {
+            changesVisibleChart = false
+        }
+        return AutoChartPreferenceApplicationResult(
+            application: application,
+            changesVisibleChart: changesVisibleChart)
+    }
+
+    private func applyPreferenceApplication(
+        _ preference: AutoChartPreference
+    ) -> AutoChartPreferenceApplication {
         guard preference != publishedValues.preference else { return .unchanged }
         guard let request else {
             let revision = reserveLifecycleRevision()
@@ -448,6 +510,19 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
             return nil
         }
         return (analysis, presented)
+    }
+
+    private var effectiveChartTarget: EffectiveChartTarget {
+        if let presentationTarget {
+            return .prepared(presentationTarget.chart.id)
+        }
+        if preferenceUpdatePending {
+            return .unresolved
+        }
+        if let presented = readyState?.presented {
+            return .prepared(presented.preparedChart.id)
+        }
+        return .none
     }
 
     private var reusablePreparedChartAnalyses: [AutoChartAnalysis<RowID>] {
