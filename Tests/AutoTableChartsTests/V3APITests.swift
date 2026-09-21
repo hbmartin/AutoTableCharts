@@ -4557,9 +4557,10 @@ private final class ProgressRecorder: @unchecked Sendable {
                 }
             }
 
-            let application = session.applyPreference(
+            let result = session.applyPreferenceResult(
                 .chart(.specific(alternative.id)))
-            #expect(application == .superseded)
+            #expect(result.application == .superseded)
+            #expect(result.changesVisibleChart)
             guard case .idle = session.state else {
                 Issue.record("Synchronous cancellation did not leave idle state.")
                 continue
@@ -4657,6 +4658,54 @@ private final class ProgressRecorder: @unchecked Sendable {
             }
             if unloads {
                 #expect(session.retry() == .noRequest)
+            }
+        }
+        #endif
+    }
+
+    @Test(
+        .disabled(if: !testHooksAvailable, testHooksUnavailable),
+        .timeLimit(.minutes(1)))
+    func supersededPreferenceResultUsesTheEffectiveVisibleTarget() async throws {
+        #if ATC_TEST_HOOKS
+        for preservesVisibleChart in [true, false] {
+            let session = AutoChartSession<Int>(cache: AutoChartCache())
+            defer {
+                session.attemptDidStartForTesting = nil
+                session.cancel()
+            }
+            let request = try AutoChartRequest(table: domainDataset(
+                key: .trusted(
+                    identity: "preference-result-superseded-\(preservesVisibleChart)",
+                    revision: "1")))
+            #expect(session.load(request) == .started)
+            let analysis = try await readyAnalysis(from: session)
+            let presented = try await readyPresentation(from: session) { _ in true }
+            let alternative = try #require(
+                analysis.outcome.catalog?.cataloged.first {
+                    $0.id != presented.preparedChart.recommendation.id
+                })
+            session.attemptDidStartForTesting = { [weak session] in
+                guard let session else { return }
+                if preservesVisibleChart {
+                    session.setPreference(.chart(.specific(
+                        presented.preparedChart.recommendation.id)))
+                } else {
+                    session.setPreference(.table)
+                }
+            }
+
+            let result = session.applyPreferenceResult(
+                .chart(.specific(alternative.id)))
+
+            #expect(result.application == .superseded)
+            #expect(result.changesVisibleChart == !preservesVisibleChart)
+            if preservesVisibleChart {
+                guard case .ready(_, let final?) = session.state else {
+                    Issue.record("The superseding preference removed the visible chart.")
+                    continue
+                }
+                #expect(final.preparedChart.id == presented.preparedChart.id)
             }
         }
         #endif
@@ -5234,17 +5283,25 @@ private final class ProgressRecorder: @unchecked Sendable {
         let explicitPreferenceRetry: @MainActor (
             AutoChartPreference
         ) -> AutoChartRetryApplication = session.retry
+        let detailedPreferenceApplication: @MainActor (
+            AutoChartPreference
+        ) -> AutoChartPreferenceApplicationResult = session.applyPreferenceResult
 
         _ = storedPreferenceLoad
         _ = explicitPreferenceLoad
+        #expect(detailedPreferenceApplication(.automatic).application == .unchanged)
         #expect(storedPreferenceRetry() == .noRequest)
         #expect(explicitPreferenceRetry(.table) == .noRequest)
     }
 
     @Test func preferenceApplicationReportsLifecycleOutcomes() async throws {
         let unloaded = AutoChartSession<Int>(cache: AutoChartCache())
-        #expect(unloaded.applyPreference(.table) == .stored)
-        #expect(unloaded.applyPreference(.table) == .unchanged)
+        let stored = unloaded.applyPreferenceResult(.table)
+        #expect(stored.application == .stored)
+        #expect(!stored.changesVisibleChart)
+        let unchanged = unloaded.applyPreferenceResult(.table)
+        #expect(unchanged.application == .unchanged)
+        #expect(!unchanged.changesVisibleChart)
         #expect(unloaded.preference == .table)
 
         let request = try AutoChartRequest(table: domainDataset())
@@ -5330,9 +5387,10 @@ private final class ProgressRecorder: @unchecked Sendable {
         })
 
         callback.arm()
-        #expect(
-            session.applyPreference(.chart(.specific(alternative.id)))
-                == .reusedPreparedChart)
+        let result = session.applyPreferenceResult(
+            .chart(.specific(alternative.id)))
+        #expect(result.application == .reusedPreparedChart)
+        #expect(result.changesVisibleChart)
         #expect(await waitForV3Condition {
             callback.isBlocked && session.isPresentationPending
         })
@@ -5378,10 +5436,11 @@ private final class ProgressRecorder: @unchecked Sendable {
             for: [0], analysisID: initial.id)
         let savedSelection = session.selection
 
-        let application = session.applyPreference(
+        let result = session.applyPreferenceResult(
             .chart(.specific(selected.id)))
 
-        #expect(application == .reusedPreparedChart)
+        #expect(result.application == .reusedPreparedChart)
+        #expect(!result.changesVisibleChart)
         guard case .ready(let updated, let unchanged?) = session.state else {
             Issue.record("The off-catalog rebind must remain ready synchronously.")
             return
@@ -5484,9 +5543,10 @@ private final class ProgressRecorder: @unchecked Sendable {
         #expect(await waitForV3Condition {
             callback.isBlocked && session.isPresentationPending
         })
-        #expect(
-            session.applyPreference(.chart(.recommended))
-                == .reusedPreparedChart)
+        #expect(session.currentRecommendation?.id == primary.id)
+        let result = session.applyPreferenceResult(.chart(.recommended))
+        #expect(result.application == .reusedPreparedChart)
+        #expect(result.changesVisibleChart)
         guard case .ready(let visibleAnalysis, let stillVisible?) = session.state else {
             Issue.record("Pending-target reuse did not retain the visible chart.")
             return
