@@ -161,13 +161,16 @@ elif (( $# == 2 )) && [[ "$1" == "--xcode-derived-data" ]]; then
     fi
 
     found_module_representation=false
-    while IFS= read -r -d '' artifact; do
-      if collect_module_artifacts "$artifact"; then
+    while IFS= read -r -d '' release_product_path; do
+      if collect_module_artifacts \
+        "$release_product_path/$target_name.swiftmodule"
+      then
         found_module_representation=true
       fi
     done < <(
       find "$products_root" \
-        -path "*/Release-*/$target_name.swiftmodule" \
+        -type d \
+        -name 'Release-*' \
         -print0
     )
     if [[ "$found_module_representation" != true ]]; then
