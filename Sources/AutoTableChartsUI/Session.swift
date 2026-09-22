@@ -74,6 +74,7 @@ private struct AutoChartSessionPublishedChanges: OptionSet {
     static let presentationPending = Self(rawValue: 1 << 4)
     static let chartUpdatePending = Self(rawValue: 1 << 5)
     static let presentationTextResolver = Self(rawValue: 1 << 6)
+    static let retainedRequest = Self(rawValue: 1 << 7)
 }
 
 /// Main-actor lifecycle owner for one independently displayed chart result.
@@ -120,7 +121,8 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
     /// distinction is intentionally independent of ``state`` because both
     /// operations leave the session idle.
     public var hasRetainedRequest: Bool {
-        request != nil
+        access(keyPath: \.hasRetainedRequest)
+        return request != nil
     }
     /// The requested chart choice, including while a prior chart remains visible,
     /// cached preparation is pending, or a retryable attempt has failed.
@@ -299,10 +301,17 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
                 publishRecommendation()
             }
         }
+        let publishRetainedRequest = {
+            if changes.contains(.retainedRequest) {
+                self.withMutation(keyPath: \.hasRetainedRequest, publishPreference)
+            } else {
+                publishPreference()
+            }
+        }
         if changes.contains(.state) {
-            withMutation(keyPath: \.state, publishPreference)
+            withMutation(keyPath: \.state, publishRetainedRequest)
         } else {
-            publishPreference()
+            publishRetainedRequest()
         }
         return didPublish
     }
@@ -750,10 +759,11 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
     public func unload() {
         let revision = reserveLifecycleRevision()
         let generation = self.generation &+ 1
-        let changes: PublishedChanges = [
+        var changes: PublishedChanges = [
             .state, .currentRecommendation, .presentationPending,
             .chartUpdatePending, .presentationTextResolver, .selection,
         ]
+        if request != nil { changes.insert(.retainedRequest) }
         publish(revision: revision, changes: changes) {
             self.cancelInFlightWork(
                 generation: generation,
@@ -843,6 +853,7 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
             .chartUpdatePending, .presentationTextResolver,
         ]
         if !keepsReadyChart { changes.insert(.state) }
+        if self.request == nil { changes.insert(.retainedRequest) }
         if changesPreference { changes.insert(.preference) }
         if shouldClearSelection { changes.insert(.selection) }
         let installed = publish(revision: revision, changes: changes) { [self] in
