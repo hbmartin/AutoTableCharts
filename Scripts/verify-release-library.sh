@@ -44,6 +44,8 @@ collect_module_artifacts() {
     local sibling_artifact
     for sibling_artifact in \
       "$module_stem.swiftinterface" \
+      "$module_stem.private.swiftinterface" \
+      "$module_stem.package.swiftinterface" \
       "$module_stem.swiftdoc" \
       "$module_stem.abi.json"
     do

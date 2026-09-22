@@ -115,9 +115,19 @@ add_swiftpm_legacy_module() {
   local module_name="$2"
   printf 'clean module for %s\n' "$module_name" \
     > "$fixture_path/$module_name.swiftmodule"
+  add_swiftpm_legacy_interfaces "$fixture_path" "$module_name"
+  add_swiftpm_legacy_module_sidecars "$fixture_path" "$module_name"
+}
+
+add_swiftpm_legacy_interfaces() {
+  local fixture_path="$1"
+  local module_name="$2"
   printf 'clean interface for %s\n' "$module_name" \
     > "$fixture_path/$module_name.swiftinterface"
-  add_swiftpm_legacy_module_sidecars "$fixture_path" "$module_name"
+  printf 'clean private interface for %s\n' "$module_name" \
+    > "$fixture_path/$module_name.private.swiftinterface"
+  printf 'clean package interface for %s\n' "$module_name" \
+    > "$fixture_path/$module_name.package.swiftinterface"
 }
 
 add_swiftpm_legacy_module_sidecars() {
@@ -132,8 +142,7 @@ add_swiftpm_legacy_module_sidecars() {
 add_swiftpm_legacy_interface() {
   local fixture_path="$1"
   local module_name="$2"
-  printf 'clean interface for %s\n' "$module_name" \
-    > "$fixture_path/$module_name.swiftinterface"
+  add_swiftpm_legacy_interfaces "$fixture_path" "$module_name"
   add_swiftpm_legacy_module_sidecars "$fixture_path" "$module_name"
 }
 
@@ -344,6 +353,26 @@ for target_name in AutoTableCharts AutoTableChartsUI; do
 done
 expect_success \
   swiftpm-interface-only swiftpm "$fixture_path" "$swiftpm_success_message"
+
+fixture_path="$(new_fixture swiftpm-package-interface-leak)"
+for target_name in AutoTableCharts AutoTableChartsUI; do
+  add_swiftpm_legacy_object "$fixture_path" "$target_name"
+  add_swiftpm_legacy_interface "$fixture_path" "$target_name"
+done
+printf 'environmentApplicationForTesting\n' \
+  >> "$fixture_path/AutoTableChartsUI.package.swiftinterface"
+expect_failure \
+  swiftpm-package-interface-leak swiftpm "$fixture_path" "$leak_message"
+
+fixture_path="$(new_fixture swiftpm-private-interface-leak)"
+for target_name in AutoTableCharts AutoTableChartsUI; do
+  add_swiftpm_legacy_object "$fixture_path" "$target_name"
+  add_swiftpm_legacy_interface "$fixture_path" "$target_name"
+done
+printf 'sessionForTesting\n' \
+  >> "$fixture_path/AutoTableChartsUI.private.swiftinterface"
+expect_failure \
+  swiftpm-private-interface-leak swiftpm "$fixture_path" "$leak_message"
 
 fixture_path="$(new_fixture swiftpm-missing-object)"
 add_swiftpm_current_object "$fixture_path" AutoTableCharts
