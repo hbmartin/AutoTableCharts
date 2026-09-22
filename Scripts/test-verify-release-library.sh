@@ -96,6 +96,18 @@ add_swiftpm_current_module() {
     > "$module_path/arm64-apple-macos.swiftmodule"
   printf 'clean interface for %s\n' "$module_name" \
     > "$module_path/arm64-apple-macos.swiftinterface"
+  add_swiftpm_current_module_sidecars "$fixture_path" "$module_name"
+}
+
+add_swiftpm_current_module_sidecars() {
+  local fixture_path="$1"
+  local module_name="$2"
+  local module_path="$fixture_path/Modules/$module_name.swiftmodule"
+  mkdir -p "$module_path"
+  printf 'clean documentation for %s\n' "$module_name" \
+    > "$module_path/arm64-apple-macos.swiftdoc"
+  printf 'clean ABI for %s\n' "$module_name" \
+    > "$module_path/arm64-apple-macos.abi.json"
 }
 
 add_swiftpm_legacy_module() {
@@ -103,6 +115,26 @@ add_swiftpm_legacy_module() {
   local module_name="$2"
   printf 'clean module for %s\n' "$module_name" \
     > "$fixture_path/$module_name.swiftmodule"
+  printf 'clean interface for %s\n' "$module_name" \
+    > "$fixture_path/$module_name.swiftinterface"
+  add_swiftpm_legacy_module_sidecars "$fixture_path" "$module_name"
+}
+
+add_swiftpm_legacy_module_sidecars() {
+  local fixture_path="$1"
+  local module_name="$2"
+  printf 'clean documentation for %s\n' "$module_name" \
+    > "$fixture_path/$module_name.swiftdoc"
+  printf 'clean ABI for %s\n' "$module_name" \
+    > "$fixture_path/$module_name.abi.json"
+}
+
+add_swiftpm_legacy_interface() {
+  local fixture_path="$1"
+  local module_name="$2"
+  printf 'clean interface for %s\n' "$module_name" \
+    > "$fixture_path/$module_name.swiftinterface"
+  add_swiftpm_legacy_module_sidecars "$fixture_path" "$module_name"
 }
 
 add_swiftpm_current_layout() {
@@ -143,6 +175,32 @@ add_xcode_module() {
   mkdir -p "$release_path/$module_name.swiftmodule"
   printf 'clean module for %s\n' "$module_name" \
     > "$release_path/$module_name.swiftmodule/arm64-apple-ios.swiftmodule"
+  printf 'clean interface for %s\n' "$module_name" \
+    > "$release_path/$module_name.swiftmodule/arm64-apple-ios.swiftinterface"
+  add_xcode_module_sidecars "$derived_data_path" "$module_name"
+}
+
+add_xcode_module_sidecars() {
+  local derived_data_path="$1"
+  local module_name="$2"
+  local release_path
+  release_path="$(xcode_release_path "$derived_data_path")"
+  mkdir -p "$release_path/$module_name.swiftmodule"
+  printf 'clean documentation for %s\n' "$module_name" \
+    > "$release_path/$module_name.swiftmodule/arm64-apple-ios.swiftdoc"
+  printf 'clean ABI for %s\n' "$module_name" \
+    > "$release_path/$module_name.swiftmodule/arm64-apple-ios.abi.json"
+}
+
+add_xcode_interface() {
+  local derived_data_path="$1"
+  local module_name="$2"
+  local release_path
+  release_path="$(xcode_release_path "$derived_data_path")"
+  mkdir -p "$release_path/$module_name.swiftmodule"
+  printf 'clean interface for %s\n' "$module_name" \
+    > "$release_path/$module_name.swiftmodule/arm64-apple-ios.swiftinterface"
+  add_xcode_module_sidecars "$derived_data_path" "$module_name"
 }
 
 add_xcode_layout() {
@@ -168,7 +226,7 @@ run_audit() {
       ;;
     *)
       echo "Unknown release-layout audit mode: $audit_mode" >&2
-      exit 2
+      return 2
       ;;
   esac
 }
@@ -179,10 +237,16 @@ expect_success() {
   local fixture_path="$3"
   local expected_message="$4"
   local output
-  if ! output="$(run_audit "$audit_mode" "$fixture_path" 2>&1)"; then
+  local status
+  if output="$(run_audit "$audit_mode" "$fixture_path" 2>&1)"; then
+    status=0
+  else
+    status=$?
+  fi
+  if (( status != 0 )); then
     echo "Release-layout fixture $fixture_name unexpectedly failed:" >&2
     echo "$output" >&2
-    exit 1
+    exit "$status"
   fi
   if ! grep -Fq "$expected_message" <<< "$output"
   then
@@ -197,12 +261,40 @@ expect_failure() {
   local fixture_path="$3"
   local expected_message="$4"
   local output
+  local status
   if output="$(run_audit "$audit_mode" "$fixture_path" 2>&1)"; then
     echo "Release-layout fixture $fixture_name unexpectedly passed." >&2
     exit 1
+  else
+    status=$?
+  fi
+  if (( status != 1 )); then
+    echo "Release-layout fixture $fixture_name could not run:" >&2
+    echo "$output" >&2
+    exit "$status"
   fi
   if ! grep -Fq "$expected_message" <<< "$output"; then
     echo "Release-layout fixture $fixture_name missed its diagnostic:" >&2
+    echo "$output" >&2
+    exit 1
+  fi
+}
+
+expect_usage_failure() {
+  local output
+  local status
+  if output="$("$audit_script" --invalid-argument 2>&1)"; then
+    status=0
+  else
+    status=$?
+  fi
+  if (( status != 2 )); then
+    echo "Release audit usage fixture returned status $status instead of 2:" >&2
+    echo "$output" >&2
+    exit 1
+  fi
+  if ! grep -Fq 'Usage:' <<< "$output"; then
+    echo "Release audit usage fixture missed its diagnostic:" >&2
     echo "$output" >&2
     exit 1
   fi
@@ -213,6 +305,30 @@ xcode_success_message='Xcode release library and module metadata contain no test
 leak_message='Test hooks leaked into SwiftPM release library or its module metadata.'
 xcode_leak_message='Test hooks leaked into Xcode release library or its module metadata.'
 
+expect_usage_failure
+
+fixture_path="$(new_fixture unknown-audit-mode)"
+if unknown_mode_output="$(
+  expect_failure \
+    unknown-audit-mode unknown "$fixture_path" 'unused diagnostic' 2>&1
+)"; then
+  unknown_mode_status=0
+else
+  unknown_mode_status=$?
+fi
+if (( unknown_mode_status != 2 )); then
+  echo "Unknown audit mode returned status $unknown_mode_status instead of 2:" >&2
+  echo "$unknown_mode_output" >&2
+  exit 1
+fi
+if ! grep -Fq 'Unknown release-layout audit mode: unknown' \
+  <<< "$unknown_mode_output"
+then
+  echo "Unknown audit mode fixture missed its diagnostic:" >&2
+  echo "$unknown_mode_output" >&2
+  exit 1
+fi
+
 fixture_path="$(new_fixture swiftpm-current)"
 add_swiftpm_current_layout "$fixture_path"
 expect_success swiftpm-current swiftpm "$fixture_path" "$swiftpm_success_message"
@@ -220,6 +336,14 @@ expect_success swiftpm-current swiftpm "$fixture_path" "$swiftpm_success_message
 fixture_path="$(new_fixture swiftpm-legacy)"
 add_swiftpm_legacy_layout "$fixture_path"
 expect_success swiftpm-legacy swiftpm "$fixture_path" "$swiftpm_success_message"
+
+fixture_path="$(new_fixture swiftpm-interface-only)"
+for target_name in AutoTableCharts AutoTableChartsUI; do
+  add_swiftpm_legacy_object "$fixture_path" "$target_name"
+  add_swiftpm_legacy_interface "$fixture_path" "$target_name"
+done
+expect_success \
+  swiftpm-interface-only swiftpm "$fixture_path" "$swiftpm_success_message"
 
 fixture_path="$(new_fixture swiftpm-missing-object)"
 add_swiftpm_current_object "$fixture_path" AutoTableCharts
@@ -237,6 +361,16 @@ done
 add_swiftpm_current_module "$fixture_path" AutoTableCharts
 expect_failure \
   swiftpm-missing-module swiftpm "$fixture_path" \
+  'Could not find the release module for AutoTableChartsUI.'
+
+fixture_path="$(new_fixture swiftpm-sidecars-without-module)"
+for target_name in AutoTableCharts AutoTableChartsUI; do
+  add_swiftpm_current_object "$fixture_path" "$target_name"
+done
+add_swiftpm_current_module "$fixture_path" AutoTableCharts
+add_swiftpm_current_module_sidecars "$fixture_path" AutoTableChartsUI
+expect_failure \
+  swiftpm-sidecars-without-module swiftpm "$fixture_path" \
   'Could not find the release module for AutoTableChartsUI.'
 
 fixture_path="$(new_fixture swiftpm-symbol-leak)"
@@ -257,14 +391,49 @@ printf 'sessionForTesting\n' \
   >> "$fixture_path/Modules/AutoTableChartsUI.swiftmodule/arm64-apple-macos.swiftinterface"
 expect_failure swiftpm-interface-leak swiftpm "$fixture_path" "$leak_message"
 
+fixture_path="$(new_fixture swiftpm-documentation-leak)"
+add_swiftpm_current_layout "$fixture_path"
+printf 'sessionForTesting\n' \
+  >> "$fixture_path/Modules/AutoTableChartsUI.swiftmodule/arm64-apple-macos.swiftdoc"
+expect_failure swiftpm-documentation-leak swiftpm "$fixture_path" "$leak_message"
+
+fixture_path="$(new_fixture swiftpm-abi-leak)"
+add_swiftpm_current_layout "$fixture_path"
+printf 'sessionForTesting\n' \
+  >> "$fixture_path/Modules/AutoTableChartsUI.swiftmodule/arm64-apple-macos.abi.json"
+expect_failure swiftpm-abi-leak swiftpm "$fixture_path" "$leak_message"
+
 fixture_path="$(new_fixture swiftpm-legacy-module-leak)"
 add_swiftpm_legacy_layout "$fixture_path"
 printf 'sessionForTesting\n' >> "$fixture_path/AutoTableChartsUI.swiftmodule"
 expect_failure swiftpm-legacy-module-leak swiftpm "$fixture_path" "$leak_message"
 
+fixture_path="$(new_fixture swiftpm-legacy-documentation-leak)"
+add_swiftpm_legacy_layout "$fixture_path"
+printf 'sessionForTesting\n' >> "$fixture_path/AutoTableChartsUI.swiftdoc"
+expect_failure \
+  swiftpm-legacy-documentation-leak swiftpm "$fixture_path" "$leak_message"
+
+fixture_path="$(new_fixture swiftpm-legacy-abi-leak)"
+add_swiftpm_legacy_layout "$fixture_path"
+printf 'sessionForTesting\n' >> "$fixture_path/AutoTableChartsUI.abi.json"
+expect_failure swiftpm-legacy-abi-leak swiftpm "$fixture_path" "$leak_message"
+
+fixture_path="$(new_fixture xcode-missing-products)"
+expect_failure \
+  xcode-missing-products xcode "$fixture_path" \
+  'Could not find Xcode build products under'
+
 fixture_path="$(new_fixture xcode-current)"
 add_xcode_layout "$fixture_path"
 expect_success xcode-current xcode "$fixture_path" "$xcode_success_message"
+
+fixture_path="$(new_fixture xcode-interface-only)"
+for target_name in AutoTableCharts AutoTableChartsUI; do
+  add_xcode_object "$fixture_path" "$target_name"
+  add_xcode_interface "$fixture_path" "$target_name"
+done
+expect_success xcode-interface-only xcode "$fixture_path" "$xcode_success_message"
 
 fixture_path="$(new_fixture xcode-missing-object)"
 add_xcode_object "$fixture_path" AutoTableCharts
@@ -284,6 +453,16 @@ expect_failure \
   xcode-missing-module xcode "$fixture_path" \
   'Could not find Xcode Release modules for AutoTableChartsUI under'
 
+fixture_path="$(new_fixture xcode-sidecars-without-module)"
+for target_name in AutoTableCharts AutoTableChartsUI; do
+  add_xcode_object "$fixture_path" "$target_name"
+done
+add_xcode_module "$fixture_path" AutoTableCharts
+add_xcode_module_sidecars "$fixture_path" AutoTableChartsUI
+expect_failure \
+  xcode-sidecars-without-module xcode "$fixture_path" \
+  'Could not find Xcode Release modules for AutoTableChartsUI under'
+
 fixture_path="$(new_fixture xcode-symbol-leak)"
 add_xcode_layout "$fixture_path"
 xcode_release="$(xcode_release_path "$fixture_path")"
@@ -296,5 +475,26 @@ xcode_release="$(xcode_release_path "$fixture_path")"
 printf 'sessionForTesting\n' \
   >> "$xcode_release/AutoTableChartsUI.swiftmodule/arm64-apple-ios.swiftmodule"
 expect_failure xcode-module-leak xcode "$fixture_path" "$xcode_leak_message"
+
+fixture_path="$(new_fixture xcode-interface-leak)"
+add_xcode_layout "$fixture_path"
+xcode_release="$(xcode_release_path "$fixture_path")"
+printf 'sessionForTesting\n' \
+  >> "$xcode_release/AutoTableChartsUI.swiftmodule/arm64-apple-ios.swiftinterface"
+expect_failure xcode-interface-leak xcode "$fixture_path" "$xcode_leak_message"
+
+fixture_path="$(new_fixture xcode-documentation-leak)"
+add_xcode_layout "$fixture_path"
+xcode_release="$(xcode_release_path "$fixture_path")"
+printf 'sessionForTesting\n' \
+  >> "$xcode_release/AutoTableChartsUI.swiftmodule/arm64-apple-ios.swiftdoc"
+expect_failure xcode-documentation-leak xcode "$fixture_path" "$xcode_leak_message"
+
+fixture_path="$(new_fixture xcode-abi-leak)"
+add_xcode_layout "$fixture_path"
+xcode_release="$(xcode_release_path "$fixture_path")"
+printf 'sessionForTesting\n' \
+  >> "$xcode_release/AutoTableChartsUI.swiftmodule/arm64-apple-ios.abi.json"
+expect_failure xcode-abi-leak xcode "$fixture_path" "$xcode_leak_message"
 
 echo "Verified SwiftPM and Xcode release-library artifact discovery."

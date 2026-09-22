@@ -185,12 +185,6 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         let lifecycleRevision: UInt64
     }
 
-    private enum EffectiveChartTarget: Equatable {
-        case prepared(AutoChartPreparedChartID)
-        case unresolved
-        case noChart
-    }
-
     private let cache: AutoChartCache
     private let analyzer: AutoChartAnalyzer
     private let presenter: AutoChartPresenter
@@ -410,8 +404,8 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
             changesVisibleChart = false
         case .reusedPreparedChart, .startedReplacement, .superseded:
             if let visiblePreparedChartID {
-                changesVisibleChart = effectiveChartTarget
-                    != .prepared(visiblePreparedChartID)
+                changesVisibleChart = effectivePreparedChartID
+                    != visiblePreparedChartID
             } else {
                 changesVisibleChart = false
             }
@@ -517,17 +511,17 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         return (analysis, presented)
     }
 
-    private var effectiveChartTarget: EffectiveChartTarget {
+    private var effectivePreparedChartID: AutoChartPreparedChartID? {
         if let presentationTarget {
-            return .prepared(presentationTarget.chart.id)
+            return presentationTarget.chart.id
         }
         if preferenceUpdatePending {
-            return .unresolved
+            return nil
         }
         if let presented = readyState?.presented {
-            return .prepared(presented.preparedChart.id)
+            return presented.preparedChart.id
         }
-        return .noChart
+        return nil
     }
 
     private var reusablePreparedChartAnalyses: [AutoChartAnalysis<RowID>] {
@@ -602,15 +596,8 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
             formatters: formatters,
             textResolver: textResolver)
         let revision = reserveLifecycleRevision()
-        let newConfiguration = loadedPresentationConfiguration.applying(newOverrides)
-        let installed = publish(
-            revision: revision,
-            changes: [.presentationTextResolver]
-        ) {
-            self.environmentPresentationOverrides = newOverrides
-            self.presentationConfiguration = newConfiguration
-        }
-        guard installed else { return }
+        environmentPresentationOverrides = newOverrides
+        presentationConfiguration = effectivePresentationConfiguration
         #if ATC_TEST_HOOKS
         environmentApplicationForTesting?()
         #endif
@@ -626,16 +613,8 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         _ configuration: PresentationConfiguration
     ) {
         let revision = reserveLifecycleRevision()
-        let effectiveConfiguration = configuration.applying(
-            environmentPresentationOverrides)
-        let installed = publish(
-            revision: revision,
-            changes: [.presentationTextResolver]
-        ) {
-            self.loadedPresentationConfiguration = configuration
-            self.presentationConfiguration = effectiveConfiguration
-        }
-        guard installed else { return }
+        loadedPresentationConfiguration = configuration
+        presentationConfiguration = effectivePresentationConfiguration
         rebuildPresentation(reservedRevision: revision)
     }
 
@@ -661,6 +640,7 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         let request = target.map { presentationRequest(for: $0.chart) }
         var changes: PublishedChanges = [
             .state, .presentationPending, .chartUpdatePending,
+            .presentationTextResolver,
         ]
         if let request,
             presentationMaySynchronouslyClearSelection(request: request)
