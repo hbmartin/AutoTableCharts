@@ -113,6 +113,15 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         access(keyPath: \.preference)
         return publishedValues.preference
     }
+    /// Whether the session retains a request that can be retried or restarted by
+    /// a preference change.
+    ///
+    /// Cancellation preserves the request, while ``unload()`` removes it. This
+    /// distinction is intentionally independent of ``state`` because both
+    /// operations leave the session idle.
+    public var hasRetainedRequest: Bool {
+        request != nil
+    }
     /// The requested chart choice, including while a prior chart remains visible,
     /// cached preparation is pending, or a retryable attempt has failed.
     public var currentRecommendation: AutoChartRecommendation? {

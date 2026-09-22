@@ -4224,6 +4224,7 @@ private final class ProgressRecorder: @unchecked Sendable {
             presentationContext: .init(identity: "superseded"))
 
         #expect(result == .superseded)
+        #expect(session.hasRetainedRequest)
         guard case .idle = session.state else {
             Issue.record("A superseded load overwrote cancellation.")
             return
@@ -4327,6 +4328,7 @@ private final class ProgressRecorder: @unchecked Sendable {
         let result = session.load(supersededRequest)
 
         #expect(result == .superseded)
+        #expect(!session.hasRetainedRequest)
         guard case .idle = session.state else {
             Issue.record("A superseded load overwrote unload.")
             return
@@ -4627,6 +4629,7 @@ private final class ProgressRecorder: @unchecked Sendable {
             }
 
             #expect(session.retry() == .superseded)
+            #expect(session.hasRetainedRequest != unloads)
             guard case .idle = session.state else {
                 Issue.record("Superseded retry did not leave the session idle.")
                 continue
