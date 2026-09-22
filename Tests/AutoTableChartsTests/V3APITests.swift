@@ -5160,10 +5160,21 @@ private final class ProgressRecorder: @unchecked Sendable {
                     revision: "1")))
             #expect(session.load(request) == .started)
             _ = try await readyPresentation(from: session) { _ in true }
+            let retainedResolver = AutoChartTextResolver {
+                "retained:\($0.defaultText)"
+            }
+            let resolverChanges = V3Counter()
+            withObservationTracking {
+                _ = session.presentationTextResolver
+            } onChange: {
+                resolverChanges.increment()
+            }
             var didSupersede = false
+            var resolverChangesBeforeSupersession: Int?
             session.environmentApplicationForTesting = { [weak session] in
                 guard !didSupersede, let session else { return }
                 didSupersede = true
+                resolverChangesBeforeSupersession = resolverChanges.value
                 if unloads {
                     session.unload()
                 } else {
@@ -5174,9 +5185,14 @@ private final class ProgressRecorder: @unchecked Sendable {
             session.applyPresentationEnvironment(
                 context: .init(identity: "retained-environment"),
                 formatters: nil,
-                textResolver: nil)
+                textResolver: retainedResolver)
 
             session.environmentApplicationForTesting = nil
+            #expect(resolverChangesBeforeSupersession == 1)
+            #expect(resolverChanges.value == 1)
+            #expect(
+                session.presentationTextResolver.callbackIdentity
+                    == retainedResolver.callbackIdentity)
             guard case .idle = session.state else {
                 Issue.record("Environment supersession did not leave the session idle.")
                 continue
@@ -5288,7 +5304,8 @@ private final class ProgressRecorder: @unchecked Sendable {
         defer { stateSession.cancel() }
         let request = try AutoChartRequest(table: domainDataset(
             key: .trusted(identity: "untracked-lifecycle-read", revision: "1")))
-        #expect(stateSession.load(request) == .started)
+        let resolver = AutoChartTextResolver { $0.defaultText }
+        #expect(stateSession.load(request, textResolver: resolver) == .started)
         _ = try await readyPresentation(from: stateSession) { _ in true }
         let unexpectedStateChanges = V3Counter()
         withObservationTracking {
@@ -5299,7 +5316,7 @@ private final class ProgressRecorder: @unchecked Sendable {
             unexpectedStateChanges.increment()
         }
 
-        stateSession.cancel()
+        stateSession.unload()
         #expect(unexpectedStateChanges.value == 0)
     }
 
@@ -5357,9 +5374,10 @@ private final class ProgressRecorder: @unchecked Sendable {
             cachedAnalysis.outcome.catalog?.cataloged.first {
                 $0.id != cachedPresentation.preparedChart.recommendation.id
             })
-        #expect(
-            cached.applyPreference(.chart(.specific(alternative.id)))
-                == .startedReplacement)
+        let replacement = cached.applyPreferenceResult(
+            .chart(.specific(alternative.id)))
+        #expect(replacement.application == .startedReplacement)
+        #expect(replacement.changesVisibleChart)
         _ = try await readyPresentation(from: cached) {
             $0.preparedChart.recommendation.id == alternative.id
         }

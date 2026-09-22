@@ -188,7 +188,7 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
     private enum EffectiveChartTarget: Equatable {
         case prepared(AutoChartPreparedChartID)
         case unresolved
-        case none
+        case noChart
     }
 
     private let cache: AutoChartCache
@@ -239,6 +239,8 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         changes: PublishedChanges,
         mutation: @escaping () -> Void
     ) -> Bool {
+        // `changes` describes every property the commit may need to mutate after
+        // earlier Observation callbacks run, not only values differing at entry.
         guard lifecycleRevision == revision else { return false }
         var didPublish = false
         let commit = {
@@ -403,13 +405,16 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         let visiblePreparedChartID = readyState?.presented?.preparedChart.id
         let application = applyPreferenceApplication(preference)
         let changesVisibleChart: Bool
-        if application == .unchanged || application == .stored {
+        switch application {
+        case .unchanged, .stored:
             changesVisibleChart = false
-        } else if let visiblePreparedChartID {
-            changesVisibleChart = effectiveChartTarget
-                != .prepared(visiblePreparedChartID)
-        } else {
-            changesVisibleChart = false
+        case .reusedPreparedChart, .startedReplacement, .superseded:
+            if let visiblePreparedChartID {
+                changesVisibleChart = effectiveChartTarget
+                    != .prepared(visiblePreparedChartID)
+            } else {
+                changesVisibleChart = false
+            }
         }
         return AutoChartPreferenceApplicationResult(
             application: application,
@@ -522,7 +527,7 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         if let presented = readyState?.presented {
             return .prepared(presented.preparedChart.id)
         }
-        return .none
+        return .noChart
     }
 
     private var reusablePreparedChartAnalyses: [AutoChartAnalysis<RowID>] {
@@ -597,8 +602,15 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
             formatters: formatters,
             textResolver: textResolver)
         let revision = reserveLifecycleRevision()
-        environmentPresentationOverrides = newOverrides
-        presentationConfiguration = effectivePresentationConfiguration
+        let newConfiguration = loadedPresentationConfiguration.applying(newOverrides)
+        let installed = publish(
+            revision: revision,
+            changes: [.presentationTextResolver]
+        ) {
+            self.environmentPresentationOverrides = newOverrides
+            self.presentationConfiguration = newConfiguration
+        }
+        guard installed else { return }
         #if ATC_TEST_HOOKS
         environmentApplicationForTesting?()
         #endif
@@ -614,8 +626,16 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         _ configuration: PresentationConfiguration
     ) {
         let revision = reserveLifecycleRevision()
-        loadedPresentationConfiguration = configuration
-        presentationConfiguration = effectivePresentationConfiguration
+        let effectiveConfiguration = configuration.applying(
+            environmentPresentationOverrides)
+        let installed = publish(
+            revision: revision,
+            changes: [.presentationTextResolver]
+        ) {
+            self.loadedPresentationConfiguration = configuration
+            self.presentationConfiguration = effectiveConfiguration
+        }
+        guard installed else { return }
         rebuildPresentation(reservedRevision: revision)
     }
 
@@ -641,7 +661,6 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
         let request = target.map { presentationRequest(for: $0.chart) }
         var changes: PublishedChanges = [
             .state, .presentationPending, .chartUpdatePending,
-            .presentationTextResolver,
         ]
         if let request,
             presentationMaySynchronouslyClearSelection(request: request)
@@ -1189,6 +1208,10 @@ public final class AutoChartSession<RowID: Hashable & Sendable> {
     private func presentationMaySynchronouslyClearSelection(
         request: AutoChartPresentationRequest
     ) -> Bool {
+        // A matching request can reuse its presentation synchronously. Keep the
+        // selection transaction even when entry-time provenance matches: an
+        // earlier state or recommendation observer can install a foreign
+        // selection before the guarded commit runs.
         guard let readyState, let presented = readyState.presented,
             presented.requestID == request.id
         else { return false }

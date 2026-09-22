@@ -27,6 +27,8 @@ AutoChartSessionView(session: session)
 - ``AutoChartRetryApplication``
 - ``AutoChartSession/applyPreference(_:)``
 - ``AutoChartPreferenceApplication``
+- ``AutoChartSession/applyPreferenceResult(_:)``
+- ``AutoChartPreferenceApplicationResult``
 - ``AutoChartSessionView``
 - ``AutoChartPreparationPlaceholder``
 

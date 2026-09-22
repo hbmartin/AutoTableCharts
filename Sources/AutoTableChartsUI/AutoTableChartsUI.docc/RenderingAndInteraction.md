@@ -24,6 +24,13 @@ presentation work pending. During that interval, a ready state's analysis and
 presented payload continue to describe the same visible chart, while
 ``AutoChartSession/currentRecommendation`` describes the requested replacement.
 
+Use ``AutoChartSession/applyPreferenceResult(_:)`` when the host also needs to know
+whether to discard state associated with the chart visible at call entry. Its
+``AutoChartPreferenceApplicationResult/changesVisibleChart`` value compares prepared
+chart identity when a target is known. An unresolved replacement counts as a change,
+while a superseded application describes the effective synchronous target left by
+the winning operation.
+
 ``AutoChartPresenter`` performs localization, formatting, ordering, and
 histogram label resolution before a resolved chart body is evaluated. Its bounded
 memo is keyed by prepared-chart identity, ``AutoChartPresentationContext``, the
