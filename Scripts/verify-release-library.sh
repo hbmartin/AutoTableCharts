@@ -10,6 +10,55 @@ test_hook_pattern='ATC_TEST_HOOKS|TestHooks?|ForTesting'
 audit_symbol_files=()
 audit_module_files=()
 
+collect_module_artifacts() {
+  local module_path="$1"
+  local found_representation=false
+
+  if [[ -f "$module_path" ]]; then
+    audit_module_files+=("$module_path")
+    found_representation=true
+  elif [[ -d "$module_path" ]]; then
+    local artifact
+    while IFS= read -r -d '' artifact; do
+      audit_module_files+=("$artifact")
+      case "$artifact" in
+        *.swiftmodule | *.swiftinterface)
+          found_representation=true
+          ;;
+      esac
+    done < <(
+      find "$module_path" \
+        -type f \
+        \( \
+          -name '*.swiftmodule' \
+          -o -name '*.swiftinterface' \
+          -o -name '*.swiftdoc' \
+          -o -name '*.abi.json' \
+        \) \
+        -print0
+    )
+  fi
+
+  if [[ ! -d "$module_path" ]]; then
+    local module_stem="${module_path%.swiftmodule}"
+    local sibling_artifact
+    for sibling_artifact in \
+      "$module_stem.swiftinterface" \
+      "$module_stem.swiftdoc" \
+      "$module_stem.abi.json"
+    do
+      if [[ -f "$sibling_artifact" ]]; then
+        audit_module_files+=("$sibling_artifact")
+        if [[ "$sibling_artifact" == *.swiftinterface ]]; then
+          found_representation=true
+        fi
+      fi
+    done
+  fi
+
+  [[ "$found_representation" == true ]]
+}
+
 audit_release_artifacts() {
   local artifact_description="$1"
   local release_symbols
@@ -71,25 +120,16 @@ if (( $# == 0 )); then
   shopt -u nullglob
 
   for module_name in AutoTableCharts AutoTableChartsUI; do
-    module_file_count_before=${#audit_module_files[@]}
+    found_module_representation=false
     for release_module_path in \
       "$release_bin_path/Modules/$module_name.swiftmodule" \
       "$release_bin_path/$module_name.swiftmodule"
     do
-      if [[ -f "$release_module_path" ]]; then
-        audit_module_files+=("$release_module_path")
-      elif [[ -d "$release_module_path" ]]; then
-        while IFS= read -r -d '' artifact; do
-          audit_module_files+=("$artifact")
-        done < <(
-          find "$release_module_path" \
-            -type f \
-            \( -name '*.swiftmodule' -o -name '*.swiftinterface' \) \
-          -print0
-        )
+      if collect_module_artifacts "$release_module_path"; then
+        found_module_representation=true
       fi
     done
-    if (( ${#audit_module_files[@]} == module_file_count_before )); then
+    if [[ "$found_module_representation" != true ]]; then
       echo "Could not find the release module for $module_name." >&2
       exit 1
     fi
@@ -118,16 +158,17 @@ elif (( $# == 2 )) && [[ "$1" == "--xcode-derived-data" ]]; then
       exit 1
     fi
 
-    module_file_count_before=${#audit_module_files[@]}
+    found_module_representation=false
     while IFS= read -r -d '' artifact; do
-      audit_module_files+=("$artifact")
+      if collect_module_artifacts "$artifact"; then
+        found_module_representation=true
+      fi
     done < <(
       find "$products_root" \
-        -type f \
-        -path "*/Release-*/$target_name.swiftmodule/*.swiftmodule" \
+        -path "*/Release-*/$target_name.swiftmodule" \
         -print0
     )
-    if (( ${#audit_module_files[@]} == module_file_count_before )); then
+    if [[ "$found_module_representation" != true ]]; then
       echo "Could not find Xcode Release modules for $target_name under $products_root." >&2
       exit 1
     fi

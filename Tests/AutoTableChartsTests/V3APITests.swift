@@ -4245,25 +4245,37 @@ private final class ProgressRecorder: @unchecked Sendable {
         _ = try await readyPresentation(from: session) {
             $0.context.identity == "initial"
         }
+        let retainedResolver = AutoChartTextResolver {
+            "retained:\($0.defaultText)"
+        }
         let observation = V3ObservationLoop()
         observation.track {
-            _ = session.state
+            _ = session.presentationTextResolver
         } onChange: {
             observation.cancel()
             session.cancel()
         }
 
-        session.setPresentationContext(.init(identity: "retained"))
+        session.setPresentationContext(
+            .init(identity: "retained"), textResolver: retainedResolver)
 
         guard case .idle = session.state else {
             Issue.record("Context rebuilding did not yield to cancellation.")
             return
         }
+        #expect(
+            session.presentationTextResolver.callbackIdentity
+                == retainedResolver.callbackIdentity)
         #expect(session.retry() == .started)
         let retried = try await readyPresentation(from: session) {
             $0.context.identity == "retained"
+                && $0.textResolver.callbackIdentity
+                    == retainedResolver.callbackIdentity
         }
         #expect(retried.context.identity == "retained")
+        #expect(
+            retried.textResolver.callbackIdentity
+                == retainedResolver.callbackIdentity)
     }
 
     @Test func nestedPresentationContextWins() async throws {
@@ -5143,17 +5155,11 @@ private final class ProgressRecorder: @unchecked Sendable {
         #endif
     }
 
-    @Test(
-        .disabled(if: !testHooksAvailable, testHooksUnavailable),
-        .timeLimit(.minutes(1)))
+    @Test(.timeLimit(.minutes(1)))
     func supersededEnvironmentApplicationRetainsOverrides() async throws {
-        #if ATC_TEST_HOOKS
         for unloads in [false, true] {
             let session = AutoChartSession<Int>(cache: AutoChartCache())
-            defer {
-                session.environmentApplicationForTesting = nil
-                session.cancel()
-            }
+            defer { session.cancel() }
             let request = try AutoChartRequest(table: domainDataset(
                 key: .trusted(
                     identity: "environment-supersession-\(unloads)",
@@ -5163,18 +5169,13 @@ private final class ProgressRecorder: @unchecked Sendable {
             let retainedResolver = AutoChartTextResolver {
                 "retained:\($0.defaultText)"
             }
-            let resolverChanges = V3Counter()
-            withObservationTracking {
+            let observation = V3ObservationLoop()
+            var didSupersede = false
+            observation.track {
                 _ = session.presentationTextResolver
             } onChange: {
-                resolverChanges.increment()
-            }
-            var didSupersede = false
-            var resolverChangesBeforeSupersession: Int?
-            session.environmentApplicationForTesting = { [weak session] in
-                guard !didSupersede, let session else { return }
+                observation.cancel()
                 didSupersede = true
-                resolverChangesBeforeSupersession = resolverChanges.value
                 if unloads {
                     session.unload()
                 } else {
@@ -5187,9 +5188,7 @@ private final class ProgressRecorder: @unchecked Sendable {
                 formatters: nil,
                 textResolver: retainedResolver)
 
-            session.environmentApplicationForTesting = nil
-            #expect(resolverChangesBeforeSupersession == 1)
-            #expect(resolverChanges.value == 1)
+            #expect(didSupersede)
             #expect(
                 session.presentationTextResolver.callbackIdentity
                     == retainedResolver.callbackIdentity)
@@ -5208,11 +5207,14 @@ private final class ProgressRecorder: @unchecked Sendable {
             }
             let presented = try await readyPresentation(from: session) {
                 $0.context.identity == "retained-environment"
+                    && $0.textResolver.callbackIdentity
+                        == retainedResolver.callbackIdentity
             }
-            #expect(didSupersede)
             #expect(presented.context.identity == "retained-environment")
+            #expect(
+                presented.textResolver.callbackIdentity
+                    == retainedResolver.callbackIdentity)
         }
-        #endif
     }
 
     @Test func contextOnlyUpdatesPreserveLoadedPresentationCallbacks() async throws {
@@ -5301,11 +5303,9 @@ private final class ProgressRecorder: @unchecked Sendable {
         #expect(unexpectedPreferenceChanges.value == 0)
 
         let stateSession = AutoChartSession<Int>(cache: AutoChartCache())
-        defer { stateSession.cancel() }
         let request = try AutoChartRequest(table: domainDataset(
             key: .trusted(identity: "untracked-lifecycle-read", revision: "1")))
-        let resolver = AutoChartTextResolver { $0.defaultText }
-        #expect(stateSession.load(request, textResolver: resolver) == .started)
+        #expect(stateSession.load(request) == .started)
         _ = try await readyPresentation(from: stateSession) { _ in true }
         let unexpectedStateChanges = V3Counter()
         withObservationTracking {
