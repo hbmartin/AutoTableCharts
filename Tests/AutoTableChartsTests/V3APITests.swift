@@ -3193,6 +3193,41 @@ private final class ProgressRecorder: @unchecked Sendable {
         unlisted.cancel()
     }
 
+    @Test func retainedRequestObservationTracksPresenceChangesOnly() throws {
+        let session = AutoChartSession<Int>(cache: AutoChartCache())
+        let initialChanges = V3Counter()
+        withObservationTracking {
+            #expect(!session.hasRetainedRequest)
+        } onChange: {
+            initialChanges.increment()
+        }
+
+        let firstRequest = try AutoChartRequest(table: domainDataset(
+            key: .trusted(identity: "retained-observation", revision: "1")))
+        #expect(session.load(firstRequest) == .started)
+        #expect(initialChanges.value == 1)
+
+        let retainedChanges = V3Counter()
+        withObservationTracking {
+            #expect(session.hasRetainedRequest)
+        } onChange: {
+            retainedChanges.increment()
+        }
+
+        let replacement = try AutoChartRequest(table: domainDataset(
+            key: .trusted(identity: "retained-observation", revision: "2")))
+        #expect(session.load(replacement) == .started)
+        session.cancel()
+        #expect(session.hasRetainedRequest)
+        #expect(retainedChanges.value == 0)
+
+        session.unload()
+        #expect(!session.hasRetainedRequest)
+        #expect(retainedChanges.value == 1)
+        session.unload()
+        #expect(retainedChanges.value == 1)
+    }
+
     @Test func unloadForgetsRequestStateButRetainsSpecificPreference() async throws {
         let cache = AutoChartCache()
         let request = try AutoChartRequest(table: domainDataset())
