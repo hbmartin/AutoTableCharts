@@ -206,10 +206,9 @@ add_xcode_interface() {
   local module_name="$2"
   local release_path
   release_path="$(xcode_release_path "$derived_data_path")"
-  mkdir -p "$release_path/$module_name.swiftmodule"
+  mkdir -p "$release_path"
   printf 'clean interface for %s\n' "$module_name" \
-    > "$release_path/$module_name.swiftmodule/arm64-apple-ios.swiftinterface"
-  add_xcode_module_sidecars "$derived_data_path" "$module_name"
+    > "$release_path/$module_name.swiftinterface"
 }
 
 add_xcode_layout() {
@@ -463,6 +462,17 @@ for target_name in AutoTableCharts AutoTableChartsUI; do
   add_xcode_interface "$fixture_path" "$target_name"
 done
 expect_success xcode-interface-only xcode "$fixture_path" "$xcode_success_message"
+
+fixture_path="$(new_fixture xcode-flat-interface-leak)"
+for target_name in AutoTableCharts AutoTableChartsUI; do
+  add_xcode_object "$fixture_path" "$target_name"
+  add_xcode_interface "$fixture_path" "$target_name"
+done
+xcode_release="$(xcode_release_path "$fixture_path")"
+printf 'sessionForTesting\n' \
+  >> "$xcode_release/AutoTableChartsUI.swiftinterface"
+expect_failure \
+  xcode-flat-interface-leak xcode "$fixture_path" "$xcode_leak_message"
 
 fixture_path="$(new_fixture xcode-missing-object)"
 add_xcode_object "$fixture_path" AutoTableCharts
