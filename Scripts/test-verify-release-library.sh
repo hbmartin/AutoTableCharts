@@ -162,15 +162,41 @@ add_swiftpm_legacy_layout() {
   done
 }
 
+add_swiftpm_interface_layout() {
+  local fixture_path="$1"
+  for target_name in AutoTableCharts AutoTableChartsUI; do
+    add_swiftpm_legacy_object "$fixture_path" "$target_name"
+    add_swiftpm_legacy_interface "$fixture_path" "$target_name"
+  done
+}
+
+add_swiftpm_mixed_layout() {
+  local fixture_path="$1"
+  add_swiftpm_current_layout "$fixture_path"
+  for target_name in AutoTableCharts AutoTableChartsUI; do
+    add_swiftpm_legacy_interfaces "$fixture_path/Modules" "$target_name"
+    add_swiftpm_legacy_module_sidecars "$fixture_path/Modules" "$target_name"
+  done
+}
+
 xcode_release_path() {
-  printf '%s\n' "$1/Build/Products/Release-iphoneos"
+  printf '%s\n' "$1/Build/Products/${2:-Release-iphoneos}"
+}
+
+xcode_module_stem() {
+  local release_path
+  release_path="$(xcode_release_path "$1" "${3:-Release-iphoneos}")"
+  if [[ "${4:-direct}" == framework ]]; then
+    release_path="$release_path/PackageFrameworks/$2.framework/Modules"
+  fi
+  printf '%s\n' "$release_path/$2"
 }
 
 add_xcode_object() {
   local derived_data_path="$1"
   local target_name="$2"
   local release_path
-  release_path="$(xcode_release_path "$derived_data_path")"
+  release_path="$(xcode_release_path "$derived_data_path" "${3:-Release-iphoneos}")"
   mkdir -p "$release_path"
   printf 'clean symbol for %s\n' "$target_name" \
     > "$release_path/$target_name.o"
@@ -179,44 +205,102 @@ add_xcode_object() {
 add_xcode_module() {
   local derived_data_path="$1"
   local module_name="$2"
-  local release_path
-  release_path="$(xcode_release_path "$derived_data_path")"
-  mkdir -p "$release_path/$module_name.swiftmodule"
+  local module_stem
+  module_stem="$(
+    xcode_module_stem "$derived_data_path" "$module_name" \
+      "${3:-Release-iphoneos}" "${4:-direct}"
+  )"
+  mkdir -p "$module_stem.swiftmodule"
   printf 'clean module for %s\n' "$module_name" \
-    > "$release_path/$module_name.swiftmodule/arm64-apple-ios.swiftmodule"
+    > "$module_stem.swiftmodule/arm64-apple-ios.swiftmodule"
   printf 'clean interface for %s\n' "$module_name" \
-    > "$release_path/$module_name.swiftmodule/arm64-apple-ios.swiftinterface"
-  add_xcode_module_sidecars "$derived_data_path" "$module_name"
+    > "$module_stem.swiftmodule/arm64-apple-ios.swiftinterface"
+  add_xcode_module_sidecars "$derived_data_path" "$module_name" \
+    "${3:-Release-iphoneos}" "${4:-direct}"
 }
 
 add_xcode_module_sidecars() {
   local derived_data_path="$1"
   local module_name="$2"
-  local release_path
-  release_path="$(xcode_release_path "$derived_data_path")"
-  mkdir -p "$release_path/$module_name.swiftmodule"
+  local module_stem
+  module_stem="$(
+    xcode_module_stem "$derived_data_path" "$module_name" \
+      "${3:-Release-iphoneos}" "${4:-direct}"
+  )"
+  mkdir -p "$module_stem.swiftmodule"
   printf 'clean documentation for %s\n' "$module_name" \
-    > "$release_path/$module_name.swiftmodule/arm64-apple-ios.swiftdoc"
+    > "$module_stem.swiftmodule/arm64-apple-ios.swiftdoc"
   printf 'clean ABI for %s\n' "$module_name" \
-    > "$release_path/$module_name.swiftmodule/arm64-apple-ios.abi.json"
+    > "$module_stem.swiftmodule/arm64-apple-ios.abi.json"
 }
 
 add_xcode_interface() {
   local derived_data_path="$1"
   local module_name="$2"
-  local release_path
-  release_path="$(xcode_release_path "$derived_data_path")"
-  mkdir -p "$release_path"
+  local module_stem
+  module_stem="$(
+    xcode_module_stem "$derived_data_path" "$module_name" \
+      "${3:-Release-iphoneos}" "${4:-direct}"
+  )"
+  mkdir -p "$module_stem.swiftmodule"
   printf 'clean interface for %s\n' "$module_name" \
-    > "$release_path/$module_name.swiftinterface"
+    > "$module_stem.swiftmodule/arm64-apple-ios.swiftinterface"
+  add_xcode_module_sidecars "$derived_data_path" "$module_name" \
+    "${3:-Release-iphoneos}" "${4:-direct}"
+}
+
+add_xcode_flat_interface() {
+  local module_stem
+  module_stem="$(
+    xcode_module_stem "$1" "$2" "${3:-Release-iphoneos}" "${4:-direct}"
+  )"
+  mkdir -p "${module_stem%/*}"
+  printf 'clean interface for %s\n' "$2" \
+    > "$module_stem.${5:-swiftinterface}"
+}
+
+add_xcode_flat_sidecars() {
+  local module_stem
+  module_stem="$(
+    xcode_module_stem "$1" "$2" "${3:-Release-iphoneos}" "${4:-direct}"
+  )"
+  mkdir -p "${module_stem%/*}"
+  printf 'clean documentation for %s\n' "$2" > "$module_stem.swiftdoc"
+  printf 'clean ABI for %s\n' "$2" > "$module_stem.abi.json"
 }
 
 add_xcode_layout() {
   local derived_data_path="$1"
   for target_name in AutoTableCharts AutoTableChartsUI; do
-    add_xcode_object "$derived_data_path" "$target_name"
-    add_xcode_module "$derived_data_path" "$target_name"
+    add_xcode_object "$derived_data_path" "$target_name" "${2:-Release-iphoneos}"
+    add_xcode_module "$derived_data_path" "$target_name" \
+      "${2:-Release-iphoneos}" "${3:-direct}"
   done
+}
+
+add_xcode_interface_layout() {
+  local derived_data_path="$1"
+  for target_name in AutoTableCharts AutoTableChartsUI; do
+    add_xcode_object "$derived_data_path" "$target_name" "${2:-Release-iphoneos}"
+    add_xcode_interface "$derived_data_path" "$target_name" \
+      "${2:-Release-iphoneos}" "${3:-direct}"
+  done
+}
+
+add_xcode_flat_layout() {
+  local derived_data_path="$1"
+  for target_name in AutoTableCharts AutoTableChartsUI; do
+    add_xcode_object "$derived_data_path" "$target_name" "${2:-Release-iphoneos}"
+    add_xcode_flat_interface "$derived_data_path" "$target_name" \
+      "${2:-Release-iphoneos}" "${3:-direct}" "${4:-swiftinterface}"
+    add_xcode_flat_sidecars "$derived_data_path" "$target_name" \
+      "${2:-Release-iphoneos}" "${3:-direct}"
+  done
+}
+
+add_xcode_mixed_layout() {
+  add_xcode_layout "$1"
+  add_xcode_flat_layout "$1"
 }
 
 run_audit() {
@@ -346,28 +430,19 @@ add_swiftpm_legacy_layout "$fixture_path"
 expect_success swiftpm-legacy swiftpm "$fixture_path" "$swiftpm_success_message"
 
 fixture_path="$(new_fixture swiftpm-interface-only)"
-for target_name in AutoTableCharts AutoTableChartsUI; do
-  add_swiftpm_legacy_object "$fixture_path" "$target_name"
-  add_swiftpm_legacy_interface "$fixture_path" "$target_name"
-done
+add_swiftpm_interface_layout "$fixture_path"
 expect_success \
   swiftpm-interface-only swiftpm "$fixture_path" "$swiftpm_success_message"
 
 fixture_path="$(new_fixture swiftpm-package-interface-leak)"
-for target_name in AutoTableCharts AutoTableChartsUI; do
-  add_swiftpm_legacy_object "$fixture_path" "$target_name"
-  add_swiftpm_legacy_interface "$fixture_path" "$target_name"
-done
+add_swiftpm_interface_layout "$fixture_path"
 printf 'environmentApplicationForTesting\n' \
   >> "$fixture_path/AutoTableChartsUI.package.swiftinterface"
 expect_failure \
   swiftpm-package-interface-leak swiftpm "$fixture_path" "$leak_message"
 
 fixture_path="$(new_fixture swiftpm-private-interface-leak)"
-for target_name in AutoTableCharts AutoTableChartsUI; do
-  add_swiftpm_legacy_object "$fixture_path" "$target_name"
-  add_swiftpm_legacy_interface "$fixture_path" "$target_name"
-done
+add_swiftpm_interface_layout "$fixture_path"
 printf 'sessionForTesting\n' \
   >> "$fixture_path/AutoTableChartsUI.private.swiftinterface"
 expect_failure \
@@ -457,17 +532,11 @@ add_xcode_layout "$fixture_path"
 expect_success xcode-current xcode "$fixture_path" "$xcode_success_message"
 
 fixture_path="$(new_fixture xcode-interface-only)"
-for target_name in AutoTableCharts AutoTableChartsUI; do
-  add_xcode_object "$fixture_path" "$target_name"
-  add_xcode_interface "$fixture_path" "$target_name"
-done
+add_xcode_interface_layout "$fixture_path"
 expect_success xcode-interface-only xcode "$fixture_path" "$xcode_success_message"
 
 fixture_path="$(new_fixture xcode-flat-interface-leak)"
-for target_name in AutoTableCharts AutoTableChartsUI; do
-  add_xcode_object "$fixture_path" "$target_name"
-  add_xcode_interface "$fixture_path" "$target_name"
-done
+add_xcode_flat_layout "$fixture_path"
 xcode_release="$(xcode_release_path "$fixture_path")"
 printf 'sessionForTesting\n' \
   >> "$xcode_release/AutoTableChartsUI.swiftinterface"
@@ -535,5 +604,189 @@ xcode_release="$(xcode_release_path "$fixture_path")"
 printf 'sessionForTesting\n' \
   >> "$xcode_release/AutoTableChartsUI.swiftmodule/arm64-apple-ios.abi.json"
 expect_failure xcode-abi-leak xcode "$fixture_path" "$xcode_leak_message"
+
+# Mixed layouts must audit the flat siblings as well as the directory contents.
+for audit_mode in swiftpm xcode; do
+  fixture_name="$audit_mode-mixed-clean"
+  fixture_path="$(new_fixture "$fixture_name")"
+  if [[ "$audit_mode" == swiftpm ]]; then
+    add_swiftpm_mixed_layout "$fixture_path"
+    success_message="$swiftpm_success_message"
+    expected_leak_message="$leak_message"
+  else
+    add_xcode_mixed_layout "$fixture_path"
+    success_message="$xcode_success_message"
+    expected_leak_message="$xcode_leak_message"
+  fi
+  expect_success "$fixture_name" "$audit_mode" "$fixture_path" "$success_message"
+
+  for artifact_suffix in \
+    swiftinterface private.swiftinterface package.swiftinterface swiftdoc abi.json
+  do
+    fixture_name="$audit_mode-mixed-$artifact_suffix-leak"
+    fixture_path="$(new_fixture "$fixture_name")"
+    if [[ "$audit_mode" == swiftpm ]]; then
+      add_swiftpm_mixed_layout "$fixture_path"
+      module_stem="$fixture_path/Modules/AutoTableChartsUI"
+    else
+      add_xcode_mixed_layout "$fixture_path"
+      module_stem="$(xcode_module_stem "$fixture_path" AutoTableChartsUI)"
+    fi
+    printf 'sessionForTesting\n' >> "$module_stem.$artifact_suffix"
+    expect_failure \
+      "$fixture_name" "$audit_mode" "$fixture_path" "$expected_leak_message"
+  done
+done
+
+for interface_suffix in swiftinterface private.swiftinterface package.swiftinterface; do
+  fixture_name="xcode-flat-$interface_suffix-only"
+  fixture_path="$(new_fixture "$fixture_name")"
+  add_xcode_flat_layout "$fixture_path" Release-iphoneos direct "$interface_suffix"
+  expect_success "$fixture_name" xcode "$fixture_path" "$xcode_success_message"
+done
+
+for artifact_suffix in \
+  private.swiftinterface package.swiftinterface swiftdoc abi.json
+do
+  fixture_name="xcode-flat-$artifact_suffix-leak"
+  fixture_path="$(new_fixture "$fixture_name")"
+  add_xcode_flat_layout "$fixture_path"
+  module_stem="$(xcode_module_stem "$fixture_path" AutoTableChartsUI)"
+  printf 'sessionForTesting\n' >> "$module_stem.$artifact_suffix"
+  expect_failure "$fixture_name" xcode "$fixture_path" "$xcode_leak_message"
+done
+
+fixture_path="$(new_fixture xcode-flat-sidecars-without-module)"
+add_xcode_object "$fixture_path" AutoTableCharts
+add_xcode_object "$fixture_path" AutoTableChartsUI
+add_xcode_flat_interface "$fixture_path" AutoTableCharts
+add_xcode_flat_sidecars "$fixture_path" AutoTableChartsUI
+expect_failure \
+  xcode-flat-sidecars-without-module xcode "$fixture_path" \
+  'Could not find Xcode Release modules for AutoTableChartsUI under'
+
+fixture_path="$(new_fixture xcode-nested-interface-only-leak)"
+add_xcode_interface_layout "$fixture_path"
+module_stem="$(xcode_module_stem "$fixture_path" AutoTableChartsUI)"
+printf 'sessionForTesting\n' \
+  >> "$module_stem.swiftmodule/arm64-apple-ios.swiftinterface"
+expect_failure \
+  xcode-nested-interface-only-leak xcode "$fixture_path" "$xcode_leak_message"
+
+fixture_path="$(new_fixture xcode-second-architecture-leak)"
+add_xcode_layout "$fixture_path"
+module_stem="$(xcode_module_stem "$fixture_path" AutoTableChartsUI)"
+printf 'sessionForTesting\n' \
+  > "$module_stem.swiftmodule/x86_64-apple-ios-simulator.private.swiftinterface"
+expect_failure \
+  xcode-second-architecture-leak xcode "$fixture_path" "$xcode_leak_message"
+
+for framework_layout in module interface flat; do
+  fixture_name="xcode-framework-$framework_layout"
+  fixture_path="$(new_fixture "$fixture_name")"
+  case "$framework_layout" in
+    module) add_xcode_layout "$fixture_path" Release-iphoneos framework ;;
+    interface) add_xcode_interface_layout "$fixture_path" Release-iphoneos framework ;;
+    flat) add_xcode_flat_layout "$fixture_path" Release-iphoneos framework ;;
+  esac
+  expect_success "$fixture_name" xcode "$fixture_path" "$xcode_success_message"
+
+  # A clean direct module must not hide a leak in another module location.
+  add_xcode_layout "$fixture_path"
+  module_stem="$(
+    xcode_module_stem "$fixture_path" AutoTableChartsUI Release-iphoneos framework
+  )"
+  if [[ "$framework_layout" == flat ]]; then
+    leak_path="$module_stem.private.swiftinterface"
+  else
+    leak_path="$module_stem.swiftmodule/arm64-apple-ios.swiftinterface"
+  fi
+  printf 'sessionForTesting\n' >> "$leak_path"
+  expect_failure \
+    "$fixture_name-with-direct-leak" xcode "$fixture_path" "$xcode_leak_message"
+done
+
+for macos_layout in module flat; do
+  fixture_name="xcode-macos-$macos_layout"
+  fixture_path="$(new_fixture "$fixture_name")"
+  if [[ "$macos_layout" == module ]]; then
+    add_xcode_layout "$fixture_path" Release
+  else
+    add_xcode_flat_layout "$fixture_path" Release
+  fi
+  expect_success "$fixture_name" xcode "$fixture_path" "$xcode_success_message"
+  module_stem="$(xcode_module_stem "$fixture_path" AutoTableChartsUI Release)"
+  printf 'sessionForTesting\n' >> "$module_stem.swiftinterface"
+  expect_failure "$fixture_name-leak" xcode "$fixture_path" "$xcode_leak_message"
+done
+
+for leak_configuration in Release Release-iphoneos; do
+  fixture_name="xcode-multiple-configurations-$leak_configuration-leak"
+  fixture_path="$(new_fixture "$fixture_name")"
+  add_xcode_layout "$fixture_path" Release
+  add_xcode_layout "$fixture_path" Release-iphoneos
+  module_stem="$(
+    xcode_module_stem "$fixture_path" AutoTableChartsUI "$leak_configuration"
+  )"
+  printf 'sessionForTesting\n' \
+    >> "$module_stem.swiftmodule/arm64-apple-ios.swiftinterface"
+  expect_failure "$fixture_name" xcode "$fixture_path" "$xcode_leak_message"
+done
+
+for artifact_suffix in swiftdoc abi.json; do
+  fixture_name="xcode-orphan-$artifact_suffix-leak"
+  fixture_path="$(new_fixture "$fixture_name")"
+  add_xcode_layout "$fixture_path"
+  add_xcode_flat_sidecars "$fixture_path" AutoTableChartsUI Release-iphonesimulator
+  module_stem="$(
+    xcode_module_stem "$fixture_path" AutoTableChartsUI Release-iphonesimulator
+  )"
+  printf 'sessionForTesting\n' >> "$module_stem.$artifact_suffix"
+  expect_failure "$fixture_name" xcode "$fixture_path" "$xcode_leak_message"
+done
+
+fixture_path="$(new_fixture 'xcode derived data with spaces')"
+add_xcode_flat_layout "$fixture_path" Release-iphoneos framework
+add_xcode_layout "$fixture_path" Release
+expect_success xcode-path-with-spaces xcode "$fixture_path" "$xcode_success_message"
+
+fixture_path="$(new_fixture xcode-ignored-configurations)"
+add_xcode_layout "$fixture_path"
+for ignored_configuration in Debug Debug-iphoneos ReleaseCandidate; do
+  add_xcode_layout "$fixture_path" "$ignored_configuration"
+  ignored_release="$(xcode_release_path "$fixture_path" "$ignored_configuration")"
+  printf 'sessionForTesting\n' >> "$ignored_release/AutoTableChartsUI.o"
+  printf 'sessionForTesting\n' \
+    >> "$ignored_release/AutoTableChartsUI.swiftmodule/arm64-apple-ios.swiftinterface"
+done
+expect_success \
+  xcode-ignored-configurations xcode "$fixture_path" "$xcode_success_message"
+
+fixture_path="$(new_fixture xcode-only-ignored-configurations)"
+for ignored_configuration in Debug Debug-iphoneos ReleaseCandidate; do
+  add_xcode_layout "$fixture_path" "$ignored_configuration"
+done
+expect_failure \
+  xcode-only-ignored-configurations xcode "$fixture_path" \
+  'Could not find an Xcode Release AutoTableCharts.o under'
+
+fixture_path="$(new_fixture xcode-only-ignored-ui-module)"
+add_xcode_object "$fixture_path" AutoTableCharts
+add_xcode_object "$fixture_path" AutoTableChartsUI
+add_xcode_module "$fixture_path" AutoTableCharts
+for ignored_configuration in Debug Debug-iphoneos ReleaseCandidate; do
+  add_xcode_module "$fixture_path" AutoTableChartsUI "$ignored_configuration"
+done
+expect_failure \
+  xcode-only-ignored-ui-module xcode "$fixture_path" \
+  'Could not find Xcode Release modules for AutoTableChartsUI under'
+
+fixture_path="$(new_fixture xcode-exact-target-names)"
+add_xcode_layout "$fixture_path"
+xcode_release="$(xcode_release_path "$fixture_path")"
+printf 'sessionForTesting\n' > "$xcode_release/AutoTableChartsUIExtra.o"
+printf 'sessionForTesting\n' > "$xcode_release/AutoTableChartsUIExtra.swiftinterface"
+expect_success \
+  xcode-exact-target-names xcode "$fixture_path" "$xcode_success_message"
 
 echo "Verified SwiftPM and Xcode release-library artifact discovery."

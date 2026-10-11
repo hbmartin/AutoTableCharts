@@ -39,24 +39,22 @@ collect_module_artifacts() {
     )
   fi
 
-  if [[ ! -d "$module_path" ]]; then
-    local module_stem="${module_path%.swiftmodule}"
-    local sibling_artifact
-    for sibling_artifact in \
-      "$module_stem.swiftinterface" \
-      "$module_stem.private.swiftinterface" \
-      "$module_stem.package.swiftinterface" \
-      "$module_stem.swiftdoc" \
-      "$module_stem.abi.json"
-    do
-      if [[ -f "$sibling_artifact" ]]; then
-        audit_module_files+=("$sibling_artifact")
-        if [[ "$sibling_artifact" == *.swiftinterface ]]; then
-          found_representation=true
-        fi
+  local module_stem="${module_path%.swiftmodule}"
+  local sibling_artifact
+  for sibling_artifact in \
+    "$module_stem.swiftinterface" \
+    "$module_stem.private.swiftinterface" \
+    "$module_stem.package.swiftinterface" \
+    "$module_stem.swiftdoc" \
+    "$module_stem.abi.json"
+  do
+    if [[ -f "$sibling_artifact" ]]; then
+      audit_module_files+=("$sibling_artifact")
+      if [[ "$sibling_artifact" == *.swiftinterface ]]; then
+        found_representation=true
       fi
-    done
-  fi
+    fi
+  done
 
   [[ "$found_representation" == true ]]
 }
@@ -145,34 +143,68 @@ elif (( $# == 2 )) && [[ "$1" == "--xcode-derived-data" ]]; then
     exit 1
   fi
 
+  xcode_artifact_filters=()
+  for target_name in AutoTableCharts AutoTableChartsUI; do
+    if (( ${#xcode_artifact_filters[@]} != 0 )); then
+      xcode_artifact_filters+=(-o)
+    fi
+    xcode_artifact_filters+=( \( -type f -name "$target_name.o" \) )
+    for artifact_suffix in \
+      swiftmodule swiftinterface private.swiftinterface package.swiftinterface \
+      swiftdoc abi.json
+    do
+      xcode_artifact_filters+=(-o -name "$target_name.$artifact_suffix")
+    done
+  done
+
+  # Discover both targets once, including nested framework and flat layouts.
+  xcode_release_artifacts=()
+  while IFS= read -r -d '' artifact; do
+    relative_artifact_path="${artifact#"$products_root"/}"
+    case "/$relative_artifact_path" in
+      */Release/* | */Release-*/*)
+        xcode_release_artifacts+=("$artifact")
+        ;;
+    esac
+  done < <(
+    find "$products_root" \( "${xcode_artifact_filters[@]}" \) -print0
+  )
+
   for target_name in AutoTableCharts AutoTableChartsUI; do
     symbol_file_count_before=${#audit_symbol_files[@]}
-    while IFS= read -r -d '' artifact; do
-      audit_symbol_files+=("$artifact")
-    done < <(
-      find "$products_root" \
-        -type f \
-        -path "*/Release-*/$target_name.o" \
-        -print0
-    )
+    target_module_paths=()
+    # Guard empty arrays for Bash 3.2 with nounset enabled.
+    for artifact in ${xcode_release_artifacts[@]+"${xcode_release_artifacts[@]}"}; do
+      case "${artifact##*/}" in
+        "$target_name.o")
+          audit_symbol_files+=("$artifact")
+          ;;
+        "$target_name".*)
+          release_module_path="${artifact%/*}/$target_name.swiftmodule"
+          known_module_path=false
+          for module_path in ${target_module_paths[@]+"${target_module_paths[@]}"}; do
+            if [[ "$module_path" == "$release_module_path" ]]; then
+              known_module_path=true
+              break
+            fi
+          done
+          if [[ "$known_module_path" != true ]]; then
+            target_module_paths+=("$release_module_path")
+          fi
+          ;;
+      esac
+    done
     if (( ${#audit_symbol_files[@]} == symbol_file_count_before )); then
       echo "Could not find an Xcode Release $target_name.o under $products_root." >&2
       exit 1
     fi
 
     found_module_representation=false
-    while IFS= read -r -d '' release_product_path; do
-      if collect_module_artifacts \
-        "$release_product_path/$target_name.swiftmodule"
-      then
+    for release_module_path in ${target_module_paths[@]+"${target_module_paths[@]}"}; do
+      if collect_module_artifacts "$release_module_path"; then
         found_module_representation=true
       fi
-    done < <(
-      find "$products_root" \
-        -type d \
-        -name 'Release-*' \
-        -print0
-    )
+    done
     if [[ "$found_module_representation" != true ]]; then
       echo "Could not find Xcode Release modules for $target_name under $products_root." >&2
       exit 1
